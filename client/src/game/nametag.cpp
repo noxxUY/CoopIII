@@ -71,6 +71,9 @@ namespace coopiii::game {
 
 namespace {
 
+// Set once from CoopIII.ini before the hook goes in. See SetNametagScale.
+float g_userScale = 1.0f;
+
 // CVector / RwV3d, and CRGBA. CRect's member order is the one documented in
 // addresses.h: left, bottom, right, top, which is not the order its
 // constructor takes them in.
@@ -386,7 +389,7 @@ void DrawTags() {
 		Tag &tag     = tags[count];
 		tag          = Tag{};
 		tag.playerId = id;
-		tag.m        = MeasureTag(screenH, plan.scale);
+		tag.m        = MeasureTag(screenH, plan.scale * g_userScale);
 		// The tag and the ray now point at the same spot, the top of the
 		// player's head. The clearance between that and the bottom of the tag
 		// is screen pixels rather than world metres, so it stays the same at
@@ -530,6 +533,11 @@ void __cdecl HookedHudDraw() {
 }
 
 } // namespace
+
+void SetNametagScale(float scale) {
+	if (scale >= 0.25f && scale <= 4.0f)
+		g_userScale = scale;
+}
 
 bool InstallNametags(const Client &client) {
 	g_client = &client;

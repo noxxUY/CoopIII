@@ -29,6 +29,14 @@ struct Config {
 	// it happens. Turn this on to get stock single-player pause behaviour.
 	bool menuPausesTheGame = false;
 
+	// How big a nametag is drawn, as a multiple of the built-in size. The
+	// built-in one is a fixed fraction of screen height and is the same on
+	// every resolution, so this is a preference about how prominent other
+	// players' names should be, not a correction for a screen. Clamped to
+	// something a person could still read at one end and still see past at
+	// the other.
+	float nametagScale = 1.0f;
+
 	// Parses INI text. Unknown keys are ignored, not fatal, so a config from
 	// a newer build still loads. Returns false only if `text` is empty.
 	bool ParseIni(const std::string &text);

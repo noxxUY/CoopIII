@@ -159,6 +159,7 @@ DWORD WINAPI Boot(LPVOID) {
 	// them to label, so a client that never starts doesn't leave a detour on
 	// the HUD with nothing to draw. Not fatal if it fails: the session still
 	// works, you just can't tell who is who.
+	game::SetNametagScale(g_config.nametagScale);
 	game::InstallNametags(g_client);
 
 	Log("CoopIII ready");

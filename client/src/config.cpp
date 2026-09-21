@@ -93,6 +93,10 @@ bool Config::ParseIni(const std::string &text) {
 			logToFile = ParseBool(value, logToFile);
 		} else if (IEquals(key, "menupausesthegame") || IEquals(key, "pause")) {
 			menuPausesTheGame = ParseBool(value, menuPausesTheGame);
+		} else if (IEquals(key, "nametagscale")) {
+			const double s = std::strtod(value.c_str(), nullptr);
+			if (s >= 0.25 && s <= 4.0)
+				nametagScale = static_cast<float>(s);
 		}
 		// Unknown keys: ignored on purpose (see config.h).
 
