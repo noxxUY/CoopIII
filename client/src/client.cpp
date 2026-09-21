@@ -43,10 +43,17 @@ void Client::UnseatPlayer(RemotePlayer &player) {
 
 void Client::ClearRoster() {
 	m_localPlayerId       = 0xFF;
+	m_localNetId          = INVALID_NETID;
 	m_localVehicleNetId   = INVALID_NETID;
 	m_vehicleClaimPending = false;
 	// A new session hasn't been told anything about us yet.
 	m_sentModelId         = 0xFFFF;
+	// Nor has it been told we died. A death announced to the old session is
+	// not a death this one knows about, and leaving the flag set would mean
+	// the first respawn after a reconnect gets announced on its own.
+	m_deathAnnounced      = false;
+	m_lastAttackerNetId   = INVALID_NETID;
+	m_lastAttackerMs      = 0;
 	for (RemotePlayer &p : m_players) {
 		if (p.poolHandle >= 0)
 			UnseatPlayer(p);
@@ -134,6 +141,12 @@ void Client::HandleMessage(const Message &msg) {
 		OnShot(*p);
 	} else if (const S_Explosion *p = msg.as<S_Explosion>()) {
 		OnExplosion(*p);
+	} else if (const S_Damage *p = msg.as<S_Damage>()) {
+		OnDamage(*p);
+	} else if (const S_Death *p = msg.as<S_Death>()) {
+		OnDeath(*p);
+	} else if (const S_Respawn *p = msg.as<S_Respawn>()) {
+		OnRespawn(*p);
 	}
 	// Anything else isn't handled yet, and stays silently ignored rather
 	// than logged - the server already sends world state and chat, and a
@@ -146,12 +159,23 @@ void Client::OnWelcome(const S_Welcome &pkt) {
 		Log("client: server rejected the connection (reason %u)", pkt.reject);
 		return;
 	}
-	Log("client: joined as player %u (netId %u), %u slots, %u Hz, %02u:%02u",
-	    pkt.playerId, pkt.netId, pkt.maxPlayers, pkt.snapshotHz, pkt.hour, pkt.minute);
+	m_friendlyFire = (pkt.flags & SESSION_FRIENDLY_FIRE) != 0;
+	Log("client: joined as player %u (netId %u), %u slots, %u Hz, %02u:%02u, "
+	    "friendly fire %s",
+	    pkt.playerId, pkt.netId, pkt.maxPlayers, pkt.snapshotHz, pkt.hour, pkt.minute,
+	    m_friendlyFire ? "on" : "off");
 
 	// A welcome starts a session, so anything left from a previous one is stale.
 	ClearRoster();
 	m_localPlayerId = pkt.playerId;
+	m_localNetId    = pkt.netId;
+
+	// The one part of friendly fire the server can't enforce by refusing to
+	// relay: an explosion is replayed locally at a position its owner chose,
+	// so this machine is the one that has to decline the blast. See
+	// SessionFlags in protocol.h.
+	if (m_bridge.SetFriendlyFire)
+		m_bridge.SetFriendlyFire(m_friendlyFire);
 }
 
 void Client::OnJoin(const S_PlayerJoin &pkt) {
@@ -321,6 +345,11 @@ void Client::SendLocalState() {
 	if (!m_bridge.SampleLocalPlayer(body))
 		return;   // no player right now - menus, loading, a cutscene
 
+	// Off the same sample, before it goes anywhere. Reading the ped a second
+	// time just to look at one float would mean walking its animation list
+	// twice a tick for nothing.
+	UpdateLocalLife(body);
+
 	C_PlayerState pkt;
 	InitHeader(pkt, WallClock::NowMs());
 	pkt.body = body;
@@ -366,6 +395,153 @@ void Client::OnExplosion(const S_Explosion &pkt) {
 	m_bridge.PlayRemoteExplosion(p, pkt.body);
 }
 
+// ---- damage, death and respawn ---------------------------------------------
+//
+// The asymmetry here is the design, not an accident. Damage arrives for us
+// and we apply it to ourselves; death and respawn arrive for somebody else
+// and we apply them to their ped. There is no packet in this group that lets
+// one machine change another player's health, and that's the point
+// (docs/protocol.md §1.10).
+
+void Client::OnDamage(const S_Damage &pkt) {
+	// The server sends this to the victim alone, but a relay is a relay.
+	// Applying somebody else's hit to ourselves because the netId didn't
+	// match would be the one failure this whole design exists to prevent.
+	if (m_localNetId == INVALID_NETID || pkt.body.victimNetId != m_localNetId)
+		return;
+	if (!m_bridge.ApplyRemoteDamage)
+		return;
+
+	// Blame, where we can resolve it. A null attacker still hurts: their ped
+	// may not have streamed in, and the shot happened either way.
+	RemotePlayer *attacker = nullptr;
+	if (pkt.attackerId < MAX_PLAYERS && pkt.attackerId != m_localPlayerId &&
+	    m_players[pkt.attackerId].active) {
+		attacker            = &m_players[pkt.attackerId];
+		m_lastAttackerNetId = attacker->netId;
+		m_lastAttackerMs    = WallClock::NowMs();
+	}
+
+	m_bridge.ApplyRemoteDamage(attacker, pkt.body);
+}
+
+// Somebody else died. Their ped becomes a corpse, in whatever pose their own
+// engine picked.
+//
+// The seat comes off first, and that isn't tidiness. CPed::SetDie's
+// PED_DRIVING arm calls FlagToDestroyWhenNextProcessed on anything that
+// isn't the player ped, and every remote player is a CCivilianPed - so
+// killing a seated remote ped hands it to the engine to delete, and we find
+// out a frame later when the pool handle stops resolving.
+void Client::OnDeath(const S_Death &pkt) {
+	if (pkt.playerId >= MAX_PLAYERS || pkt.playerId == m_localPlayerId)
+		return;
+
+	RemotePlayer &p = m_players[pkt.playerId];
+	if (!p.active)
+		return;
+
+	Log("client: %s died (killer net %u)", p.nick.c_str(), pkt.killerNetId);
+
+	UnseatPlayer(p);
+	// And stop asking for the seat back. Without this UpdateRemoteSeats sees
+	// a standing instruction it can still carry out and puts the corpse back
+	// behind the wheel on the very next frame.
+	p.seatVehicleNetId = INVALID_NETID;
+
+	if (p.poolHandle >= 0 && m_bridge.KillRemotePed)
+		m_bridge.KillRemotePed(p, pkt.animId);
+}
+
+// And they're back. The corpse is destroyed and a fresh ped built the same
+// way the first one was, because CPed::SetDie has no undo: it zeroes the
+// health, clears the collision and hands the clump a death animation.
+void Client::OnRespawn(const S_Respawn &pkt) {
+	if (pkt.playerId >= MAX_PLAYERS || pkt.playerId == m_localPlayerId)
+		return;
+
+	RemotePlayer &p = m_players[pkt.playerId];
+	if (!p.active)
+		return;
+
+	Log("client: %s respawned", p.nick.c_str());
+
+	UnseatPlayer(p);
+	p.seatVehicleNetId = INVALID_NETID;
+	if (p.poolHandle >= 0 && m_bridge.DespawnRemote)
+		m_bridge.DespawnRemote(p);
+	p.poolHandle = -1;
+
+	// The old life's snapshots are half a city away from the new one. Keeping
+	// them would have the rebuilt ped rendered at the place its owner died
+	// for the length of the interpolation delay, then snapped to the
+	// hospital - so the buffer starts empty and the ped appears once real
+	// positions arrive, about a snapshot and a delay later.
+	p.interp.Clear();
+
+	p.last.pos     = pkt.body.pos;
+	p.last.heading = pkt.body.heading;
+	p.last.health  = 100.0f;
+	p.last.armour  = 0.0f;
+	p.haveState    = true;
+
+	// A new ped starts with none of this applied, same as after a model
+	// change. Leave them set and the rebuilt player stands unarmed in a
+	// T-pose until they next change weapon.
+	p.appliedAnimId  = ANIM_NONE;
+	p.appliedAnimId2 = ANIM_NONE;
+	p.appliedWeapon  = 0xFFFF;
+
+	p.spawnPending = true;
+	if (m_bridge.RequestModel)
+		m_bridge.RequestModel(p.modelId);
+}
+
+void Client::AnnounceDeath(uint16_t animId) {
+	if (m_deathAnnounced)
+		return;
+	m_deathAnnounced = true;
+
+	const uint16_t killer = KillCreditFor(m_lastAttackerNetId, m_lastAttackerMs,
+	                                      WallClock::NowMs(), KILL_CREDIT_MS);
+
+	C_Death out;
+	InitHeader(out, WallClock::NowMs());
+	out.killerNetId = killer;
+	out.animId      = animId;
+	m_net.Send(out, CH_EVENT);
+	Log("client: we died (killer net %u, anim %u)", killer, animId);
+}
+
+void Client::UpdateLocalLife(const PlayerStateBody &body) {
+	const LifeEvent event = LifeEventFor(body.health, m_deathAnnounced);
+	if (event == LifeEvent::NOTHING)
+		return;
+
+	if (event == LifeEvent::DIED) {
+		// Usually already announced by the time we get here: the
+		// CPed::SetDie detour fires inside the frame and SendLocalCombat
+		// drains it before this runs, with the animation the engine chose.
+		// This is the path for a build where that hook didn't install.
+		AnnounceDeath(ANIM_NONE);
+		return;
+	}
+
+	// Alive again. GTA III resurrects the same ped rather than making a new
+	// one, so from here a respawn is just health coming back - the position
+	// that goes with it is wherever the hospital put us.
+	m_deathAnnounced    = false;
+	m_lastAttackerNetId = INVALID_NETID;
+	m_lastAttackerMs    = 0;
+
+	C_Respawn out;
+	InitHeader(out, WallClock::NowMs());
+	out.body.pos     = body.pos;
+	out.body.heading = body.heading;
+	m_net.Send(out, CH_EVENT);
+	Log("client: we respawned at %.1f %.1f %.1f", body.pos.x, body.pos.y, body.pos.z);
+}
+
 void Client::SendLocalCombat() {
 	if (!m_bridge.DrainLocalCombat)
 		return;
@@ -380,16 +556,35 @@ void Client::SendLocalCombat() {
 	const uint8_t     n = m_bridge.DrainLocalCombat(events, MAX_PER_FRAME);
 
 	for (uint8_t i = 0; i < n; ++i) {
-		if (events[i].kind == CombatEvent::SHOT) {
+		switch (events[i].kind) {
+		case CombatEvent::SHOT: {
 			C_Shot out;
 			InitHeader(out, WallClock::NowMs());
 			out.body = events[i].shot;
 			m_net.Send(out, CH_EVENT);
-		} else {
+			break;
+		}
+		case CombatEvent::EXPLOSION: {
 			C_Explosion out;
 			InitHeader(out, WallClock::NowMs());
 			out.body = events[i].explosion;
 			m_net.Send(out, CH_EVENT);
+			break;
+		}
+		case CombatEvent::DAMAGE: {
+			// A hit our engine resolved on somebody else's ped and was
+			// stopped from applying. The server decides whether it's
+			// allowed to land at all (friendly fire), and the victim
+			// decides what it does to them.
+			C_Damage out;
+			InitHeader(out, WallClock::NowMs());
+			out.body = events[i].damage;
+			m_net.Send(out, CH_EVENT);
+			break;
+		}
+		case CombatEvent::DEATH:
+			AnnounceDeath(events[i].deathAnimId);
+			break;
 		}
 	}
 }

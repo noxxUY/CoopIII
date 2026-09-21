@@ -961,7 +961,8 @@ constexpr uintptr_t FindPlayerPed     = 0x004A1150;
 constexpr uintptr_t FindPlayerVehicle = 0x004A10C0;
 
 constexpr uintptr_t CPed__SetStoredState = 0x004C5DB0;
-constexpr uintptr_t CPed__SetDie         = 0x004D37D0;
+// CPed::SetDie has moved to the damage/death block at the end of the combat
+// section, where it is called from and where its proof is written out.
 
 // ---- ped lifecycle --------------------------------------------------------
 //
@@ -2029,6 +2030,141 @@ constexpr uintptr_t CProjectileInfo__AddProjectile = 0x0055B030;
 constexpr uintptr_t CProjectileInfo__RemoveProjectile = 0x0055B700;
 constexpr uintptr_t CProjectileInfo__RemoveNotAdd     = 0x0055B770;
 constexpr uintptr_t CProjectileInfo__GetProjectileInfo = 0x0055B010;
+
+// ---- damage, death and respawn --------------------------------------------
+//
+// Verified 2026-09-21. Two functions, and between them they are the whole
+// feature: one decides that a ped was hurt, the other that it died.
+//
+// __thiscall bool CPed::InflictDamage(CEntity *damagedBy, eWeaponType method,
+//                                     float damage, ePedPieceTypes pedPiece,
+//                                     uint8 direction).
+//
+// Found by working backwards from CPed::SetDie, which was already located
+// (docs/addresses-unverified.md) and is now proved below: scanning .text for
+// E8 rel32s to it gives eleven call sites, and the pair at 0x004EAD15 /
+// 0x004EADBD sits inside one function whose tail is re3 PedFight.cpp:2444-2470
+// statement for statement. 0x004EA410 is a `ret` followed by zero padding to
+// the next 16-byte boundary, so 0x004EA420 is a real function start and not a
+// landing halfway into one.
+//
+// The prologue names it beyond argument:
+//
+//   0x004EA420  fld  [0x005F9AB8] -> [esp+10h]    float dieDelta = 4.0f
+//   0x004EA435  fld  [0x005F9A88] -> [esp+14h]    float dieSpeed = 0.0f
+//   0x004EA43F  mov  ebx, 0Dh                     dieAnim = ANIM_STD_KO_FRONT
+//   0x004EA448  mov  byte [esp+8], 0              headShot = false
+//   0x004EA44F  mov  byte [esp+0Ch], 0            willLinger = false
+//   0x004EA454  call FindPlayerPed / cmp ebp,eax  if (player == this)
+//   0x004EA462  cmp  byte [eax+584h], 0           !player->m_bCanBeDamaged
+//   0x004EA485  [ebp+224h] == 30h or 31h          DyingOrDead()
+//   0x004EA4A1  mov al,[ebp+51h] / and al,1       bUsesCollision, which
+//                                                 re-confirms ENTITY_FLAGS_A
+//                                                 and ENTITY_USES_COLLISION
+//   0x004EA4A8  cmp  dword [esp+38h], 14h         method != WEAPONTYPE_DROWNING
+//
+// and the tail closes it:
+//
+//   fld [ebp+2C0h] / fsub healthImpact / fcomp [0x005F9ADC]
+//                                       m_fHealth - healthImpact >= 1.0f
+//   cmp byte [ebp+314h],0               bInVehicle
+//   mov ecx,[ebp+310h] / [ecx+50h] &= 7 |= 58h
+//                                       m_pMyVehicle->SetStatus(
+//                                           STATUS_PLAYER_DISABLED), 58h>>3 = 11
+//   push [0x005F9A88] / push [0x005F9AB8] / push 0ADh / call CPed::SetDie
+//                                       SetDie(ANIM_STD_NUM, 4.0f, 0.0f)
+//   mov al,1 / ret 14h                  returns true when the ped died
+//
+// `ret 14h` is five stack arguments with `this` in ecx, and the 21 call sites
+// land in exactly the modules re3 says call it: CGarages, CFire, CWorld's
+// explosion sweep, CPed's own collision and drowning paths, KillPedWithCar,
+// CAutomobile's drowning, CExplosion::Update and five places inside CWeapon.
+//
+// CoopIII detours this to take a hit on a remote player's ped away from the
+// local engine and put it on the wire instead, and calls it directly to apply
+// somebody else's hit to the local player. docs/protocol.md §1.10.
+constexpr uintptr_t CPed__InflictDamage = 0x004EA420;
+
+// __thiscall void CPed::SetDie(AnimationId anim, float delta, float speed).
+//
+// `ret 0Ch`, three stack arguments, and re3 Ped.cpp:6303-6353 in order:
+// FindPlayerPed / `cmp byte [eax+584h],0` (m_bCanBeDamaged), `m_threatEntity
+// = nil` at +0x18C, the DyingOrDead pair 30h/31h, `delta *= 0.5f` off
+// 0x005F84B0 for PED_FALL/PED_GETUP, CPed::SetStoredState (0x004C5DB0),
+// ClearAll (0x004C7F20), `m_fHealth = 0` at +0x2C0, the PED_DRIVING (2Ch)
+// arm calling CPed::IsPlayer (0x004D48E0) and then vtable slot 0x40,
+// `bInVehicle` at +0x314 with `m_pVehicleAnim->blendDelta = -1000.0f` at
+// +0x1D8/+0x1C, `m_nPedState = 30h` (PED_DIE), and finally `cmp esi,0ADh`
+// for the ANIM_STD_NUM case.
+//
+// Two things to know before calling it on a remote ped. It sets health to 0
+// and clears the ped's collision through ClearAll, so it's a one-way trip:
+// the way back is a new ped, not an undo. And its PED_DRIVING arm calls
+// FlagToDestroyWhenNextProcessed for anything that isn't the player, so a
+// seated remote ped has to be taken out of its car before it is killed or
+// the engine deletes it on the next frame.
+constexpr uintptr_t CPed__SetDie = 0x004D37D0;
+
+// The defaults every caller of SetDie passes, read off the two globals the
+// call sites push rather than copied from re3's declaration.
+constexpr float PED_DIE_DELTA = 4.0f;   // 0x005F9AB8
+constexpr float PED_DIE_SPEED = 0.0f;   // 0x005F9A88
+
+// AnimationId. ANIM_STD_KO_FRONT is InflictDamage's `mov ebx,0Dh` default;
+// ANIM_STD_NUM is SetDie's `cmp esi,0ADh` and means "no die animation at
+// all", which is the arm that only clears bIsPedDieAnimPlaying.
+//
+// Note the retail number: 0ADh is 173, while re3's `main` AnimationId enum
+// puts ANIM_STD_NUM at 174. re3 has one animation this build does not, so
+// anything that bounds an id must use the group's own numAssociations read at
+// runtime (ped.cpp AnimGroupCount) and never a count taken from re3.
+constexpr uint16_t ANIM_STD_KO_FRONT = 13;
+constexpr uint16_t ANIM_STD_NUM      = 173;
+
+// eWeaponType past the inventory range. These aren't weapons, they're damage
+// *causes*, and they never have a CPed::m_weapons slot - IsInventoryWeapon in
+// pedanim.h is what keeps one of them from indexing that array.
+//
+// WEAPONTYPE_DROWNING is the one the binary states directly: InflictDamage
+// tests `cmp dword [esp+38h],14h` twice, once for the bUsesCollision bypass
+// and once for the in-vehicle branch, and 14h is 20. The rest follow from
+// re3's enum with that as the anchor.
+//
+// DROWNING and the default arm matter more than they look. Neither checks a
+// proof flag at all, so the four proofs a remote ped carries do not cover
+// them: a remote ped standing in water on an observer's machine drowns
+// locally, whatever its owner says. That hole is why CoopIII refuses damage
+// at InflictDamage rather than relying on the flags.
+constexpr uint8_t WEAPONTYPE_LAST_WEAPONTYPE = 14;
+constexpr uint8_t WEAPONTYPE_ARMOUR          = 15;
+constexpr uint8_t WEAPONTYPE_RAMMEDBYCAR     = 16;
+constexpr uint8_t WEAPONTYPE_RUNOVERBYCAR    = 17;
+constexpr uint8_t WEAPONTYPE_EXPLOSION       = 18;
+constexpr uint8_t WEAPONTYPE_UZI_DRIVEBY     = 19;
+constexpr uint8_t WEAPONTYPE_DROWNING        = 20;
+constexpr uint8_t WEAPONTYPE_FALL            = 21;
+constexpr uint8_t WEAPONTYPE_UNIDENTIFIED    = 22;
+
+// ePedPieceTypes, InflictDamage's fourth argument. Seven of them, and it
+// switches on all seven in the bullet arm to pick which limb comes off
+// (re3 PedFight.cpp:2200-2240). Nothing indexes an array with it, but it
+// still gets bounded on the way in: an unknown piece would take the shot
+// down the `default:` path and leave dieAnim at whatever it was.
+constexpr uint8_t PEDPIECE_TORSO    = 0;
+constexpr uint8_t PEDPIECE_MID      = 1;
+constexpr uint8_t PEDPIECE_LEFTARM  = 2;
+constexpr uint8_t PEDPIECE_RIGHTARM = 3;
+constexpr uint8_t PEDPIECE_LEFTLEG  = 4;
+constexpr uint8_t PEDPIECE_RIGHTLEG = 5;
+constexpr uint8_t PEDPIECE_HEAD     = 6;
+constexpr uint8_t PEDPIECE_COUNT    = 7;
+
+// InflictDamage's fifth argument: which way the hit came from, 0 front,
+// 1 left, 2 back, 3 right. It only picks between the four
+// ANIM_STD_HIGHIMPACT_* animations (25..28), so a bad value is cosmetic
+// rather than dangerous, but it gets bounded anyway because it arrives off a
+// socket.
+constexpr uint8_t PED_DAMAGE_DIRECTIONS = 4;
 
 // ---- helpers --------------------------------------------------------------
 

@@ -124,9 +124,14 @@ DWORD WINAPI Boot(LPVOID) {
 	// event, and only the engine knows when one actually happened. Not fatal
 	// if this fails either: a session with no muzzle flashes and no synced
 	// grenades is a worse session, not a broken game, and the log says why.
+	//
+	// The one worth reading the log for is CPed::InflictDamage. Without it
+	// nothing can hurt a remote player, and the proof flags on their ped go
+	// back to being the only thing keeping the local engine from deciding
+	// their health.
 	if (!game::InstallCombatHooks())
-		Log("CoopIII: combat is not fully hooked; firing and explosions may not "
-		    "reach other players");
+		Log("CoopIII: combat is not fully hooked; firing, explosions and damage "
+		    "may not reach other players");
 
 	const WorldBridge bridge = game::MakeWorldBridge();
 	if (!g_client.Start(g_config.host, g_config.port, g_config.nick, bridge)) {

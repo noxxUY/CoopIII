@@ -34,7 +34,7 @@ void CopyText(char *dst, size_t capacity, const std::string &src) {
 
 class Server {
 public:
-	bool Start(uint16_t port) {
+	bool Start(uint16_t port, bool friendlyFire) {
 		if (!NetInit()) {
 			std::printf("[coopiii] enet init failed\n");
 			return false;
@@ -44,7 +44,9 @@ public:
 			NetDeinit();
 			return false;
 		}
-		std::printf("[coopiii] listening on %u, %u slots\n", port, MAX_PLAYERS);
+		m_session.SetFriendlyFire(friendlyFire);
+		std::printf("[coopiii] listening on %u, %u slots, friendly fire %s\n", port,
+		            MAX_PLAYERS, friendlyFire ? "on" : "off");
 		return true;
 	}
 
@@ -133,6 +135,18 @@ private:
 			if (const auto *pkt = msg.as<C_Explosion>())
 				OnExplosion(peer, *pkt);
 			break;
+		case OP_C_DAMAGE:
+			if (const auto *pkt = msg.as<C_Damage>())
+				OnDamage(peer, *pkt);
+			break;
+		case OP_C_DEATH:
+			if (const auto *pkt = msg.as<C_Death>())
+				OnDeath(peer, *pkt);
+			break;
+		case OP_C_RESPAWN:
+			if (const auto *pkt = msg.as<C_Respawn>())
+				OnRespawn(peer, *pkt);
+			break;
 		case OP_C_EXIT_VEHICLE:
 			if (const auto *pkt = msg.as<C_ExitVehicle>())
 				OnExitVehicle(peer, *pkt);
@@ -174,6 +188,10 @@ private:
 		welcome.hour       = m_session.Clock().Hour();
 		welcome.minute     = m_session.Clock().Minute();
 		welcome.weather    = m_session.Weather();
+		// The session's own rules. Only one so far, and the client needs it
+		// because an explosion is the one kind of damage that never passes
+		// through here to be refused (protocol.h, SessionFlags).
+		welcome.flags      = m_session.FriendlyFire() ? SESSION_FRIENDLY_FIRE : 0;
 		m_net.SendTo(peer, welcome, CH_EVENT);
 
 		// Tell the newcomer who's already here...
@@ -288,6 +306,98 @@ private:
 			return;
 
 		S_Explosion out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.body     = in.body;
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// ---- damage, death and respawn -----------------------------------------
+	//
+	// The server arbitrates one thing here and relays the rest. What it
+	// arbitrates is whether a hit between two players is allowed to happen at
+	// all; what it relays is what the two machines say about their own
+	// players. It never decides anyone's health, because it doesn't have it:
+	// armour, invulnerability and the player's own damage multiplier all live
+	// on the victim's machine (docs/protocol.md §1.10).
+
+	// A hit one player's machine resolved on another player's ped.
+	//
+	// Point to point, not a broadcast. Only the victim has anything to do
+	// with it, and what everyone else needs to see - the health, the flinch,
+	// the death - reaches them through the victim's own snapshots a moment
+	// later.
+	void OnDamage(PeerId peer, const C_Damage &in) {
+		Player *attacker = m_session.FindByPeer(peer);
+		if (!attacker)
+			return;
+
+		Player *victim = m_session.FindByNetId(in.body.victimNetId);
+		if (!victim || victim == attacker)
+			return;
+
+		// docs/roadmap.md §5.2. Off by default, and off means the packet
+		// stops here: no client is asked to hurt itself on another's behalf,
+		// so there's nothing to get wrong further down.
+		if (!m_session.FriendlyFire())
+			return;
+
+		// Already on the floor. A burst that was in flight when they died
+		// would otherwise land on a corpse, and the victim's own
+		// InflictDamage would refuse it anyway - this just saves the trip.
+		if (!victim->alive)
+			return;
+
+		S_Damage out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.attackerId = attacker->id;
+		out.body       = in.body;
+		m_net.SendTo(victim->peer, out, CH_EVENT);
+	}
+
+	// "I died." Believed, not checked: the sender is the only machine that
+	// knows its own health, which is the same reason there is no S_Death the
+	// server invents on its own.
+	void OnDeath(PeerId peer, const C_Death &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p || !p->alive)
+			return;
+
+		p->alive = false;
+
+		const Player *killer = m_session.FindByNetId(in.killerNetId);
+		std::printf("[coopiii] %s died%s%s\n", p->nick.c_str(),
+		            killer ? ", killed by " : "", killer ? killer->nick.c_str() : "");
+
+		S_Death out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId    = p->id;
+		out.killerNetId = in.killerNetId;
+		out.animId      = in.animId;
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// And back again. The position is theirs to decide too: GTA III picks the
+	// nearest hospital on their machine, and nobody else has the restart
+	// points for the island they happened to die on.
+	void OnRespawn(PeerId peer, const C_Respawn &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+
+		p->alive   = true;
+		p->pos     = in.body.pos;
+		p->heading = in.body.heading;
+
+		// A dead player was taken out of their car on every other machine
+		// before their ped was killed, so the session has to agree or the
+		// next joiner gets told to put them back in it.
+		if (Vehicle *v = m_session.FindVehicle(p->vehicleNetId))
+			if (v->driverPlayerId == p->id)
+				v->driverPlayerId = INVALID_PLAYER;
+		p->vehicleNetId = INVALID_NETID;
+
+		S_Respawn out;
 		InitHeader(out, in.hdr.sendTimeMs);
 		out.playerId = p->id;
 		out.body     = in.body;
@@ -440,9 +550,28 @@ private:
 
 } // namespace
 
+// server.exe [port] [-friendlyfire]
+//
+// The port stays positional because it always has been. Anything starting
+// with a dash is an option, so `atoi` never gets handed one and quietly turns
+// it into port 0.
 int main(int argc, char **argv) {
-	const uint16_t port =
-	    argc > 1 ? static_cast<uint16_t>(std::atoi(argv[1])) : DEFAULT_PORT;
+	uint16_t port         = DEFAULT_PORT;
+	bool     friendlyFire = false;   // docs/roadmap.md §5.2
+
+	for (int i = 1; i < argc; ++i) {
+		if (argv[i][0] != '-') {
+			port = static_cast<uint16_t>(std::atoi(argv[i]));
+			continue;
+		}
+		if (std::strcmp(argv[i], "-friendlyfire") == 0 ||
+		    std::strcmp(argv[i], "-ff") == 0) {
+			friendlyFire = true;
+			continue;
+		}
+		std::printf("usage: server [port] [-friendlyfire]\n");
+		return 2;
+	}
 
 	// Line-buffered so logs still show up when stdout is redirected to a file
 	// or pipe and the process gets killed instead of exiting cleanly.
@@ -452,7 +581,7 @@ int main(int argc, char **argv) {
 	std::signal(SIGTERM, OnSignal);
 
 	Server server;
-	if (!server.Start(port))
+	if (!server.Start(port, friendlyFire))
 		return 1;
 
 	while (g_running)

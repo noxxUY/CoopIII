@@ -141,6 +141,18 @@ struct Recorder {
 	// asked for anything at all.
 	std::vector<CombatEvent> localCombat;
 	int                      drains = 0;
+
+	// Damage, death and respawn. `damageAttacker` is 0xFF when the bridge
+	// was handed a null attacker, which is the "their ped hasn't streamed
+	// in" case and still has to hurt.
+	int        damages        = 0;
+	DamageBody lastDamage{};
+	uint8_t    damageAttacker = 0xFF;
+	int        kills          = 0;
+	uint8_t    lastKilled     = 0xFF;
+	uint16_t   lastKillAnim   = ANIM_NONE;
+	int        friendlyFireCalls = 0;
+	bool       friendlyFire      = false;
 };
 
 Recorder g_rec;
@@ -207,6 +219,23 @@ void RecPlayExplosion(RemotePlayer &, const ExplosionBody &body) {
 	g_rec.lastExplosion = body;
 }
 
+void RecApplyDamage(RemotePlayer *attacker, const DamageBody &body) {
+	++g_rec.damages;
+	g_rec.lastDamage     = body;
+	g_rec.damageAttacker = attacker ? attacker->playerId : 0xFF;
+}
+
+void RecKill(RemotePlayer &p, uint16_t animId) {
+	++g_rec.kills;
+	g_rec.lastKilled   = p.playerId;
+	g_rec.lastKillAnim = animId;
+}
+
+void RecSetFriendlyFire(bool on) {
+	++g_rec.friendlyFireCalls;
+	g_rec.friendlyFire = on;
+}
+
 uint8_t RecDrainLocalCombat(CombatEvent *out, uint8_t max) {
 	++g_rec.drains;
 	uint8_t n = 0;
@@ -268,6 +297,9 @@ WorldBridge RecordingBridge() {
 	b.DrainLocalCombat    = &RecDrainLocalCombat;
 	b.ReplayRemoteShot    = &RecReplayShot;
 	b.PlayRemoteExplosion = &RecPlayExplosion;
+	b.ApplyRemoteDamage   = &RecApplyDamage;
+	b.KillRemotePed       = &RecKill;
+	b.SetFriendlyFire     = &RecSetFriendlyFire;
 	return b;
 }
 
@@ -1176,6 +1208,207 @@ void TestLocalCombatIsDrainedNotSampled() {
 	Check(RecDrainLocalCombat(scratch, 8) == 0, "and then there is nothing left");
 }
 
+// ---- damage, death and respawn ---------------------------------------------
+//
+// The rule these tests exist to pin down is one sentence: the attacker
+// decides that a hit happened, the victim decides what it costs. Everything
+// here is a way of getting that wrong.
+
+S_Damage MakeDamage(uint8_t attackerId, uint16_t victimNetId, uint8_t weapon = 3,
+                    float amount = 25.0f) {
+	S_Damage d;
+	InitHeader(d, 1000);
+	d.attackerId       = attackerId;
+	d.body.victimNetId = victimNetId;
+	d.body.weapon      = weapon;
+	d.body.amount      = amount;
+	d.body.piece       = 0;
+	d.body.direction   = 2;
+	return d;
+}
+
+S_Death MakeDeath(uint8_t playerId, uint16_t animId = 13, uint16_t killer = 0) {
+	S_Death d;
+	InitHeader(d, 1000);
+	d.playerId    = playerId;
+	d.killerNetId = killer;
+	d.animId      = animId;
+	return d;
+}
+
+S_Respawn MakeRespawn(uint8_t playerId, float x) {
+	S_Respawn r;
+	InitHeader(r, 1000);
+	r.playerId    = playerId;
+	r.body.pos    = {x, 500.0f, 10.0f};
+	r.body.heading = 1.0f;
+	return r;
+}
+
+void TestDamageOnlyLandsOnUs() {
+	std::printf("\ndamage addressed to somebody else\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	// MakeWelcome gives player 0 netId 100.
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+
+	// The server sends an S_Damage to the victim alone, but a relay is a
+	// relay and the client must not lean on that. Hurting ourselves because
+	// a packet arrived is the one failure the whole design exists to stop.
+	c.HandleMessage(Wrap(MakeDamage(1, 999), CH_EVENT));
+	Check(g_rec.damages == 0, "a netId that isn't ours is refused");
+
+	c.HandleMessage(Wrap(MakeDamage(1, 100), CH_EVENT));
+	Check(g_rec.damages == 1, "a netId that is ours is applied");
+	Check(g_rec.damageAttacker == 1, "credited to the attacker we know about");
+	Check(g_rec.lastDamage.amount == 25.0f && g_rec.lastDamage.direction == 2,
+	      "with the arguments the attacker's own InflictDamage call had");
+
+	// An attacker whose ped never streamed in still hurts. The bridge gets a
+	// null attacker and the hit lands anyway.
+	c.HandleMessage(Wrap(MakeDamage(5, 100), CH_EVENT));
+	Check(g_rec.damages == 2 && g_rec.damageAttacker == 0xFF,
+	      "an attacker we have no slot for still lands the hit");
+}
+
+void TestDeathKillsTheirPed() {
+	std::printf("\na remote player dies\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+
+	c.HandleMessage(Wrap(MakeDeath(1, 17 /*ANIM_STD_KO_SHOT_FACE*/), CH_EVENT));
+	Check(g_rec.kills == 1, "her ped is killed");
+	Check(g_rec.lastKilled == 1 && g_rec.lastKillAnim == 17,
+	      "with the animation her own engine chose");
+
+	// Not twice. A second S_Death for the same life would run SetDie over a
+	// ped that has already been through it.
+	c.Tick();
+	c.Tick();
+	Check(g_rec.kills == 1, "and ticking does not kill her again");
+
+	// Our own death comes back off the relay and is ignored: we already died
+	// locally, that's where the packet came from.
+	c.HandleMessage(Wrap(MakeDeath(0), CH_EVENT));
+	Check(g_rec.kills == 1, "our own playerId is refused");
+}
+
+void TestDeathTakesThemOutOfTheCarFirst() {
+	std::printf("\ndying in a car\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+
+	c.HandleMessage(Wrap(MakeVehicleSpawn(9), CH_EVENT));
+	c.Tick();
+	S_EnterVehicle in;
+	InitHeader(in, 1000);
+	in.playerId    = 1;
+	in.body        = EnterVehicleBody{};
+	in.body.netId  = 9;
+	in.body.seat   = 0;
+	c.HandleMessage(Wrap(in, CH_EVENT));
+	c.Tick();
+	Check(g_rec.seats == 1, "she is in the car");
+
+	// CPed::SetDie's PED_DRIVING arm calls FlagToDestroyWhenNextProcessed on
+	// anything that isn't the player ped, and every remote player is a
+	// CCivilianPed. Killing a seated one hands it to the engine to delete.
+	const int unseatsBefore = g_rec.unseats;
+	c.HandleMessage(Wrap(MakeDeath(1), CH_EVENT));
+	Check(g_rec.unseats == unseatsBefore + 1, "she comes out of the seat");
+	Check(g_rec.kills == 1, "and then gets killed");
+
+	// And the standing instruction goes with her, or the reconciliation loop
+	// puts the corpse straight back behind the wheel.
+	c.Tick();
+	c.Tick();
+	Check(g_rec.seats == 1, "the corpse is not seated again");
+}
+
+void TestRespawnRebuildsThePed() {
+	std::printf("\na remote player respawns\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeDeath(1), CH_EVENT));
+
+	c.HandleMessage(Wrap(MakeRespawn(1, 777.0f), CH_EVENT));
+	Check(g_rec.despawns == 1, "the corpse is destroyed");
+	Check(c.PlayerSlot(1).poolHandle == -1, "and the handle is dropped");
+	Check(c.PlayerSlot(1).last.pos.x == 777.0f,
+	      "the hospital position seeds the next spawn");
+	Check(c.PlayerSlot(1).last.health == 100.0f, "with full health");
+
+	// Nothing until real positions arrive. The old life's snapshots were half
+	// a city away, so the buffer was cleared rather than interpolated across.
+	const int spawnsBefore = g_rec.spawns;
+	c.Tick();
+	Check(g_rec.spawns == spawnsBefore, "no ped yet, the buffer is empty");
+
+	FeedPosition(c, 1);
+	c.Tick();
+	Check(g_rec.spawns == spawnsBefore + 1, "and a fresh ped once they do");
+	Check(c.PlayerSlot(1).appliedWeapon == 0xFFFF,
+	      "which starts with nothing applied to it");
+}
+
+void TestFriendlyFireReachesTheBridge() {
+	std::printf("\nthe session's friendly fire setting\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+
+	S_Welcome off = MakeWelcome(0);
+	off.flags     = 0;
+	c.HandleMessage(Wrap(off, CH_EVENT));
+	Check(g_rec.friendlyFireCalls == 1 && !g_rec.friendlyFire,
+	      "off by default, and the bridge is told");
+
+	// The server enforces it by refusing to relay a C_Damage. The bridge
+	// needs to know anyway, because an explosion is replayed locally and
+	// never passes through the server to be refused.
+	S_Welcome on = MakeWelcome(0);
+	on.flags     = SESSION_FRIENDLY_FIRE;
+	c.HandleMessage(Wrap(on, CH_EVENT));
+	Check(g_rec.friendlyFireCalls == 2 && g_rec.friendlyFire, "and on when it's on");
+}
+
+void TestLifeStateMachine() {
+	std::printf("\nnoticing our own death and respawn\n");
+
+	// One announcement per death, whichever of the two noticed first. The
+	// CPed::SetDie detour usually gets there, and the health poll is what
+	// still works when that hook failed to install.
+	Check(LifeEventFor(100.0f, false) == LifeEvent::NOTHING, "alive and quiet");
+	Check(LifeEventFor(0.0f, false) == LifeEvent::DIED, "health hits zero");
+	Check(LifeEventFor(0.0f, true) == LifeEvent::NOTHING,
+	      "and is not announced a second time");
+	Check(LifeEventFor(100.0f, true) == LifeEvent::RESPAWNED, "health comes back");
+	Check(LifeEventFor(100.0f, false) == LifeEvent::NOTHING,
+	      "and a respawn is not announced twice either");
+
+	// A NaN read out of a ped we lost counts as dead, not as alive. `>` is
+	// false for NaN either way round, so the test is written as a negation.
+	Check(LifeEventFor(std::numeric_limits<float>::quiet_NaN(), false) == LifeEvent::DIED,
+	      "a NaN health is dead, not alive");
+
+	// Kill credit is recency. Five seconds is the window.
+	constexpr uint32_t WINDOW = 5000;
+	Check(KillCreditFor(INVALID_NETID, 0, 1000, WINDOW) == INVALID_NETID,
+	      "nobody hurt us, nobody gets the kill");
+	Check(KillCreditFor(42, 1000, 3000, WINDOW) == 42, "a recent attacker gets it");
+	Check(KillCreditFor(42, 1000, 1000 + WINDOW, WINDOW) == 42,
+	      "the edge of the window still counts");
+	Check(KillCreditFor(42, 1000, 1001 + WINDOW, WINDOW) == INVALID_NETID,
+	      "past it, the drowning is our own fault");
+	// The wall clock is a uint32 and a long session wraps it. Unsigned
+	// subtraction has to read that as a small elapsed time, not a huge one.
+	Check(KillCreditFor(42, 0xFFFFF000u, 0x00000100u, WINDOW) == 42,
+	      "a clock that wrapped is still a recent attacker");
+}
+
 // ---- animation / weapon / aim decisions -----------------------------------
 //
 // These are the parts of client/src/game/ped.cpp that are pure arithmetic,
@@ -1189,7 +1422,12 @@ using namespace coopiii::game;
 
 // The numbers a real session would produce: ASSOCGRP_STD holds the whole
 // AnimationId namespace, a style group holds four locomotion anims.
-constexpr int STD_COUNT   = 175;
+//
+// 173 and not re3's 175, because the retail 1.0 table is shorter than re3's
+// enum: CPed::SetDie tests ANIM_STD_NUM as `cmp esi,0ADh`, which is 173. The
+// real bound always comes off the group's own numAssociations at runtime
+// (ped.cpp AnimGroupCount); this is just a plausible stand-in for it.
+constexpr int STD_COUNT   = 173;
 constexpr int STYLE_GROUP = 8;   // ASSOCGRP_GANG1
 constexpr int STYLE_COUNT = 4;
 
@@ -1298,6 +1536,67 @@ void TestReplayableWeapons() {
 	Check(!IsReplayableWeapon(255), "and neither is a byte of garbage");
 }
 
+void TestDamageDecisions() {
+	std::printf("\nwhich damage may be forwarded\n");
+
+	// Rays and melee: the attacker's machine is the only one that can answer.
+	Check(IsForwardableDamage(WEAPONTYPE_COLT45), "a pistol");
+	Check(IsForwardableDamage(WEAPONTYPE_UNARMED), "a fist");
+	Check(IsForwardableDamage(WEAPONTYPE_BASEBALLBAT), "a bat");
+	Check(IsForwardableDamage(WEAPONTYPE_UZI_DRIVEBY), "a drive-by");
+
+	// The sniper is refused a *replay* because FireSniper reads the
+	// observer's own camera, and still forwards its damage, because that was
+	// resolved on the shooter's machine like any other bullet. Two different
+	// questions.
+	Check(IsForwardableDamage(WEAPONTYPE_SNIPERRIFLE) && !IsReplayableWeapon(WEAPONTYPE_SNIPERRIFLE),
+	      "a sniper hurts without being replayed");
+
+	// Explosions are already handled, at a fixed world position every
+	// machine agrees on. Forwarding them as well would apply them twice.
+	Check(!IsForwardableDamage(WEAPONTYPE_GRENADE), "a grenade is not forwarded");
+	Check(!IsForwardableDamage(WEAPONTYPE_MOLOTOV), "nor a molotov");
+	Check(!IsForwardableDamage(WEAPONTYPE_ROCKETLAUNCHER), "nor a rocket");
+	Check(!IsForwardableDamage(WEAPONTYPE_EXPLOSION), "nor a generic blast");
+
+	// And these are the victim's own business, or nobody's.
+	Check(!IsForwardableDamage(WEAPONTYPE_FLAMETHROWER), "the flamethrower keeps burning");
+	Check(!IsForwardableDamage(WEAPONTYPE_RAMMEDBYCAR), "a car is not a decision we get");
+	Check(!IsForwardableDamage(WEAPONTYPE_RUNOVERBYCAR), "nor running someone over");
+	Check(!IsForwardableDamage(WEAPONTYPE_DROWNING), "drowning happens where you drown");
+	Check(!IsForwardableDamage(WEAPONTYPE_FALL), "and so does falling");
+
+	// Both of these steer a switch inside CPed::InflictDamage, and both
+	// arrive off a socket.
+	Check(IsKnownPedPiece(PEDPIECE_TORSO) && IsKnownPedPiece(PEDPIECE_HEAD),
+	      "the seven pieces are accepted");
+	Check(!IsKnownPedPiece(PEDPIECE_COUNT) && !IsKnownPedPiece(200),
+	      "and nothing past them");
+	Check(IsKnownDamageDirection(0) && IsKnownDamageDirection(3), "four directions");
+	Check(!IsKnownDamageDirection(4), "and no fifth");
+}
+
+void TestDeathAnimChoice() {
+	std::printf("\nwhich animation a death plays\n");
+
+	// CPed::SetDie hands its id straight to BlendAnimation against
+	// ASSOCGRP_STD with nothing in between, so the bound is the group's own
+	// size. 173 is the retail ANIM_STD_NUM, one below re3's.
+	Check(PlanDeathAnim(17, STD_COUNT) == 17, "a real id is played as sent");
+	Check(PlanDeathAnim(ANIM_NONE, STD_COUNT) == ANIM_STD_KO_FRONT,
+	      "a sender with no animation gets the engine's own default");
+	Check(PlanDeathAnim(9999, STD_COUNT) == ANIM_STD_KO_FRONT,
+	      "and so does an id off the end of the group");
+	Check(PlanDeathAnim(ANIM_STD_NUM, STD_COUNT) == ANIM_STD_NUM,
+	      "ANIM_STD_NUM means they really died without one");
+
+	// Before the anim files load there is no group to index at all, and the
+	// id that means "play nothing" is the only safe answer.
+	Check(PlanDeathAnim(17, 0) == ANIM_STD_NUM, "nothing loaded, nothing played");
+	Check(PlanDeathAnim(ANIM_NONE, 4) == ANIM_STD_NUM,
+	      "a group too small for the default plays nothing rather than reading past it");
+}
+
 void TestProjectileWeapons() {
 	std::printf("\nwhich weapons put something in the air\n");
 
@@ -1382,6 +1681,14 @@ int main() {
 	TestExplosionDoesNotNeedAPed();
 	TestCombatFromAStranger();
 	TestLocalCombatIsDrainedNotSampled();
+	TestDamageDecisions();
+	TestDeathAnimChoice();
+	TestDamageOnlyLandsOnUs();
+	TestDeathKillsTheirPed();
+	TestDeathTakesThemOutOfTheCarFirst();
+	TestRespawnRebuildsThePed();
+	TestFriendlyFireReachesTheBridge();
+	TestLifeStateMachine();
 
 	std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL",
 	            g_failures, g_failures == 1 ? "" : "s");

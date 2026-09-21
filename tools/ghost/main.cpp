@@ -1,6 +1,6 @@
 // A synthetic second player.
 //
-//   ghost [host] [port] [nick] [-car] [-inout] [-shoot] [-throw]
+//   ghost [host] [port] [nick] [-car] [-inout] [-shoot] [-throw] [-hurt]
 //
 // -car   also claims a vehicle and parks it in front of the player. Puts the
 //        real client through the vehicle pool, CAutomobile's constructor and
@@ -23,6 +23,21 @@
 //        copy ends silently instead of detonating wherever it feels like.
 //        A second fire in the wrong street means CProjectileInfo::RemoveProjectile
 //        isn't being suppressed.
+// -hurt  makes the shots real, in both directions. Needs the server started
+//        with -friendlyfire, or it does nothing at all and that is the gate
+//        working.
+//
+//        Outbound: a C_Damage per round, so the player watches their health
+//        drop, dies, fades to the hospital and comes back. That covers
+//        S_Damage reaching CPed::InflictDamage on the local player, the
+//        CPed::SetDie detour catching the death, and the C_Respawn that
+//        follows.
+//
+//        Inbound: the ghost takes the damage it is sent, announces its own
+//        death when it runs out and respawns four seconds later. That is the
+//        only way to see the observer half in a real game: a remote ped
+//        playing a death animation, staying a corpse, and then being rebuilt
+//        somewhere else. Shoot the ghost and watch it fall over.
 //
 // Connects like a real client, finds whoever else is in the session, and
 // walks a slow circle a few metres from them. The ghost itself isn't the
@@ -66,6 +81,7 @@ int main(int argc, char **argv) {
 	bool inOutFlag = false;
 	bool shootFlag = false;
 	bool throwFlag = false;
+	bool hurtFlag  = false;
 	for (int i = 1; i < argc; ++i) {
 		if (std::strcmp(argv[i], "-car") == 0)
 			carFlag = true;
@@ -75,6 +91,15 @@ int main(int argc, char **argv) {
 			shootFlag = true;
 		if (std::strcmp(argv[i], "-throw") == 0)
 			throwFlag = true;
+		if (std::strcmp(argv[i], "-hurt") == 0)
+			hurtFlag = true;
+	}
+
+	// -hurt on its own would be a player losing health with nothing on
+	// screen to explain it, which is a worse test than no test.
+	if (hurtFlag && !shootFlag) {
+		shootFlag = true;
+		std::printf("-hurt implies -shoot, so the damage has a muzzle flash\n");
 	}
 
 	WallClock::Start();
@@ -140,10 +165,31 @@ int main(int argc, char **argv) {
 	uint32_t nextSwitchMs  = 0;       // set when the car is first claimed
 
 	uint8_t  targetId  = 0xFF;
+	uint16_t targetNetId = INVALID_NETID;
 	Vec3     target{0.0f, 0.0f, 0.0f};
 	float    targetHeading = 0.0f;
 	bool     haveTarget = false;
 	uint32_t sentCount  = 0;
+
+	// -hurt. The ghost keeps its own health the way a real client keeps the
+	// engine's: it goes down when somebody hits it, and when it runs out the
+	// ghost is the one that says so. Nobody else gets a vote, which is the
+	// rule the whole damage design is built on.
+	uint16_t myNetId      = INVALID_NETID;
+	float    ghostHealth  = 100.0f;
+	bool     ghostDead    = false;
+	uint32_t reviveAtMs   = 0;
+	uint8_t  hitDirection = 0;
+	// Per round. An uzi does about 8, and the player's own 0.33 multiplier is
+	// applied on their machine, not here - the wire carries the argument, not
+	// the outcome.
+	constexpr float    HURT_PER_ROUND  = 8.0f;
+	constexpr uint8_t  PEDPIECE_TORSO_ = 0;
+	constexpr uint16_t ANIM_KO_FRONT   = 13;   // ANIM_STD_KO_FRONT
+	// What GTA III itself waits before the hospital (CGameLogic::Update's
+	// 0x1000 ms), so the ghost's corpse lies there about as long as a real
+	// player's does.
+	constexpr uint32_t GHOST_DEATH_MS  = 4096;
 
 	RateLimiter          rate(SNAPSHOT_HZ);
 	std::vector<Message> messages;
@@ -172,19 +218,48 @@ int main(int argc, char **argv) {
 					std::printf("rejected by the server (reason %u)\n", w->reject);
 					return 1;
 				}
-				myId = w->playerId;
-				std::printf("welcomed as player %u\n", myId);
+				myId    = w->playerId;
+				myNetId = w->netId;
+				std::printf("welcomed as player %u (net %u), friendly fire %s\n", myId,
+				            myNetId,
+				            (w->flags & SESSION_FRIENDLY_FIRE) ? "on" : "off");
+				if (hurtFlag && !(w->flags & SESSION_FRIENDLY_FIRE))
+					std::printf("  -hurt will do nothing: restart the server with "
+					            "-friendlyfire\n");
 			} else if (const S_PlayerJoin *j = msg.as<S_PlayerJoin>()) {
 				if (j->playerId != myId) {
 					char n[NICK_LEN];
 					std::memcpy(n, j->nick, sizeof(n));
 					n[NICK_LEN - 1] = '\0';
 					targetId        = j->playerId;
+					targetNetId     = j->netId;
 					target          = j->pos;
 					targetHeading   = j->heading;
 					haveTarget      = true;
-					std::printf("following player %u (\"%s\") at %.1f %.1f %.1f\n",
-					            j->playerId, n, j->pos.x, j->pos.y, j->pos.z);
+					std::printf("following player %u (\"%s\", net %u) at %.1f %.1f %.1f\n",
+					            j->playerId, n, j->netId, j->pos.x, j->pos.y, j->pos.z);
+				}
+			} else if (const S_Damage *d = msg.as<S_Damage>()) {
+				// Somebody shot the ghost. Health is ours to keep, so this is
+				// the only place it goes down, and the death that follows is
+				// ours to announce.
+				if (!ghostDead && d->body.victimNetId == myNetId) {
+					ghostHealth -= d->body.amount;
+					std::printf("hit for %.0f by player %u, %.0f left\n", d->body.amount,
+					            d->attackerId, ghostHealth > 0.0f ? ghostHealth : 0.0f);
+					if (ghostHealth <= 0.0f) {
+						ghostHealth = 0.0f;
+						ghostDead   = true;
+						reviveAtMs  = WallClock::NowMs() + GHOST_DEATH_MS;
+
+						C_Death death;
+						InitHeader(death, WallClock::NowMs());
+						death.killerNetId =
+						    d->attackerId == targetId ? targetNetId : INVALID_NETID;
+						death.animId = ANIM_KO_FRONT;
+						client.Send(death, CH_EVENT);
+						std::printf("the ghost died\n");
+					}
 				}
 			} else if (const S_PlayerState *s = msg.as<S_PlayerState>()) {
 				if (s->playerId == targetId) {
@@ -236,7 +311,10 @@ int main(int argc, char **argv) {
 			pkt.body.moveSpeed.y   = speed * std::cos(angle);
 			pkt.body.moveSpeed.z   = 0.0f;
 
-			pkt.body.health    = 100.0f;
+			// Health rides the snapshot like a real client's does. A ghost
+			// lying dead keeps sending it, which is what makes the corpse
+			// stay where it fell instead of drifting.
+			pkt.body.health    = ghostHealth;
 			pkt.body.armour    = 0.0f;
 			pkt.body.moveState = 2;   // PEDMOVE_WALK
 			pkt.body.pedState  = 0;
@@ -279,7 +357,23 @@ int main(int argc, char **argv) {
 			// just see one flag set for a second.
 			const uint32_t nowMs = WallClock::NowMs();
 
-			if (shootFlag && nowMs >= nextShotMs) {
+			// Back on our feet. The position is wherever the orbit has
+			// reached, which stands in for the hospital a real client would
+			// report: what matters to the receiver is that it is somewhere
+			// else and that the ped has to be rebuilt to get there.
+			if (ghostDead && nowMs >= reviveAtMs) {
+				ghostDead   = false;
+				ghostHealth = 100.0f;
+
+				C_Respawn back;
+				InitHeader(back, nowMs);
+				back.body.pos     = pkt.body.pos;
+				back.body.heading = pkt.body.heading;
+				client.Send(back, CH_EVENT);
+				std::printf("the ghost respawned\n");
+			}
+
+			if (shootFlag && !ghostDead && nowMs >= nextShotMs) {
 				nextShotMs = nowMs + SHOT_PERIOD_MS;
 
 				C_Shot shot{};
@@ -292,9 +386,28 @@ int main(int argc, char **argv) {
 				                        std::cos(pkt.body.aimYaw), 0.0f};
 				shot.body.speed  = 0.0f;   // instant hit: no projectile
 				client.Send(shot, CH_EVENT);
+
+				// And the hit that goes with it. A real client works this out
+				// from its own bullet trace inside CPed::InflictDamage; the
+				// ghost has no trace, so it just declares one. The packet is
+				// identical either way, which is the point.
+				if (hurtFlag && targetNetId != INVALID_NETID) {
+					C_Damage hit{};
+					InitHeader(hit, nowMs);
+					hit.body.victimNetId = targetNetId;
+					hit.body.weapon      = WEAPON_UZI;
+					hit.body.amount      = HURT_PER_ROUND;
+					hit.body.piece       = PEDPIECE_TORSO_;
+					// Cycled so all four ANIM_STD_HIGHIMPACT_* reactions get
+					// a turn. A player who always falls the same way is a
+					// direction byte that never made it across.
+					hit.body.direction   = hitDirection;
+					hitDirection         = static_cast<uint8_t>((hitDirection + 1) % 4);
+					client.Send(hit, CH_EVENT);
+				}
 			}
 
-			if (throwFlag && nowMs >= nextThrowMs && pendingBlastMs == 0) {
+			if (throwFlag && !ghostDead && nowMs >= nextThrowMs && pendingBlastMs == 0) {
 				nextThrowMs = nowMs + THROW_PERIOD_MS;
 
 				C_Shot shot{};

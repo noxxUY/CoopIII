@@ -85,6 +85,29 @@ inline AnimPlan PlanAnim(uint16_t animId, int pedGroup, int pedGroupCount,
 	return plan;
 }
 
+// Which animation a received death should actually play.
+//
+// CPed::SetDie passes its animId straight to CAnimManager::BlendAnimation
+// against ASSOCGRP_STD, so the same rule as everywhere else applies: the id
+// becomes a subscript with nothing checking it. The one id that is always
+// safe is ANIM_STD_NUM, the value SetDie tests for and answers by playing
+// nothing at all - which makes it the right fallback when the animations
+// aren't loaded yet.
+//
+// ANIM_NONE on the wire means the sender couldn't capture what its engine
+// picked, usually because the CPed::SetDie detour didn't install. A front
+// knockdown is the engine's own default for that, and it's what InflictDamage
+// starts every hit with.
+inline uint16_t PlanDeathAnim(uint16_t wire, int stdGroupCount) {
+	if (stdGroupCount <= 0)
+		return ANIM_STD_NUM;
+	if (wire == ANIM_STD_NUM)
+		return ANIM_STD_NUM;   // the sender really did die without one
+	if (wire == ANIM_NONE || wire >= stdGroupCount)
+		return ANIM_STD_KO_FRONT < stdGroupCount ? ANIM_STD_KO_FRONT : ANIM_STD_NUM;
+	return wire;
+}
+
 // eMoveState arrives as a byte from a machine we don't control. The engine
 // reads it as a 32-bit enum and switches on it with no default bound, so a
 // value past PEDMOVE_SPRINT falls through CPed::SetMoveAnim's switch and

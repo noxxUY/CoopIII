@@ -74,18 +74,66 @@ struct RemotePlayer {
 	bool Seated() const { return seatedVehicleNetId != INVALID_NETID; }
 };
 
-// Something the local player did with a weapon, on its way to the wire.
+// Something the local player did with a weapon, or that a weapon did to
+// them, on its way to the wire.
 //
 // Sampled by the detours in game/combat.h instead of read off the ped once a
 // frame, because these are events and the ped only carries state - an Uzi
 // empties a clip between two snapshots, and an explosion leaves nothing
 // behind on the thrower to sample at all. docs/protocol.md §1.9.
+//
+// DAMAGE is the odd one out: it's a hit the local engine was about to apply
+// to somebody else's ped and was stopped from applying. The event is what
+// happens instead of the damage, not a record of it (§1.10).
 struct CombatEvent {
-	enum Kind : uint8_t { SHOT, EXPLOSION };
+	enum Kind : uint8_t { SHOT, EXPLOSION, DAMAGE, DEATH };
 	uint8_t       kind = SHOT;
 	ShotBody      shot{};
 	ExplosionBody explosion{};
+	DamageBody    damage{};
+	// The animation the engine chose for this death, straight out of its own
+	// CPed::SetDie call. ANIM_NONE if the detour that captures it isn't
+	// installed, in which case the observer picks its own.
+	uint16_t      deathAnimId = ANIM_NONE;
 };
+
+// ---- our own life ----------------------------------------------------------
+//
+// Two decisions, pulled out of Client so tools/clienttest can reach them
+// without a socket. They're the whole of the local death/respawn state
+// machine, and both are the kind of thing that looks obviously right and
+// then fires twice.
+
+enum class LifeEvent : uint8_t { NOTHING, DIED, RESPAWNED };
+
+// What a freshly sampled health means, given whether a death is already out
+// on the wire.
+//
+// Health is the entire input. CGameLogic writes 0 the moment the player dies
+// and 100 again at the hospital, and nothing in between ever leaves a living
+// player at zero - the in-vehicle arm of CPed::InflictDamage writes 1.0f
+// rather than 0.0f precisely so that stays true. Written as `!(health > 0)`
+// so a NaN off a corrupt read counts as dead rather than as alive.
+inline LifeEvent LifeEventFor(float health, bool deathAnnounced) {
+	if (!(health > 0.0f))
+		return deathAnnounced ? LifeEvent::NOTHING : LifeEvent::DIED;
+	return deathAnnounced ? LifeEvent::RESPAWNED : LifeEvent::NOTHING;
+}
+
+// Who gets the kill, if anyone.
+//
+// Recency, not proof. Whoever last damaged us, if it was recent enough to
+// plausibly be the reason. A player who shot us five seconds ago and then
+// watched us drown doesn't get it, and neither does anyone when we walked
+// into the water on our own.
+inline uint16_t KillCreditFor(uint16_t lastAttackerNetId, uint32_t lastAttackerMs,
+                              uint32_t nowMs, uint32_t windowMs) {
+	if (lastAttackerNetId == INVALID_NETID)
+		return INVALID_NETID;
+	// Unsigned subtraction, so a clock that wrapped past 2^32 reads as a
+	// small elapsed time rather than an enormous one.
+	return (nowMs - lastAttackerMs) <= windowMs ? lastAttackerNetId : INVALID_NETID;
+}
 
 // A vehicle this machine is observing rather than simulating.
 //
@@ -226,6 +274,25 @@ struct WorldBridge {
 	void (*ReplayRemoteShot)(RemotePlayer &player, const ShotBody &shot) = nullptr;
 	void (*PlayRemoteExplosion)(RemotePlayer &player,
 	                            const ExplosionBody &body) = nullptr;
+
+	// Hurt the *local* player, with somebody else's hit, through the engine's
+	// own CPed::InflictDamage. `attacker` is who gets the blame and may be
+	// null when their ped hasn't streamed in; the damage lands either way.
+	//
+	// This is the only place in CoopIII where a packet reduces anyone's
+	// health, and it is deliberately the one player this machine owns.
+	void (*ApplyRemoteDamage)(RemotePlayer *attacker, const DamageBody &body) = nullptr;
+
+	// Kill a remote player's ped, with the animation their own engine chose.
+	// One way: the ped is a corpse afterwards and the way back is a new ped,
+	// which is what RespawnRemote is for.
+	void (*KillRemotePed)(RemotePlayer &player, uint16_t animId) = nullptr;
+
+	// Whether this session allows players to hurt each other
+	// (docs/roadmap.md §5.2). The server enforces it by refusing to relay a
+	// C_Damage, so this only covers the one kind of damage that never goes
+	// near the server: an explosion every machine replays for itself.
+	void (*SetFriendlyFire)(bool enabled) = nullptr;
 };
 
 class Client {
@@ -282,6 +349,9 @@ private:
 	void OnExitVehicle(const S_ExitVehicle &pkt);
 	void OnShot(const S_Shot &pkt);
 	void OnExplosion(const S_Explosion &pkt);
+	void OnDamage(const S_Damage &pkt);
+	void OnDeath(const S_Death &pkt);
+	void OnRespawn(const S_Respawn &pkt);
 
 	// Finds an existing slot, or claims a free one. Null when the table's
 	// full, which isn't fatal - the vehicle just isn't shown, and the next
@@ -306,6 +376,21 @@ private:
 	// are discrete events on the reliable channel and there are only ever a
 	// handful per second.
 	void SendLocalCombat();
+	// Announce our own death or our own respawn, from the health we just
+	// sampled. Called with the body SendLocalState already has, so the ped
+	// only gets read once per tick.
+	//
+	// Health is the whole state machine. CGameLogic sets it to 0 the moment
+	// the player dies and back to 100 at the hospital, and nothing in
+	// between ever leaves it at zero on a living player - the in-vehicle arm
+	// of CPed::InflictDamage writes 1.0f rather than 0.0f precisely so that
+	// stays true. Reading the ped state instead would drag addresses.h into
+	// this file for no gain.
+	void UpdateLocalLife(const PlayerStateBody &body);
+	// Puts one C_Death on the wire, whichever of the two noticed first.
+	// `animId` is ANIM_NONE when it was the health poll rather than the
+	// engine's own SetDie.
+	void AnnounceDeath(uint16_t animId);
 	// One reliable packet on change, not two bytes riding every snapshot: a
 	// model index only changes a handful of times in a playthrough at most.
 	void SendLocalModel();
@@ -314,8 +399,31 @@ private:
 	WorldBridge m_bridge;
 
 	uint8_t      m_localPlayerId = 0xFF;
+	// Our own netId, which is how everyone else's C_Damage names us. Kept so
+	// an S_Damage that somehow arrives for somebody else can be thrown away
+	// instead of applied to us.
+	uint16_t     m_localNetId    = INVALID_NETID;
 	RemotePlayer m_players[MAX_PLAYERS];
 	RateLimiter  m_sendRate{SNAPSHOT_HZ};
+
+	// ---- our own life ------------------------------------------------------
+	//
+	// One flag, set when a death has been announced and cleared when the
+	// respawn has. Two things can notice a death - the CPed::SetDie detour,
+	// which knows which animation played, and the health poll, which works
+	// even when that detour failed to install - and this is what keeps them
+	// from announcing it twice.
+	bool     m_deathAnnounced = false;
+	// Who hurt us last, and when, so a death can be credited to them. Plain
+	// recency, the way every game does it: a player who shot you five
+	// seconds ago and then watched you drown doesn't get the kill.
+	uint16_t m_lastAttackerNetId = INVALID_NETID;
+	uint32_t m_lastAttackerMs    = 0;
+	static constexpr uint32_t KILL_CREDIT_MS = 5000;
+
+	// What S_Welcome said about friendly fire. Only used to pass it on to
+	// the bridge; the server is what actually enforces it.
+	bool m_friendlyFire = false;
 
 	// Sized for a co-op session, not for traffic - these are the cars
 	// players are actually in or have touched, not Liberty City's whole

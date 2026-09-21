@@ -21,6 +21,15 @@ struct Player {
 	Vec3        pos     = {};
 	float       heading = 0.0f;
 	uint16_t    vehicleNetId = INVALID_NETID;   // vehicle being driven, if any
+
+	// Whether this player has told us they're dead.
+	//
+	// The server doesn't work this out, it's told: a player's health lives on
+	// their own machine and nowhere else (docs/protocol.md §1.10). What it's
+	// for is refusing to relay a hit onto somebody who is already on the
+	// floor, so a burst that arrives a moment after a death doesn't get
+	// applied to a corpse and count as a second kill.
+	bool        alive = true;
 };
 
 // A vehicle the session knows about, meaning one a player has actually been
@@ -70,8 +79,20 @@ public:
 
 	Player *FindByPeer(uint32_t peer);
 	Player *FindById(uint8_t id);
+	// Players are addressed by netId on the wire wherever the thing being
+	// addressed is an entity rather than a slot - C_Damage names its victim
+	// that way, and so does the killer in a death.
+	Player *FindByNetId(uint16_t netId);
 
 	uint16_t AllocNetId() { return m_nextNetId++; }
+
+	// docs/roadmap.md §5.2: server-configurable, off by default. With it off
+	// the server simply doesn't relay a C_Damage between players, so no
+	// client is ever asked to hurt itself on another's behalf. Clients are
+	// told which way it's set in S_Welcome, because one kind of damage never
+	// reaches the server at all: an explosion replayed locally.
+	bool FriendlyFire() const { return m_friendlyFire; }
+	void SetFriendlyFire(bool on) { m_friendlyFire = on; }
 
 	const std::vector<Player> &Players() const { return m_players; }
 	uint8_t Count() const;
@@ -102,6 +123,7 @@ private:
 	GameClock            m_clock;
 	uint8_t              m_weather   = 0;   // WEATHER_SUNNY
 	uint16_t             m_nextNetId = 1;   // 0 is INVALID_NETID
+	bool                 m_friendlyFire = false;   // docs/roadmap.md §5.2
 };
 
 // Trims to capacity and guarantees NUL termination. Returns the clean string.

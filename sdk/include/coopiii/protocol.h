@@ -23,7 +23,12 @@ namespace coopiii {
 // 6: PlayerStateBody gained animGroup. GTA III has no sideways-walk
 //    animation id; strafing is a different group entirely, with its own
 //    walk and run, same for every armed stance. See that field below.
-constexpr uint16_t PROTOCOL_VERSION = 6;
+// 7: damage, death and respawn. DamageBody grew `direction`, S_Welcome grew
+//    `flags` so a client knows whether the session has friendly fire on, and
+//    C_Death was added because the shapes reserved at version 5 had the
+//    server announcing a death it has no way of knowing about.
+//    docs/protocol.md §1.10.
+constexpr uint16_t PROTOCOL_VERSION = 7;
 constexpr uint16_t DEFAULT_PORT     = 2001;
 constexpr uint8_t  MAX_PLAYERS      = 8;
 constexpr uint8_t  SNAPSHOT_HZ      = 25;   // docs/protocol.md §1.2
@@ -64,6 +69,11 @@ enum Opcode : uint8_t {
 	OP_S_RESPAWN         = 0x26,
 	OP_C_EXPLOSION       = 0x27,
 	OP_S_EXPLOSION       = 0x28,
+	// Out of order because the block above was numbered before anyone had
+	// worked out who gets to announce a death. It isn't the server: only the
+	// machine that owns a player knows what that player's health really is.
+	// See C_Death.
+	OP_C_DEATH           = 0x29,
 
 	OP_C_ENTER_VEHICLE   = 0x30,
 	OP_S_ENTER_VEHICLE   = 0x31,
@@ -88,6 +98,18 @@ enum RejectReason : uint8_t {
 	REJECT_NONE            = 0,
 	REJECT_BAD_VERSION     = 1,
 	REJECT_FULL            = 2,
+};
+
+// Session-wide rules a client has to know about, handed over in S_Welcome.
+enum SessionFlags : uint8_t {
+	// docs/roadmap.md §5.2: server-configurable, off by default. The server
+	// is the one that enforces it, by refusing to relay a C_Damage between
+	// players at all. This bit exists because one kind of damage never
+	// reaches the server: an explosion is replayed at a fixed world position
+	// and every machine decides for itself whether its own player is
+	// standing in it (§1.9.2). A client that knows friendly fire is off
+	// makes its own player immune for the length of that replay.
+	SESSION_FRIENDLY_FIRE = 1 << 0,
 };
 
 #pragma pack(push, 1)
@@ -131,6 +153,7 @@ struct S_Welcome {
 	uint8_t  snapshotHz;
 	uint8_t  hour, minute;
 	uint8_t  weather;
+	uint8_t  flags;         // SessionFlags
 };
 
 struct S_PlayerJoin {
@@ -328,11 +351,39 @@ struct S_Shot {
 	ShotBody body;
 };
 
+// One hit, as the attacker's machine resolved it, before anything was
+// applied to anyone.
+//
+// This is the shooter's own CPed::InflictDamage call, taken away from their
+// engine and put on the wire instead. Every field is an argument of that
+// function, unchanged: no multiplier, no armour, no reduction. The victim's
+// machine feeds them back into its own InflictDamage, so armour, the player's
+// own damage multiplier, the hit reaction and death all happen exactly where
+// single player puts them.
+//
+// Why the attacker decides and the victim applies, rather than either one
+// doing both:
+//
+//   The attacker fired a ray from a position only they know, at an instant
+//   only they know. Let the victim work out whether they were hit and the
+//   question becomes "was A's ped, interpolated 100 ms late, in front of me",
+//   which is how you get shot around corners. So the hit is the attacker's.
+//
+//   The health is the victim's. Nobody else has their armour, their current
+//   state, or whether some mission just made them invulnerable, and two
+//   machines subtracting from the same health pool disagree within seconds.
+//
+// docs/protocol.md §1.10.
 struct DamageBody {
 	uint16_t victimNetId;
-	uint8_t  weapon;
-	float    amount;
-	uint8_t  piece;         // ePedPieceTypes
+	uint8_t  weapon;        // eWeaponType, and only the ones §1.10.1 allows
+	float    amount;        // CPed::InflictDamage's `damage`, raw
+	uint8_t  piece;         // ePedPieceTypes, 0..6
+	// Which side the hit came from, 0 front, 1 left, 2 back, 3 right. Picks
+	// between the four ANIM_STD_HIGHIMPACT_* reactions. Costs a byte and is
+	// the difference between being knocked the way you were shot and always
+	// falling on your face.
+	uint8_t  direction;
 };
 
 struct C_Damage {
@@ -341,11 +392,36 @@ struct C_Damage {
 	DamageBody body;
 };
 
+// Sent to the victim alone, not broadcast. Nobody else needs it: the health
+// it produces rides the victim's own snapshots a moment later, and the hit
+// reaction is an animation that rides them too.
 struct S_Damage {
 	static constexpr uint8_t OPCODE = OP_S_DAMAGE;
 	PacketHeader hdr;
 	uint8_t    attackerId;
 	DamageBody body;
+};
+
+// "I died." Sent by the machine whose player it is, and by no one else.
+//
+// The version-5 draft had only S_Death, which put the decision on the server.
+// That contradicts the one rule the whole design rests on: a player's health
+// lives on their own machine, so their own machine is the only thing that can
+// say when it ran out. The server relays and keeps score; it doesn't decide.
+//
+// animId is the animation the engine picked for this particular death, taken
+// from the CPed::SetDie call it made. A headshot, a drowning and a car
+// knocking you over are three different animations and the observer has no
+// way to work out which. ANIM_NONE means the sender couldn't capture one and
+// the observer should use its default.
+struct C_Death {
+	static constexpr uint8_t OPCODE = OP_C_DEATH;
+	PacketHeader hdr;
+	// Whoever damaged the sender last, if it was recent enough to be the
+	// reason. INVALID_NETID for drowning, a fall, a car, or a kill nobody
+	// has a claim on.
+	uint16_t killerNetId;
+	uint16_t animId;
 };
 
 struct S_Death {
@@ -386,6 +462,19 @@ struct S_Explosion {
 	ExplosionBody body;
 };
 
+// "I'm alive again, over here."
+//
+// GTA III resurrects the same CPed rather than making a new one
+// (CGameLogic::RestorePlayerStuffDuringResurrection), so on the owner's
+// machine a respawn is a teleport and a health reset and nothing else. On
+// every other machine it isn't: what they have is a corpse, in the state
+// CPed::SetDie left it, with its collision cleared and its health at zero.
+// There's no un-die, so the corpse gets destroyed and a fresh ped built the
+// same way the first one was.
+//
+// The transform is here because the two ends of that are half a city apart.
+// A ped rebuilt from the snapshot stream alone would be born at the place its
+// owner died and then snap to the hospital once the buffer caught up.
 struct RespawnBody {
 	Vec3  pos;
 	float heading;
@@ -511,7 +600,7 @@ static_assert(offsetof(PlayerStateBody, flags)    == 64, "flags is last");
 static_assert(sizeof(VehicleStateBody)== 72, "vehicle state layout");
 static_assert(sizeof(S_VehicleState)  == 78, "vehicle snapshot layout");
 static_assert(sizeof(C_Hello)         == 33, "hello layout");
-static_assert(sizeof(S_Welcome)       == 14, "welcome layout");
+static_assert(sizeof(S_Welcome)       == 15, "welcome layout");
 
 // 2 netId + 1 seat + 1 jack + 2 model + 1 + 1 colour + 1 pad + 12 pos + 16 rot
 static_assert(sizeof(EnterVehicleBody) == 37, "enter-vehicle layout");
@@ -529,5 +618,16 @@ static_assert(offsetof(ShotBody, speed) == 25, "speed follows dir");
 static_assert(sizeof(ExplosionBody)   == 13, "explosion layout");
 static_assert(sizeof(C_Explosion)     == 18, "explosion layout");
 static_assert(sizeof(S_Explosion)     == 19, "explosion layout");
+
+// 2 victim + 1 weapon + 4 amount + 1 piece + 1 direction
+static_assert(sizeof(DamageBody)      == 9,  "damage layout");
+static_assert(sizeof(C_Damage)        == 14, "damage layout");
+static_assert(sizeof(S_Damage)        == 15, "damage layout");
+static_assert(offsetof(DamageBody, piece) == 7, "piece and direction are last");
+static_assert(sizeof(C_Death)         == 9,  "death layout");
+static_assert(sizeof(S_Death)         == 10, "death layout");
+static_assert(sizeof(RespawnBody)     == 16, "respawn layout");
+static_assert(sizeof(C_Respawn)       == 21, "respawn layout");
+static_assert(sizeof(S_Respawn)       == 22, "respawn layout");
 
 } // namespace coopiii

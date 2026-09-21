@@ -41,4 +41,18 @@ void *ResolveRemotePed(RemotePlayer &player);
 // isn't holding plays the wrong animation, wrong stance, no model in hand.
 bool GiveRemoteWeapon(RemotePlayer &player, void *ped, uint8_t weapon);
 
+// Is this CPed one of the remote players, and if so which one?
+//
+// The reverse of RemotePlayer::poolHandle, for the one caller that gets
+// handed a raw pointer by the engine and has to decide, right there, whether
+// the local machine is allowed to hurt it. Answers through the pool
+// reference rather than by comparing pointers, so a recycled slot says no.
+bool RemotePlayerForPed(const void *ped, uint16_t &netId);
+
+// How many animations ASSOCGRP_STD actually holds in this build, or 0 before
+// the anim files have loaded. The bound every id off the wire gets measured
+// against, read from the engine rather than taken from re3 - the retail 1.0
+// table is one entry shorter than re3's enum (addresses.h, ANIM_STD_NUM).
+int32_t StdAnimGroupCount();
+
 } // namespace coopiii::game

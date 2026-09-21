@@ -215,6 +215,59 @@ bool SampleLocalPlayerModel(uint16_t &modelId) {
 	return true;
 }
 
+// ---- which peds belong to which player ------------------------------------
+//
+// The reverse of RemotePlayer::poolHandle, and it exists for exactly one
+// caller: the CPed::InflictDamage detour, which is handed a raw CPed* by the
+// engine and has to answer "is this somebody else's player?" before it
+// decides whether the local machine may hurt it. There is no time to go and
+// ask the roster - the answer has to be right there, in the middle of the
+// engine's own call.
+//
+// Keyed by the pool reference rather than by the pointer, and that's the
+// whole safety argument. A raw pointer table would keep matching after the
+// engine recycled the slot, and the first civilian to inherit it would start
+// reporting its bullet wounds to the network as a player's. CPools::GetPed
+// compares the slot's flags byte, so a stale reference resolves to null
+// instead (ResolveRemote below has the long version).
+struct RemotePedIdentity {
+	int32_t  poolHandle = -1;
+	uint16_t netId      = INVALID_NETID;
+	uint8_t  playerId   = 0xFF;
+};
+
+RemotePedIdentity g_remotePeds[MAX_PLAYERS];
+
+void RememberRemotePed(const RemotePlayer &player) {
+	if (player.playerId >= MAX_PLAYERS)
+		return;
+	g_remotePeds[player.playerId] = RemotePedIdentity{player.poolHandle, player.netId,
+	                                                  player.playerId};
+}
+
+void ForgetRemotePed(const RemotePlayer &player) {
+	if (player.playerId < MAX_PLAYERS)
+		g_remotePeds[player.playerId] = RemotePedIdentity{};
+}
+
+// Eight comparisons, each one a CPools::GetPed. That's cheap enough for the
+// place this is called from: CPed::InflictDamage runs when something actually
+// hits something, not once per ped per frame.
+bool LookupRemotePed(const void *ped, uint16_t &netId) {
+	if (!ped)
+		return false;
+	using GetPedFn = void *(__cdecl *)(int32_t);
+	for (const RemotePedIdentity &id : g_remotePeds) {
+		if (id.poolHandle < 0)
+			continue;
+		if (Func<GetPedFn>(CPools__GetPed)(id.poolHandle) != ped)
+			continue;
+		netId = id.netId;
+		return true;
+	}
+	return false;
+}
+
 // Turns a remote player's pool handle back into a live CPed, or null.
 //
 // RemotePlayer::poolHandle is the engine's own ped reference format:
@@ -251,6 +304,7 @@ void *ResolveRemote(RemotePlayer &player) {
 	               : "object is no longer a CCivilianPed"));
 	player.poolHandle   = -1;
 	player.spawnPending = true;
+	ForgetRemotePed(player);
 	return nullptr;
 }
 
@@ -457,6 +511,7 @@ bool SpawnRemote(RemotePlayer &player) {
 	++Global<uint32_t>(CPopulation__ms_nTotalMissionPeds);
 
 	player.poolHandle = Func<RefFn>(CPools__GetPedRef)(ped);
+	RememberRemotePed(player);
 
 	// A new ped inherits none of what got driven into the old one, and this
 	// path also runs when a ped comes back after the engine took it away.
@@ -479,6 +534,7 @@ void DespawnRemote(RemotePlayer &player) {
 	void *ped = ResolveRemote(player);
 	player.poolHandle   = -1;
 	player.spawnPending = false;
+	ForgetRemotePed(player);
 	if (!ped)
 		return;   // engine already destroyed it, ResolveRemote already said so
 
@@ -592,6 +648,43 @@ void *FindAnimById(void *clump, uint16_t animId) {
 			found = assoc;
 	});
 	return found;
+}
+
+// Is an overlay we drove still alive, or has the engine already ended it
+// behind our back?
+//
+// This is the difference between a remote player firing and a remote player
+// firing once. Every weapon animation is declared
+// ASSOC_FADEOUTWHENDONE | ASSOC_PARTIAL in the engine's own table
+// (CAnimManager's ms_aAnimAssocDefinitions, and
+// CAnimBlendAssociation::Init copies those flags onto every copy), so one
+// cycle plays, CAnimBlendAssociation::UpdateTime sets blendDelta to -4 and
+// ASSOC_DELETEFADEDOUT, and the association is gone a quarter of a second
+// later. On the shooter's own machine CPed::FireGun puts it straight back
+// for the next round. An observer has no FireGun: the id just sits on the
+// wire for as long as the trigger is held, unchanged, with nothing playing.
+//
+// CPed::SetMoveAnim ends overlays the same way, fading out every partial
+// that is *not* ASSOC_FADEOUTWHENDONE whenever the move state changes to a
+// walk, a run or a sprint. Weapon animations are spared by that flag;
+// knockdowns and punches are not, and they die the same silent death.
+//
+// Neither one changes the id on the wire, so neither one is visible to a
+// comparison against the last id applied. Hence this.
+bool AnimStillPlaying(void *clump, uint16_t animId) {
+	void *const assoc = FindAnimById(clump, animId);
+	if (!assoc)
+		return false;
+
+	// Condemned: something has given it a negative blend delta and asked for
+	// it to be deleted once it reaches zero. Both routes above leave exactly
+	// that state. Catching it here rather than waiting for the association
+	// to disappear is what keeps the gap invisible, and it costs nothing -
+	// CAnimManager::BlendAnimation revives an association it finds by
+	// recomputing the delta as (1 - blendAmount) * delta, which is positive.
+	const int32_t flags = Field<int32_t>(assoc, ANIM_FLAGS);
+	return !((flags & ASSOC_DELETEFADEDOUT) &&
+	         Field<float>(assoc, ANIM_BLEND_DELTA) < 0.0f);
 }
 
 // The five animations CPed::SetMoveAnim can pick from, and therefore exactly
@@ -709,7 +802,20 @@ void ApplyAnimation(RemotePlayer &player, void *ped) {
 		player.appliedAnimId = player.last.animId;
 	}
 
-	if (player.last.animId2 == player.appliedAnimId2)
+	// The overlay, and this is not the same test as the one above it.
+	//
+	// A base animation is safe to drive on change alone: the engine replaces
+	// it rather than deleting it, so something is always playing. An overlay
+	// is not. It can end on its own while the wire still names it, and then
+	// the ped stands there holding a gun that fires silently. So the
+	// question is "is it still playing", not "has the id changed".
+	//
+	// A weapon animation whose owner is holding the trigger reaches this
+	// once per cycle, which is the same rate the shooter's own engine
+	// re-blends it at.
+	if (player.last.animId2 == player.appliedAnimId2 &&
+	    (player.appliedAnimId2 == ANIM_NONE ||
+	     AnimStillPlaying(clump, player.appliedAnimId2)))
 		return;
 
 	if (player.last.animId2 == ANIM_NONE) {
@@ -793,14 +899,20 @@ void ApplyWeapon(RemotePlayer &player, void *ped) {
 	GiveWeaponTo(player, ped, player.last.weapon);
 }
 
-// bIsShooting - the *state* of holding the trigger down, not a shot itself.
+// bIsShooting - the state of holding the trigger down, not a shot itself.
 //
-// Individual shots don't come through here, they arrive as C_Shot and get
-// replayed through the engine's own CWeapon::Fire (game/combat.h). This flag
-// sits between them. It's an engine input like everything else in this file:
-// CPed::ProcessControl reads it on its way past, and writing it is why a
-// remote player holding fire keeps the firing posture instead of snapping
-// back to a carry stance between rounds.
+// Worth being honest about what this does, because it used to claim more.
+// The flag drives nothing visual. In the whole engine it is written in one
+// place, the tail of CWeapon::Fire, and read in four, all of them script
+// opcodes (IS_CHAR_SHOOTING_IN_AREA and its neighbours). It is not what puts
+// a ped in a firing posture, and it is not what plays the firing animation:
+// that's bIsAttacking, which CPed::FireGun acts on by actually firing the
+// weapon, which is not an observer's decision to make.
+//
+// What makes a remote player look like they're shooting is the overlay
+// animation in ApplyAnimation, which their own machine sampled off its own
+// ped. This flag is mirrored anyway so a co-op mission script asking "is
+// that character shooting" gets the same answer on every machine.
 void ApplyFiring(RemotePlayer &player, void *ped) {
 	uint8_t &flags = Field<uint8_t>(ped, offs::PED_FLAGS_C);
 	if (player.last.flags & PF_FIRING)
@@ -1047,6 +1159,20 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	Field<float>(ped, offs::PED_HEALTH) = player.last.health;
 	Field<float>(ped, offs::PED_ARMOUR) = player.last.armour;
 
+	// A corpse gets carried, not driven.
+	//
+	// Position still comes off the wire, because the owner's own ped is
+	// still falling over and its snapshots say where it lands. Everything
+	// below does not: CPed::SetDie hands the clump a death animation and
+	// CPed::ProcessControl plays it out, and re-blending the walk the
+	// snapshot happens to still name, or asking a dead ped to aim, is how
+	// you get a corpse standing up mid-fall. The state is read off the ped
+	// rather than off player.last.health because the ped is what actually
+	// has a death animation running.
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+		return;
+
 	// The locomotion animation isn't chosen here. Writing m_nMoveState is
 	// what makes CPed::SetMoveAnim - called later this same frame by
 	// CPed::ProcessControl - blend the walk, run, sprint or idle for this
@@ -1076,6 +1202,12 @@ bool GiveRemoteWeapon(RemotePlayer &player, void *ped, uint8_t weapon) {
 	return GiveWeaponTo(player, ped, weapon);
 }
 
+bool RemotePlayerForPed(const void *ped, uint16_t &netId) {
+	return LookupRemotePed(ped, netId);
+}
+
+int32_t StdAnimGroupCount() { return AnimGroupCount(ASSOCGRP_STD); }
+
 WorldBridge MakeWorldBridge() {
 	WorldBridge b;
 	b.SampleLocalPlayer = &SampleLocalPlayer;
@@ -1102,6 +1234,9 @@ WorldBridge MakeWorldBridge() {
 	b.DrainLocalCombat    = &DrainLocalCombat;
 	b.ReplayRemoteShot    = &ReplayRemoteShot;
 	b.PlayRemoteExplosion = &PlayRemoteExplosion;
+	b.ApplyRemoteDamage   = &ApplyRemoteDamage;
+	b.KillRemotePed       = &KillRemotePed;
+	b.SetFriendlyFire     = &SetFriendlyFire;
 
 	// Every address in the spawn path comes from the game's own
 	// COMMAND_CREATE_CHAR / COMMAND_DELETE_CHAR handlers (addresses.h records
@@ -1111,7 +1246,7 @@ WorldBridge MakeWorldBridge() {
 	// before it ever rendered.
 	Log("bridge: full - local sampling, ped spawn/despawn, pose, animation, "
 	    "weapon and aim, vehicle spawn/despawn, state and seating, plus "
-	    "firing, projectiles and explosions");
+	    "firing, projectiles, explosions, damage, death and respawn");
 	return b;
 }
 

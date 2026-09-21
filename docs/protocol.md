@@ -245,16 +245,12 @@ Everything else a replayed shot can touch (traffic, ambient peds, glass) has no
 owner anywhere in the session and is already expected to differ between
 machines (§3).
 
-Consequence, and it isn't a bug: no player can currently shoot another player.
-The shooter's machine cannot decide it, because the victim's ped is bulletproof
-there; the victim's machine will not, because the replay is defused. Closing
-that is what `C_Damage` / `S_Damage` / `S_Death` are reserved for: the shooter's
-machine intercepts its own hit on a remote ped and sends it, and the victim
-applies it to itself. It's a separate piece of work with its own in-game
-verification. Doing it by accident, by simply letting the replayed shot damage
-the local player, would mean the question "did A hit B" is answered by B's
-machine, using A's position interpolated 100 ms late. People would be shot
-around corners.
+Consequence: a replayed shot never damages anybody. It is a muzzle flash, a
+report, a decal and a projectile, and nothing else. What makes a shot hurt is
+§1.10, where the shooter's machine intercepts its own hit and sends it. Doing
+it the other way, by simply letting the replayed shot damage the local player,
+would mean the question "did A hit B" is answered by B's machine, using A's
+position interpolated 100 ms late. People would be shot around corners.
 
 Explosions are the exception, and not an inconsistency. §1.9.3's explosion is
 replayed at a fixed world position that its owner chose, so "is B standing in
@@ -308,13 +304,225 @@ a throw against a wall, where `CWeapon::FireProjectile` finds the line of sight
 blocked and goes straight to `CProjectileInfo::RemoveNotAdd` without ever
 creating a projectile.
 
-#### 1.9.4 Ammunition is not synced
+#### 1.9.4 A partial animation ends itself, and an observer has to notice
+
+The overlay in `animId2` is not a state that persists until it is replaced. It
+is an animation with an end.
+
+Every weapon animation is declared `ASSOC_FADEOUTWHENDONE | ASSOC_PARTIAL` in
+`CAnimManager`'s own `ms_aAnimAssocDefinitions` table
+(`src/animation/AnimManager.cpp:72-78`), and `CAnimBlendAssociation::Init`
+copies those flags onto every copy made from the group
+(`src/animation/AnimBlendAssociation.cpp:85-98`). So when one cycle finishes,
+`UpdateTime` sets `blendDelta = -4.0f` and `ASSOC_DELETEFADEDOUT`
+(`AnimBlendAssociation.cpp:159-175`) and the association is deleted a quarter
+of a second later.
+
+On the shooter's own machine that is fine: `CPed::FireGun` blends it again for
+the next round, and only when it is missing
+(`src/peds/PedFight.cpp:563-590`). An observer has no `FireGun`. The `animId2`
+on the wire stays the same for as long as the trigger is held, so a receiver
+that only re-blends when the id *changes* plays exactly one cycle and then
+nothing at all, for the rest of the burst.
+
+`CPed::SetMoveAnim` ends overlays the same way from the other direction: on any
+change of move state to walk, run or sprint it gives every partial that is
+*not* `ASSOC_FADEOUTWHENDONE` a `blendDelta` of `-2.0f` plus
+`ASSOC_DELETEFADEDOUT`, and calls `ClearAimFlag` and `ClearLookFlag`
+(`src/peds/Ped.cpp:526-540`). Weapon animations are spared by their flag;
+knockdowns and punches are not.
+
+Consequence: the receiver's test is "is the overlay still playing", not "has
+the id changed". An association with `ASSOC_DELETEFADEDOUT` and a negative
+`blendDelta` has been condemned by one of those two routes and gets blended
+again. `CAnimManager::BlendAnimation` revives an association it finds rather
+than making a second one, by recomputing the delta as
+`(1 - blendAmount) * delta` (`AnimManager.cpp:744-747`), so the revival is
+cheap and the phase is re-seeded from `animTime2` on the way through.
+
+The aim flag recovers on its own, because `SetAimFlag` is driven every frame
+the sender reports `PF_AIMING`.
+
+#### 1.9.5 `PF_FIRING` is `bIsShooting`, and `bIsShooting` draws nothing
+
+Worth writing down, because the name suggests otherwise. `CPed::bIsShooting`
+is written in exactly one place in the engine, the tail of `CWeapon::Fire`
+(`src/weapons/Weapon.cpp:260`), and read in four, all of them script opcodes
+(`src/control/Script3.cpp:1701,1717,1872,1880`). It is not what holds a ped in
+a firing posture and it is not what plays the firing animation.
+
+The flag that does that is `bIsAttacking`, and an observer must not set it:
+`CPed::FireGun` acts on it by actually discharging the weapon
+(`PedFight.cpp:536`), which is the shooter's decision and already arrives as
+`C_Shot`.
+
+So `PF_FIRING` is mirrored onto the remote ped because a co-op mission script
+asking "is that character shooting" should get the same answer everywhere, and
+for no other reason. What makes a remote player look like they are shooting is
+§1.9.4.
+
+#### 1.9.6 Ammunition is not synced
 
 `CPed::GiveWeapon` gives a remote ped a large fixed amount and the replay resets
 that slot to `WEAPONSTATE_READY` before each shot. A remote player's clip is not
 a thing anyone can see; what it *can* do is make `CWeapon::Fire` refuse
 (`if (m_nAmmoInClip <= 0) return false`) and silently stop rendering their
 shots. Syncing the real count would buy nothing and add a failure mode.
+
+### 1.10 Damage, death and respawn: the attacker decides the hit, the victim decides the health
+
+§1.9 is what a shot looks like. This is what it does.
+
+The split is one sentence: **the attacker's machine decides that a hit
+happened, the victim's machine decides what it costs.** Everything else here
+follows from it.
+
+Neither half is arbitrary. The attacker fired a ray from a position only they
+have, at an instant only they have, along an aim only they have. Ask the victim
+to work out whether they were hit and they are doing it from a ped interpolated
+100 ms into the past, which is the textbook recipe for being shot around
+corners. But the health is the victim's: nobody else has their armour, their
+`m_bCanBeDamaged`, or the 0.33 multiplier `CPed::InflictDamage` applies to a
+player and to nothing else, and two machines subtracting from one health pool
+disagree within seconds.
+
+#### 1.10.1 One seam, and it is `CPed::InflictDamage`
+
+Everything in the engine that hurts a ped ends up in
+`CPed::InflictDamage(damagedBy, method, damage, pedPiece, direction)`
+(`src/peds/PedFight.cpp:2034`). Bullets, fists, fire, explosions, cars,
+drowning, falling. CoopIII detours it, and that one detour does both jobs:
+
+- If the victim is another player's ped, the call is **refused**. Nothing on
+  this machine may change the health of a player this machine does not own.
+- If it was refused and the attacker was the local player ped and the cause is
+  one the attacker legitimately owns, the same arguments go out as `C_Damage`
+  instead.
+
+The victim's machine receives `S_Damage` and calls the same function on its own
+player with the arguments off the wire. Armour, the player multiplier, the
+`ANIM_STD_HIGHIMPACT_*` reaction, the limb that comes off and the death all
+happen in the place single player puts them, because they happen in the
+function single player uses.
+
+Which causes get forwarded, and why the rest do not:
+
+| Cause | Forwarded | Why |
+|---|---|---|
+| `UNARMED`, `BASEBALLBAT`, `COLT45`, `UZI`, `SHOTGUN`, `AK47`, `M16`, `SNIPERRIFLE`, `UZI_DRIVEBY` | yes | a ray or a melee reach the attacker's machine resolved |
+| `ROCKETLAUNCHER`, `MOLOTOV`, `GRENADE`, `EXPLOSION` | no | already handled, and handled better, by §1.9.3. A blast is replayed at a fixed world position, so "was I in it" is a question about the victim, answered on the victim's machine with nothing stale in it. Forwarding it as well would apply it twice |
+| `FLAMETHROWER` | no | `CShotInfo` keeps damaging for as long as the shot lives, so one trigger pull becomes a stream of packets, and the victim would burn with no flame on screen because the flamethrower is not replayed either |
+| `RAMMEDBYCAR`, `RUNOVERBYCAR` | no | a remote ped is teleported 25 times a second, which is not a motion any collision test was written for, and `CPed::KillPedWithCar`'s hit is a flat 1000 |
+| `DROWNING`, `FALL` | no | these happen to a player on their own machine, where they are already handled correctly |
+
+`SNIPERRIFLE` is on the list even though §1.9.2 refuses to *replay* a sniper
+shot. The two questions are not the same one. The replay is refused because
+`CWeapon::FireSniper` fires along the observer's own camera; the damage was
+resolved on the shooter's machine like any other bullet. A sniper that hurts
+without a visible flash is a cosmetic gap, not a missing weapon.
+
+#### 1.10.2 The proof flags stay, and why they were never enough
+
+Remote peds are still `bBulletProof`, `bFireProof`, `bCollisionProof`,
+`bMeleeProof` and `bExplosionProof` (§1.9.2, Area B). They are a backstop now
+rather than the mechanism: a detour that failed to install has to fail closed,
+and §1.9.2's explosion rule genuinely depends on `bExplosionProof`.
+
+They could never have been the mechanism on their own. `InflictDamage` checks a
+proof flag inside a `switch` on the damage cause, and two arms of that switch
+check nothing at all:
+
+- `WEAPONTYPE_DROWNING` has its own arm with no flag test
+  (`PedFight.cpp:2355`), and the `!bUsesCollision` early return is explicitly
+  waived for it. So a remote ped standing in water on an observer's machine
+  drowns locally, stays a corpse for everyone watching that screen, and no
+  amount of health off the wire brings it back, because nothing off the wire
+  resets `m_nPedState`.
+- the `default:` arm covers everything else, including `UZI_DRIVEBY`.
+
+Stating the rule once, in the detour, closes both. That is the actual fix; the
+flags are the belt.
+
+#### 1.10.3 Friendly fire is the server's, except for the one kind it never sees
+
+`docs/roadmap.md` §5.2: server-configurable, off by default. Off means the
+server does not relay `C_Damage` between players at all, so no client is ever
+asked to hurt itself on another's behalf. `server.exe [port] [-friendlyfire]`.
+
+The exception is the explosion. A blast never passes through the server as
+damage: it is replayed locally from `S_Explosion` and this machine's own engine
+decides whether the local player is standing in it. So the client has to be the
+one that declines, which is why `S_Welcome` carries `SESSION_FRIENDLY_FIRE` and
+why the observer flips its own player `bExplosionProof` for the length of the
+replay, the same flip §1.9.2 uses for bullets.
+
+Known gap, stated rather than papered over: the *fire* a molotov leaves behind
+is a `CFire` with no owner, and it burns whoever walks into it regardless. That
+is treated as terrain, not as an attack. Friendly fire governs what one player
+aims at another.
+
+#### 1.10.4 A death is announced by the player who died
+
+`S_Death` existed from version 5 with no `C_Death` beside it, which implied the
+server worked out who died. It cannot: a player's health lives on their own
+machine and nowhere else. Version 7 adds `C_DEATH` (0x29) and the server relays
+it.
+
+The dying machine notices in two independent ways, and they share one
+"already announced" flag:
+
+- a detour on `CPed::SetDie`, which carries the `AnimationId` the engine chose
+  for *this* death. A headshot, a drowning and a car knocking you over are
+  three different animations and an observer has no way to derive which;
+- the sampled health crossing to zero, which works when that detour failed to
+  install and sends `ANIM_NONE` instead.
+
+The snapshot cannot carry it, and this is worth knowing before anyone tries:
+a death animation is created with `blendAmount` 0 and does not become the
+clump's dominant association for several frames, by which point the player has
+been on the floor with nobody told.
+
+`killerNetId` is recency, not proof. Whoever last damaged the sender, if it was
+within five seconds. A player who shot you and then watched you drown does not
+get the kill.
+
+Observers call `CPed::SetDie` on that player's ped with the animation off the
+wire. Two consequences to respect:
+
+- the ped is **taken out of its seat first**. `SetDie`'s `PED_DRIVING` arm
+  calls `FlagToDestroyWhenNextProcessed` on anything that is not the player
+  ped, and every remote player is a `CCivilianPed`, so killing a seated one
+  hands it to the engine to delete;
+- the pose stream stops driving a corpse. Position still comes off the wire,
+  because the owner's ped is still falling over and its snapshots say where it
+  lands, but the animation, the weapon, the aim and the move state do not.
+  Re-blending the walk the snapshot still names over a death animation is how
+  a corpse stands back up.
+
+#### 1.10.5 A respawn rebuilds the ped
+
+On the owner's machine a respawn is a teleport and a health reset:
+`CGameLogic::RestorePlayerStuffDuringResurrection`
+(`src/control/GameLogic.cpp:282`) resurrects the same `CPed` rather than making
+a new one.
+
+On every other machine it is not, because what they have is a corpse.
+`CPed::SetDie` zeroed the health, cleared the collision through `ClearAll` and
+handed the clump a death animation, and there is no undo for any of that. So
+`S_Respawn` destroys the ped and the ordinary two-phase spawn (§1.6) builds a
+new one.
+
+The transform is on the wire because the two ends of a respawn are half a city
+apart. A ped rebuilt from the snapshot stream alone would be born where its
+owner died and then snap to the hospital once the interpolation buffer caught
+up, so the buffer is cleared and `last` is seeded from the packet. The ped
+reappears about a snapshot plus an interpolation delay later, which nobody
+notices against a four second death fade.
+
+v1 stops there. The corpse is not left lying around to be walked over, there is
+no wasted message for other players, and no kill feed. `killerNetId` is carried
+and logged by the server so a scoreboard has something to read when there is
+one.
 
 ---
 
@@ -413,7 +621,7 @@ In:
 - Enter/exit/carjack, using the engine's own API so animations play correctly:
   `SetEnterCar` (`Ped.h:701`), `SetExitCar` (703), `SetCarJack` (711),
   `SetPedPositionInCar` (565)
-- Damage/death: `InflictDamage` (612), `SetDie` (545), `SetDead` (546)
+- Damage/death/respawn: `InflictDamage` (612), `SetDie` (545). The design is §1.10
 - Clock + weather
 - Chat
 
@@ -444,7 +652,7 @@ model that doesn't exist yet.
 | Opcode | Name | Ch | Payload |
 |---|---|---|---|
 | 0x01 | `C_HELLO` | 1 | protocol version, nickname, model id |
-| 0x02 | `S_WELCOME` | 1 | your `playerId`, server tick rate, world state |
+| 0x02 | `S_WELCOME` | 1 | your `playerId`, your `netId`, server tick rate, world state, session flags (§1.10.3) |
 | 0x03 | `S_PLAYER_JOIN` | 1 | `playerId`, `netId`, nickname, model id, spawn transform |
 | 0x04 | `S_PLAYER_LEAVE` | 1 | `playerId`, reason |
 | 0x10 | `C_PLAYER_STATE` | 0 | pos `float[3]`, heading `float`, `m_vecMoveSpeed` `float[3]`, `m_nMoveState` `u8`, `m_nPedState` `u8`, anim `u16` + time `float` + speed `float`, partial anim `u16` + time `float`, health `float`, armour `float`, weapon `u8`, aim yaw/pitch `float[2]`, flags `u8` (64 bytes) |
@@ -452,10 +660,11 @@ model that doesn't exist yet.
 | 0x12 | `C_VEHICLE_STATE` | 0 | `netId`, pos `float[3]`, quat `float[4]`, move/turn speed `float[6]`, steer/gas/brake `float[3]`, gear `u8`, health `float`, flags `u8` |
 | 0x13 | `S_VEHICLE_STATE` | 0 | same, relayed |
 | 0x20 | `C_SHOT` / 0x21 `S_SHOT` | 1 | weapon `u8`, origin `float[3]`, direction `float[3]`, speed `float` (§1.9.1) |
-| 0x22 | `C_DAMAGE` / 0x23 `S_DAMAGE` | 1 | victim `netId`, weapon `u8`, amount `float`, piece `u8`; reserved, see §1.9.2 |
-| 0x24 | `S_DEATH` | 1 | `playerId`, killer `netId`, anim `u16`; reserved |
-| 0x25 | `C_RESPAWN` / 0x26 `S_RESPAWN` | 1 | spawn transform |
+| 0x22 | `C_DAMAGE` / 0x23 `S_DAMAGE` | 1 | victim `netId`, weapon `u8`, amount `float`, piece `u8`, direction `u8` (§1.10.1). `S_DAMAGE` goes to the victim alone, not broadcast |
+| 0x24 | `S_DEATH` | 1 | `playerId`, killer `netId`, anim `u16` |
+| 0x25 | `C_RESPAWN` / 0x26 `S_RESPAWN` | 1 | spawn transform (§1.10.5) |
 | 0x27 | `C_EXPLOSION` / 0x28 `S_EXPLOSION` | 1 | type `u8`, pos `float[3]` (§1.9.3) |
+| 0x29 | `C_DEATH` | 1 | killer `netId`, anim `u16` (§1.10.4). Out of order because the block above was numbered before it was clear who announces a death |
 | 0x30 | `C_ENTER_VEHICLE` / 0x31 `S_ENTER_VEHICLE` | 1 | `netId`, seat `u8`, jack `bool` |
 | 0x32 | `C_EXIT_VEHICLE` / 0x33 `S_EXIT_VEHICLE` | 1 | `netId` |
 | 0x34 | `S_VEHICLE_SPAWN` | 1 | `netId`, model id, transform, colours |

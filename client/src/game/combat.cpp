@@ -24,10 +24,24 @@ namespace {
 //   CProjectileInfo::RemoveProjectile the one place a projectile turns into
 //                                     an explosion, and therefore the one
 //                                     place to stop an observer deciding that
+//   CPed::InflictDamage               everything in the engine that hurts a
+//                                     ped goes through here, which makes it
+//                                     both the one place to stop this machine
+//                                     hurting somebody else's player and the
+//                                     one place to learn that it tried
+//   CPed::SetDie                      and the one place the engine decides
+//                                     which animation a death plays
 
 Detour g_fire;
 Detour g_explode;
 Detour g_removeProjectile;
+Detour g_inflictDamage;
+Detour g_setDie;
+
+// What S_Welcome said about friendly fire (docs/roadmap.md §5.2). Off until
+// a session says otherwise, which is also the right answer for a client that
+// isn't in one.
+bool g_friendlyFire = false;
 
 // Set while CoopIII is driving the engine rather than the player.
 //
@@ -245,6 +259,30 @@ void RecordLocalExplosion(uint8_t type, const float *pos) {
 	Push(ev);
 }
 
+// A hit the local engine just resolved on somebody else's player, recorded
+// *instead* of being applied. The arguments are CPed::InflictDamage's own,
+// untouched: no multiplier, no armour, no clamp. All of that belongs to the
+// victim's machine, which is the only one that knows their armour and their
+// state.
+void RecordLocalDamage(uint16_t victimNetId, uint32_t method, float damage,
+                       uint32_t piece, uint32_t direction) {
+	CombatEvent ev;
+	ev.kind               = CombatEvent::DAMAGE;
+	ev.damage.victimNetId = victimNetId;
+	ev.damage.weapon      = static_cast<uint8_t>(method);
+	ev.damage.amount      = damage;
+	ev.damage.piece       = static_cast<uint8_t>(piece);
+	ev.damage.direction   = static_cast<uint8_t>(direction);
+	Push(ev);
+}
+
+void RecordLocalDeath(uint32_t animId) {
+	CombatEvent ev;
+	ev.kind = CombatEvent::DEATH;
+	ev.deathAnimId = animId < ANIM_NONE ? static_cast<uint16_t>(animId) : ANIM_NONE;
+	Push(ev);
+}
+
 // ---- the detours ----------------------------------------------------------
 
 // __thiscall bool CWeapon::Fire(CEntity *shooter, CVector *fireSource).
@@ -326,6 +364,106 @@ void __cdecl HookedRemoveProjectile(void *info, void *projectile) {
 	g_removeProjectile.Original<RemoveProjectileFn>()(info, projectile);
 }
 
+// __thiscall bool CPed::InflictDamage(CEntity *damagedBy, eWeaponType method,
+//                                     float damage, ePedPieceTypes pedPiece,
+//                                     uint8 direction).
+//
+// Same __fastcall trick as HookedFire, and the same reason: it's how a free
+// function receives `this` in ecx with the five stack arguments left exactly
+// where __thiscall put them. `ret 14h` is those five slots.
+//
+// This detour is where the host-authoritative rule stops being a property of
+// five flags on a ped and becomes a property of the code.
+//
+// The flags stay. bBulletProof and its four siblings are still set in
+// ped.cpp, because a detour that failed to install has to fail closed, and
+// because §1.9.2's explosion rule genuinely depends on bExplosionProof. But
+// they were never enough on their own: InflictDamage checks a proof flag
+// inside a switch on the damage cause, and two of that switch's arms check
+// nothing at all. WEAPONTYPE_DROWNING is one of them, so a remote ped
+// standing in water on an observer's machine drowned locally and stayed a
+// corpse for everyone watching, whatever its owner's health said. The
+// `default:` arm is the other.
+//
+// So the rule is stated here, once, positively: nothing on this machine may
+// damage a player this machine does not own. Anything the local player did
+// on purpose becomes a packet instead.
+using InflictThisFn = bool(__thiscall *)(void *, void *, uint32_t, float, uint32_t,
+                                         uint32_t);
+using InflictHookFn = bool(__fastcall *)(void *, void *, void *, uint32_t, float,
+                                         uint32_t, uint32_t);
+
+bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
+                                    uint32_t method, float damage, uint32_t piece,
+                                    uint32_t direction) {
+	void *const localPed = PlayerPed();
+
+	// Nothing that happens inside a replay is allowed to hurt anyone. A
+	// replayed shot is somebody else's bullet being drawn, not fired: the
+	// hit it would find here is this machine's answer to a question only the
+	// shooter's machine may answer, off a ped interpolated 100 ms late.
+	//
+	// ReplayRemoteShot also flips the local player bulletproof around the
+	// call, and that isn't redundant - it's the half that still works when
+	// this hook failed to install.
+	if (g_replaying && self && self == localPed)
+		return false;
+
+	uint16_t victimNetId = INVALID_NETID;
+	if (self && RemotePlayerForPed(self, victimNetId)) {
+		// Somebody else's player. Their health is theirs.
+		//
+		// Only what the local player did deliberately goes on the wire. A
+		// city NPC shooting a remote player is a shot that happened in one
+		// simulation and not in the others (docs/protocol.md §3), and
+		// forwarding it would kill someone with a cop they can't see.
+		if (!g_replaying && damagedBy && damagedBy == localPed &&
+		    IsForwardableDamage(static_cast<uint8_t>(method)))
+			RecordLocalDamage(victimNetId, method, damage, piece, direction);
+
+		// False is "the ped did not die", which is what every caller of this
+		// function already handles for a hit that wasn't fatal.
+		return false;
+	}
+
+	return g_inflictDamage.Original<InflictHookFn>()(self, nullptr, damagedBy, method,
+	                                                 damage, piece, direction);
+}
+
+// __thiscall void CPed::SetDie(AnimationId anim, float delta, float speed).
+//
+// Here to answer one question: which animation did the engine pick for the
+// local player's death? Nothing else can say. The snapshot can't - a death
+// animation is created with a blendAmount of 0 and doesn't become the
+// dominant one until several frames later, by which point the player has
+// been lying on the floor with nobody else told about it.
+//
+// The announcement itself doesn't depend on this hook. Client::UpdateLocalLife
+// watches the sampled health and announces a death with ANIM_NONE if this
+// never fired, so a failed install costs the right animation and nothing
+// else.
+using SetDieHookFn = void(__fastcall *)(void *, void *, uint32_t, float, float);
+using SetDieThisFn = void(__thiscall *)(void *, uint32_t, float, float);
+
+void __fastcall HookedSetDie(void *self, void * /*edx*/, uint32_t animId, float delta,
+                             float speed) {
+	const bool localPlayer = self && self == PlayerPed();
+
+	// SetDie returns without doing anything for a ped that's already dying,
+	// and for a player MakePlayerSafe has made undamageable. Both would look
+	// like a death from the outside, so the test is the transition rather
+	// than the state: alive before, PED_DIE after.
+	const uint32_t before =
+	    localPlayer ? Field<uint32_t>(self, offs::PED_STATE) : PEDSTATE_NONE;
+	const bool wasDying = before == PEDSTATE_DIE || before == PEDSTATE_DEAD;
+
+	g_setDie.Original<SetDieHookFn>()(self, nullptr, animId, delta, speed);
+
+	if (localPlayer && !wasDying &&
+	    Field<uint32_t>(self, offs::PED_STATE) == PEDSTATE_DIE)
+		RecordLocalDeath(animId);
+}
+
 } // namespace
 
 // ---- installation ---------------------------------------------------------
@@ -348,6 +486,9 @@ bool InstallCombatHooks() {
 	     reinterpret_cast<void *>(&HookedAddExplosion), &g_explode},
 	    {"CProjectileInfo::RemoveProjectile", CProjectileInfo__RemoveProjectile,
 	     reinterpret_cast<void *>(&HookedRemoveProjectile), &g_removeProjectile},
+	    {"CPed::InflictDamage", CPed__InflictDamage,
+	     reinterpret_cast<void *>(&HookedInflictDamage), &g_inflictDamage},
+	    {"CPed::SetDie", CPed__SetDie, reinterpret_cast<void *>(&HookedSetDie), &g_setDie},
 	};
 
 	bool all = true;
@@ -381,13 +522,19 @@ void RemoveCombatHooks() {
 	g_fire.Remove();
 	g_explode.Remove();
 	g_removeProjectile.Remove();
+	g_inflictDamage.Remove();
+	g_setDie.Remove();
 	g_count = g_head = 0;
+	g_friendlyFire = false;
 }
 
 bool CombatHooksInstalled() {
 	return g_fire.IsInstalled() && g_explode.IsInstalled() &&
-	       g_removeProjectile.IsInstalled();
+	       g_removeProjectile.IsInstalled() && g_inflictDamage.IsInstalled() &&
+	       g_setDie.IsInstalled();
 }
+
+void SetFriendlyFire(bool enabled) { g_friendlyFire = enabled; }
 
 uint8_t DrainLocalCombat(CombatEvent *out, uint8_t max) {
 	uint8_t n = 0;
@@ -432,7 +579,7 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
 	// out-of-ammo state, and reloads on its own schedule via CTimer. A
 	// remote player's clip isn't something anyone can see, and it's not
 	// something this machine gets an opinion on - so the slot gets put back
-	// into a state the engine will always fire from. docs/protocol.md §1.9.4.
+	// into a state the engine will always fire from. docs/protocol.md §1.9.6.
 	constexpr int32_t REMOTE_CLIP = 500;
 	Field<uint32_t>(weapon, offs::WEAPON_STATE)       = WEAPONSTATE_READY;
 	Field<int32_t>(weapon, offs::WEAPON_AMMO_IN_CLIP) = REMOTE_CLIP;
@@ -539,9 +686,101 @@ void PlayRemoteExplosion(RemotePlayer &player, const ExplosionBody &body) {
 	// player - same test the sampler uses.
 	void *const culprit = ResolveRemotePed(player);
 
+	// Friendly fire, the one place the server can't enforce it.
+	//
+	// Every other kind of damage between players is a C_Damage the server
+	// can simply refuse to relay. A blast isn't: it's replayed here, at a
+	// position its owner chose, and this machine's own engine decides
+	// whether the local player is standing in it. So this machine has to be
+	// the one that declines, and the same bit flip ped.cpp uses on remote
+	// peds does it.
+	//
+	// The bit gets restored rather than the byte, same as the bulletproof
+	// flip in ReplayRemoteShot: the player may legitimately already be
+	// explosion-proof from a cheat or a mission.
+	void *const  localPed = PlayerPed();
+	const bool   guard    = !g_friendlyFire && localPed != nullptr;
+	const bool   wasProof =
+	    guard && (Field<uint8_t>(localPed, offs::ENTITY_FLAGS_B) &
+	                offs::ENTITY_EXPLOSION_PROOF) != 0;
+	if (guard)
+		Field<uint8_t>(localPed, offs::ENTITY_FLAGS_B) |= offs::ENTITY_EXPLOSION_PROOF;
+
 	using AddFn = bool(__cdecl *)(void *, void *, int, const float *, uint32_t);
 	Func<AddFn>(CExplosion__AddExplosion)(nullptr, culprit,
 	                                      static_cast<int>(body.type), pos, 0);
+
+	if (guard && !wasProof)
+		Field<uint8_t>(localPed, offs::ENTITY_FLAGS_B) = static_cast<uint8_t>(
+		    Field<uint8_t>(localPed, offs::ENTITY_FLAGS_B) & ~offs::ENTITY_EXPLOSION_PROOF);
+}
+
+// ---- damage, death and respawn ---------------------------------------------
+
+void ApplyRemoteDamage(RemotePlayer *attacker, const DamageBody &body) {
+	void *const ped = PlayerPed();
+	if (!ped)
+		return;   // no player right now: menus, loading, between lives
+
+	// Everything below is a bound on something that arrived off a socket and
+	// is about to be handed to the engine. The weapon steers a switch in
+	// InflictDamage, the piece steers another one and decides which limb
+	// comes off, and the amount reaches CPed::m_fHealth - which is read by
+	// the HUD, by the AI and, through the death path, by the ped's matrix.
+	if (!IsForwardableDamage(body.weapon))
+		return;
+	if (!IsKnownPedPiece(body.piece))
+		return;
+
+	float amount = 0.0f;
+	if (!FiniteOr(body.amount, 0.0f, amount) || !(amount > 0.0f))
+		return;
+	if (amount > MAX_REMOTE_DAMAGE)
+		amount = MAX_REMOTE_DAMAGE;
+
+	const uint32_t direction =
+	    IsKnownDamageDirection(body.direction) ? body.direction : 0u;
+
+	// Blame. Passing their ped means the engine's own bookkeeping - the
+	// threat entity, CDarkel's kill register, the blood - points at the
+	// player who did it rather than at nobody. Null is fine and means the
+	// same thing the script's own damage calls mean by it.
+	void *const culprit = attacker ? ResolveRemotePed(*attacker) : nullptr;
+
+	// Through the real function, not the trampoline. The detour above passes
+	// straight through for a ped that isn't a remote player, and the local
+	// player never is, so this reaches the engine either way - including on
+	// a build where the hook failed to install.
+	Func<InflictThisFn>(CPed__InflictDamage)(ped, culprit, body.weapon, amount,
+	                                         body.piece, direction);
+}
+
+void KillRemotePed(RemotePlayer &player, uint16_t animId) {
+	void *const ped = ResolveRemotePed(player);
+	if (!ped)
+		return;
+
+	// Already a corpse. SetDie returns early for this itself, but calling it
+	// twice is still worth not doing: the second call would be a second
+	// SetStoredState over a state that is already the death's.
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+		return;
+
+	// The id goes to CAnimManager::BlendAnimation against ASSOCGRP_STD with
+	// nothing in between, so it gets bounded against that group's real size
+	// first. PlanDeathAnim is pure arithmetic and clienttest covers it.
+	const uint16_t anim = PlanDeathAnim(animId, StdAnimGroupCount());
+
+	Func<SetDieThisFn>(CPed__SetDie)(ped, anim, PED_DIE_DELTA, PED_DIE_SPEED);
+
+	// Whatever was driven into this ped is gone with it. ClearAll took the
+	// weapon model off the hand and SetDie replaced the animation, so
+	// leaving these set would have ApplyRemotePose skip both as "already
+	// applied" if the ped somehow came back.
+	player.appliedWeapon  = 0xFFFF;
+	player.appliedAnimId  = ANIM_NONE;
+	player.appliedAnimId2 = ANIM_NONE;
 }
 
 } // namespace coopiii::game

@@ -66,6 +66,15 @@ Player *Session::FindByPeer(uint32_t peer) {
 	return it == m_players.end() ? nullptr : &*it;
 }
 
+Player *Session::FindByNetId(uint16_t netId) {
+	if (netId == INVALID_NETID)
+		return nullptr;
+	auto it = std::find_if(m_players.begin(), m_players.end(), [netId](const Player &p) {
+		return p.active && p.netId == netId;
+	});
+	return it == m_players.end() ? nullptr : &*it;
+}
+
 Player *Session::FindById(uint8_t id) {
 	if (id >= m_players.size() || !m_players[id].active)
 		return nullptr;
