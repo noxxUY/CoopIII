@@ -134,6 +134,34 @@ inline uint16_t KillCreditFor(uint16_t lastAttackerNetId, uint32_t lastAttackerM
 	// small elapsed time rather than an enormous one.
 	return (nowMs - lastAttackerMs) <= windowMs ? lastAttackerNetId : INVALID_NETID;
 }
+// The time of day and the sky, as one machine's engine has them.
+//
+// Same four fields as WorldStateBody on the wire, kept separate because the
+// engine seam below shouldn't have to speak in packets - that's the rule the
+// rest of WorldBridge follows too.
+struct WorldState {
+	uint8_t hour       = 0;
+	uint8_t minute     = 0;
+	uint8_t weather    = 0;   // CWeather::NewWeatherType
+	uint8_t weatherOld = 0;   // CWeather::OldWeatherType
+};
+
+// How far this machine's clock may sit from the host's before we move it.
+//
+// Not zero, and that's the whole design. A world packet is a round trip old
+// before it arrives, so a client that matched the host exactly would be told
+// to step its clock every single second, and GTA III hangs a lot on the
+// minute: the HUD clock, where the sun is, whether the streetlights are on.
+// Three game minutes is three seconds of real time and nothing on screen can
+// show it, while anything that actually matters - a mission setting the
+// time, a client that joined at a different hour - is hours out and gets
+// corrected at once.
+constexpr int kClockToleranceMinutes = 3;
+
+// Signed distance from one time of day to another, in minutes, the short way
+// round a 24 hour dial. 23:59 to 00:01 is +2, not +1438.
+int ClockDriftMinutes(uint8_t fromHour, uint8_t fromMinute, uint8_t toHour,
+                      uint8_t toMinute);
 
 // A vehicle this machine is observing rather than simulating.
 //
@@ -293,6 +321,27 @@ struct WorldBridge {
 	// C_Damage, so this only covers the one kind of damage that never goes
 	// near the server: an explosion every machine replays for itself.
 	void (*SetFriendlyFire)(bool enabled) = nullptr;
+	// ---- time of day and weather ------------------------------------------
+	//
+	// Read on the host, to tell the session what time it is. Read on everyone
+	// else too, to work out how far off they are before deciding whether
+	// moving the clock is worth the jump it costs.
+	//
+	// False when there's no world to read: the menu, a loading screen.
+	bool (*SampleWorld)(WorldState &out) = nullptr;
+
+	// Put the session's time of day on this machine. Only called once the
+	// drift is past kClockToleranceMinutes, so it's allowed to be a jump.
+	void (*ApplyWorldTime)(uint8_t hour, uint8_t minute) = nullptr;
+
+	// Pin this machine's sky to the pair the host is blending between, and
+	// stop the local weather rotation picking its own next one.
+	void (*ApplyWorldWeather)(uint8_t weather, uint8_t weatherOld) = nullptr;
+
+	// Give the sky back to the engine. Called when this machine becomes the
+	// host, because a pinned sky never changes again and the session would
+	// otherwise inherit whatever the last host was looking at, forever.
+	void (*ReleaseWorldWeather)() = nullptr;
 };
 
 class Client {
@@ -310,6 +359,14 @@ public:
 	// source of truth and doesn't depend on the socket thread having run.
 	uint8_t  LocalPlayerId() const { return m_localPlayerId; }
 	uint32_t RoundTripMs() const { return m_net.RoundTripMs(); }
+
+	// Whether this machine's own game is the one everyone else's clock and
+	// sky follow. INVALID_PLAYER on either side means no, so this is false
+	// before the first welcome and after a disconnect.
+	uint8_t HostPlayerId() const { return m_hostPlayerId; }
+	bool    IsHost() const {
+		return m_localPlayerId != INVALID_PLAYER && m_localPlayerId == m_hostPlayerId;
+	}
 
 	const RemotePlayer &PlayerSlot(uint8_t id) const { return m_players[id]; }
 	uint8_t             RemoteCount() const;
@@ -352,6 +409,16 @@ private:
 	void OnDamage(const S_Damage &pkt);
 	void OnDeath(const S_Death &pkt);
 	void OnRespawn(const S_Respawn &pkt);
+	void OnWorldState(const S_WorldState &pkt);
+
+	// The one place m_hostPlayerId changes, so that becoming or stopping
+	// being the host is a single event with one handler instead of something
+	// two packet paths each have to remember.
+	void SetHost(uint8_t hostPlayerId);
+	// Move the clock if it's drifted far enough to be worth the jump, and
+	// mirror the sky. Does nothing on the host: the host is what this is a
+	// copy of.
+	void ApplyWorldState(const WorldStateBody &body);
 
 	// Finds an existing slot, or claims a free one. Null when the table's
 	// full, which isn't fatal - the vehicle just isn't shown, and the next
@@ -394,6 +461,10 @@ private:
 	// One reliable packet on change, not two bytes riding every snapshot: a
 	// model index only changes a handful of times in a playthrough at most.
 	void SendLocalModel();
+	// Only the host sends this, and only once a second. Below the snapshot
+	// rate because a game minute is a real second, so 25 Hz would be 25
+	// identical packets for every one that said anything new.
+	void SendLocalWorld();
 
 	NetThread   m_net;
 	WorldBridge m_bridge;
@@ -424,6 +495,17 @@ private:
 	// What S_Welcome said about friendly fire. Only used to pass it on to
 	// the bridge; the server is what actually enforces it.
 	bool m_friendlyFire = false;
+	// Whose game the session's time of day comes from. INVALID_PLAYER until
+	// a welcome or a world packet says.
+	uint8_t     m_hostPlayerId = INVALID_PLAYER;
+	RateLimiter m_worldRate{1};
+
+	// Whether it was us that pinned this machine's sky. Only set while we're
+	// following somebody else's, and it's what stops a machine that has been
+	// the host all along from releasing a weather its own mission script
+	// forced - FORCE_WEATHER is a campaign opcode and undoing it mid-mission
+	// would be us changing the weather, not following it.
+	bool m_weatherPinned = false;
 
 	// Sized for a co-op session, not for traffic - these are the cars
 	// players are actually in or have touched, not Liberty City's whole

@@ -44,6 +44,11 @@ void Client::UnseatPlayer(RemotePlayer &player) {
 void Client::ClearRoster() {
 	m_localPlayerId       = 0xFF;
 	m_localNetId          = INVALID_NETID;
+	// Nobody's clock is ours to follow once the session is gone. The sky
+	// stays pinned where the last host left it, deliberately: unpinning it
+	// here would change the weather on a player who has just been
+	// disconnected and is about to reconnect to the same session.
+	m_hostPlayerId        = INVALID_PLAYER;
 	m_localVehicleNetId   = INVALID_NETID;
 	m_vehicleClaimPending = false;
 	// A new session hasn't been told anything about us yet.
@@ -109,6 +114,10 @@ void Client::PostFrame() {
 	// channel, and a burst would arrive as one clump.
 	SendLocalCombat();
 
+	// Also above the limiter, with a 1 Hz one of its own inside it. A game
+	// minute is a real second, so anything faster is repetition.
+	SendLocalWorld();
+
 	if (!m_sendRate.Ready(WallClock::NowMs()))
 		return;
 	SendLocalModel();
@@ -147,11 +156,12 @@ void Client::HandleMessage(const Message &msg) {
 		OnDeath(*p);
 	} else if (const S_Respawn *p = msg.as<S_Respawn>()) {
 		OnRespawn(*p);
+	} else if (const S_WorldState *p = msg.as<S_WorldState>()) {
+		OnWorldState(*p);
 	}
 	// Anything else isn't handled yet, and stays silently ignored rather
-	// than logged - the server already sends world state and chat, and a
-	// per-packet log line at 25 Hz would drown out the one message that
-	// actually matters.
+	// than logged - the server already sends chat, and a per-packet log line
+	// at 25 Hz would drown out the one message that actually matters.
 }
 
 void Client::OnWelcome(const S_Welcome &pkt) {
@@ -176,6 +186,18 @@ void Client::OnWelcome(const S_Welcome &pkt) {
 	// SessionFlags in protocol.h.
 	if (m_bridge.SetFriendlyFire)
 		m_bridge.SetFriendlyFire(m_friendlyFire);
+	SetHost(pkt.hostPlayerId);
+
+	// The time of day is worth having before the first world packet, which
+	// is up to a second away. Skipped when we turn out to be the host, since
+	// the hour above is a copy of our own clock at best and the server's
+	// stand-in at worst.
+	WorldStateBody world{};
+	world.hour       = pkt.hour;
+	world.minute     = pkt.minute;
+	world.weather    = pkt.weather;
+	world.weatherOld = pkt.weatherOld;
+	ApplyWorldState(world);
 }
 
 void Client::OnJoin(const S_PlayerJoin &pkt) {
@@ -587,6 +609,125 @@ void Client::SendLocalCombat() {
 			break;
 		}
 	}
+}
+
+// ---- time of day and weather -----------------------------------------------
+//
+// One player's game is the session's clock, and everyone else is nudged
+// toward it. docs/protocol.md §2.7 is the argument for picking a player
+// rather than letting the server keep a clock of its own; what matters here
+// is that being corrected has to be cheaper than being wrong.
+//
+// So a correction is a jump, and the tolerance is what stops it happening.
+// GTA III's clock runs on its own at the same rate on every machine, so two
+// synced games stay synced; the drift that does show up comes from joining
+// at a different hour, from a loading screen, or from the script moving the
+// clock outright. All of those are far bigger than kClockToleranceMinutes
+// and get fixed in one step, while the one or two minutes of lag that a
+// packet is worth never moves anything.
+
+int ClockDriftMinutes(uint8_t fromHour, uint8_t fromMinute, uint8_t toHour,
+                      uint8_t toMinute) {
+	constexpr int kDay  = 24 * 60;
+	constexpr int kHalf = kDay / 2;
+
+	const int from = (int(fromHour) % 24) * 60 + int(fromMinute) % 60;
+	const int to   = (int(toHour) % 24) * 60 + int(toMinute) % 60;
+
+	int drift = to - from;
+	if (drift > kHalf)
+		drift -= kDay;
+	else if (drift < -kHalf)
+		drift += kDay;
+	return drift;
+}
+
+void Client::SetHost(uint8_t hostPlayerId) {
+	const bool was = IsHost();
+	m_hostPlayerId = hostPlayerId;
+	if (was == IsHost())
+		return;
+
+	if (IsHost()) {
+		Log("client: we're the host now, so our clock and our sky are the "
+		    "session's");
+		// If this machine spent any time as an ordinary client its sky is
+		// pinned to whatever the last host reported, and a pinned sky never
+		// rotates again. Hand it back or the session inherits one weather
+		// type from the moment of the handover and keeps it forever.
+		//
+		// Only if we were the ones who pinned it. A machine that has been
+		// the host since it joined may have a ForcedWeatherType its own
+		// mission script set, and that one isn't ours to clear.
+		if (m_weatherPinned && m_bridge.ReleaseWorldWeather) {
+			m_bridge.ReleaseWorldWeather();
+			m_weatherPinned = false;
+		}
+	} else {
+		Log("client: player %u has the session clock", hostPlayerId);
+	}
+}
+
+void Client::OnWorldState(const S_WorldState &pkt) {
+	SetHost(pkt.hostPlayerId);
+	ApplyWorldState(pkt.body);
+}
+
+void Client::ApplyWorldState(const WorldStateBody &body) {
+	// The host is the original, not a copy of one.
+	if (IsHost())
+		return;
+
+	// eWeatherType indexes arrays inside CWeather with no bounds check of
+	// its own, and CClock only ever tests its hour for >= 24 after an
+	// increment, so a value out of range here doesn't self-correct. Nothing
+	// on the wire is trusted into either.
+	constexpr uint8_t WEATHER_TOTAL = 4;
+
+	if (body.hour <= 23 && body.minute <= 59 && m_bridge.SampleWorld &&
+	    m_bridge.ApplyWorldTime) {
+		WorldState mine;
+		if (m_bridge.SampleWorld(mine)) {
+			const int drift =
+			    ClockDriftMinutes(mine.hour, mine.minute, body.hour, body.minute);
+			if (drift > kClockToleranceMinutes || drift < -kClockToleranceMinutes) {
+				Log("client: clock is %d minute(s) off the session, moving "
+				    "%02u:%02u -> %02u:%02u",
+				    drift, mine.hour, mine.minute, body.hour, body.minute);
+				m_bridge.ApplyWorldTime(body.hour, body.minute);
+			}
+		}
+	}
+
+	// Weather is written every time rather than on change. The "only on
+	// change" rule the ped and vehicle code follows is there because those
+	// calls rebuild models and restart animation blends; this one is a
+	// couple of 16-bit stores, and writing it unconditionally means the
+	// local weather rotation can never quietly win a race against us.
+	if (body.weather < WEATHER_TOTAL && body.weatherOld < WEATHER_TOTAL &&
+	    m_bridge.ApplyWorldWeather) {
+		m_bridge.ApplyWorldWeather(body.weather, body.weatherOld);
+		m_weatherPinned = true;
+	}
+}
+
+void Client::SendLocalWorld() {
+	if (!IsHost() || !m_bridge.SampleWorld)
+		return;
+	if (!m_worldRate.Ready(WallClock::NowMs()))
+		return;
+
+	WorldState mine;
+	if (!m_bridge.SampleWorld(mine))
+		return;   // no world to report - a loading screen, the menu
+
+	C_WorldState out;
+	InitHeader(out, WallClock::NowMs());
+	out.body.hour       = mine.hour;
+	out.body.minute     = mine.minute;
+	out.body.weather    = mine.weather;
+	out.body.weatherOld = mine.weatherOld;
+	m_net.Send(out, CH_EVENT);
 }
 
 // ---- vehicles --------------------------------------------------------------

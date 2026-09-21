@@ -16,6 +16,18 @@ void GameClock::Advance(uint32_t elapsedMs) {
 	}
 }
 
+bool GameClock::Set(uint8_t hour, uint8_t minute) {
+	if (hour > 23 || minute > 59)
+		return false;
+	m_hour    = hour;
+	m_minute  = minute;
+	// Start the next minute from scratch. Keeping the leftover would let a
+	// report land a fraction of a second before a rollover and tick the
+	// minute straight back off again.
+	m_accumMs = 0;
+	return true;
+}
+
 Session::Session(uint8_t maxPlayers) : m_players(maxPlayers) {
 	for (uint8_t i = 0; i < maxPlayers; ++i)
 		m_players[i].id = i;
@@ -45,6 +57,7 @@ Player *Session::AddPlayer(uint32_t peer, const char *nick, uint16_t modelId,
 	slot->modelId    = modelId;
 
 	reject = REJECT_NONE;
+	PickHost();
 	return &*slot;
 }
 
@@ -56,7 +69,41 @@ uint8_t Session::RemovePeer(uint32_t peer) {
 	const uint8_t id = p->id;
 	*p               = Player{};
 	p->id            = id;
+	PickHost();
 	return id;
+}
+
+// The host keeps the job until they leave, and then the lowest active slot
+// takes it.
+//
+// The "still here?" test in front is not a shortcut, it is the whole rule.
+// Slots are reused, so picking the lowest active slot unconditionally would
+// hand the session's clock to whoever happened to fill slot 0 next - a player
+// who just connected, whose game is at whatever time they left it, and who
+// would then drag everyone else's clock to it. A handover should only ever
+// happen because the host left.
+void Session::PickHost() {
+	if (m_hostId != INVALID_PLAYER && FindById(m_hostId))
+		return;
+
+	m_hostId = INVALID_PLAYER;
+	for (const Player &p : m_players)
+		if (p.active) {
+			m_hostId = p.id;
+			return;
+		}
+}
+
+bool Session::SetWeather(uint8_t weather, uint8_t weatherOld) {
+	// eWeatherType is 0..3 and CWeather indexes arrays with it without a
+	// bounds check, so a bad value would be a crash on every client rather
+	// than a wrong sky on one.
+	constexpr uint8_t WEATHER_TOTAL = 4;
+	if (weather >= WEATHER_TOTAL || weatherOld >= WEATHER_TOTAL)
+		return false;
+	m_weather    = weather;
+	m_weatherOld = weatherOld;
+	return true;
 }
 
 Player *Session::FindByPeer(uint32_t peer) {

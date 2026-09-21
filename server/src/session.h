@@ -49,8 +49,14 @@ struct Vehicle {
 	uint8_t  driverPlayerId = INVALID_PLAYER;
 };
 
-// Advances one in-game minute per 1000 real ms, matching the game's own rate
-// (CClock::Initialise(1000), re3 src/core/Game.cpp:596).
+// The session's idea of the time of day.
+//
+// It is not the authority. The host player's own CClock is (see HostId
+// below), and Set() is how the host's report lands here. What this does is
+// carry the time between those reports and give a joiner something sane
+// before the first one arrives, so it keeps advancing at the game's own rate
+// of one in-game minute per 1000 real ms (CClock::Initialise(1000), which
+// the retail exe does with a literal `push 3E8h` at 0x0048C289).
 class GameClock {
 public:
 	static constexpr uint32_t MS_PER_GAME_MINUTE = 1000;
@@ -58,6 +64,9 @@ public:
 	GameClock(uint8_t hour = 12, uint8_t minute = 0) : m_hour(hour), m_minute(minute) {}
 
 	void Advance(uint32_t elapsedMs);
+	// Out-of-range values are dropped rather than clamped: a client sending
+	// hour 200 is a client we can't believe about the minute either.
+	bool Set(uint8_t hour, uint8_t minute);
 	uint8_t Hour() const { return m_hour; }
 	uint8_t Minute() const { return m_minute; }
 
@@ -99,7 +108,22 @@ public:
 
 	GameClock &Clock() { return m_clock; }
 	uint8_t Weather() const { return m_weather; }
-	void SetWeather(uint8_t w) { m_weather = w; }
+	uint8_t WeatherOld() const { return m_weatherOld; }
+	// The pair CWeather blends between, not one type. See WorldStateBody.
+	bool SetWeather(uint8_t weather, uint8_t weatherOld);
+
+	// ---- host -------------------------------------------------------------
+	//
+	// One connected player is the host, and the session's time of day and sky
+	// are whatever that player's game says they are. The server runs no game,
+	// so a clock it kept on its own would be nobody's; docs/campaign.md
+	// already gives the host this job for the mission script, and the script
+	// is one of the things that moves the clock.
+	//
+	// It's the first player in, it stays theirs for as long as they're
+	// connected, and on their way out it passes to the lowest-numbered
+	// player still here. Nothing votes on it: one server, one answer.
+	uint8_t HostId() const { return m_hostId; }
 
 	// ---- vehicles ---------------------------------------------------------
 	//
@@ -121,9 +145,15 @@ private:
 	std::vector<Player>  m_players;
 	std::vector<Vehicle> m_vehicles;
 	GameClock            m_clock;
-	uint8_t              m_weather   = 0;   // WEATHER_SUNNY
-	uint16_t             m_nextNetId = 1;   // 0 is INVALID_NETID
+	uint8_t              m_weather    = 0;   // WEATHER_SUNNY
+	uint8_t              m_weatherOld = 0;
+	uint8_t              m_hostId     = INVALID_PLAYER;
+	uint16_t             m_nextNetId  = 1;   // 0 is INVALID_NETID
 	bool                 m_friendlyFire = false;   // docs/roadmap.md §5.2
+
+	// Called after the roster changes. Keeps the host on the lowest active
+	// slot, and clears it when the session empties out.
+	void PickHost();
 };
 
 // Trims to capacity and guarantees NUL termination. Returns the clean string.

@@ -1,5 +1,7 @@
-// CoopIII dedicated server. Relays player/vehicle state and owns world state
-// (clock, weather). Authority model is in docs/protocol.md §2.1.
+// CoopIII dedicated server. Relays player/vehicle state, and relays the host
+// player's time of day and weather to everyone else. Authority model is in
+// docs/protocol.md §2.1, and §2.7 for why the clock belongs to a player
+// rather than to this process.
 
 #include "session.h"
 
@@ -67,7 +69,10 @@ public:
 		for (const ServerEvent &ev : m_events)
 			Handle(ev);
 
-		// World state at 1 Hz (docs/protocol.md §2.3).
+		// World state at 1 Hz (docs/protocol.md §2.3). OnWorldState resets
+		// this timer, so with a host reporting normally the tick below never
+		// fires - it's what keeps the session's clock moving while the host
+		// is on a loading screen or hasn't sent anything yet.
 		if (now - m_lastWorldMs >= 1000) {
 			m_lastWorldMs = now;
 			BroadcastWorldState();
@@ -101,8 +106,18 @@ private:
 		out.playerId = p->id;
 		out.reason   = LEAVE_QUIT;
 
+		const uint8_t wasHost = m_session.HostId();
 		m_session.RemovePeer(peer);
 		m_net.Broadcast(out, CH_EVENT, peer);
+
+		// The host walking out hands the clock to whoever is left. Everyone
+		// finds out from the next world packet, at most a second away, which
+		// is also when the new host starts reporting.
+		if (wasHost == out.playerId && m_session.HostId() != INVALID_PLAYER) {
+			const Player *host = m_session.FindById(m_session.HostId());
+			std::printf("[coopiii] the host left; %s has the clock now\n",
+			            host ? host->nick.c_str() : "?");
+		}
 	}
 
 	void OnMessage(PeerId peer, const Message &msg) {
@@ -151,6 +166,10 @@ private:
 			if (const auto *pkt = msg.as<C_ExitVehicle>())
 				OnExitVehicle(peer, *pkt);
 			break;
+		case OP_C_WORLD_STATE:
+			if (const auto *pkt = msg.as<C_WorldState>())
+				OnWorldState(peer, *pkt);
+			break;
 		case OP_C_CHAT:
 			if (const auto *pkt = msg.as<C_Chat>())
 				OnChat(peer, *pkt);
@@ -185,13 +204,15 @@ private:
 		welcome.netId      = p->netId;
 		welcome.maxPlayers = MAX_PLAYERS;
 		welcome.snapshotHz = SNAPSHOT_HZ;
-		welcome.hour       = m_session.Clock().Hour();
-		welcome.minute     = m_session.Clock().Minute();
-		welcome.weather    = m_session.Weather();
+		welcome.hour         = m_session.Clock().Hour();
+		welcome.minute       = m_session.Clock().Minute();
+		welcome.weather      = m_session.Weather();
+		welcome.weatherOld   = m_session.WeatherOld();
+		welcome.hostPlayerId = m_session.HostId();
 		// The session's own rules. Only one so far, and the client needs it
 		// because an explosion is the one kind of damage that never passes
 		// through here to be refused (protocol.h, SessionFlags).
-		welcome.flags      = m_session.FriendlyFire() ? SESSION_FRIENDLY_FIRE : 0;
+		welcome.flags        = m_session.FriendlyFire() ? SESSION_FRIENDLY_FIRE : 0;
 		m_net.SendTo(peer, welcome, CH_EVENT);
 
 		// Tell the newcomer who's already here...
@@ -248,6 +269,9 @@ private:
 
 		std::printf("[coopiii] %s joined (slot %u, net %u)\n", p->nick.c_str(),
 		            p->id, p->netId);
+		if (m_session.HostId() == p->id)
+			std::printf("[coopiii] %s is the host; the session's clock is theirs\n",
+			            p->nick.c_str());
 	}
 
 	S_PlayerJoin MakeJoin(const Player &p) const {
@@ -529,15 +553,37 @@ private:
 		std::printf("[chat] %s: %s\n", p->nick.c_str(), text.c_str());
 	}
 
+	// The host's game telling the session what time it is.
+	//
+	// Relayed rather than merely stored, and the 1 Hz timer is reset on the
+	// way out so the free-running broadcast doesn't add a second of age to
+	// something that just arrived. With a host connected this path is the
+	// only one that ever fires; the timer below is what covers a session
+	// whose host is loading, or hasn't reported yet.
+	void OnWorldState(PeerId peer, const C_WorldState &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || p->id != m_session.HostId())
+			return;   // not the host, so not the session's clock
+
+		if (!m_session.Clock().Set(in.body.hour, in.body.minute))
+			return;
+		m_session.SetWeather(in.body.weather, in.body.weatherOld);
+
+		m_lastWorldMs = NowMs();
+		BroadcastWorldState();
+	}
+
 	void BroadcastWorldState() {
 		if (m_session.Count() == 0)
 			return;
 
 		S_WorldState out;
 		InitHeader(out, NowMs());
-		out.hour    = m_session.Clock().Hour();
-		out.minute  = m_session.Clock().Minute();
-		out.weather = m_session.Weather();
+		out.body.hour       = m_session.Clock().Hour();
+		out.body.minute     = m_session.Clock().Minute();
+		out.body.weather    = m_session.Weather();
+		out.body.weatherOld = m_session.WeatherOld();
+		out.hostPlayerId    = m_session.HostId();
 		m_net.Broadcast(out, CH_EVENT);
 	}
 

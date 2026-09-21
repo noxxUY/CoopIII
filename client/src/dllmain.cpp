@@ -19,6 +19,7 @@
 #include "game/ped.h"
 #include "game/verify.h"
 #include "game/world.h"
+#include "game/worldstate.h"
 #include "hook/hook.h"
 #include "log.h"
 
@@ -140,7 +141,12 @@ DWORD WINAPI Boot(LPVOID) {
 		Log("CoopIII: combat is not fully hooked; firing, explosions and damage "
 		    "may not reach other players");
 
-	const WorldBridge bridge = game::MakeWorldBridge();
+	WorldBridge bridge = game::MakeWorldBridge();
+	// Clock and weather are wired here rather than inside MakeWorldBridge
+	// because they share nothing with the ped and vehicle code: different
+	// addresses, different file, no entities involved.
+	game::AddWorldToBridge(bridge);
+
 	if (!g_client.Start(g_config.host, g_config.port, g_config.nick, bridge)) {
 		Log("CoopIII: the network client failed to start; the frame hook stays "
 		    "installed but nothing will be sent");

@@ -589,8 +589,9 @@ one.
 ### 2.1 Topology: dedicated server, client-authoritative players
 
 Each client is authoritative over (a) its own ped and (b) the vehicle it is
-currently driving. The server owns global state (clock, weather) and assigns
-ownership for everything else.
+currently driving. One designated client, the host, is additionally
+authoritative over the time of day and the weather (§2.7). The server relays
+all of it and assigns ownership for everything else.
 
 Why not server-authoritative: GTA III physics is frame-rate-coupled through
 `ms_fTimeStep` (§1.2) and not deterministic across machines, so rolling back or
@@ -624,7 +625,7 @@ Rejected: raw UDP + hand-rolled reliability (rebuilding ENet badly), TCP
 |---|---|---|
 | Player snapshot | 25 Hz | Smooth at 100 ms interp delay (§2.6) without flooding; see §1.2 |
 | Vehicle snapshot (driver's) | 25 Hz, same packet as its driver | avoids ped/vehicle desync within a frame |
-| World state (clock, weather) | 1 Hz | `CClock`/`CWeather` update per frame but change slowly (`Game.cpp:1031-1032`) |
+| World state (clock, weather) | 1 Hz, host → server → everyone | `CClock`/`CWeather` update per frame but change slowly (`Game.cpp:1031-1032`), and a game minute is a real second, so anything faster is repetition (§2.7) |
 | Events | on occurrence, reliable | shots, damage, enter/exit, death |
 
 Bandwidth check at 8 players: 7 remotes × 25 Hz × ~72 B ≈ 12.6 KB/s down per
@@ -667,6 +668,59 @@ collision system and produces the jitter these mods are known for.
 Peds interpolate `m_fRotationCur` as a scalar angle (§1.7). Vehicles slerp the
 orientation quaternion.
 
+### 2.7 Time of day and weather belong to the host, not to the server
+
+The session's clock is one player's `CClock`. That player is the host: the
+first one to connect, and on their way out the lowest-numbered player still
+in. Everyone else, and only everyone else, is corrected toward it.
+
+**Why not keep the clock on the server.** The server has no GTA III running,
+so a clock it keeps is a clock nobody is playing to. Three things follow
+from that and none of them have a workaround:
+
+1. The campaign moves the clock. `SET_TIME_OF_DAY` (opcode 192) calls
+   `CClock::SetGameClock` outright, and `FORCE_WEATHER` / `FORCE_WEATHER_NOW`
+   / `RELEASE_WEATHER` (437-439) do the same to the sky. `campaign.md` §2
+   already puts the script on the host, so the host's engine is where those
+   opcodes land. A server-authoritative clock would drag the time back off
+   whatever the mission just set it to, once a second, for the whole mission.
+2. `CClock` is driven by `CTimer::GetTimeInMilliseconds()`, which stops on a
+   loading screen and is scaled by `ms_fTimeScale` (§1.2). A server counting
+   real milliseconds is not modelling that, it is only approximating it, and
+   the approximation drifts in the one direction nothing corrects.
+3. It is what was asked for. The time everyone sees should be the time the
+   person running the session sees.
+
+The cost is a handover when the host quits, which is one byte on a packet
+that was already being sent.
+
+A host that never reports leaves the session on the server's stand-in clock,
+which is the old behaviour rather than a broken one. Worth knowing when
+testing: `tools/ghost` has no `CClock`, so if it connects before any real
+client it becomes the host and nobody's time of day gets followed. Start the
+game first.
+
+**Corrections are a jump, and the tolerance is what stops them.** A world
+packet is at least a round trip old and the host reports once a second, so a
+client that matched exactly would be told to step its clock every second, and
+GTA III hangs the HUD clock, the sun's position and the streetlights off the
+minute. So a client only moves once it is more than three game minutes out
+(`kClockToleranceMinutes` in `client/src/client.h`). Three game minutes is
+three real seconds, which nothing on screen can show; everything that
+genuinely matters - joining at a different hour, a loading screen, a mission
+setting the time - is hours out and gets fixed in one step. Two synced games
+then stay synced on their own, because `CClock` runs at the same rate on
+every machine.
+
+**Weather is a pair, not a type.** `CWeather` blends from `OldWeatherType` to
+`NewWeatherType` across a game hour, so one type says where the sky is going
+and not where it is. Both go on the wire. The position within the blend does
+not: `CWeather::Update` recomputes it as `CClock::GetMinutes() / 60` at the
+top of every frame, so once the clock agrees the blend agrees for free.
+Receivers also pin `ForcedWeatherType`, without which the local rotation
+picks its own next type at the hour boundary and shows the wrong sky for the
+second before the next packet arrives.
+
 ---
 
 ## 3. v1 sync scope
@@ -679,8 +733,9 @@ In:
 - Enter/exit/carjack, using the engine's own API so animations play correctly:
   `SetEnterCar` (`Ped.h:701`), `SetExitCar` (703), `SetCarJack` (711),
   `SetPedPositionInCar` (565)
-- Damage/death/respawn: `InflictDamage` (612), `SetDie` (545). The design is §1.10
-- Clock + weather
+- Damage/death/respawn: `InflictDamage` (612), `SetDie` (545), `SetDead` (546).
+  The design is §1.10
+- Clock + weather, taken from the host's own game (§2.7)
 - Chat
 
 Out (deliberately, for v1):
@@ -710,7 +765,7 @@ model that doesn't exist yet.
 | Opcode | Name | Ch | Payload |
 |---|---|---|---|
 | 0x01 | `C_HELLO` | 1 | protocol version, nickname, model id |
-| 0x02 | `S_WELCOME` | 1 | your `playerId`, your `netId`, server tick rate, world state, session flags (§1.10.3) |
+| 0x02 | `S_WELCOME` | 1 | your `playerId`, your `netId`, server tick rate, world state, `hostPlayerId` (§2.7), session flags (§1.10.3) |
 | 0x03 | `S_PLAYER_JOIN` | 1 | `playerId`, `netId`, nickname, model id, spawn transform |
 | 0x04 | `S_PLAYER_LEAVE` | 1 | `playerId`, reason |
 | 0x10 | `C_PLAYER_STATE` | 0 | pos `float[3]`, heading `float`, `m_vecMoveSpeed` `float[3]`, `m_nMoveState` `u8`, `m_nPedState` `u8`, anim `u16` + time `float` + speed `float`, partial anim `u16` + time `float`, health `float`, armour `float`, weapon `u8`, aim yaw/pitch `float[2]`, flags `u8` (64 bytes) |
@@ -727,7 +782,8 @@ model that doesn't exist yet.
 | 0x32 | `C_EXIT_VEHICLE` / 0x33 `S_EXIT_VEHICLE` | 1 | `netId` |
 | 0x34 | `S_VEHICLE_SPAWN` | 1 | `netId`, model id, transform, colours |
 | 0x35 | `S_VEHICLE_DESPAWN` | 1 | `netId` |
-| 0x40 | `S_WORLD_STATE` | 1 | game hour/minute, weather type, blend |
+| 0x40 | `S_WORLD_STATE` | 1 | game hour/minute, both weather types, `hostPlayerId` (§2.7) |
+| 0x41 | `C_WORLD_STATE` | 1 | the host's own hour/minute and weather pair; dropped from anyone else |
 | 0x50 | `C_CHAT` / 0x51 `S_CHAT` | 1 | `playerId`, text |
 
 ---

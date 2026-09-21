@@ -154,6 +154,18 @@ target("ghost")
     add_includedirs("client/src")
     add_deps("sdk")
 
+-- The server's roster, its host election and its clock, with no socket.
+-- Session used to be a list and a counter, which nettest covered well
+-- enough by driving two real clients through it. It now decides whose game
+-- the whole session takes its time of day from, and that is worth being
+-- able to test without waiting for two clients to connect.
+target("sessiontest")
+    set_kind("binary")
+    set_default(false)
+    add_files("tools/sessiontest/*.cpp", "server/src/session.cpp")
+    add_includedirs("server/src")
+    add_deps("sdk")
+
 -- Resolves rel32 call targets and checks whether they land on a function
 -- start. Exists because hand arithmetic got one wrong and crashed the game.
 target("calltarget")

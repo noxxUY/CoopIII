@@ -240,8 +240,12 @@ int main(int argc, char **argv) {
 	const Message *world = FindOp(inbox[0], OP_S_WORLD_STATE);
 	Check(world != nullptr, "world state arrives at ~1 Hz");
 	if (world)
-		if (const auto *w = world->as<S_WorldState>())
-			Check(w->hour < 24 && w->minute < 60, "clock in range");
+		if (const auto *w = world->as<S_WorldState>()) {
+			Check(w->body.hour < 24 && w->body.minute < 60, "clock in range");
+			// Neither of these two ever sent a C_WorldState, so this is the
+			// server's own stand-in clock, and the host it names is alice.
+			Check(w->hostPlayerId == 0, "the first player in is the host");
+		}
 
 	// --- leave -------------------------------------------------------------
 	inbox[0].clear();

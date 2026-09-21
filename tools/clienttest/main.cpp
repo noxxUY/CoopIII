@@ -42,17 +42,34 @@ Message Wrap(const T &pkt, Channel ch) {
 	return m;
 }
 
-S_Welcome MakeWelcome(uint8_t playerId, uint8_t reject = 0) {
+// hostPlayerId defaults to "nobody", so the tests that predate the world
+// clock keep behaving the way they did: not the host, and nothing to follow.
+S_Welcome MakeWelcome(uint8_t playerId, uint8_t reject = 0,
+                      uint8_t hostPlayerId = INVALID_PLAYER) {
 	S_Welcome w;
 	InitHeader(w, 1000);
-	w.reject     = reject;
-	w.playerId   = playerId;
-	w.netId      = uint16_t(100 + playerId);
-	w.maxPlayers = MAX_PLAYERS;
-	w.snapshotHz = SNAPSHOT_HZ;
-	w.hour       = 12;
-	w.minute     = 0;
-	w.weather    = 0;
+	w.reject       = reject;
+	w.playerId     = playerId;
+	w.netId        = uint16_t(100 + playerId);
+	w.maxPlayers   = MAX_PLAYERS;
+	w.snapshotHz   = SNAPSHOT_HZ;
+	w.hour         = 12;
+	w.minute       = 0;
+	w.weather      = 0;
+	w.weatherOld   = 0;
+	w.hostPlayerId = hostPlayerId;
+	return w;
+}
+
+S_WorldState MakeWorldState(uint8_t hostPlayerId, uint8_t hour, uint8_t minute,
+                            uint8_t weather = 0, uint8_t weatherOld = 0) {
+	S_WorldState w;
+	InitHeader(w, 1000);
+	w.body.hour       = hour;
+	w.body.minute     = minute;
+	w.body.weather    = weather;
+	w.body.weatherOld = weatherOld;
+	w.hostPlayerId    = hostPlayerId;
 	return w;
 }
 
@@ -154,6 +171,18 @@ struct Recorder {
 	uint16_t   lastKillAnim   = ANIM_NONE;
 	int        friendlyFireCalls = 0;
 	bool       friendlyFire      = false;
+	// World. `world` is what this machine's engine would report; the rest is
+	// what the client asked to have done to it.
+	WorldState world{12, 0, 0, 0};
+	bool       haveWorld       = true;
+	int        worldSamples    = 0;
+	int        timeApplies     = 0;
+	int        weatherApplies  = 0;
+	int        weatherReleases = 0;
+	uint8_t    appliedHour       = 0xFF;
+	uint8_t    appliedMinute     = 0xFF;
+	uint8_t    appliedWeather    = 0xFF;
+	uint8_t    appliedWeatherOld = 0xFF;
 };
 
 Recorder g_rec;
@@ -252,6 +281,28 @@ void RecCorrectVehicle(RemoteVehicle &, const VehicleTransform &at) {
 	g_rec.lastCorrection = at;
 }
 
+bool RecSampleWorld(WorldState &out) {
+	++g_rec.worldSamples;
+	if (!g_rec.haveWorld)
+		return false;
+	out = g_rec.world;
+	return true;
+}
+
+void RecApplyWorldTime(uint8_t hour, uint8_t minute) {
+	++g_rec.timeApplies;
+	g_rec.appliedHour   = hour;
+	g_rec.appliedMinute = minute;
+}
+
+void RecApplyWorldWeather(uint8_t weather, uint8_t weatherOld) {
+	++g_rec.weatherApplies;
+	g_rec.appliedWeather    = weather;
+	g_rec.appliedWeatherOld = weatherOld;
+}
+
+void RecReleaseWorldWeather() { ++g_rec.weatherReleases; }
+
 void RecApplyVehicle(RemoteVehicle &, const VehicleStateBody &body) {
 	++g_rec.vehicleApplies;
 	g_rec.lastVehicleBody = body;
@@ -301,6 +352,11 @@ WorldBridge RecordingBridge() {
 	b.ApplyRemoteDamage   = &RecApplyDamage;
 	b.KillRemotePed       = &RecKill;
 	b.SetFriendlyFire     = &RecSetFriendlyFire;
+
+	b.SampleWorld         = &RecSampleWorld;
+	b.ApplyWorldTime      = &RecApplyWorldTime;
+	b.ApplyWorldWeather   = &RecApplyWorldWeather;
+	b.ReleaseWorldWeather = &RecReleaseWorldWeather;
 	return b;
 }
 
@@ -1790,6 +1846,195 @@ void TestProjectileWeapons() {
 	Check(!IsKnownExplosionType(255), "and neither is a byte of garbage");
 }
 
+// ---- time of day and weather ------------------------------------------------
+
+void TestClockDriftIsCircular() {
+	std::printf("\nhow far apart two times of day are\n");
+
+	Check(ClockDriftMinutes(12, 0, 12, 0) == 0, "the same time is no distance");
+	Check(ClockDriftMinutes(12, 0, 12, 5) == 5, "ahead of us is positive");
+	Check(ClockDriftMinutes(12, 5, 12, 0) == -5, "behind us is negative");
+	Check(ClockDriftMinutes(11, 55, 12, 5) == 10, "and it crosses the hour");
+
+	// The one that a plain subtraction gets wrong, and it gets it wrong by
+	// most of a day - which would then look like an enormous drift and snap
+	// the clock every second at midnight.
+	Check(ClockDriftMinutes(23, 59, 0, 1) == 2, "midnight is two minutes away, not 1438");
+	Check(ClockDriftMinutes(0, 1, 23, 59) == -2, "and two minutes back the other way");
+
+	const int halfADay = ClockDriftMinutes(12, 0, 0, 0);
+	Check(halfADay == 720 || halfADay == -720, "opposite sides of the dial are 12 hours");
+}
+
+void TestClockOnlyMovesWhenItIsWorthIt() {
+	std::printf("\ncorrecting a drifting clock\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(1, 0, /*host=*/0), CH_EVENT));
+	g_rec.timeApplies = 0;
+	g_rec.world       = WorldState{12, 0, 0, 0};
+
+	c.HandleMessage(Wrap(MakeWorldState(0, 12, 2), CH_EVENT));
+	Check(g_rec.timeApplies == 0, "two minutes out is left alone");
+
+	c.HandleMessage(Wrap(MakeWorldState(0, 11, 58), CH_EVENT));
+	Check(g_rec.timeApplies == 0, "and so is two minutes out the other way");
+
+	c.HandleMessage(Wrap(MakeWorldState(0, 12, 3), CH_EVENT));
+	Check(g_rec.timeApplies == 0, "the tolerance itself is not past the tolerance");
+
+	c.HandleMessage(Wrap(MakeWorldState(0, 12, 20), CH_EVENT));
+	Check(g_rec.timeApplies == 1, "twenty minutes out gets moved");
+	Check(g_rec.appliedHour == 12 && g_rec.appliedMinute == 20,
+	      "and moved to what the session said, not part of the way");
+
+	// A client that joined at a different hour is the normal case, and the
+	// arithmetic has to survive it being on the far side of midnight.
+	g_rec.world = WorldState{23, 55, 0, 0};
+	c.HandleMessage(Wrap(MakeWorldState(0, 0, 30), CH_EVENT));
+	Check(g_rec.timeApplies == 2 && g_rec.appliedHour == 0,
+	      "and across midnight too");
+}
+
+void TestTheHostKeepsItsOwnClock() {
+	std::printf("\nthe host is not corrected\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0, 0, /*host=*/0), CH_EVENT));
+
+	Check(c.IsHost(), "the welcome says we're the host");
+	Check(g_rec.timeApplies == 0, "so the welcome's hour isn't applied to us");
+
+	g_rec.world = WorldState{12, 0, 0, 0};
+	c.HandleMessage(Wrap(MakeWorldState(0, 3, 0, 2, 1), CH_EVENT));
+	Check(g_rec.timeApplies == 0, "and neither is a world packet's");
+	Check(g_rec.weatherApplies == 0, "nor its weather - it's a copy of ours");
+
+	// A machine that has been the host since it joined may have a
+	// ForcedWeatherType its own mission script set. FORCE_WEATHER is a
+	// campaign opcode; clearing it mid-mission would be us changing the
+	// weather rather than following it.
+	Check(g_rec.weatherReleases == 0,
+	      "and a host that never followed anyone leaves its own sky alone");
+}
+
+void TestWelcomeSetsTheClockStraightAway() {
+	std::printf("\njoining a session already in progress\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	g_rec.world = WorldState{12, 0, 0, 0};
+
+	S_Welcome w = MakeWelcome(1, 0, /*host=*/0);
+	w.hour      = 3;
+	w.minute    = 30;
+	w.weather   = 2;
+	w.weatherOld = 1;
+	c.HandleMessage(Wrap(w, CH_EVENT));
+
+	Check(!c.IsHost(), "player 1 isn't the host here");
+	Check(g_rec.timeApplies == 1 && g_rec.appliedHour == 3 &&
+	          g_rec.appliedMinute == 30,
+	      "the welcome moves the clock without waiting for a world packet");
+	Check(g_rec.weatherApplies == 1 && g_rec.appliedWeather == 2 &&
+	          g_rec.appliedWeatherOld == 1,
+	      "and brings the sky over with it");
+}
+
+void TestWeatherIsAPairAndIsWrittenEveryTime() {
+	std::printf("\nmirroring the host's sky\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(1, 0, /*host=*/0), CH_EVENT));
+	g_rec.weatherApplies = 0;
+
+	c.HandleMessage(Wrap(MakeWorldState(0, 12, 0, /*weather=*/2, /*old=*/1), CH_EVENT));
+	Check(g_rec.weatherApplies == 1, "a world packet writes the weather");
+	Check(g_rec.appliedWeather == 2 && g_rec.appliedWeatherOld == 1,
+	      "both ends of the blend, not just the one being blended towards");
+
+	// Not change-gated on purpose: it's two 16-bit stores, and the local
+	// weather rotation picks its own next type every game hour. Skipping a
+	// write because nothing changed on the wire would let that win.
+	c.HandleMessage(Wrap(MakeWorldState(0, 12, 0, 2, 1), CH_EVENT));
+	Check(g_rec.weatherApplies == 2, "and writes it again next second");
+}
+
+void TestBecomingTheHostGivesTheSkyBack() {
+	std::printf("\nthe host leaving\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(1, 0, /*host=*/0), CH_EVENT));
+	Check(g_rec.weatherReleases == 0, "an ordinary client's sky stays pinned");
+
+	// Player 0 quit, so the server says we have it now. A pinned sky never
+	// rotates again, so the new host has to be unpinned or the session gets
+	// one weather type for the rest of its life.
+	c.HandleMessage(Wrap(MakeWorldState(1, 12, 0), CH_EVENT));
+	Check(c.IsHost(), "the world packet is how we find out");
+	Check(g_rec.weatherReleases == 1, "and the sky goes back to the engine");
+
+	c.HandleMessage(Wrap(MakeWorldState(1, 12, 1), CH_EVENT));
+	Check(g_rec.weatherReleases == 1, "once, not once a second");
+}
+
+void TestRubbishWorldStateIsIgnored() {
+	std::printf("\nworld state that can't be true\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(1, 0, /*host=*/0), CH_EVENT));
+	g_rec.timeApplies    = 0;
+	g_rec.weatherApplies = 0;
+
+	// CClock only tests its hour for >= 24 *after* an increment, so garbage
+	// written into it doesn't come back on its own.
+	c.HandleMessage(Wrap(MakeWorldState(0, 25, 0), CH_EVENT));
+	Check(g_rec.timeApplies == 0, "hour 25 isn't a time of day");
+
+	c.HandleMessage(Wrap(MakeWorldState(0, 12, 99), CH_EVENT));
+	Check(g_rec.timeApplies == 0, "minute 99 isn't either");
+
+	// eWeatherType indexes arrays inside CWeather with no bounds check. The
+	// two packets above carried a valid weather with their bad time, which
+	// is the point: a bad hour doesn't throw the sky away with it.
+	Check(g_rec.weatherApplies == 2, "a bad hour doesn't stop the sky arriving");
+
+	const int before = g_rec.weatherApplies;
+	c.HandleMessage(Wrap(MakeWorldState(0, 12, 0, /*weather=*/9), CH_EVENT));
+	Check(g_rec.weatherApplies == before, "and weather 9 doesn't exist");
+}
+
+void TestNoWorldToReadMeansNoCorrection() {
+	std::printf("\nnothing to correct yet\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(1, 0, /*host=*/0), CH_EVENT));
+	g_rec.timeApplies = 0;
+
+	// A loading screen. There's no clock to compare against, so there's no
+	// drift to act on - and the next packet is a second away.
+	g_rec.haveWorld = false;
+	c.HandleMessage(Wrap(MakeWorldState(0, 3, 0), CH_EVENT));
+	Check(g_rec.timeApplies == 0, "a clock we can't read isn't moved");
+
+	g_rec.haveWorld = true;
+	c.HandleMessage(Wrap(MakeWorldState(0, 3, 0), CH_EVENT));
+	Check(g_rec.timeApplies == 1, "and it's picked up as soon as it can be");
+}
+
+void TestDisconnectDropsTheHost() {
+	std::printf("\nthe session ending\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0, 0, /*host=*/0), CH_EVENT));
+	Check(c.IsHost(), "we were the host");
+
+	// A second welcome is a new session. Nobody's clock is ours to follow
+	// until the new one says whose it is.
+	c.HandleMessage(Wrap(MakeWelcome(2, 0, INVALID_PLAYER), CH_EVENT));
+	Check(!c.IsHost(), "and we aren't any more");
+	Check(c.HostPlayerId() == INVALID_PLAYER, "with nobody else holding it either");
+}
+
 void TestAngleWrap() {
 	std::printf("\naim yaw wrapping\n");
 	constexpr float kPi = 3.14159265358979323846f;
@@ -2121,6 +2366,15 @@ int main() {
 	TestTagHealthText();
 	TestTagNameIsSafeForCFont();
 	TestEightTagsDoNotStack();
+	TestClockDriftIsCircular();
+	TestClockOnlyMovesWhenItIsWorthIt();
+	TestTheHostKeepsItsOwnClock();
+	TestWelcomeSetsTheClockStraightAway();
+	TestWeatherIsAPairAndIsWrittenEveryTime();
+	TestBecomingTheHostGivesTheSkyBack();
+	TestRubbishWorldStateIsIgnored();
+	TestNoWorldToReadMeansNoCorrection();
+	TestDisconnectDropsTheHost();
 
 	std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL",
 	            g_failures, g_failures == 1 ? "" : "s");

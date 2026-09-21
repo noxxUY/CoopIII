@@ -95,6 +95,140 @@ constexpr uintptr_t CTimer__EndUserPause                     = 0x004AD4A0;
 constexpr uintptr_t CTimer__m_UserPause                      = 0x0095CD7C;
 constexpr uintptr_t CTimer__m_CodePause                      = 0x0095CDB1;
 
+// ---- time of day and weather ----------------------------------------------
+//
+// Verified 2026-09-21. Found the way the ped and vehicle paths were: by
+// walking the script opcodes that already do the thing, instead of hunting a
+// symbol by name. The dispatcher at 0x00439500 is a chain of
+// `cmp dx,<limit> / jge / movsx eax,dx / push eax / call <range handler>`,
+// and each range handler is `lea eax,[opcode - base] / cmp eax,<count> / ja
+// default / jmp [eax*4 + <table>]`.
+//
+//   SET_TIME_OF_DAY    192  ->  100..199 table 0x005EEA7C, entry 92
+//                               handler 0x0043D1EB
+//   FORCE_WEATHER      437  ->  400..499 table 0x005EEFC8, entry 37
+//   FORCE_WEATHER_NOW  438                              entry 38
+//   RELEASE_WEATHER    439                              entry 39
+//
+// The 400..499 range handler is 0x00440CB0 and its base opcode is a round
+// 400 (`lea edx,[eax + 0FFFFFE70h]`, i.e. eax - 0x190). The 100 table is the
+// one the ped spawn already uses, and entry 54 there is still CREATE_CHAR's
+// 0x0043BA03 - which is how this pass knew it had the right base before
+// trusting anything else it read out of it.
+//
+// Every rel32 below was resolved with tools/calltarget, not by hand.
+
+// Clock.cpp:74. __cdecl(uint8 h, uint8 m) - both arguments still take a
+// 4-byte stack slot; the callee reads the low byte of each.
+//
+//   0x004733C0  mov  eax, [0x00885B48]        CTimer::GetTimeInMilliseconds()
+//               mov  word [0x0095CC7C], 0     ms_nGameClockSeconds = 0
+//               mov  [0x009430E4], eax        ms_nLastClockTick
+//               mov  al, [esp+4]
+//               mov  [0x0095CDA6], al         ms_nGameClockHours
+//               mov  al, [esp+8]
+//               mov  [0x0095CDC8], al         ms_nGameClockMinutes
+//               ret
+//
+// 0x00885B48 is CTimer::m_snTimeInMilliseconds, recorded above from an
+// unrelated pass - the two agree, which is the kind of mutual confirmation
+// worth looking for.
+//
+// Prefer this over writing the two bytes directly. It also rebases
+// ms_nLastClockTick, so the engine's own CClock::Update measures the next
+// game minute from the correction rather than immediately ticking one off
+// whatever was left over.
+constexpr uintptr_t CClock__SetGameClock = 0x004733C0;
+
+// Three more witnesses for the same globals, each from a different function:
+//
+//   CClock::Initialise  0x00473370  `mov byte [0x0095CDA6], 0Ch` and
+//                                   `mov byte [0x0095CDC8], 0` - Clock.cpp:25's
+//                                   12:00, as a literal. CGame::Initialise
+//                                   calls it with `push 3E8h` at 0x0048C289
+//                                   (Game.cpp:596), so a game minute really
+//                                   is 1000 ms.
+//   CClock::Update      0x00473460  `inc byte [0x0095CDC8]`, then
+//                                   `cmp byte [0x0095CDC8], 3Ch` / `inc byte
+//                                   [0x0095CDA6]` / `cmp byte [0x0095CDA6],
+//                                   18h` - 60 and 24, i.e. Clock.cpp:53-66.
+//   CClock::StoreClock  0x00473540  reads hours, minutes and seconds in
+//                                   declaration order into three stored
+//                                   copies, and RestoreClock (0x00473570) is
+//                                   its mirror.
+//
+// GetGameClockMinutesUntil (0x004733F0, Clock.cpp:83) settles which of the
+// two bytes is which on its own: it does `imul edx, [0x0095CDA6], 3Ch` and
+// adds [0x0095CDC8], so the one multiplied by 60 is the hour.
+constexpr uintptr_t CClock__Initialise             = 0x00473370;
+constexpr uintptr_t CClock__Update                 = 0x00473460;
+constexpr uintptr_t CClock__ms_nGameClockHours     = 0x0095CDA6;   // uint8
+constexpr uintptr_t CClock__ms_nGameClockMinutes   = 0x0095CDC8;   // uint8
+constexpr uintptr_t CClock__ms_nGameClockSeconds   = 0x0095CC7C;   // uint16
+constexpr uintptr_t CClock__ms_nLastClockTick      = 0x009430E4;   // uint32
+constexpr uintptr_t CClock__ms_nMillisecondsPerGameMinute = 0x008F2C64;   // uint32
+
+// CWeather's three type globals and the blend position between them. All
+// four are pinned by CWeather::Init (0x00522BA0, Weather.cpp:105-118), which
+// happens to give each one a different literal:
+//
+//   mov word [0x0095CC70], 0        NewWeatherType    = WEATHER_SUNNY
+//   mov word [0x0095CCEC], 1        OldWeatherType    = WEATHER_CLOUDY
+//   mov dword [0x008F2520], 0       InterpolationValue = 0.0f
+//   or  word [0x0095CC80], 0FFFFh   ForcedWeatherType = WEATHER_RANDOM (-1)
+//
+// CWeather::Update confirms old and new a second time and in the other
+// direction: at 0x00522C4C it does `mov ax,[0x0095CC70] / mov
+// [0x0095CCEC],ax`, which is Weather.cpp:125's `OldWeatherType =
+// NewWeatherType` and can only be read that way round.
+//
+// The type numbering is confirmed against the retail data rather than re3's
+// header: WeatherTypesList at 0x005FFBC8 reads 0,0,...,1,1,2,2,1,0 at
+// entries 16..21, matching Weather.cpp's table exactly.
+constexpr uintptr_t CWeather__NewWeatherType     = 0x0095CC70;   // int16
+constexpr uintptr_t CWeather__OldWeatherType     = 0x0095CCEC;   // int16
+constexpr uintptr_t CWeather__ForcedWeatherType  = 0x0095CC80;   // int16
+constexpr uintptr_t CWeather__InterpolationValue = 0x008F2520;   // float
+
+enum eWeatherType {
+	WEATHER_SUNNY  = 0,
+	WEATHER_CLOUDY = 1,
+	WEATHER_RAINY  = 2,
+	WEATHER_FOGGY  = 3,
+	WEATHER_TOTAL  = 4,
+	WEATHER_RANDOM = -1,   // ForcedWeatherType only: "let the list decide"
+};
+
+// Weather.cpp:270-284. All three are two or three plain stores and nothing
+// else, which is why game/world.cpp writes the globals rather than calling
+// them - there is no registration hiding in here the way there is in the ped
+// and vehicle spawn paths. Recorded because they are the proof:
+//
+//   ForceWeather     0x00523170  mov eax,[esp+4] / mov [Forced],ax / ret
+//   ForceWeatherNow  0x00523180  mov ecx,[esp+4] / mov [Old],cx /
+//                                mov ax,[Old] / mov [New],ax /
+//                                mov [Forced],cx / ret
+//   ReleaseWeather   0x005231A0  or word [Forced],0FFFFh / ret
+constexpr uintptr_t CWeather__ForceWeather    = 0x00523170;
+constexpr uintptr_t CWeather__ForceWeatherNow = 0x00523180;
+constexpr uintptr_t CWeather__ReleaseWeather  = 0x005231A0;
+constexpr uintptr_t CWeather__Update          = 0x00522C10;
+
+// The one ordering fact the whole feature rests on. CGame::Process calls
+// these two back to back (Game.cpp:1031-1032):
+//
+//   0x0048C8EB  call 0x00473460    CClock::Update
+//   0x0048C8F0  call 0x00522C10    CWeather::Update
+//
+// and CWeather::Update opens with `mov al, [0x0095CDC8]` (the clock's
+// minutes) and ends by storing that minute over 60 into InterpolationValue.
+// So the blend between the old and new weather types is a function of the
+// clock and is recomputed every frame. Sync the clock and the blend follows;
+// there is no reason to put it on the wire.
+//
+// CoopIII's PreFrame runs before CGame::Process, so anything written to
+// either from there is what these two read this frame, not next frame.
+
 // ---- startup state machine ------------------------------------------------
 //
 // gGameState, the variable WinMain (0x00582710) switches on. Verified by

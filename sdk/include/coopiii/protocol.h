@@ -28,7 +28,10 @@ namespace coopiii {
 //    C_Death was added because the shapes reserved at version 5 had the
 //    server announcing a death it has no way of knowing about.
 //    docs/protocol.md §1.10.
-constexpr uint16_t PROTOCOL_VERSION = 7;
+// 8: time of day and weather follow the host's game instead of the server's
+//    synthetic clock. C_WorldState added, S_WorldState and S_Welcome carry
+//    hostPlayerId and the second weather type. docs/protocol.md §2.7.
+constexpr uint16_t PROTOCOL_VERSION = 8;
 constexpr uint16_t DEFAULT_PORT     = 2001;
 constexpr uint8_t  MAX_PLAYERS      = 8;
 constexpr uint8_t  SNAPSHOT_HZ      = 25;   // docs/protocol.md §1.2
@@ -83,6 +86,7 @@ enum Opcode : uint8_t {
 	OP_S_VEHICLE_DESPAWN = 0x35,
 
 	OP_S_WORLD_STATE     = 0x40,
+	OP_C_WORLD_STATE     = 0x41,
 
 	OP_C_CHAT            = 0x50,
 	OP_S_CHAT            = 0x51,
@@ -153,6 +157,12 @@ struct S_Welcome {
 	uint8_t  snapshotHz;
 	uint8_t  hour, minute;
 	uint8_t  weather;
+	uint8_t  weatherOld;
+	// Who the session is taking its time of day from, or INVALID_PLAYER
+	// while nobody has been picked. Here as well as in S_WorldState so a
+	// newcomer who turns out to be the host never applies the hour above:
+	// the host's own game is what that hour is supposed to be tracking.
+	uint8_t  hostPlayerId;
 	uint8_t  flags;         // SessionFlags
 };
 
@@ -578,11 +588,42 @@ struct S_VehicleDespawn {
 
 // ---- world (CH_EVENT) ----------------------------------------------------
 
-struct S_WorldState {
-	static constexpr uint8_t OPCODE = OP_S_WORLD_STATE;
-	PacketHeader hdr;
+// Time of day and sky, as one player's game has them.
+//
+// The session follows a designated host player rather than a clock the
+// server keeps on its own. The server has no GTA III running, so a clock it
+// invented is nobody's; the host has one, the campaign's script can move it
+// (SET_TIME_OF_DAY, FORCE_WEATHER), and docs/campaign.md already puts the
+// script on the host. §2.7 is the argument in full.
+//
+// Two weather types because CWeather doesn't have one. It blends from
+// OldWeatherType to NewWeatherType across a game hour, so a single type
+// describes the destination and not the sky. The blend position isn't sent:
+// CWeather::Update recomputes it as CClock::GetMinutes()/60 every frame, so
+// once the clock matches, the blend matches for free.
+struct WorldStateBody {
 	uint8_t hour, minute;
 	uint8_t weather;        // eWeatherType: 0 sunny, 1 cloudy, 2 rainy, 3 foggy
+	uint8_t weatherOld;     // the one being blended out of
+};
+
+// Only the host sends this, once a second. The server drops it from anyone
+// else, the same way it drops a vehicle snapshot from a player who isn't
+// driving that vehicle.
+struct C_WorldState {
+	static constexpr uint8_t OPCODE = OP_C_WORLD_STATE;
+	PacketHeader   hdr;
+	WorldStateBody body;
+};
+
+struct S_WorldState {
+	static constexpr uint8_t OPCODE = OP_S_WORLD_STATE;
+	PacketHeader   hdr;
+	WorldStateBody body;
+	// The current host. Carried on every world packet rather than announced
+	// once, because it's how a client finds out it has become the host after
+	// the previous one quit, and because it's free here.
+	uint8_t        hostPlayerId;
 };
 
 // ---- chat (CH_EVENT) -----------------------------------------------------
@@ -614,7 +655,11 @@ static_assert(offsetof(PlayerStateBody, flags)    == 64, "flags is last");
 static_assert(sizeof(VehicleStateBody)== 72, "vehicle state layout");
 static_assert(sizeof(S_VehicleState)  == 78, "vehicle snapshot layout");
 static_assert(sizeof(C_Hello)         == 33, "hello layout");
-static_assert(sizeof(S_Welcome)       == 15, "welcome layout");
+static_assert(sizeof(S_Welcome)       == 17, "welcome layout");
+
+static_assert(sizeof(WorldStateBody)  == 4,  "world state layout");
+static_assert(sizeof(C_WorldState)    == 9,  "world state layout");
+static_assert(sizeof(S_WorldState)    == 10, "world state layout");
 
 // 2 netId + 1 seat + 1 jack + 2 model + 1 + 1 colour + 1 pad + 12 pos + 16 rot
 static_assert(sizeof(EnterVehicleBody) == 37, "enter-vehicle layout");

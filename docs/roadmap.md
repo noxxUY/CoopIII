@@ -269,8 +269,8 @@ nothing else. The address is no longer the obstacle.
 
 | What | Status |
 |---|---|
-| Clock | ✅ 1 Hz |
-| Weather | ✅ 1 Hz |
+| Clock | ✅ follows the host's `CClock`, not a clock the server keeps on its own. The host reports at 1 Hz; everyone else is moved only once they are more than 3 game minutes out, so the HUD clock and the sun do not stutter. Needs an in-game run |
+| Weather | ✅ follows the host's `CWeather`. Both ends of the blend are sent, since a single type describes where the sky is going and not where it is. Needs an in-game run |
 | Pickups | ❌ needs exclusive collection |
 | Garages / doors | ❌ |
 | Explosions, fires | ❌ |
