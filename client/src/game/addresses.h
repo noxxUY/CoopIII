@@ -2329,6 +2329,269 @@ inline bool LooksLikeGameObject(uintptr_t value) {
 inline bool MovingListNodeIsSane(uintptr_t item, uintptr_t vtable) {
 	return LooksLikeGameObject(item) && IsImageAddress(vtable);
 }
+// ---- the HUD: bitmap font, 2D sprites, world to screen --------------------
+//
+// Everything a nametag needs to be drawn with the game's own font and the
+// game's own weapon icons rather than an imitation of them. Verified
+// 2026-09-21 by walking the retail image and matching it against
+// reference/re3 src/render/Hud.cpp, src/render/Font.cpp and
+// src/render/Sprite.cpp statement for statement.
+//
+//   CHud::Initialise (0x005048F0) is re3 Hud.cpp:179-205. It pushes "hud"
+//   (0x005FDB28) and "MODELS/HUD.TXD" (0x005FDB2C) into the txd store, then:
+//     mov  ebp,0095CB9Ch
+//     mov  eax,[ebx*8+005FDA70h] / mov edx,[ebx*8+005FDA74h]   WeaponFilenames
+//     mov  ecx,ebp / call 0051EA70              CSprite2d::SetTexture(n, mask)
+//     inc  ebx / add ebp,4 / cmp ebx,17h
+//   so Sprites lives at 0x0095CB9C, a CSprite2d is 4 bytes wide (it is one
+//   RwTexture*), and there are 23 of them. CHud::Shutdown (0x00504C50) walks
+//   the same base with the same stride and the same count.
+//
+//   CHud::Draw (0x005052A0) opens with re3 Hud.cpp:320-329 exactly:
+//     push 1 / call 00492F60                    CPad::GetPad(1)
+//     cmp  word [eax+18h],0                     NewState.Start
+//     cmp  word [eax+42h],0                     OldState.Start (0x2A + 0x18)
+//     mov  byte [0095CD89h],al                  m_Wants_To_Draw_Hud = !it
+//     cmp  byte [0095CD5Bh],1                   CReplay::Mode == PLAYBACK
+//     cmp  byte [0095CD89h],1 / test al,al      && !TheCamera.m_WideScreenOn
+//   with al loaded from 0x006FAD68, which is TheCamera + 0x70. Its one and
+//   only caller is Render2dStuff, at 0x0048E420, and the four calls after it
+//   are OnscnTimer / CMessages::Display / CDarkel::DrawMessages /
+//   CGarages::PrintMessages / CPad::PrintErrorMessage / CFont::DrawFonts, in
+//   re3 main.cpp:1510-1519 order.
+//
+//   CFont::Initialise's tail (0x00500B00-0x00500B90) calls sixteen setters in
+//   re3 Font.cpp:127-143 order, which is what names them one by one, and each
+//   setter body writes a different member of the struct at 0x008F317C. That
+//   struct matches re3's CFontDetails field for field, so the setter list
+//   below is proved twice over: by the order they are called in and by the
+//   offset each one writes.
+//
+//   CFont::InitPerFrame (0x00500BE0) is re3 Font.cpp:105-112:
+//     mov eax,[0095CC04h] / push 1Eh / call 0051EB70 / mov [008F31B4h],eax
+//     mov eax,[0095CC08h] / push 0Fh / call 0051EB70
+//     mov eax,[0095CC0Ch] / push 0Fh / call 0051EB70
+//   i.e. Details.bank = GetBank(30, Sprite[0].m_pTexture) and two more banks
+//   of 15. This was the "high confidence, unverified" row in
+//   docs/addresses-unverified.md; it holds, so it lives here now.
+//
+//   CSprite::CalcScreenCoors (0x0051C3A0) is re3 Sprite.cpp:37-58:
+//     fld [008E2DC4h] / fld [009434F0h]         far clip, near clip
+//     push 7095F0h / call 004BA4D0              TheCamera.m_viewMatrix * in
+//     fld 1.0f / fadd nearclip / fcomp z        z <= nearZ + 1 -> false
+//     fcom farclip / cmp byte [esp+38h],0       farclip argument
+//     fld 1.0f / fdiv z                         recip
+//     fild [008F436Ch] / fmul / fmul [edi]      out->x *= SCREEN_WIDTH*recip
+//     fild [008F4370h] / fmul / fmul [edi+4]    out->y *= SCREEN_HEIGHT*recip
+//     fild width  -> [esi]                      *outw
+//     fild height -> [ebx]                      *outh
+//     fld [005FF280h] / fdiv [005FBC6Ch]        DefaultFOV / CDraw::ms_fFOV
+//   It is __cdecl (plain ret) and takes five dwords.
+
+constexpr uintptr_t CHud__Draw     = 0x005052A0;   // __cdecl, no arguments
+constexpr uintptr_t CHud__Sprites  = 0x0095CB9C;   // CSprite2d[23]
+constexpr size_t    SIZEOF_SPRITE2D          = 0x04;
+constexpr size_t    NUM_HUD_SPRITES          = 23;
+constexpr uintptr_t CHud__m_Wants_To_Draw_Hud = 0x0095CD89;   // bool
+
+// TheCamera + this is the byte CHud::Draw tests before drawing anything.
+// Cutscenes and the widescreen bars set it.
+constexpr size_t CAMERA_WIDESCREEN_ON = 0x70;   // -> 0x006FAD68
+
+// A HUD sprite index IS the eWeaponType: Hud.cpp:539 is
+// `Sprites[WeaponType].Draw(...)` and the retail does the same indexing off
+// the value it read out of m_weapons[m_currentWeapon] (0x00506216,
+// `lea ebx,[ebx*4] / add ebx,0095CB9Ch`). 0..12 are the twelve weapons plus
+// the detonator; 13 and 14 are blank entries.
+constexpr uint8_t HUD_SPRITE_LAST_WEAPON = 12;
+
+// CSprite2d::Draw(const CRect &r, const CRGBA &col, float u0, float v0,
+//                 float u1, float v1, float u2, float v2, float u3, float v3)
+// __thiscall, ret 28h. The retail call at 0x0050625E passes the rect pointer
+// first and the colour pointer second, and the callee hands both straight to
+// CSprite2d::SetVertices (0x0051F220) with the colour repeated four times,
+// which is re3 Sprite2d.cpp's Draw.
+constexpr uintptr_t CSprite2d__Draw          = 0x0051ED90;
+constexpr uintptr_t CSprite2d__SetRenderState = 0x0051F950;
+constexpr uintptr_t CSprite2d__DrawBank      = 0x0051EC50;
+constexpr uintptr_t CSprite2d__GetBank       = 0x0051EB70;
+
+// The UV inset the HUD itself draws a weapon icon with, read out of
+// 0x0050622C-0x0050625C: 0.015 at 0x005FDBBC, 1.0 at 0x005FDB5C, 0.0 at
+// 0x005FDB60. Same eight numbers as re3 Hud.cpp:539-551, same order.
+constexpr float HUD_ICON_U0 = 0.015f, HUD_ICON_V0 = 0.015f;
+constexpr float HUD_ICON_U1 = 1.0f,   HUD_ICON_V1 = 0.0f;
+constexpr float HUD_ICON_U2 = 0.015f, HUD_ICON_V2 = 1.0f;
+constexpr float HUD_ICON_U3 = 1.0f,   HUD_ICON_V3 = 1.0f;
+
+// CRect is { left, bottom, right, top } in memory, in that order, even
+// though its constructor takes (l, t, r, b). CRect::CRect at 0x004BA330 is
+// four fld/fstp pairs and says so outright: arg1 -> +0x00, arg2 -> +0x0C,
+// arg3 -> +0x08, arg4 -> +0x04. re3 math/Rect.h declares the same order.
+// Build one by hand rather than calling the constructor and getting the
+// argument order backwards.
+constexpr size_t RECT_LEFT = 0x00, RECT_BOTTOM = 0x04, RECT_RIGHT = 0x08,
+                 RECT_TOP = 0x0C;
+
+// CSprite::CalcScreenCoors(const RwV3d *in, RwV3d *out, float *outw,
+//                          float *outh, bool farclip) -> bool
+// __cdecl. out->z comes back as the view-space depth, which is the only
+// distance a nametag needs, so nothing here has to know where the camera is.
+constexpr uintptr_t CSprite__CalcScreenCoors = 0x0051C3A0;
+constexpr uintptr_t CDraw__ms_fFarClipZ      = 0x008E2DC4;
+constexpr uintptr_t CDraw__ms_fNearClipZ     = 0x009434F0;
+constexpr uintptr_t CDraw__ms_fFOV           = 0x005FBC6C;
+constexpr uintptr_t CCamera__m_viewMatrix    = 0x007095F0;
+
+// RsGlobal, from re3 skel/skeleton.h: appName, width, height, maximumWidth,
+// maximumHeight, maxFPS, quit. The analysis pass already had quit at
+// 0x008F4378, which puts the struct at 0x008F4360 and the two members below
+// where CalcScreenCoors and every SCREEN_SCALE_* in the HUD read them.
+// SCREEN_WIDTH is the int at 0x008F436C; the HUD's own scaling is
+// `value * SCREEN_WIDTH / 640` (1/640 = 0.0015625 at 0x005FDB58) on x and
+// `value * SCREEN_HEIGHT / 448` (1/448 at 0x005FDB4C) on y, so the retail
+// build does scale its HUD with the resolution.
+constexpr uintptr_t RsGlobal__maximumWidth  = 0x008F436C;   // int32
+constexpr uintptr_t RsGlobal__maximumHeight = 0x008F4370;   // int32
+constexpr float     HUD_REF_WIDTH  = 640.0f;
+constexpr float     HUD_REF_HEIGHT = 448.0f;
+
+// CFont. Details is the struct every setter writes into; the offsets in the
+// comments are from re3's CFontDetails and each one is witnessed by the
+// setter beside it.
+constexpr uintptr_t CFont__Details      = 0x008F317C;
+constexpr uintptr_t CFont__Sprite       = 0x0095CC04;   // CSprite2d[3]
+constexpr uintptr_t CFont__InitPerFrame = 0x00500BE0;
+constexpr uintptr_t CFont__DrawFonts    = 0x00501B50;   // recorded, not called
+
+// PrintString(float x, float y, wchar *s), __cdecl, three dwords. It returns
+// immediately if the first character is '*' (cmp word [esi],2Ah at
+// 0x00500F64) and it treats '~' as the start of a colour token, so a nickname
+// has to be filtered before it gets here.
+constexpr uintptr_t CFont__PrintString = 0x00500F50;
+
+// GetStringWidth(wchar *s, bool spaces) -> float in st0, __cdecl. The width
+// comes back in screen pixels with whatever scale is currently set, so set
+// the style, the scale and prop on/off first. PrintString itself calls it
+// this way at 0x00501005 (`push 0 / push esi / call 005018A0`).
+constexpr uintptr_t CFont__GetStringWidth = 0x005018A0;
+
+constexpr uintptr_t CFont__SetScale               = 0x00501B80;   // +0x04,+0x08
+constexpr uintptr_t CFont__SetSlantRefPoint       = 0x00501BA0;   // +0x10,+0x14
+constexpr uintptr_t CFont__SetSlant               = 0x00501BC0;   // +0x0C
+constexpr uintptr_t CFont__SetColor               = 0x00501BD0;   // +0x00
+constexpr uintptr_t CFont__SetJustifyOn           = 0x00501C60;   // +0x18
+constexpr uintptr_t CFont__SetJustifyOff          = 0x00501C80;
+constexpr uintptr_t CFont__SetCentreOn            = 0x00501C90;   // +0x19
+constexpr uintptr_t CFont__SetCentreOff           = 0x00501CB0;
+constexpr uintptr_t CFont__SetWrapx               = 0x00501CC0;   // +0x28
+constexpr uintptr_t CFont__SetCentreSize          = 0x00501CD0;   // +0x2C
+constexpr uintptr_t CFont__SetBackgroundOn        = 0x00501CE0;   // +0x1B
+constexpr uintptr_t CFont__SetBackgroundOff       = 0x00501CF0;
+constexpr uintptr_t CFont__SetBackgroundColor     = 0x00501D00;   // +0x24
+constexpr uintptr_t CFont__SetBackGroundOnlyTextOn  = 0x00501D30; // +0x1C
+constexpr uintptr_t CFont__SetBackGroundOnlyTextOff = 0x00501D40;
+constexpr uintptr_t CFont__SetRightJustifyOn      = 0x00501D50;   // +0x1A
+constexpr uintptr_t CFont__SetRightJustifyOff     = 0x00501D70;
+constexpr uintptr_t CFont__SetPropOff             = 0x00501D90;   // +0x1D
+constexpr uintptr_t CFont__SetPropOn              = 0x00501DA0;
+constexpr uintptr_t CFont__SetFontStyle           = 0x00501DB0;   // +0x34, int16
+constexpr uintptr_t CFont__SetRightJustifyWrap    = 0x00501DC0;   // +0x30
+constexpr uintptr_t CFont__SetAlphaFade           = 0x00501DD0;   // +0x20
+constexpr uintptr_t CFont__SetDropShadowPosition  = 0x00501E70;   // +0x3C, int16
+constexpr uintptr_t CFont__SetDropColor           = 0x00501DE0;   // +0x3E
+// Details.bank sits at +0x38 between style and dropShadowPosition, which is
+// what CFont::DrawFonts reads (`mov eax,[008F31B4h]` at 0x00501B50).
+
+// Details.wrapX. CFont::PrintString starts a new line as soon as x passes it
+// (`fld [008F31A4h]` at 0x00501040), and CFont::Initialise leaves it at a flat
+// 640.0f whatever the resolution is (0x00500B10 pushes the constant at
+// 0x005FD708). So anything printing past x=640 on a wider screen has to raise
+// it first, and put it back if it does.
+constexpr size_t FONTDETAILS_WRAPX = 0x28;
+
+// re3 Font.h's enum. FONT_HEADING is the face the clock, the money and the
+// health counter are drawn in, and the retail proves the value: the
+// DrawHealth setup at 0x005063E8 is `push 2 / call 00501DB0`.
+constexpr int16_t FONT_BANK    = 0;
+constexpr int16_t FONT_PAGER   = 1;
+constexpr int16_t FONT_HEADING = 2;
+
+// A glyph cell in FONT_BANK/FONT_HEADING is 32*scaleX wide and 40*scaleY*0.5
+// tall in screen pixels (re3 Font.cpp CFont::PrintChar). Line height is the
+// only one a caller needs.
+constexpr float FONT_CELL_HEIGHT = 20.0f;
+
+// SetAlphaFade is multiplied into whatever SetColor is handed next, and
+// CHud::Draw leaves it at whatever its zone-name fade last computed
+// (0x0050939C). Anything that prints its own text has to set it.
+constexpr float FONT_ALPHA_OPAQUE = 255.0f;
+
+// ---- can this point see that point ----------------------------------------
+//
+// CWorld has two ray tests and they are not interchangeable.
+// ProcessLineOfSight walks every sector the line crosses to find the *nearest*
+// hit and fills in a CColPoint and the entity that owns it.
+// GetIsLineOfSightClear answers yes or no and returns the moment anything
+// blocks. For "is this player behind something" the second one is the right
+// tool and it is several times cheaper on a blocked line, which is the case
+// that happens in a city.
+//
+//   CWorld::GetIsLineOfSightClear (0x004AEAA0) is re3 World.cpp:462-560:
+//     push ebx/esi/edi/ebp / sub esp,260h
+//     cmp word [0095CC64h],0FFFFh / inc it, or call 004B1F60 and set it to 1
+//                                            AdvanceCurrentScanCode, inlined
+//     mov eax,[esp+274h] / fld [eax]         point1.x, i.e. argument 1
+//     fmul 0.025 / fadd 50.0                 GetSectorIndexX: x/40 + 2000/40,
+//                                            which agrees with the
+//                                            WORLD_MIN_XY and SECTOR_SIZE_XY
+//                                            already recorded above
+//   and the four-branch sector walk after it calls
+//   GetIsLineOfSightSectorClear seventeen times, once per arm and once per
+//   step of the diagonal. All 57 call sites in the image clean `add esp,24h`,
+//   which is the nine arguments re3 declares. One of them, at 0x0042BC51,
+//   pushes six zeroes then `push 1 / push ecx / push eax`, i.e.
+//   (p1, p2, true, false, false, false, false, false) with a defaulted ninth,
+//   the same shape as re3 PathFind.cpp:1462.
+//
+//   CWorld::GetIsLineOfSightSectorClear (0x004B2000) is re3 World.cpp:563-598:
+//     cmp byte [esp+0Ch],0                   checkBuildings
+//     push 0 / push eax / push ebp / push esi / call 004B2160
+//     lea eax,[esi+4]                        the BUILDINGS_OVERLAP list
+//     cmp byte [esp+1Ch],0 / lea eax,[esi+10h]  checkVehicles, list index 4
+//   so a CPtrList is 4 bytes and the lists are in re3's eEntityList order.
+//
+// The two flags worth understanding before choosing them, both from
+// GetIsLineOfSightSectorListClear (0x004B2160), re3 World.cpp:601-622:
+//   ignoreSeeThrough goes straight to CCollision::TestLineOfSight, which then
+//     skips surfaces the collision data marks see-through. Glass and railings.
+//   ignoreSomeObjects skips anything CameraToIgnoreThisObject says yes to,
+//     which is every temporary object plus every object flagged
+//     m_bCameraToIgnoreThisObject. That flag is the level's own list of props
+//     that are not allowed to get between you and what you are looking at.
+// It also skips entities with bUsesCollision clear, and it stamps
+// m_scanCode on everything it touches.
+constexpr uintptr_t CWorld__GetIsLineOfSightClear          = 0x004AEAA0;
+constexpr uintptr_t CWorld__GetIsLineOfSightSectorClear    = 0x004B2000;
+constexpr uintptr_t CWorld__GetIsLineOfSightSectorListClear = 0x004B2160;
+constexpr uintptr_t CWorld__ClearScanCodes                 = 0x004B1F60;
+
+// Recorded because the next person to want a ray will find it first and it is
+// the wrong one for a yes-or-no question. 11 arguments, `add esp,2Ch` at all
+// 45 of its call sites, and it contains the same inlined AdvanceCurrentScanCode
+// at 0x004B0DE6.
+constexpr uintptr_t CWorld__ProcessLineOfSight = 0x004B0DE0;
+
+// The camera's own position, for casting from. CCamera derives from
+// CPlaceable, so it is the matrix position at the usual offs::POSITION:
+// CSprite::CalcHorizonCoors (0x0051C4A0) opens `mov eax,6FAD2Ch` and then
+// `fld [eax] / fld [eax+4]` with the z forced to zero, which is re3
+// Sprite.cpp:19-21's `CVector p = TheCamera.GetPosition(); p.z = 0.0f;`.
+// 0x006FAD2C is TheCamera + 0x34.
+//
+// The engine casts a ray from exactly here for the same kind of question: re3
+// AudioLogic.cpp:3646 decides whether a sound is occluded with
+// GetIsLineOfSightClear(TheCamera.GetPosition(), soundPos, true, ...).
 
 // ---- helpers --------------------------------------------------------------
 

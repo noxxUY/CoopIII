@@ -55,6 +55,7 @@ tables, so the section counts below no longer match their headings.
 | `CPed::m_pVehicleAnim` `0x1D8` | `CPed::CPed` nils it at `[eax+1D8h]`, between `m_animGroup` (0x1D4) and `m_vecAnimMoveDelta` (0x1DC) |
 | `CPed::m_nPedType` `0x32C` | `CPed::CPed` writes its `pedType` argument to `[ecx+32Ch]` |
 | `CPed::GiveWeapon` `0x004CF9B0` | the whole function is re3 Ped.cpp:4700-4720, including the 99999 ammo cap (`cmp eax,1869Fh`) and the OUT_OF_AMMO → READY reset |
+| `CFont::InitPerFrame` `0x00500BE0` | held. It is re3 Font.cpp:105-112 instruction for instruction: `mov eax,[0095CC04h] / push 1Eh / call 0051EB70 / mov [008F31B4h],eax`, then the same two lines with `push 0Fh` for `Sprite[1]` and `Sprite[2]`, i.e. `Details.bank = CSprite2d::GetBank(30, Sprite[0].m_pTexture)` and two banks of 15. Promoted with the whole of the HUD font and sprite surface it belongs to; see the `---- the HUD ----` section of `addresses.h` |
 
 ### The `CVehicle` layout, verified 2026-09-21 (Area E)
 
@@ -141,7 +142,6 @@ afternoon to them.
 | `CMenuManager::Process` | `0x00485100` | function | high | src/core/Game.cpp:1018 and src/core/main.cpp:1764 |
 | `CSprite2d::SetRecipNearClip` | `0x0051EA20` | function | high | src/core/main.cpp:1760, src/core/Game.cpp:1025 |
 | `CSprite2d::InitPerFrame` | `0x0051EAE0` | function | high | src/core/main.cpp:1561/1761, src/core/Game.cpp:1026 |
-| `CFont::InitPerFrame` | `0x00500BE0` | function | high | src/core/main.cpp:1562/1762, src/core/Game.cpp:1027 |
 | `CPad::DoCheats` | `0x00492F00` | function | medium | src/core/Game.cpp:1030 |
 | `CClock::Update` | `0x00473460` | function | medium | src/core/Game.cpp:1031 |
 | `CWeather::Update` | `0x00522C10` | function | medium | src/core/Game.cpp:1032 |

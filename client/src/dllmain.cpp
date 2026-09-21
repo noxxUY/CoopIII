@@ -14,6 +14,7 @@
 #include "config.h"
 #include "game/combat.h"
 #include "game/frame.h"
+#include "game/nametag.h"
 #include "game/pause.h"
 #include "game/ped.h"
 #include "game/verify.h"
@@ -146,6 +147,14 @@ DWORD WINAPI Boot(LPVOID) {
 		return 0;
 	}
 
+	// Nametags hang off CHud::Draw rather than the frame pump, because they're
+	// drawn in the render pass and everything the frame pump reaches happens
+	// before it (game/nametag.cpp). Last, and only once there's a session for
+	// them to label, so a client that never starts doesn't leave a detour on
+	// the HUD with nothing to draw. Not fatal if it fails: the session still
+	// works, you just can't tell who is who.
+	game::InstallNametags(g_client);
+
 	Log("CoopIII ready");
 	return 0;
 }
@@ -168,6 +177,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 		// so unhooking is only really safe on an explicit unload. Either way
 		// the process is going away regardless - keep this minimal.
 		if (g_started) {
+			// First, because the draw reads the roster straight out of the
+			// client and the client is about to be stopped.
+			game::RemoveNametags();
 			g_client.Stop();
 			game::RemovePausePolicy();
 			// Before the frame hook, and before MinHook goes away. Removing

@@ -11,6 +11,7 @@
 
 #include "client.h"
 #include "game/combat.h"
+#include "game/nametag.h"
 #include "game/pedanim.h"
 
 #include <cstdio>
@@ -1803,6 +1804,260 @@ void TestAngleWrap() {
 	      "a heading plus a torso yaw that crosses the seam comes out the far side");
 }
 
+// ---- nametags -------------------------------------------------------------
+//
+// Only the arithmetic. What a tag looks like needs two running games and a
+// pair of eyes; what it does at 50 metres, with a name full of rubbish, or
+// with eight players standing on the same doorstep does not.
+
+void TestTagDistanceCurve() {
+	std::printf("\nnametag size and fade with distance\n");
+
+	const TagPlan close = PlanTag(6.0f);
+	Check(close.draw && close.alpha == 255, "a player at 6 m is drawn solid");
+	Check(close.scale > 1.1f, "and at full size");
+
+	const TagPlan behind = PlanTag(-4.0f);
+	Check(!behind.draw, "a player behind the camera gets no tag");
+	const TagPlan onTheLens = PlanTag(0.0f);
+	Check(!onTheLens.draw, "and neither does one at exactly zero depth");
+
+	// The tag has to be gone before the ped is, or it pops off a player who
+	// is still on screen.
+	Check(!PlanTag(TAG_RANGE_M).draw, "nothing at the streaming radius");
+	Check(!PlanTag(TAG_RANGE_M + 50.0f).draw, "nor past it");
+
+	const TagPlan fading = PlanTag(TAG_RANGE_M - TAG_FADE_BAND_M * 0.5f);
+	Check(fading.draw && fading.alpha > 0 && fading.alpha < 255,
+	      "halfway through the fade band it is half there");
+	Check(PlanTag(TAG_RANGE_M - TAG_FADE_BAND_M - 1.0f).alpha == 255,
+	      "just inside the band it is still solid");
+
+	Check(PlanTag(40.0f).scale < PlanTag(20.0f).scale,
+	      "further away is smaller");
+	Check(PlanTag(TAG_FAR_M * 2.0f).scale == 0.0f,
+	      "past the range there is no scale to speak of");
+	// The floor is what keeps a distant tag legible instead of a smudge.
+	const TagPlan farOff = PlanTag(TAG_RANGE_M - 0.5f);
+	Check(farOff.scale >= TAG_MIN_SCALE, "and it never shrinks past the floor");
+
+	// The range itself, pinned to the number that was asked for rather than to
+	// whatever the constant happens to say, so moving it back is a test
+	// failure and not a silent change.
+	Check(TAG_RANGE_M == 50.0f, "tags are gone by 50 m");
+	Check(PlanTag(39.0f).alpha == 255, "solid at 39 m");
+	Check(PlanTag(45.0f).alpha > 0 && PlanTag(45.0f).alpha < 255, "going at 45 m");
+	Check(!PlanTag(50.0f).draw, "gone at 50 m");
+	// A fifth of the range spent fading, the same proportion as before.
+	Check(TAG_FADE_BAND_M * 5.0f == TAG_RANGE_M, "the fade band is a fifth of the range");
+}
+
+void TestProbeBudget() {
+	std::printf("\nline of sight probes are rationed\n");
+
+	bool    eligible[MAX_PLAYERS];
+	uint8_t out[MAX_PLAYERS];
+	for (int i = 0; i < MAX_PLAYERS; ++i)
+		eligible[i] = true;
+
+	// Eight players must not mean eight rays.
+	uint8_t cursor = 0;
+	int     seen[MAX_PLAYERS] = {};
+	for (int frame = 0; frame < MAX_PLAYERS; ++frame) {
+		const int n = PlanProbes(eligible, MAX_PLAYERS, TAG_PROBE_BUDGET, cursor, out);
+		Check(n <= TAG_PROBE_BUDGET, "the budget is never exceeded");
+		for (int i = 0; i < n; ++i)
+			++seen[out[i]];
+	}
+
+	bool everyone = true;
+	for (int i = 0; i < MAX_PLAYERS; ++i)
+		if (seen[i] == 0)
+			everyone = false;
+	Check(everyone, "and every player is still tested within eight frames");
+
+	bool evenly = true;
+	for (int i = 0; i < MAX_PLAYERS; ++i)
+		if (seen[i] != 1)
+			evenly = false;
+	Check(evenly, "exactly once each, so nobody is starved and nobody is favoured");
+
+	// Slots that failed the free gates must never cost a ray.
+	for (int i = 0; i < MAX_PLAYERS; ++i)
+		eligible[i] = (i == 5);
+	cursor = 0;
+	bool onlyFive = true;
+	for (int frame = 0; frame < 20; ++frame) {
+		const int n = PlanProbes(eligible, MAX_PLAYERS, TAG_PROBE_BUDGET, cursor, out);
+		for (int i = 0; i < n; ++i)
+			if (out[i] != 5)
+				onlyFive = false;
+	}
+	Check(onlyFive, "a slot that is off screen or out of range is never probed");
+
+	for (int i = 0; i < MAX_PLAYERS; ++i)
+		eligible[i] = false;
+	cursor = 0;
+	Check(PlanProbes(eligible, MAX_PLAYERS, TAG_PROBE_BUDGET, cursor, out) == 0,
+	      "nobody eligible means no rays at all");
+
+	// A cursor left pointing past the end by a roster that shrank.
+	for (int i = 0; i < MAX_PLAYERS; ++i)
+		eligible[i] = true;
+	cursor = 200;
+	Check(PlanProbes(eligible, MAX_PLAYERS, TAG_PROBE_BUDGET, cursor, out) == 1,
+	      "a stale cursor past the end wraps instead of picking nothing");
+}
+
+void TestOcclusionFade() {
+	std::printf("\nnametags fade behind walls rather than blinking\n");
+
+	// End to end takes the whole interval, not one frame.
+	float v = 1.0f;
+	v = StepVisibility(v, false, 16);
+	Check(v > 0.8f && v < 1.0f, "one frame behind a wall barely moves it");
+
+	int frames = 0;
+	while (v > 0.0f && frames < 1000) {
+		v = StepVisibility(v, false, 16);
+		++frames;
+	}
+	Check(v == 0.0f, "held behind a wall it does reach zero");
+	Check(frames * 16 >= int(TAG_OCCLUSION_FADE_MS) - 32,
+	      "and takes about the fade interval to get there");
+
+	// The endpoints hold. Stepping past them would make the tag take longer to
+	// react the longer it had been sitting still.
+	v = 0.0f;
+	for (int i = 0; i < 40; ++i)
+		v = StepVisibility(v, true, TAG_MAX_STEP_MS);
+	Check(v == 1.0f, "coming back it stops at fully visible and stays there");
+	for (int i = 0; i < 40; ++i)
+		v = StepVisibility(v, false, TAG_MAX_STEP_MS);
+	Check(v == 0.0f, "and going it stops at fully hidden and stays there");
+
+	// The clamp is what stops a loading screen from snapping every tag.
+	const float slow = StepVisibility(1.0f, false, 5000);
+	const float fast = StepVisibility(1.0f, false, TAG_MAX_STEP_MS);
+	Check(slow == fast, "a huge frame gap is treated as the longest believable one");
+
+	// The thin obstacle. A lamp post blocks the line for about a tenth of a
+	// second, and at one probe per frame per eight players that is at most a
+	// couple of blocked answers. The tag has to dip and come back, not vanish.
+	v = 1.0f;
+	for (int i = 0; i < 2; ++i)
+		v = StepVisibility(v, false, 16);
+	Check(v > 0.5f, "two blocked answers only dim a tag, they do not hide it");
+	Check(TagAlpha(255, v) > 128, "which is a dip on screen, not a blink");
+	for (int i = 0; i < 2; ++i)
+		v = StepVisibility(v, true, 16);
+	Check(v == 1.0f, "and it is back to solid two frames after the post is passed");
+}
+
+void TestOcclusionAlpha() {
+	std::printf("\nocclusion reuses the distance alpha rather than adding a second\n");
+
+	Check(TagAlpha(255, 1.0f) == 255, "visible and close is fully solid");
+	Check(TagAlpha(255, 0.0f) == 0, "hidden is hidden however close they are");
+	// A player far enough to be fading who also steps behind a wall must not
+	// come out brighter than either curve alone would have made them.
+	const uint8_t halfDistance = PlanTag(TAG_RANGE_M - TAG_FADE_BAND_M * 0.5f).alpha;
+	Check(TagAlpha(halfDistance, 0.5f) < halfDistance,
+	      "the two fades multiply instead of fighting");
+	Check(TagAlpha(halfDistance, 1.0f) == halfDistance,
+	      "and a clear line leaves the distance fade exactly as it was");
+}
+
+void TestTagHealthText() {
+	std::printf("\nnametag health text\n");
+	char out[16];
+
+	TagHealth(100.0f, out, sizeof(out));
+	Check(std::string(out) == "{ 100", "full health is the heart and a number");
+	TagHealth(63.7f, out, sizeof(out));
+	Check(std::string(out) == "{ 64", "and it rounds rather than truncating");
+
+	TagHealth(0.0f, out, sizeof(out));
+	Check(std::string(out) == "WASTED", "no health is the word, not a zero");
+	TagHealth(-5.0f, out, sizeof(out));
+	Check(std::string(out) == "WASTED", "and so is negative health");
+
+	// A player on 0.4 health is alive. Saying WASTED over someone still
+	// standing is worse than rounding up.
+	TagHealth(0.4f, out, sizeof(out));
+	Check(std::string(out) == "{ 1", "a sliver of health still reads as alive");
+
+	TagHealth(100000.0f, out, sizeof(out));
+	Check(std::string(out) == "{ 999", "a silly health value is clamped, not wrapped");
+}
+
+void TestTagNameIsSafeForCFont() {
+	std::printf("\nnametag names are made safe for CFont\n");
+	char out[TAG_NAME_MAX + 1];
+
+	TagName("noxx", out, sizeof(out));
+	Check(std::string(out) == "NOXX", "names are drawn in caps, like the rest of the HUD");
+
+	// CFont::PrintString returns without drawing anything when the first
+	// character is '*', so a nickname could otherwise hide its own tag.
+	TagName("*ghost", out, sizeof(out));
+	Check(out[0] != '*', "a leading asterisk cannot blank the whole string");
+
+	// '~' opens a formatting token, which would eat the rest of the line and
+	// could recolour it.
+	TagName("a~b", out, sizeof(out));
+	Check(std::string(out).find('~') == std::string::npos,
+	      "a tilde cannot open a colour token");
+
+	// CFont indexes Size[style][c - ' '], 193 entries wide.
+	TagName("\x01\xFF", out, sizeof(out));
+	Check(std::string(out) == "??", "bytes outside printable ASCII are replaced");
+
+	TagName("", out, sizeof(out));
+	Check(out[0] != '\0', "an empty nickname still draws something");
+	TagName(nullptr, out, sizeof(out));
+	Check(out[0] != '\0', "and so does no nickname at all");
+
+	TagName("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", out, sizeof(out));
+	Check(std::strlen(out) == TAG_NAME_MAX,
+	      "a long nickname is cut, not shrunk: a tag that resizes is a tag that moves");
+}
+
+void TestEightTagsDoNotStack() {
+	std::printf("\neight players bunched together\n");
+
+	// Every tag at the same screen point, which is the doorway case.
+	TagBox placed[8];
+	int    count = 0;
+	for (int i = 0; i < 8; ++i) {
+		const TagBox want{100.0f, 200.0f, 380.0f, 400.0f};
+		const float  lift = TagLift(want, placed, count, 2.0f);
+		placed[count]     = TagBox{want.left, want.right, want.top - lift,
+                               want.bottom - lift};
+		++count;
+	}
+
+	Check(placed[0].top == 380.0f, "the nearest player keeps the spot over their head");
+
+	bool anyOverlap = false;
+	for (int i = 0; i < count; ++i)
+		for (int j = i + 1; j < count; ++j)
+			if (TagBoxesOverlap(placed[i], placed[j], 0.0f))
+				anyOverlap = true;
+	Check(!anyOverlap, "and none of the other seven ends up on top of another");
+
+	bool climbing = true;
+	for (int i = 1; i < count; ++i)
+		if (placed[i].top >= placed[i - 1].top)
+			climbing = false;
+	Check(climbing, "each one is lifted above the last, in order");
+
+	// Tags that were never going to collide must not be moved at all.
+	const TagBox a{0.0f, 50.0f, 100.0f, 130.0f};
+	const TagBox b{300.0f, 350.0f, 100.0f, 130.0f};
+	Check(TagLift(b, &a, 1, 2.0f) == 0.0f, "a tag well clear of another stays put");
+}
+
 } // namespace
 
 int main() {
@@ -1859,6 +2114,13 @@ int main() {
 	TestRespawnRebuildsThePed();
 	TestFriendlyFireReachesTheBridge();
 	TestLifeStateMachine();
+	TestTagDistanceCurve();
+	TestProbeBudget();
+	TestOcclusionFade();
+	TestOcclusionAlpha();
+	TestTagHealthText();
+	TestTagNameIsSafeForCFont();
+	TestEightTagsDoNotStack();
 
 	std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL",
 	            g_failures, g_failures == 1 ? "" : "s");

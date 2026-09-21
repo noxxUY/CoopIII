@@ -95,7 +95,12 @@ a host-authoritative script (`campaign.md` §2).
       and aim yaw. Built and unit-tested, but it still needs an in-game run to
       confirm it looks right. Protocol 2. See `protocol.md` §1.8 for the wire
       format and `client/src/game/addresses.h` for the offsets it reads.
-- [ ] Nametags over remote players.
+- [x] Nametags over remote players. Weapon icon, name, health, drawn with the
+      game's own `CFont` and its own `hud.txd` sprites from a detour on
+      `CHud::Draw`. Fade out by 50 m and fade out behind walls, the second
+      through one `CWorld::GetIsLineOfSightClear` per frame shared round robin
+      across the roster. Built and unit-tested, not yet run in-game. See
+      `client/src/game/nametag.h` for the design and the numbers.
 - [x] Decide the streaming policy (§2.1). Settled, see §5.3.
 
 Done when: two players can see each other walk around Portland and it looks
