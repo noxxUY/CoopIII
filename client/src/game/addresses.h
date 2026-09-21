@@ -1781,6 +1781,50 @@ constexpr uintptr_t CWorld__Process = 0x004B1A60;
 constexpr uintptr_t RpAnimBlendClumpGetFirstAssociation = 0x004031B0;
 constexpr uintptr_t RpAnimBlendClumpUpdateAnimations    = 0x004024B0;
 
+// How many animations may be on a clump at once before the engine starts
+// writing over its own stack.
+//
+// RpAnimBlendClumpUpdateAnimations builds an array of the nodes it is about
+// to blend, in a local, and neither fills it nor terminates it with a bound:
+//
+//   0x004024B4  sub  esp, 40h                     the whole frame
+//   0x004024F0  xor  esi, esi                     i = 0
+//   0x00402527  mov  [esp+esi*4+10h], eax         nodes[i++] = assoc->GetNode(0)
+//   0x0040256E  mov  dword [esp+esi*4+10h], 0     nodes[i] = nil
+//
+// The array starts at esp+0x10 and the frame ends at esp+0x40, so there is
+// room for twelve. What follows it is the function's own saved state:
+//
+//   [esp+40h] saved ebx   <- nodes[12]
+//   [esp+44h] saved esi   <- nodes[13]
+//   [esp+48h] saved edi   <- nodes[14]
+//   [esp+4Ch] saved ebp   <- nodes[15]
+//   [esp+50h] return address                      <- nodes[16]
+//   [esp+54h] the clump argument                  <- nodes[17]
+//   [esp+58h] timeDelta                           <- nodes[18]
+//
+// A thirteenth animation corrupts the caller's registers, a seventeenth the
+// return address, and an eighteenth the clump. The last of those is what a
+// live crash dump caught: ESI was 0x11, the terminator wrote null over the
+// clump argument, and two hundred bytes later the function's own tail read it
+// back and faulted at 0x004025D2 on `mov eax,[eax+4]`, address 4.
+//
+// Worth knowing that saved edi and ebp are in that window, because
+// CWorld::Process's walk over the moving list keeps the node cursor in edi
+// and the entity in ebp across this very call. Fifteen animations on one
+// clump and the list walk resumes on registers this function restored out of
+// the overflow.
+//
+// **re3 declares this array as sixteen** (`CAnimBlendNode *nodes[16]`,
+// src/animation/RpAnimBlend.h:8-12). The retail build has twelve. Anyone
+// sizing a cap from re3 would be four over and would not find out until the
+// game corrupted its own stack.
+//
+// The terminator is written at nodes[count], so eleven associations is the
+// last count that stays inside the frame.
+constexpr int ANIM_UPDATE_NODE_SLOTS  = 12;
+constexpr int MAX_CLUMP_ANIM_ASSOCS   = ANIM_UPDATE_NODE_SLOTS - 1;   // 11
+
 // CMatrix::UpdateRW(), __thiscall on the CMatrix (i.e. entity + offs::MATRIX).
 // Copies right/up/at/pos into the attached RwMatrix and calls RwMatrixUpdate.
 // 0x004B8E00 is CMatrix::AttachRW, which calls it; 0x004B8E50 is

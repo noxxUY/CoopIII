@@ -1735,6 +1735,57 @@ void TestMovingListNodeSanity() {
 // same association. Which part you see is whether it is running and where it
 // loops, and getting that wrong is what made a remote player draw their gun
 // over and over without ever firing it.
+// The check for the crash at 0x004025D2, which is the same shape of bug as
+// the two before it and the first one with arithmetic that matches a
+// register dump exactly.
+//
+// RpAnimBlendClumpUpdateAnimations builds an array of the nodes it is about
+// to blend, in a 12-entry local, and neither fills nor terminates it with a
+// bound. Past that the array runs into the function's own saved registers,
+// its return address and its arguments. The dump had ESI at 0x11, and
+// nodes[17] is exactly the clump argument, which the terminator then wrote
+// null over.
+//
+// No unit test can count the associations on a real clump. What it can pin
+// is the number, which is the thing that was wrong: re3 declares this array
+// as sixteen and the retail build has twelve, so anyone sizing a cap from
+// the decompilation would be four over and would not find out until the game
+// corrupted its own stack.
+void TestAnimClumpLimit() {
+	std::printf("\nhow many animations a clump may carry\n");
+
+	// The engine's number, read off `sub esp,40h` with the array at
+	// esp+0x10, not off re3's declaration.
+	Check(ANIM_UPDATE_NODE_SLOTS == 12, "the node array has twelve slots");
+	Check(ANIM_UPDATE_NODE_SLOTS != 16,
+	      "and not re3's sixteen, which would be four past the end of the frame");
+
+	// The terminator is written at nodes[count], so a count equal to the
+	// slot count already writes one past.
+	Check(MAX_CLUMP_ANIM_ASSOCS == ANIM_UPDATE_NODE_SLOTS - 1,
+	      "so the last safe count is one below it");
+
+	// And CoopIII keeps back room for the animations the engine adds on its
+	// own, which it does every frame without asking.
+	Check(MAX_REMOTE_ANIM_ASSOCS < MAX_CLUMP_ANIM_ASSOCS,
+	      "CoopIII stops short of the engine's limit");
+
+	Check(AnimClumpHasRoom(0), "an empty clump has room");
+	Check(AnimClumpHasRoom(MAX_REMOTE_ANIM_ASSOCS - 1), "and one below the cap");
+	Check(!AnimClumpHasRoom(MAX_REMOTE_ANIM_ASSOCS), "at the cap it does not");
+	Check(!AnimClumpHasRoom(MAX_CLUMP_ANIM_ASSOCS), "nor at the engine's limit");
+	Check(!AnimClumpHasRoom(17),
+	      "and nor at seventeen, which is the count that crashed the game");
+
+	// The surplus is how many have to go before one more can be added.
+	Check(AnimClumpSurplus(0) == 0, "nothing to drop from an empty clump");
+	Check(AnimClumpSurplus(MAX_REMOTE_ANIM_ASSOCS - 1) == 0,
+	      "nor with a slot still free");
+	Check(AnimClumpSurplus(MAX_REMOTE_ANIM_ASSOCS) == 1, "one over, drop one");
+	Check(AnimClumpSurplus(17) == 17 - (MAX_REMOTE_ANIM_ASSOCS - 1),
+	      "and seventeen has to lose enough to get back under");
+}
+
 void TestWeaponAnimLoop() {
 	std::printf("\nthe firing loop of a weapon animation\n");
 
@@ -2350,6 +2401,7 @@ int main() {
 	TestDamageDecisions();
 	TestMovingListTeardown();
 	TestMovingListNodeSanity();
+	TestAnimClumpLimit();
 	TestWeaponAnimLoop();
 	TestRemoteDamageToTheLocalPlayer();
 	TestDeathAnimChoice();

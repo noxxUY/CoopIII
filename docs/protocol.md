@@ -174,6 +174,31 @@ everything else, and bounds-check against that group's `numAssociations` before
 the call. An id off the end of a 4-entry group reads 0x40-byte strides past the
 array and hands the result to the blender.
 
+#### 1.8.1.1 And a clump holds twelve animations, not as many as you like
+
+The second unchecked bound in the same subsystem, found the same way, and the
+one that actually crashed the game.
+
+`RpAnimBlendClumpUpdateAnimations` builds an array of the nodes it is about to
+blend, in a local, and neither fills it nor terminates it with a bound. The
+retail frame has room for twelve; past that the array runs into the
+function's own saved registers, its return address and its arguments.
+`client/src/game/addresses.h` carries the stack map and the register dump that
+proved it.
+
+Two things make this worth stating in the protocol document rather than only
+in the code. The first is that **re3 declares the array as sixteen**
+(`src/animation/RpAnimBlend.h:8-12`) and the retail build has twelve, so the
+decompilation will actively mislead anyone who sizes a cap from it. The second
+is that `CWorld::Process` keeps its moving-list cursor in `edi` across this
+call, and saved `edi` is inside the overflow region, so an overfull clump
+corrupts a list walk that has nothing to do with animation.
+
+Consequence: anything that adds an animation to a ped CoopIII owns counts
+first. `MAX_REMOTE_ANIM_ASSOCS` in `client/src/game/pedanim.h` keeps two slots
+back for the animations the engine blends on its own, and a per-frame sweep
+drops the least visible ones if the count ever goes over.
+
 #### 1.8.2 Ids are portable between groups
 
 Within every group, `assocList[i].animId == i` (`CAnimBlendAssocGroup::CreateAssociations`),

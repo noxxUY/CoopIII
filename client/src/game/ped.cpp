@@ -47,8 +47,15 @@ void *AnimClumpData(void *clump) {
 // The 64 cap isn't about the engine misbehaving, it's about us. A ped we've
 // already lost can still resolve for one more frame, and walking a freed
 // list with no bound turns into an infinite loop on the game thread instead
-// of a crash - much harder to diagnose. No ped legitimately has anywhere
-// close to 64 associations.
+// of a crash - much harder to diagnose.
+//
+// It used to say "no ped legitimately has anywhere close to 64 associations"
+// and treat that as reassurance. It is true and it was the wrong thing to be
+// reassured by: the engine breaks at thirteen, not at sixty-four.
+// RpAnimBlendClumpUpdateAnimations has room for twelve and bounds-checks
+// nothing, so a clump CoopIII has overfilled makes it write over its own
+// return address. MAX_REMOTE_ANIM_ASSOCS in pedanim.h is the number that
+// matters; this one only stops a runaway walk.
 template <class Fn>
 void ForEachAnim(void *clump, Fn fn) {
 	void *data = AnimClumpData(clump);
@@ -675,11 +682,23 @@ float SafeAnimTime(float wire) {
 // seeks it to the phase the sender was at. Returns false if the id can't be
 // played safely; the caller leaves its applied-id alone in that case and
 // tries again next change.
-bool BlendRemoteAnim(void *clump, int pedGroup, uint16_t animId, float animTime,
-                     float animSpeed, bool applySpeed) {
+// Both defined below, with the rest of the clump bookkeeping.
+void *FindAnimById(void *clump, uint16_t animId);
+bool  MakeAnimRoom(RemotePlayer &player, void *clump);
+
+bool BlendRemoteAnim(RemotePlayer &player, void *clump, int pedGroup, uint16_t animId,
+                     float animTime, float animSpeed, bool applySpeed) {
 	const AnimPlan plan = PlanAnim(animId, pedGroup, AnimGroupCount(pedGroup),
 	                               AnimGroupCount(ASSOCGRP_STD));
 	if (!plan.valid)
+		return false;
+
+	// BlendAnimation adds an association when it does not find one, and a
+	// clump that is already at the engine's limit cannot take another
+	// without RpAnimBlendClumpUpdateAnimations writing past the end of its
+	// node array. Reviving one that is already there is free, so only a
+	// genuine addition has to ask.
+	if (!FindAnimById(clump, animId) && !MakeAnimRoom(player, clump))
 		return false;
 
 	using BlendFn = void *(__cdecl *)(void *, int, int, float);
@@ -722,6 +741,124 @@ void FadeOutPartial(void *clump, uint16_t animId) {
 		Field<float>(assoc, ANIM_BLEND_DELTA) = -4.0f;
 		Field<int32_t>(assoc, ANIM_FLAGS)     = flags | ASSOC_DELETEFADEDOUT;
 	});
+}
+
+// How many animations are on this clump right now.
+//
+// This is the number RpAnimBlendClumpUpdateAnimations is about to index its
+// twelve-slot node array with, so it is the number that decides whether the
+// engine is about to corrupt its own stack. Every association counts:
+// UpdateBlend only returns false for one that deletes itself on that very
+// call, and a fading association is still there until it reaches zero.
+int CountAnims(void *clump) {
+	int n = 0;
+	ForEachAnim(clump, [&](void *) { ++n; });
+	return n;
+}
+
+// Mark an association for deletion on the engine's next pass over the clump.
+//
+// Not a fade: blendAmount goes to zero and the delta negative, which is the
+// exact condition CAnimBlendAssociation::UpdateBlend deletes on, and
+// UpdateBlend runs at the top of RpAnimBlendClumpUpdateAnimations. So an
+// association dropped here is gone before the node array is filled, in the
+// same frame, rather than lingering for the quarter second a fade takes.
+void DropAnimNow(void *assoc) {
+	Field<float>(assoc, ANIM_BLEND_AMOUNT) = 0.0f;
+	Field<float>(assoc, ANIM_BLEND_DELTA)  = -1.0f;
+	Field<int32_t>(assoc, ANIM_FLAGS) |= ASSOC_DELETEFADEDOUT;
+}
+
+// Get a clump back under the engine's limit, weakest animations first.
+//
+// "Weakest" is lowest blendAmount, which is the engine's own idea of what is
+// least visible: RpAnimBlendClumpGetMainAssociation picks the highest. The
+// two animations CoopIII is currently driving are never dropped, because
+// dropping them would just have the next frame add them again and we would
+// be back here.
+//
+// Returns how many were dropped.
+int PruneAnims(void *clump, uint16_t keepA, uint16_t keepB, int surplus) {
+	if (surplus <= 0)
+		return 0;
+
+	// Small and fixed: this runs on the game thread and the walk above is
+	// already bounded at 64.
+	constexpr int MAX_TRACKED = 64;
+	void  *assocs[MAX_TRACKED];
+	float  blends[MAX_TRACKED];
+	int    n = 0;
+
+	ForEachAnim(clump, [&](void *assoc) {
+		if (n >= MAX_TRACKED)
+			return;
+		const int32_t id = Field<int32_t>(assoc, ANIM_ID);
+		if (id == static_cast<int32_t>(keepA) || id == static_cast<int32_t>(keepB))
+			return;
+		// Already on its way out, so it is not part of the problem.
+		if (Field<float>(assoc, ANIM_BLEND_DELTA) < 0.0f &&
+		    (Field<int32_t>(assoc, ANIM_FLAGS) & ASSOC_DELETEFADEDOUT))
+			return;
+		assocs[n] = assoc;
+		blends[n] = Field<float>(assoc, ANIM_BLEND_AMOUNT);
+		++n;
+	});
+
+	int dropped = 0;
+	while (dropped < surplus) {
+		int weakest = -1;
+		for (int i = 0; i < n; ++i)
+			if (assocs[i] && (weakest < 0 || blends[i] < blends[weakest]))
+				weakest = i;
+		if (weakest < 0)
+			break;   // nothing left that may be dropped
+		DropAnimNow(assocs[weakest]);
+		assocs[weakest] = nullptr;
+		++dropped;
+	}
+	return dropped;
+}
+
+// Make room for one more animation on this clump, and say whether there is
+// any. False means the caller must not add: the engine's node array is full
+// and one more association writes past the end of it.
+// Keep a clump inside the engine's limit whatever put the animations there.
+//
+// MakeAnimRoom only runs when CoopIII wants to add one, and CoopIII is not
+// the only thing adding: CPed::ProcessControl and CPed::SetMoveAnim blend
+// animations onto a remote ped every frame without asking anybody. So this
+// runs unconditionally, once per remote ped per frame, before CGame::Process
+// gets the chance to walk the clump.
+//
+// It is the last line of defence for a crash that has no symptoms until it
+// happens, so it is deliberately not conditional on anything CoopIII knows.
+void EnforceAnimLimit(RemotePlayer &player, void *clump) {
+	const int count = CountAnims(clump);
+	const int surplus = AnimClumpSurplus(count + 1);   // +1: room to still add one
+	if (surplus <= 0)
+		return;
+
+	const int dropped =
+	    PruneAnims(clump, player.appliedAnimId, player.appliedAnimId2, surplus);
+	if (dropped > 0)
+		Log("bridge: %s's ped was carrying %d animations, past what the engine's "
+		    "node array can index; dropped %d",
+		    player.nick.c_str(), count, dropped);
+}
+
+bool MakeAnimRoom(RemotePlayer &player, void *clump) {
+	const int count = CountAnims(clump);
+	if (AnimClumpHasRoom(count))
+		return true;
+
+	const int dropped = PruneAnims(clump, player.appliedAnimId,
+	                               player.appliedAnimId2, AnimClumpSurplus(count));
+	if (dropped > 0)
+		Log("bridge: %s's ped had %d animations on it, which is past what "
+		    "RpAnimBlendClumpUpdateAnimations can index; dropped %d",
+		    player.nick.c_str(), count, dropped);
+
+	return AnimClumpHasRoom(count - dropped);
 }
 
 // The first association on the clump with this id, or null.
@@ -823,8 +960,8 @@ void ApplyOverlay(RemotePlayer &player, void *clump, int pedGroup) {
 	// purge of every partial on a change of move state.
 	void *assoc = FindAnimById(clump, want);
 	if (!assoc || AnimIsCondemned(assoc)) {
-		if (!BlendRemoteAnim(clump, pedGroup, want, player.last.animTime2, 1.0f,
-		                     false))
+		if (!BlendRemoteAnim(player, clump, pedGroup, want, player.last.animTime2,
+		                     1.0f, false))
 			return;
 		assoc = FindAnimById(clump, want);
 		if (!assoc)
@@ -928,6 +1065,11 @@ void ApplyAnimGroup(RemotePlayer &player, void *ped, void *clump) {
 
 	Field<int32_t>(ped, offs::PED_ANIM_GROUP) = wanted;
 
+	// Five at once is the biggest single thing CoopIII does to a clump, and
+	// the engine's node array only holds twelve. Each one replaces an
+	// animation that is already there, but the replacement and the original
+	// both exist until the original's fade completes, so a group change
+	// briefly doubles the locomotion animations.
 	using AddFn = void *(__cdecl *)(void *, int, int);
 	for (const uint16_t id : MOVE_ANIMS) {
 		// Same bound as PlanAnim, and it's not optional here either. A
@@ -948,6 +1090,9 @@ void ApplyAnimGroup(RemotePlayer &player, void *ped, void *clump) {
 		if (!old)
 			continue;   // not playing: nothing to re-hang
 
+		if (!MakeAnimRoom(player, clump))
+			break;   // no room, and the old group keeps playing
+
 		void *const fresh =
 		    Func<AddFn>(CAnimManager__AddAnimation)(clump, wanted, static_cast<int>(id));
 		if (!fresh)
@@ -956,11 +1101,11 @@ void ApplyAnimGroup(RemotePlayer &player, void *ped, void *clump) {
 		Field<float>(fresh, ANIM_BLEND_AMOUNT) = Field<float>(old, ANIM_BLEND_AMOUNT);
 		Field<float>(fresh, ANIM_BLEND_DELTA)  = Field<float>(old, ANIM_BLEND_DELTA);
 
-		// -1000, not a gentle fade - the replacement already carries this
-		// one's blend, so two copies of the same stride overlapping for a
-		// quarter second would just read as a stumble.
-		Field<float>(old, ANIM_BLEND_DELTA) = -1000.0f;
-		Field<int32_t>(old, ANIM_FLAGS) |= ASSOC_DELETEFADEDOUT;
+		// Gone on the engine's next pass, not faded. The replacement already
+		// carries this one's blend, so there is nothing to fade out, and
+		// leaving it on the clump for even one frame is a slot the node
+		// array does not have.
+		DropAnimNow(old);
 	}
 
 	// Whatever base animation we last drove belongs to the old group now.
@@ -979,8 +1124,8 @@ void ApplyAnimation(RemotePlayer &player, void *ped) {
 	const int pedGroup = Field<int32_t>(ped, offs::PED_ANIM_GROUP);
 
 	if (player.last.animId != player.appliedAnimId &&
-	    BlendRemoteAnim(clump, pedGroup, player.last.animId, player.last.animTime,
-	                    player.last.animSpeed, true)) {
+	    BlendRemoteAnim(player, clump, pedGroup, player.last.animId,
+	                    player.last.animTime, player.last.animSpeed, true)) {
 		player.appliedAnimId = player.last.animId;
 	}
 
@@ -1283,6 +1428,13 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	void *ped = ResolveRemote(player);
 	if (!ped)
 		return;
+
+	// Before anything else, and before every early return below, because it
+	// is not about what CoopIII is applying this frame. A clump with more
+	// than twelve animations on it makes RpAnimBlendClumpUpdateAnimations
+	// write its node array over its own return address, and the ped being
+	// seated or dead does not make that any less true.
+	EnforceAnimLimit(player, ClumpOf(ped));
 
 	// A seated ped belongs to the engine now. CPed::ProcessControl puts it
 	// back in its seat from the car's own matrix every frame, so everything

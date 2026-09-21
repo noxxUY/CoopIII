@@ -244,7 +244,7 @@ struct Tag {
 	float   scale   = 0.0f;
 	uint8_t alpha   = 0;
 	uint8_t weapon  = 0;
-	bool    icon    = false;
+	bool    hasIcon = false;
 	float   health  = 0.0f;
 
 	// Where a line of sight ray would be aimed for this player, kept so the
@@ -254,12 +254,10 @@ struct Tag {
 	uint16_t name[TAG_NAME_MAX + 1]{};
 	uint16_t hp[16]{};
 
-	float nameScaleX = 0.0f, nameScaleY = 0.0f;
-	float hpScaleX = 0.0f, hpScaleY = 0.0f;
-	float nameW = 0.0f, hpW = 0.0f;
-	float nameH = 0.0f, hpH = 0.0f;
-	float iconW = 0.0f, iconH = 0.0f, iconGap = 0.0f;
-	float lineGap = 0.0f;
+	// Everything derived, in one place, from the screen height and the
+	// distance. The two widths are the exception: only CFont can answer those.
+	TagMetrics m;
+	float      nameW = 0.0f, hpW = 0.0f;
 
 	TagBox box;
 };
@@ -289,9 +287,13 @@ void DrawIcon(const Tag &tag) {
 	if (Field<void *>(sprite, 0) == nullptr)
 		return;
 
+	// Square, in screen pixels. The game's own weapon icon is
+	// SCREEN_SCALE_X(64) by SCREEN_SCALE_Y(64) and so comes out stretched wide
+	// at anything past 4:3; a label has no reason to inherit that.
+	const float size = tag.m.icon;
 	const float left = tag.box.left;
-	const float top  = tag.box.top + (tag.box.bottom - tag.box.top - tag.iconH) * 0.5f;
-	const Rect  rect{left, top + tag.iconH, left + tag.iconW, top};
+	const float top  = tag.box.top + (tag.box.bottom - tag.box.top - size) * 0.5f;
+	const Rect  rect{left, top + size, left + size, top};
 	const Rgba  white{255, 255, 255, tag.alpha};
 
 	Func<SpriteDrawFn>(CSprite2d__Draw)(sprite, &rect, &white, HUD_ICON_U0,
@@ -301,21 +303,18 @@ void DrawIcon(const Tag &tag) {
 }
 
 void DrawText(const Tag &tag) {
-	const float colH  = tag.nameH + tag.lineGap + tag.hpH;
-	const float textX = tag.box.left + (tag.icon ? tag.iconW + tag.iconGap : 0.0f);
-	const float textY = tag.box.top + (tag.box.bottom - tag.box.top - colH) * 0.5f;
+	const float textX =
+	    tag.box.left + (tag.hasIcon ? tag.m.icon + tag.m.iconGap : 0.0f);
+	const float textY =
+	    tag.box.top + (tag.box.bottom - tag.box.top - tag.m.columnH) * 0.5f;
 
-	float shadow = TAG_SHADOW_PX * tag.scale;
-	if (shadow < TAG_SHADOW_MIN_PX)
-		shadow = TAG_SHADOW_MIN_PX;
-
-	FontScale(tag.nameScaleX, tag.nameScaleY);
+	FontScale(tag.m.nameScaleX, tag.m.nameScaleY);
 	PrintShadowed(textX, textY, tag.name, TagNameColor(tag.health), tag.alpha,
-	              shadow);
+	              tag.m.shadow);
 
-	FontScale(tag.hpScaleX, tag.hpScaleY);
-	PrintShadowed(textX, textY + tag.nameH + tag.lineGap, tag.hp,
-	              TagHealthColor(tag.health), tag.alpha, shadow);
+	FontScale(tag.m.hpScaleX, tag.m.hpScaleY);
+	PrintShadowed(textX, textY + tag.m.nameH + tag.m.lineGap, tag.hp,
+	              TagHealthColor(tag.health), tag.alpha, tag.m.shadow);
 }
 
 void DrawTags() {
@@ -327,11 +326,11 @@ void DrawTags() {
 	if (!(screenW > 0.0f) || !(screenH > 0.0f))
 		return;
 
-	// The HUD works in a 640x448 grid and scales out of it, so everything
-	// laid out here does too.
-	const float sx = screenW / HUD_REF_WIDTH;
-	const float sy = screenH / HUD_REF_HEIGHT;
-
+	// Only the height is used for sizing, and only the width for saying what
+	// counts as off the side of the screen. MeasureTag in nametag.h has the
+	// reasoning, and the short version is that this install has a widescreen
+	// fix whose whole job is undoing the aspect stretch the HUD's own 640x448
+	// grid produces, so a tag must not put that stretch back.
 	const float wrapWas = Global<float>(CFont__Details + FONTDETAILS_WRAPX);
 	FontStateForTags(screenW);
 
@@ -384,22 +383,22 @@ void DrawTags() {
 		    screen.y < -screenH * 0.5f || screen.y > screenH * 1.5f)
 			continue;
 
-		Tag &tag   = tags[count];
-		tag        = Tag{};
+		Tag &tag     = tags[count];
+		tag          = Tag{};
 		tag.playerId = id;
-		// `head` is the ped's origin plus the tag's own anchor height, so back
-		// that off and put the sight height on instead. The ray goes to the top
-		// of the ped, the tag hangs a little above it.
-		tag.sightTo = Vec3f{head.x, head.y,
-		                    head.z - TAG_HEAD_Z_M + TAG_SIGHT_Z_M};
-		tag.depth  = screen.z;
+		tag.m        = MeasureTag(screenH, plan.scale);
+		// The tag and the ray now point at the same spot, the top of the
+		// player's head. The clearance between that and the bottom of the tag
+		// is screen pixels rather than world metres, so it stays the same at
+		// every distance instead of opening up as you walk closer.
+		tag.sightTo = head;
+		tag.depth   = screen.z;
 		tag.centreX = screen.x;
-		tag.baseY  = screen.y - TAG_HEAD_GAP * plan.scale * sy;
-		tag.scale  = plan.scale;
-		tag.alpha  = plan.alpha;
-		tag.health = player.last.health;
-		tag.weapon = player.last.weapon;
-		tag.icon   = player.last.weapon <= HUD_SPRITE_LAST_WEAPON;
+		tag.baseY   = screen.y - tag.m.headGap;
+		tag.alpha   = plan.alpha;
+		tag.health  = player.last.health;
+		tag.weapon  = player.last.weapon;
+		tag.hasIcon = player.last.weapon <= HUD_SPRITE_LAST_WEAPON;
 
 		char name[TAG_NAME_MAX + 1];
 		char hp[16];
@@ -408,22 +407,11 @@ void DrawTags() {
 		Widen(name, tag.name, TAG_NAME_MAX + 1);
 		Widen(hp, tag.hp, 16);
 
-		tag.nameScaleX = TAG_NAME_SCALE_X * plan.scale * sx;
-		tag.nameScaleY = TAG_NAME_SCALE_Y * plan.scale * sy;
-		tag.hpScaleX   = TAG_HP_SCALE_X * plan.scale * sx;
-		tag.hpScaleY   = TAG_HP_SCALE_Y * plan.scale * sy;
-		tag.nameH      = FONT_CELL_HEIGHT * tag.nameScaleY;
-		tag.hpH        = FONT_CELL_HEIGHT * tag.hpScaleY;
-		tag.iconW      = TAG_ICON_SIZE * plan.scale * sx;
-		tag.iconH      = TAG_ICON_SIZE * plan.scale * sy;
-		tag.iconGap    = TAG_ICON_GAP * plan.scale * sx;
-		tag.lineGap    = TAG_LINE_GAP * plan.scale * sy;
-
 		// GetStringWidth answers in screen pixels at whatever scale is set, so
 		// it has to be asked once per line.
-		FontScale(tag.nameScaleX, tag.nameScaleY);
+		FontScale(tag.m.nameScaleX, tag.m.nameScaleY);
 		tag.nameW = FontWidth(tag.name);
-		FontScale(tag.hpScaleX, tag.hpScaleY);
+		FontScale(tag.m.hpScaleX, tag.m.hpScaleY);
 		tag.hpW = FontWidth(tag.hp);
 
 		++count;
@@ -496,17 +484,17 @@ void DrawTags() {
 		Tag &tag = tags[i];
 
 		const float colW = tag.nameW > tag.hpW ? tag.nameW : tag.hpW;
-		const float colH = tag.nameH + tag.lineGap + tag.hpH;
 		const float fullW =
-		    colW + (tag.icon ? tag.iconW + tag.iconGap : 0.0f);
-		const float fullH = colH > tag.iconH ? colH : tag.iconH;
+		    colW + (tag.hasIcon ? tag.m.icon + tag.m.iconGap : 0.0f);
+		const float fullH =
+		    tag.m.columnH > tag.m.icon ? tag.m.columnH : tag.m.icon;
 
 		tag.box.left   = tag.centreX - fullW * 0.5f;
 		tag.box.right  = tag.box.left + fullW;
 		tag.box.bottom = tag.baseY;
 		tag.box.top    = tag.baseY - fullH;
 
-		const float pad  = 2.0f * tag.scale * sy;
+		const float pad  = tag.m.lineGap;
 		const float lift = TagLift(tag.box, placed, placedCount, pad);
 		tag.box.top -= lift;
 		tag.box.bottom -= lift;
@@ -517,7 +505,7 @@ void DrawTags() {
 	// Furthest first, so on anything the lift did not fully separate the
 	// nearer player still ends up on top.
 	for (int i = count - 1; i >= 0; --i) {
-		if (tags[i].icon)
+		if (tags[i].hasIcon)
 			DrawIcon(tags[i]);
 		DrawText(tags[i]);
 	}

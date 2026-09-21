@@ -147,12 +147,15 @@ constexpr int TAG_PROBE_BUDGET = 1;
 // to stop.
 constexpr uint32_t TAG_MAX_STEP_MS = 100;
 
-// The ray is aimed at the top of the ped's collision box, not at the tag's own
-// anchor 20 cm higher up. The question worth asking is whether you can see the
-// player, not whether you can see the empty air their name floats in, and the
-// two differ exactly where it matters: somebody standing behind a low wall
-// with their head and shoulders showing. Aiming at the anchor would have said
-// "blocked" for anyone whose head clears an obstacle by less than 20 cm.
+// The ray is aimed at the top of the ped's collision box. The question worth
+// asking is whether you can see the player, not whether you can see the empty
+// air their name floats in, and the two differ exactly where it matters:
+// somebody standing behind a low wall with their head and shoulders showing.
+//
+// This used to sit below the tag's own anchor, which was 20 cm higher. The
+// anchor has since come down to meet it, for the reasons at TAG_HEAD_Z_M, so
+// the ray and the tag now point at the same spot. Kept as its own name because
+// they are two different questions that happen to share an answer.
 constexpr float TAG_SIGHT_Z_M = 0.90f;
 
 // Which slots to spend this frame's rays on. Round robin from `cursor` over
@@ -209,35 +212,137 @@ inline uint8_t TagAlpha(uint8_t distanceAlpha, float visible) {
 
 // ---- the layout ------------------------------------------------------------
 //
-// All of these are in the HUD's own reference units, the 640x448 grid every
-// SCREEN_SCALE_* in Hud.cpp works in, at tag scale 1.0. The two font scales
-// are the HUD's own health text (0.8, 1.35) taken down by the ratio the
-// mockup drew them at: the name is 0.82 of the HUD's size and the health line
-// is 0.79 of the name.
+// Every length a tag needs comes out of one number, the screen height, and
+// everything else here is a ratio. That is deliberate and it took a run in the
+// game to arrive at, so the reasoning is worth writing down.
+//
+// The first version worked in the HUD's own 640x448 grid, scaling x by
+// screenWidth/640 and y by screenHeight/448, because that is what every
+// SCREEN_SCALE_* in Hud.cpp does. Two things were wrong with that.
+//
+// It was about three times too big. The sizes were taken from the design
+// mockup as a ratio against the mockup's drawing of the HUD, but the mockup
+// drew the HUD much smaller relative to its own viewport than GTA III draws it
+// relative to a real screen, so the ratio did not carry across. A tag ended up
+// nearly the size of the game's own health readout, which for a label floating
+// over somebody's head is enormous.
+//
+// The second thing is the one that matters more. Scaling x by width and y by
+// height stretches the letters as the screen gets wider, and this install has
+// ThirteenAG's Widescreen Fix precisely to stop the HUD doing that. Its ini
+// replaces the game's HUD scale factors with its own (HudWidthScale, whose
+// original it gives as 1.0, and HudHeightScale, original 1.0714285, which is
+// 480/448), so on this machine the corner HUD is no longer drawn with the
+// formula in Hud.cpp at all. Copying that formula would have applied an
+// aspect correction the fix had already made, a second time and in the wrong
+// direction.
+//
+// So a tag does not use the HUD's scaling path, and does not read the fix's
+// numbers either. Both axes come from screen height alone. That gives the
+// three properties that were actually asked for:
+//
+//   - the letters keep their shape at any aspect ratio, because nothing here
+//     ever looks at the screen width;
+//   - a tag is the same fraction of the screen at 800x600 and at 4K;
+//   - it keeps a fixed ratio to the game's own health readout at every
+//     resolution, because that readout is also proportional to screen height
+//     under both the stock formula and the fix's. Change resolution and the
+//     two move together, which is the test for getting this right.
+//
+// The one thing it deliberately does not follow is the player's own
+// HudWidthScale/HudHeightScale sliders. Those are a preference about how big
+// the corner HUD should be, not about how big a label over somebody's head
+// should be.
 
-constexpr float TAG_NAME_SCALE_X = 0.66f;
-constexpr float TAG_NAME_SCALE_Y = 1.10f;
-constexpr float TAG_HP_SCALE_X   = 0.52f;
-constexpr float TAG_HP_SCALE_Y   = 0.87f;
+// The shape of one glyph, which is the HUD's own FONT_HEADING pair. Carried as
+// a ratio rather than as a scale: these two set how tall a letter is against
+// how wide, and the size comes from the multiplier below.
+constexpr float TAG_FONT_SHAPE_X = 0.80f;
+constexpr float TAG_FONT_SHAPE_Y = 1.35f;
 
-constexpr float TAG_ICON_SIZE = 38.0f;   // the HUD draws its own at 64
-constexpr float TAG_ICON_GAP  = 4.0f;    // icon to text column
-constexpr float TAG_LINE_GAP  = 1.0f;    // name to health
-constexpr float TAG_HEAD_GAP  = 6.0f;    // head to the bottom of the tag
+// How big the two lines are. 0.28 puts a name at roughly two percent of the
+// screen height and about a tenth of the on-screen height of the player it
+// belongs to, at ten metres. The health line keeps the 0.79 of the name that
+// the mockup drew it at.
+constexpr float TAG_NAME_SIZE = 0.28f;
+constexpr float TAG_HP_SIZE   = 0.22f;
 
-// How far above a ped's origin its head is. CTempColModels::Initialise builds
-// every ped's collision box with max z = 0.9 (retail 0x0041260A writes
-// 0x3F666666 into it, which is re3 collision/TempColModels.cpp:77), so this
-// leaves 20 cm of air. It is the one number here that is cosmetic rather than
-// load-bearing: getting it wrong moves the tag, it can't corrupt anything.
-constexpr float TAG_HEAD_Z_M = 1.10f;
+// The icon is measured against the two lines of text beside it rather than
+// being a size of its own, which is what the mockup did: 24 px of icon against
+// a 27 px column. It is a little smaller here than the mockup's 0.89, because
+// a solid filled sprite reads heavier than thin letters do, and because the
+// mockup's glyph cells were square while the game's are not.
+constexpr float TAG_ICON_OF_COLUMN = 0.80f;
+
+// Square on screen, always. The game's own weapon icon is SCREEN_SCALE_X(64)
+// by SCREEN_SCALE_Y(64), which is stretched wide at 16:9, and stopping exactly
+// that is what the Widescreen Fix is installed for.
+
+constexpr float TAG_ICON_GAP_OF_ICON = 0.15f;   // icon to text column
+constexpr float TAG_LINE_GAP_OF_NAME = 0.10f;   // name to health
+constexpr float TAG_HEAD_GAP_OF_TAG  = 0.35f;   // head to the bottom of the tag
+
+// How far above a ped's origin to put both the tag and the sight ray.
+// CTempColModels::Initialise builds every ped's collision box with max z = 0.9
+// (retail 0x0041260A writes 0x3F666666 into it, which is re3
+// collision/TempColModels.cpp:77), so this is the top of the player's head.
+//
+// It used to be 1.10, leaving 20 cm of air above the head before the tag's own
+// clearance was added on top. With a tag a third of the size that reads as
+// floating rather than sitting above somebody, and 20 cm of world space is the
+// wrong way to express a gap anyway: it grows on screen as you walk closer.
+// The clearance is TAG_HEAD_GAP_OF_TAG instead, in screen pixels, as a
+// fraction of the tag's own height, so it looks the same at every distance.
+constexpr float TAG_HEAD_Z_M = 0.90f;
 
 // The drop shadow is the HUD's own idiom, not CFont::SetDropShadowPosition:
 // DrawHealth and DrawMoney both print the string once in black at +2 px and
 // then again in colour. CFont::InitPerFrame resets dropShadowPosition to 0
-// every frame anyway, so doing it the HUD's way leaves no state behind.
-constexpr float TAG_SHADOW_PX     = 2.0f;
-constexpr float TAG_SHADOW_MIN_PX = 1.0f;
+// every frame anyway, so doing it the HUD's way leaves no state behind. A
+// fraction of the name rather than the HUD's flat 2 px, so it doesn't turn
+// into a smear at 4K or vanish at 800x600.
+constexpr float TAG_SHADOW_OF_NAME = 0.09f;
+constexpr float TAG_SHADOW_MIN_PX  = 1.0f;
+
+// Every length a tag needs, in screen pixels. One screen dimension in, so
+// there is nothing in here that can disagree with itself.
+struct TagMetrics {
+	float nameScaleX = 0.0f, nameScaleY = 0.0f;
+	float hpScaleX = 0.0f, hpScaleY = 0.0f;
+	float nameH = 0.0f, hpH = 0.0f, lineGap = 0.0f;
+	float columnH = 0.0f;
+	float icon = 0.0f, iconGap = 0.0f;   // icon is square, so one number
+	float headGap = 0.0f;
+	float shadow = 0.0f;
+};
+
+inline TagMetrics MeasureTag(float screenHeight, float distanceScale) {
+	TagMetrics m;
+
+	// One HUD reference unit in pixels, from height and nothing else.
+	const float unit = screenHeight * (1.0f / HUD_REF_HEIGHT) * distanceScale;
+
+	m.nameScaleX = TAG_FONT_SHAPE_X * TAG_NAME_SIZE * unit;
+	m.nameScaleY = TAG_FONT_SHAPE_Y * TAG_NAME_SIZE * unit;
+	m.hpScaleX   = TAG_FONT_SHAPE_X * TAG_HP_SIZE * unit;
+	m.hpScaleY   = TAG_FONT_SHAPE_Y * TAG_HP_SIZE * unit;
+
+	m.nameH   = FONT_CELL_HEIGHT * m.nameScaleY;
+	m.hpH     = FONT_CELL_HEIGHT * m.hpScaleY;
+	m.lineGap = TAG_LINE_GAP_OF_NAME * m.nameH;
+	m.columnH = m.nameH + m.lineGap + m.hpH;
+
+	m.icon    = TAG_ICON_OF_COLUMN * m.columnH;
+	m.iconGap = TAG_ICON_GAP_OF_ICON * m.icon;
+
+	m.headGap = TAG_HEAD_GAP_OF_TAG * (m.columnH > m.icon ? m.columnH : m.icon);
+
+	m.shadow = TAG_SHADOW_OF_NAME * m.nameH;
+	if (m.shadow < TAG_SHADOW_MIN_PX)
+		m.shadow = TAG_SHADOW_MIN_PX;
+
+	return m;
+}
 
 // ---- the colours -----------------------------------------------------------
 //

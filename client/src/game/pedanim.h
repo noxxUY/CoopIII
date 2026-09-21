@@ -108,6 +108,26 @@ inline uint16_t PlanDeathAnim(uint16_t wire, int stdGroupCount) {
 	return wire;
 }
 
+// How many animations CoopIII will leave on a remote ped's clump.
+//
+// The hard limit is the engine's, and it is not a soft one: past
+// MAX_CLUMP_ANIM_ASSOCS, RpAnimBlendClumpUpdateAnimations writes its node
+// array over its own saved registers, its return address and its arguments
+// (addresses.h has the stack map and the crash that proved it). Two are kept
+// back for the engine, which adds its own animations to a ped without asking
+// anybody: CPed::SetMoveAnim alone can blend a locomotion anim and fade three
+// others in the same frame.
+constexpr int MAX_REMOTE_ANIM_ASSOCS = MAX_CLUMP_ANIM_ASSOCS - 2;   // 9
+
+// May another animation be added to a clump that currently has `count`?
+inline bool AnimClumpHasRoom(int count) { return count < MAX_REMOTE_ANIM_ASSOCS; }
+
+// How many have to go before one more can be added. Zero when there is room.
+inline int AnimClumpSurplus(int count) {
+	const int over = count - (MAX_REMOTE_ANIM_ASSOCS - 1);
+	return over > 0 ? over : 0;
+}
+
 // Has a running weapon overlay reached the end of its firing loop?
 //
 // CPed::FireGun's last act, while the trigger is still held, is
