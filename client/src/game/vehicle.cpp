@@ -267,6 +267,15 @@ bool SpawnRemoteVehicle(RemoteVehicle &vehicle) {
 	Field<uint8_t>(mem, offs::VEH_COLOUR1) = vehicle.colour1;
 	Field<uint8_t>(mem, offs::VEH_COLOUR2) = vehicle.colour2;
 
+	// Same guard as the ped spawn, for the same reason: CWorld::Add's
+	// AddToMovingList has no check for an entity that is already in the list,
+	// and a second add orphans a node that nothing can ever unlink again.
+	if (Field<void *>(mem, offs::MOVING_LIST_NODE) != nullptr) {
+		Log("bridge: a newly constructed vehicle is already in the moving list; "
+		    "unlinking before CWorld::Add");
+		Func<void(__thiscall *)(void *)>(CPhysical__RemoveFromMovingList)(mem);
+	}
+
 	Func<AddFn>(CWorld__Add)(mem);
 
 	// LEVEL_IGNORE, same reason as a remote ped: the engine culls entities

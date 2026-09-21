@@ -1524,8 +1524,14 @@ void TestReplayableWeapons() {
 
 	Check(!IsReplayableWeapon(WEAPONTYPE_SNIPERRIFLE),
 	      "the sniper is refused: FireSniper fires along this machine's camera");
-	Check(!IsReplayableWeapon(WEAPONTYPE_FLAMETHROWER),
-	      "the flamethrower is refused: CShotInfo keeps damaging after the call");
+	// The flamethrower used to be refused here, because CShotInfo keeps
+	// lighting fires long after the call that made it returned. It is
+	// replayed now, and the guard moved to where it can cover that: nothing
+	// a remote player's ped does may take health off the local player, for
+	// as long as the CShotInfo and its fires live. See
+	// TestRemoteDamageToTheLocalPlayer.
+	Check(IsReplayableWeapon(WEAPONTYPE_FLAMETHROWER),
+	      "the flamethrower is replayed, so the flame comes out");
 	Check(!IsReplayableWeapon(WEAPONTYPE_DETONATOR),
 	      "the detonator is refused: it sets off bombs nobody synced");
 	Check(!IsReplayableWeapon(WEAPONTYPE_UNARMED) &&
@@ -1619,6 +1625,121 @@ void TestMovingListTeardown() {
 	Check(!NeedsMovingListUnlink(MOVING, /*linked=*/true),
 	      "moving and linked is the engine's job");
 	Check(!NeedsMovingListUnlink(MOVING, /*linked=*/false), "and so is neither");
+}
+
+// The check for the second crash at the same address, which had a register
+// dump: `node->item` was 0x0000020E. 526. A small integer sitting where an
+// entity pointer belongs, in a node the moving list still held.
+//
+// CoopIII cannot walk the engine's list from here, and it cannot know why a
+// bad node appeared. What it can do is refuse to let CWorld::Process
+// dereference one, and the decision that makes that possible is arithmetic.
+void TestMovingListNodeSanity() {
+	std::printf("\nwhat a moving list node has to look like\n");
+
+	// The value from the crash. This is the whole test.
+	Check(!LooksLikeGameObject(0x0000020E), "526 is not a pointer to anything");
+
+	// And the three reasons it isn't, each on its own, because a check that
+	// only rejects one observed value is not a check.
+	Check(!LooksLikeGameObject(0), "nor is null");
+	Check(!LooksLikeGameObject(0x0000FFFC),
+	      "nor is anything in the reserved region below 64K");
+	Check(!LooksLikeGameObject(0x80000000),
+	      "nor is kernel space, which gta3.exe cannot allocate in");
+	Check(!LooksLikeGameObject(0x1BA96B6A),
+	      "nor is a misaligned address, and every vtabled object is 4-aligned");
+
+	// Real pool addresses from the crash dump's own registers.
+	Check(LooksLikeGameObject(0x1BA96B68), "a heap address is accepted");
+	Check(LooksLikeGameObject(0x16964EDC), "and so is another one");
+
+	// The second half: an accepted pointer still has to hold a vtable, and
+	// every CEntity vtable lives in the exe's read-only data.
+	Check(IsImageAddress(CCivilianPed__vtable), "CCivilianPed's vtable is in the image");
+	Check(IsImageAddress(CPlaceable__vtable), "and so is CPlaceable's");
+	Check(!IsImageAddress(0x1BA96B68), "a heap address is not");
+	Check(!IsImageAddress(IMAGE_BASE - 4), "nor is anything below the image");
+	Check(!IsImageAddress(IMAGE_BASE + IMAGE_SIZE), "nor one byte past the end of it");
+
+	// Put together: the node from the crash is refused before anything
+	// dereferences it, and a healthy one is let through.
+	Check(!MovingListNodeIsSane(0x0000020E, CCivilianPed__vtable),
+	      "the node that crashed the game is refused");
+	Check(!MovingListNodeIsSane(0x1BA96B68, 0x1BA98CC0),
+	      "and so is a block that has been recycled for something else");
+	Check(MovingListNodeIsSane(0x1BA96B68, CCivilianPed__vtable),
+	      "a live ped is let through");
+}
+
+// The weapon animation, which is one animation and not three.
+//
+// The draw, the ready pose, the shot and the recovery are all frames of the
+// same association. Which part you see is whether it is running and where it
+// loops, and getting that wrong is what made a remote player draw their gun
+// over and over without ever firing it.
+void TestWeaponAnimLoop() {
+	std::printf("\nthe firing loop of a weapon animation\n");
+
+	// Plausible pistol numbers: the loop is the middle of the animation, the
+	// draw is in front of it and the recovery behind.
+	constexpr float START = 0.20f;
+	constexpr float END   = 0.55f;
+
+	Check(!WeaponAnimShouldLoop(0.10f, START, END), "mid-draw, keep playing");
+	Check(!WeaponAnimShouldLoop(START, START, END), "at the loop start, keep playing");
+	Check(!WeaponAnimShouldLoop(0.40f, START, END), "mid-shot, keep playing");
+	Check(!WeaponAnimShouldLoop(END, START, END), "exactly at the end, not yet");
+	Check(WeaponAnimShouldLoop(0.56f, START, END), "past it, wrap back");
+	Check(WeaponAnimShouldLoop(2.0f, START, END),
+	      "and a frame that overshot badly still wraps");
+
+	// weapon.dat is a file the player can edit, so neither number is
+	// trustworthy. A weapon with no usable loop plays straight through, the
+	// way a punch or a throw does.
+	Check(!WeaponAnimShouldLoop(1.0f, 0.0f, 0.0f), "no loop declared, no loop");
+	Check(!WeaponAnimShouldLoop(1.0f, 0.5f, 0.5f), "an empty range is not a loop");
+	Check(!WeaponAnimShouldLoop(1.0f, 0.8f, 0.2f), "nor is a backwards one");
+	Check(!WeaponAnimShouldLoop(1.0f, -1.0f, 2.0f), "nor one starting before zero");
+}
+
+// Which weapon an observer replays, and what a remote player's ped is
+// allowed to do to us. The two are related: the flamethrower only came off
+// the refused list because the second predicate covers what the first one
+// lets loose.
+void TestRemoteDamageToTheLocalPlayer() {
+	std::printf("\nwhat a remote player's ped may do to us\n");
+
+	// An explosion is replayed at a fixed position everyone agrees on, so
+	// this machine answering "was I in it" is answering a question about
+	// itself with nothing stale involved.
+	Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_GRENADE), "a grenade blast may");
+	Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_MOLOTOV), "and a molotov's");
+	Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_ROCKETLAUNCHER), "and a rocket's");
+	Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_EXPLOSION), "and a generic blast");
+
+	// A bullet may not. It arrives as S_Damage, decided by the shooter, or
+	// it does not arrive at all.
+	Check(!RemoteMayDamageLocalPlayer(WEAPONTYPE_COLT45), "a bullet may not");
+	Check(!RemoteMayDamageLocalPlayer(WEAPONTYPE_UNARMED), "nor a fist");
+	// And this is the one that matters for the flamethrower: the fire its
+	// CShotInfo lights names the remote ped as its source and burns for a
+	// second after the call that made it has returned.
+	Check(!RemoteMayDamageLocalPlayer(WEAPONTYPE_FLAMETHROWER),
+	      "and nor may the fire a replayed flame starts");
+
+	// The flame itself is replayed now, so it is visible. The damage half is
+	// still refused in both directions until fire is synced properly.
+	Check(IsReplayableWeapon(WEAPONTYPE_FLAMETHROWER), "the flame comes out");
+	Check(!IsForwardableDamage(WEAPONTYPE_FLAMETHROWER),
+	      "and its damage is still nobody's to forward");
+
+	// The refusals that did not change.
+	Check(!IsReplayableWeapon(WEAPONTYPE_SNIPERRIFLE), "the sniper is still refused");
+	Check(!IsReplayableWeapon(WEAPONTYPE_DETONATOR), "and the detonator");
+	Check(!IsReplayableWeapon(WEAPONTYPE_UNARMED) &&
+	          !IsReplayableWeapon(WEAPONTYPE_BASEBALLBAT),
+	      "and melee, which is animation and damage and nothing else");
 }
 
 void TestDeathAnimChoice() {
@@ -1728,6 +1849,9 @@ int main() {
 	TestLocalCombatIsDrainedNotSampled();
 	TestDamageDecisions();
 	TestMovingListTeardown();
+	TestMovingListNodeSanity();
+	TestWeaponAnimLoop();
+	TestRemoteDamageToTheLocalPlayer();
 	TestDeathAnimChoice();
 	TestDamageOnlyLandsOnUs();
 	TestDeathKillsTheirPed();

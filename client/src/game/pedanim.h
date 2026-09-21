@@ -108,6 +108,30 @@ inline uint16_t PlanDeathAnim(uint16_t wire, int stdGroupCount) {
 	return wire;
 }
 
+// Has a running weapon overlay reached the end of its firing loop?
+//
+// CPed::FireGun's last act, while the trigger is still held, is
+// `weaponAnimAssoc->Start(ourWeapon->m_fAnimLoopStart)` once currentTime
+// passes m_fAnimLoopEnd (re3 PedFight.cpp:712-722). So a firing weapon never
+// plays past the loop end: it cycles over the part of the animation that is
+// the shot, and the draw at the front and the recovery at the back are only
+// seen when the attack starts and stops.
+//
+// An observer that lets the same animation free-run plays the whole thing
+// instead, hits ASSOC_FADEOUTWHENDONE, and starts again from the draw. So
+// the loop gets replicated rather than the phase re-seeded off a snapshot
+// that is only accurate 25 times a second.
+//
+// loopEnd <= loopStart means weapon.dat has nothing useful for this weapon,
+// and then the answer is always no. Reading those two values out of a file
+// the player can edit is exactly the situation where "the data will be
+// sensible" is not an assumption worth making.
+inline bool WeaponAnimShouldLoop(float currentTime, float loopStart, float loopEnd) {
+	if (!(loopEnd > loopStart) || !(loopStart >= 0.0f))
+		return false;
+	return currentTime > loopEnd;
+}
+
 // eMoveState arrives as a byte from a machine we don't control. The engine
 // reads it as a 32-bit enum and switches on it with no default bound, so a
 // value past PEDMOVE_SPRINT falls through CPed::SetMoveAnim's switch and

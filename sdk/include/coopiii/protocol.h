@@ -207,6 +207,20 @@ enum PlayerFlags : uint8_t {
 	// shots go out on C_Shot (reliable channel) and this flag just keeps the
 	// ped in a firing posture in between. docs/protocol.md §1.9.
 	PF_FIRING = 1 << 1,
+
+	// ASSOC_RUNNING on the animation in animId2, and it is the difference
+	// between a player aiming and a player firing.
+	//
+	// A weapon has one animation covering the draw, the ready pose, the shot
+	// and the recovery. CPed::PointGunAt parks it on the ready frame and
+	// clears ASSOC_RUNNING; CPed::FireGun sets it running and loops it over
+	// the firing part. Send the id and the phase without this bit and the
+	// receiver has no way to tell the two apart, so it plays the whole thing
+	// from the top, forever, and what you see is a player drawing their gun
+	// over and over and never firing it.
+	//
+	// Costs nothing: a spare bit in a byte that was already on the wire.
+	PF_ANIM2_RUNNING = 1 << 2,
 };
 
 // Field sources are re3 CPed/CPhysical members, see docs/protocol.md §1.7.

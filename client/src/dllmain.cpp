@@ -17,6 +17,7 @@
 #include "game/pause.h"
 #include "game/ped.h"
 #include "game/verify.h"
+#include "game/world.h"
 #include "hook/hook.h"
 #include "log.h"
 
@@ -47,6 +48,11 @@ void PreFrame() {
 	// whether to update the world. game/pause.h has the full reasoning.
 	game::ClearPauseForTheWorld();
 	g_client.PreFrame();
+
+	// Last, after the roster has spawned and despawned whatever it was going
+	// to: look at the list CWorld::Process is about to walk and take out
+	// anything it would fault on. game/world.h says why this exists.
+	game::GuardMovingList();
 }
 
 void PostFrame() {

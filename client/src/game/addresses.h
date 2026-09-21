@@ -1471,6 +1471,40 @@ constexpr size_t WEAPONINFO_ANIM_TO_PLAY = 0x34;
 constexpr size_t WEAPONINFO_MODEL_ID     = 0x4C;
 constexpr size_t WEAPONINFO_FLAGS        = 0x50;
 
+// The animation block in the middle of CWeaponInfo, and the reason a remote
+// player's gun looked like it was being drawn over and over instead of fired.
+//
+// A weapon has one animation, not three. The draw, the aim pose, the shot and
+// the recovery are all frames of it, and which part you see is decided by
+// where the association is parked and whether it is running:
+//
+//   m_fAnimLoopStart   CPed::PointGunAt parks it here and clears
+//                      ASSOC_RUNNING. That frozen frame is the "gun up,
+//                      ready" pose, and it is what a player holding an aim
+//                      without firing is showing.
+//   m_fAnimFrameFire   CPed::FireGun discharges the weapon when the playhead
+//                      crosses this.
+//   m_fAnimLoopEnd     and wraps back to m_fAnimLoopStart while the trigger
+//                      is held, which is the automatic-fire loop. It never
+//                      plays past here until the player stops.
+//
+// All four read out of CPed::FireGun in re3's own order (PedFight.cpp:
+// 525-770), which also re-confirms m_AnimToPlay and m_Flags:
+//
+//   0x004E6BC4  mov esi,[eax+34h]     weaponAnim = m_AnimToPlay
+//   0x004E6C0A  fld dword [eax+44h]   delayBetweenAnimAndFire = m_fAnimFrameFire
+//   0x004E6CBF  mov ebp,[eax+38h]     m_Anim2ToPlay
+//   0x004E6CE3  mov eax,[eax+50h]     IsFlagSet(WEAPONFLAG_THROW)
+//   0x004E6D16  fld dword [eax+3Ch]   animStart = m_fAnimLoopStart
+//   0x004E71B9  fld dword [eax+40h]   animLoopEnd = m_fAnimLoopEnd
+//
+// and the class is bracketed at both ends by offsets this file already had:
+// m_AnimToPlay at 0x34, m_nModelId at 0x4C, m_Flags at 0x50, total 0x54.
+constexpr size_t WEAPONINFO_ANIM2_TO_PLAY   = 0x38;
+constexpr size_t WEAPONINFO_ANIM_LOOP_START = 0x3C;
+constexpr size_t WEAPONINFO_ANIM_LOOP_END   = 0x40;
+constexpr size_t WEAPONINFO_ANIM_FRAME_FIRE = 0x44;
+
 constexpr uint32_t WEAPONFLAG_CANAIM          = 0x040;
 constexpr uint32_t WEAPONFLAG_CANAIM_WITHARM  = 0x080;
 
@@ -1589,7 +1623,9 @@ constexpr uintptr_t CWorld__ms_nCurrentScanCode = 0x0095CC64;
 // reads `mov ebp,[edi] / mov edi,[edi+8]`.
 constexpr uintptr_t CWorld__ms_listMovingEntityPtrs = 0x008F433C;
 constexpr size_t    PTRNODE_ITEM = 0x00;
+constexpr size_t    PTRNODE_PREV = 0x04;
 constexpr size_t    PTRNODE_NEXT = 0x08;
+constexpr size_t    SIZEOF_PTRNODE = 0x0C;   // the `push 0Ch` every allocator uses
 
 // CWorld::Process. Its animation loop is re3 World.cpp:1865-1876 exactly:
 //     mov eax,[ebp+4Ch] / test / cmp byte [eax],2        rpCLUMP
@@ -2256,6 +2292,42 @@ inline bool WorldRemoveUnlinksFromMovingList(uint8_t entityFlagsA) {
 // teardown will walk straight past it.
 inline bool NeedsMovingListUnlink(uint8_t entityFlagsA, bool linked) {
 	return linked && !WorldRemoveUnlinksFromMovingList(entityFlagsA);
+}
+
+// Is this address inside the game image? Every CEntity vtable is, because
+// they all live in the exe's read-only data.
+inline bool IsImageAddress(uintptr_t value) {
+	return value >= IMAGE_BASE && value < IMAGE_BASE + IMAGE_SIZE;
+}
+
+// Could this value be a pointer to a game object, or is it something that
+// was never a pointer at all?
+//
+// Deliberately weak. It is not trying to prove a pointer is good, only to
+// reject a value that cannot possibly be one, because that is the shape the
+// crash at 0x004B1B25 actually had: `node->item` was 0x0000020E, 526, which
+// is a small integer sitting where an entity pointer belongs.
+//
+// Three cheap tests. Below 64K is the reserved null region no allocation ever
+// lands in. Above 2 GB is kernel space for a 32-bit process without
+// /LARGEADDRESSAWARE, and gta3.exe is not. And every C++ object with a vtable
+// is at least 4-byte aligned, which 526 is not.
+inline bool LooksLikeGameObject(uintptr_t value) {
+	constexpr uintptr_t USER_MIN = 0x00010000;
+	constexpr uintptr_t USER_MAX = 0x80000000;
+	return value >= USER_MIN && value < USER_MAX && (value & 3) == 0;
+}
+
+// Is a node in CWorld::ms_listMovingEntityPtrs safe for CWorld::Process to
+// dereference?
+//
+// `item` is the node's entity pointer and `vtable` is the first dword at that
+// address, which the caller only reads once `LooksLikeGameObject(item)` has
+// said it is worth reading. The vtable of a live entity always points into
+// the image; a block that has been recycled for something else almost never
+// does.
+inline bool MovingListNodeIsSane(uintptr_t item, uintptr_t vtable) {
+	return LooksLikeGameObject(item) && IsImageAddress(vtable);
 }
 
 // ---- helpers --------------------------------------------------------------

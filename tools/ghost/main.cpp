@@ -1,6 +1,7 @@
 // A synthetic second player.
 //
 //   ghost [host] [port] [nick] [-car] [-inout] [-shoot] [-throw] [-hurt]
+//         [-flame]
 //
 // -car   also claims a vehicle and parks it in front of the player. Puts the
 //        real client through the vehicle pool, CAutomobile's constructor and
@@ -23,6 +24,14 @@
 //        copy ends silently instead of detonating wherever it feels like.
 //        A second fire in the wrong street means CProjectileInfo::RemoveProjectile
 //        isn't being suppressed.
+// -flame holds a flamethrower and keeps the trigger down. The only way to see
+//        the one weapon whose replay was refused until now: the shot goes
+//        through CWeapon::FireAreaEffect into CShotInfo, which keeps lighting
+//        fires for a second after the call returns. Watch for flame coming
+//        out of the remote ped, and watch your own health: it must not move,
+//        because the fire that CShotInfo lights names the ghost's ped as its
+//        source and CPed::InflictDamage refuses anything a remote ped tries
+//        to take off you.
 // -hurt  makes the shots real, in both directions. Needs the server started
 //        with -friendlyfire, or it does nothing at all and that is the gate
 //        working.
@@ -82,6 +91,7 @@ int main(int argc, char **argv) {
 	bool shootFlag = false;
 	bool throwFlag = false;
 	bool hurtFlag  = false;
+	bool flameFlag = false;
 	for (int i = 1; i < argc; ++i) {
 		if (std::strcmp(argv[i], "-car") == 0)
 			carFlag = true;
@@ -93,7 +103,14 @@ int main(int argc, char **argv) {
 			throwFlag = true;
 		if (std::strcmp(argv[i], "-hurt") == 0)
 			hurtFlag = true;
+		if (std::strcmp(argv[i], "-flame") == 0)
+			flameFlag = true;
 	}
+
+	// The flamethrower is a held trigger, not a burst, so it rides the same
+	// shot cadence as everything else and just never lets go.
+	if (flameFlag)
+		shootFlag = true;
 
 	// -hurt on its own would be a player losing health with nothing on
 	// screen to explain it, which is a worse test than no test.
@@ -132,8 +149,9 @@ int main(int argc, char **argv) {
 	// snapshot as well as in the shot: the receiver puts the model in the
 	// ped's hand from the snapshot and refuses to fire a gun the ped isn't
 	// holding. Correct order, and worth exercising.
-	constexpr uint8_t  WEAPON_UZI     = 3;
-	constexpr uint8_t  WEAPON_MOLOTOV = 10;
+	constexpr uint8_t  WEAPON_UZI         = 3;
+	constexpr uint8_t  WEAPON_FLAMETHROWER = 9;
+	constexpr uint8_t  WEAPON_MOLOTOV     = 10;
 	constexpr uint8_t  EXPLOSION_MOLOTOV_TYPE = 1;
 	constexpr uint32_t SHOT_PERIOD_MS  = 250;    // four rounds a second
 	constexpr uint32_t THROW_PERIOD_MS = 3000;
@@ -143,7 +161,8 @@ int main(int argc, char **argv) {
 	// gets removed silently.
 	constexpr uint32_t FUSE_MS = 2000;
 
-	const uint8_t heldWeapon = throwFlag ? WEAPON_MOLOTOV
+	const uint8_t heldWeapon = throwFlag  ? WEAPON_MOLOTOV
+	                           : flameFlag ? WEAPON_FLAMETHROWER
 	                           : shootFlag ? WEAPON_UZI
 	                                       : 0;   // WEAPONTYPE_UNARMED
 	uint32_t nextShotMs      = 0;
@@ -378,7 +397,7 @@ int main(int argc, char **argv) {
 
 				C_Shot shot{};
 				InitHeader(shot, nowMs);
-				shot.body.weapon = WEAPON_UZI;
+				shot.body.weapon = heldWeapon;
 				// Roughly where a held gun sits: chest height, at the ped.
 				shot.body.origin = Vec3{pkt.body.pos.x, pkt.body.pos.y,
 				                        pkt.body.pos.z + 0.6f};

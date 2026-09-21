@@ -364,6 +364,64 @@ Status: not yet implemented. It touches `client/src/dllmain.cpp` and
 
 ---
 
+### 5.7 Fire is world state, and it gets synced. Two phases.
+
+Decided 2026-09-21, after a live run where a remote player held a flamethrower
+and nothing at all came out of it on the other screen.
+
+**Phase one, done: the flame has to appear.** A remote player pulling the
+trigger on a flamethrower produces visible fire on every observer, and no
+observer decides who burns.
+
+The constraint that had the flamethrower on the refused list is real and has
+not been waved away. `CWeapon::FireAreaEffect` hands the shot to `CShotInfo`,
+whose slot lives for the weapon's `m_fLifespan` and keeps setting things
+alight every frame until it expires, long after the call that created it
+returned. A guard wrapped around the call never covered that.
+
+What changed is that the guard is no longer the call. `CPed::InflictDamage`
+now refuses anything a remote player's ped tries to take off the local
+player's health, which holds for the whole life of the `CShotInfo` and every
+`CFire` it lights, because `CFire::ProcessFire` passes its `m_pSource`
+straight into `InflictDamage` and that source is the remote ped. No timer, no
+engine flag held across frames. `CShotInfo::Update` itself only lights fires
+and skips `bFireProof` peds, which every remote player already is.
+
+The exception, and it is the same one §1.9.2 already made: an explosion may
+still hurt the local player, because a blast is replayed at a fixed world
+position everyone agrees on, so "was I standing in it" is a question about us
+that we are entitled to answer.
+
+**Phase two, not built: fire is synced as world state, whatever lit it.**
+
+Not "flamethrower fire and molotov fire". Fire. Explosions, molotovs, the
+flamethrower, rockets, a car burning out, a ped alight, a script fire. Where
+it came from does not matter, which is what makes it tractable: the engine
+already treats fire as one flat table rather than as a property of the weapon
+that caused it.
+
+That table is `gFireManager`, a single global with a fixed `m_aFires[NUM_FIRES]`,
+each entry carrying `m_bIsOngoing`, `m_pEntity` and `m_vecPos`. The strongest
+hint that it is snapshot-shaped is that the engine's own replay system already
+treats it as a block: `CReplay` stores and restores the whole array plus
+`m_nTotalFires` with two `memcpy`s (re3 Replay.cpp:1176-1177, 1353-1356).
+
+Until it is built, burning is cosmetic on an observer and damaging only on the
+machine that lit it, and the fire a molotov leaves behind is terrain: it burns
+whoever walks into it, friendly fire or not.
+
+Two things to settle first, neither of which is answerable from `re3` alone
+and both of which shape the design:
+
+- whether the fire array is a fixed size in the retail build, and what that
+  size is;
+- whether a `CFire` entry can point at an entity (`m_pEntity`, a burning ped
+  or car) rather than just a position. A fire attached to a remote player's
+  ped is a different sync problem from a fire sitting on the pavement, and it
+  is the one that decides whether this is a snapshot or an event stream.
+
+---
+
 ## 6. Rules that keep paying off
 
 Learned the hard way this far in; worth not relearning.

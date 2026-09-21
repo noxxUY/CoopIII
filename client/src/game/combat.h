@@ -84,9 +84,26 @@ inline bool IsProjectileExplosion(uint8_t type) {
 //   SNIPERRIFLE            CWeapon::FireSniper returns false unless this
 //                          machine's camera is in first-person, and
 //                          otherwise fires along that camera's Front.
-//   FLAMETHROWER           hands the shot to CShotInfo, which keeps
-//                          damaging long after the guarded call returns.
 //   DETONATOR              sets off bombs that were never synced.
+//
+// The flamethrower used to be on that list and no longer is. The reason it
+// was there is real and still stands: CWeapon::FireAreaEffect hands the shot
+// to CShotInfo, whose slot lives for the weapon's m_fLifespan and keeps
+// setting things alight every frame until it expires, long after the call
+// that created it returned. A guard that only covers the call does not cover
+// that.
+//
+// What changed is that the guard is no longer the call. CPed::InflictDamage
+// refuses anything a remote player's ped tries to do to the local player's
+// health (RemoteMayDamageLocalPlayer below), and that holds for as long as
+// the CShotInfo and every CFire it starts live, without a timer and without
+// holding an engine flag across frames. CShotInfo::Update itself only lights
+// fires, and it skips bFireProof peds, which every remote player already is.
+//
+// So the flame comes out and nobody on this machine decides who burns.
+// Syncing the fires themselves, so that burning actually hurts and everyone
+// sees the same fires whatever lit them, is a separate piece of work:
+// docs/roadmap.md §5.7.
 //
 // HELICANNON (13) and anything above it aren't inventory weapons at all and
 // get refused by the bound check.
@@ -98,8 +115,41 @@ inline bool IsReplayableWeapon(uint8_t weapon) {
 	case WEAPONTYPE_AK47:
 	case WEAPONTYPE_M16:
 	case WEAPONTYPE_ROCKETLAUNCHER:
+	case WEAPONTYPE_FLAMETHROWER:
 	case WEAPONTYPE_MOLOTOV:
 	case WEAPONTYPE_GRENADE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+// May something coming off a remote player's ped reduce the local player's
+// health on this machine?
+//
+// Almost never, and the exception is the interesting part. Everything a
+// remote player legitimately does to us arrives as S_Damage, decided on
+// their machine from their own bullet trace (§1.10.1). Anything else that
+// names their ped as the culprit is this machine guessing, off a ped that is
+// interpolated 100 ms into the past.
+//
+// The exception is the blast, and it is not a hole. §1.9.2: an explosion is
+// replayed at a fixed world position that its owner chose, so "was I
+// standing in it" is a question about us, answered here, with nothing stale
+// in it. The three projectile causes and the generic EXPLOSION are that
+// question.
+//
+// This one predicate is what let the flamethrower come off the refused list.
+// The fire a replayed flame starts names the remote ped as its source
+// (CFire::ProcessFire passes m_pSource straight into InflictDamage), so the
+// flame is visible and the burning is refused, for the whole life of the
+// CShotInfo, with no timer to get wrong.
+inline bool RemoteMayDamageLocalPlayer(uint8_t weapon) {
+	switch (weapon) {
+	case WEAPONTYPE_ROCKETLAUNCHER:
+	case WEAPONTYPE_MOLOTOV:
+	case WEAPONTYPE_GRENADE:
+	case WEAPONTYPE_EXPLOSION:
 		return true;
 	default:
 		return false;

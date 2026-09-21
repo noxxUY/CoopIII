@@ -69,15 +69,20 @@ struct AnimSample {
 	uint16_t id    = ANIM_NONE;
 	float    time  = 0.0f;
 	float    speed = 1.0f;
+	// ASSOC_RUNNING. A weapon animation parked on its ready frame with this
+	// clear is a player aiming; the same id and the same phase with it set is
+	// a player firing. docs/protocol.md §1.9.4.
+	bool     running = false;
 };
 
 void ReadAnim(void *assoc, AnimSample &out) {
 	const int32_t id = Field<int32_t>(assoc, ANIM_ID);
 	if (id < 0 || id >= ANIM_NONE)
 		return;   // not a value that survives the uint16 on the wire
-	out.id    = static_cast<uint16_t>(id);
-	out.time  = Field<float>(assoc, ANIM_CURRENT_TIME);
-	out.speed = Field<float>(assoc, ANIM_SPEED);
+	out.id      = static_cast<uint16_t>(id);
+	out.time    = Field<float>(assoc, ANIM_CURRENT_TIME);
+	out.speed   = Field<float>(assoc, ANIM_SPEED);
+	out.running = (Field<int32_t>(assoc, ANIM_FLAGS) & ASSOC_RUNNING) != 0;
 }
 
 // The two animations worth sending (docs/protocol.md §1.8): the dominant
@@ -168,6 +173,8 @@ bool SampleLocalPlayer(PlayerStateBody &out) {
 		out.flags |= PF_AIMING;
 	if (flagsC & offs::PED_IS_SHOOTING)
 		out.flags |= PF_FIRING;
+	if (partial.running)
+		out.flags |= PF_ANIM2_RUNNING;
 
 	out.aimYaw = WrapAngle(
 	    aiming ? Field<float>(ped, offs::PED_LOOK_DIRECTION)
@@ -557,6 +564,22 @@ bool SpawnRemote(RemotePlayer &player) {
 	Field<float>(ped, offs::PED_ROT_CUR)  = WrapAngle(bornFacing);
 	Field<float>(ped, offs::PED_ROT_DEST) = WrapAngle(bornFacing);
 
+	// CWorld::Add's last act is AddToMovingList, and that function has no
+	// check for an entity that is already in the list: it overwrites
+	// m_movingListNode with the new node and forgets the old one, which stays
+	// linked forever with nothing left that can unlink it. So a second
+	// CWorld::Add on one entity orphans a node, and an orphaned node outlives
+	// the entity it points at.
+	//
+	// A ped straight out of the constructor cannot be in the list, because
+	// CPhysical's constructor nils the field. Checking anyway costs one load
+	// and turns the day this stops being true into a log line.
+	if (Field<void *>(ped, offs::MOVING_LIST_NODE) != nullptr) {
+		Log("bridge: a newly constructed ped is already in the moving list; "
+		    "unlinking before CWorld::Add, or the node it holds would be orphaned");
+		Func<void(__thiscall *)(void *)>(CPhysical__RemoveFromMovingList)(ped);
+	}
+
 	Func<AddFn>(CWorld__Add)(ped);
 
 	// LEVEL_IGNORE, not whatever level the position falls in.
@@ -732,10 +755,7 @@ void *FindAnimById(void *clump, uint16_t animId) {
 //
 // Neither one changes the id on the wire, so neither one is visible to a
 // comparison against the last id applied. Hence this.
-bool AnimStillPlaying(void *clump, uint16_t animId) {
-	void *const assoc = FindAnimById(clump, animId);
-	if (!assoc)
-		return false;
+bool AnimIsCondemned(void *assoc) {
 
 	// Condemned: something has given it a negative blend delta and asked for
 	// it to be deleted once it reaches zero. Both routes above leave exactly
@@ -744,8 +764,109 @@ bool AnimStillPlaying(void *clump, uint16_t animId) {
 	// CAnimManager::BlendAnimation revives an association it finds by
 	// recomputing the delta as (1 - blendAmount) * delta, which is positive.
 	const int32_t flags = Field<int32_t>(assoc, ANIM_FLAGS);
-	return !((flags & ASSOC_DELETEFADEDOUT) &&
-	         Field<float>(assoc, ANIM_BLEND_DELTA) < 0.0f);
+	return (flags & ASSOC_DELETEFADEDOUT) != 0 &&
+	       Field<float>(assoc, ANIM_BLEND_DELTA) < 0.0f;
+}
+
+// CWeaponInfo for a weapon type, or null. Declared here because the overlay
+// below needs the firing loop out of it; the definition is further down with
+// the rest of the weapon code.
+void *WeaponInfo(uint8_t weaponType);
+
+// Seek an association to a phase through the engine's own function, which
+// also re-seeks every node's keyframe cursor. Writing currentTime directly
+// leaves those pointing at the old phase.
+void SeekAnim(void *assoc, float time) {
+	using SeekFn = void(__thiscall *)(void *, float);
+	Func<SeekFn>(CAnimBlendAssociation__SetCurrentTime)(assoc, SafeAnimTime(time));
+}
+
+// How far the local phase may drift from the wire's before it gets pulled
+// back. Only used while the overlay is frozen, where the wire value does not
+// change at all, so in practice this fires once and then never again.
+constexpr float ANIM_PHASE_TOLERANCE = 0.01f;
+
+// The partial overlay: the weapon animation, a punch, a throw.
+//
+// This is the part that looked wrong on screen, and the reason is that a
+// weapon in GTA III has one animation, not three. The draw, the ready pose,
+// the shot and the recovery are all frames of ANIM_STD_WEAPON_HGUN_BODY and
+// its siblings. Which part you see is decided by two things that used to be
+// missing from this seam entirely:
+//
+//   whether the association is running. CPed::PointGunAt parks it on
+//   m_fAnimLoopStart and clears ASSOC_RUNNING, and that frozen frame is the
+//   aim. A new association is created running (CAnimManager::AddAnimation
+//   ends in Start(0.0f) for anything that is not a movement anim), so an
+//   observer that only copies the id and the phase gets a gun being drawn,
+//   played to the end, deleted by ASSOC_FADEOUTWHENDONE, and started again.
+//   Over and over, and never the firing part. PF_ANIM2_RUNNING fixes that.
+//
+//   where it loops. CPed::FireGun wraps back to m_fAnimLoopStart the moment
+//   the playhead passes m_fAnimLoopEnd while the trigger is held, so a firing
+//   weapon cycles the middle of its animation and never reaches the end.
+//   Replicating that loop is what makes a remote player firing look like a
+//   local player firing, which is the only test that means anything here.
+void ApplyOverlay(RemotePlayer &player, void *clump, int pedGroup) {
+	const uint16_t want = player.last.animId2;
+
+	if (want == ANIM_NONE) {
+		if (player.appliedAnimId2 != ANIM_NONE) {
+			FadeOutPartial(clump, player.appliedAnimId2);
+			player.appliedAnimId2 = ANIM_NONE;
+		}
+		return;
+	}
+
+	// Start it, or revive it if something has condemned it behind our back:
+	// ASSOC_FADEOUTWHENDONE when it ran to the end, or CPed::SetMoveAnim's
+	// purge of every partial on a change of move state.
+	void *assoc = FindAnimById(clump, want);
+	if (!assoc || AnimIsCondemned(assoc)) {
+		if (!BlendRemoteAnim(clump, pedGroup, want, player.last.animTime2, 1.0f,
+		                     false))
+			return;
+		assoc = FindAnimById(clump, want);
+		if (!assoc)
+			return;
+	}
+	player.appliedAnimId2 = want;
+
+	const bool running = (player.last.flags & PF_ANIM2_RUNNING) != 0;
+	int32_t   &flags   = Field<int32_t>(assoc, ANIM_FLAGS);
+	if (running)
+		flags |= ASSOC_RUNNING;
+	else
+		flags = flags & ~ASSOC_RUNNING;
+
+	if (!running) {
+		// Held, not played. Nothing advances it, so it can never reach the
+		// end, never get condemned and never restart. One seek and it sits
+		// exactly where its owner is holding it.
+		if (std::fabs(Field<float>(assoc, ANIM_CURRENT_TIME) -
+		              SafeAnimTime(player.last.animTime2)) > ANIM_PHASE_TOLERANCE)
+			SeekAnim(assoc, player.last.animTime2);
+		return;
+	}
+
+	// Running. The loop belongs to the weapon, so it only applies when this
+	// overlay really is that weapon's animation; a punch or a throw has no
+	// loop and plays straight through.
+	void *const info = WeaponInfo(player.last.weapon);
+	if (!info)
+		return;
+	const int32_t animId  = Field<int32_t>(info, WEAPONINFO_ANIM_TO_PLAY);
+	const int32_t animId2 = Field<int32_t>(info, WEAPONINFO_ANIM2_TO_PLAY);
+	if (animId != static_cast<int32_t>(want) && animId2 != static_cast<int32_t>(want))
+		return;
+
+	const float loopStart = Field<float>(info, WEAPONINFO_ANIM_LOOP_START);
+	const float loopEnd   = Field<float>(info, WEAPONINFO_ANIM_LOOP_END);
+	if (WeaponAnimShouldLoop(Field<float>(assoc, ANIM_CURRENT_TIME), loopStart,
+	                         loopEnd)) {
+		flags |= ASSOC_RUNNING;   // Start() sets this; SetCurrentTime does not
+		SeekAnim(assoc, loopStart);
+	}
 }
 
 // The five animations CPed::SetMoveAnim can pick from, and therefore exactly
@@ -863,29 +984,10 @@ void ApplyAnimation(RemotePlayer &player, void *ped) {
 		player.appliedAnimId = player.last.animId;
 	}
 
-	// The overlay, and this is not the same test as the one above it.
-	//
-	// A base animation is safe to drive on change alone: the engine replaces
-	// it rather than deleting it, so something is always playing. An overlay
-	// is not. It can end on its own while the wire still names it, and then
-	// the ped stands there holding a gun that fires silently. So the
-	// question is "is it still playing", not "has the id changed".
-	//
-	// A weapon animation whose owner is holding the trigger reaches this
-	// once per cycle, which is the same rate the shooter's own engine
-	// re-blends it at.
-	if (player.last.animId2 == player.appliedAnimId2 &&
-	    (player.appliedAnimId2 == ANIM_NONE ||
-	     AnimStillPlaying(clump, player.appliedAnimId2)))
-		return;
-
-	if (player.last.animId2 == ANIM_NONE) {
-		FadeOutPartial(clump, player.appliedAnimId2);
-		player.appliedAnimId2 = ANIM_NONE;
-	} else if (BlendRemoteAnim(clump, pedGroup, player.last.animId2,
-	                           player.last.animTime2, 1.0f, false)) {
-		player.appliedAnimId2 = player.last.animId2;
-	}
+	// The overlay is driven every frame rather than on change, because
+	// unlike a base animation it can end, freeze or be purged while the id
+	// on the wire never moves.
+	ApplyOverlay(player, clump, pedGroup);
 }
 
 // CWeaponInfo for a bounded weapon type. GetWeaponInfo is `imul eax,eax,54h

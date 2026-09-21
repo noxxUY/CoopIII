@@ -416,6 +416,24 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 	if (g_replaying && self && self == localPed)
 		return false;
 
+	// Somebody else's ped is trying to hurt our player. It doesn't get to.
+	//
+	// Every hit a remote player legitimately lands on us arrives as S_Damage,
+	// decided on their machine from their own trace. Anything that reaches
+	// here instead is this machine working it out for itself, off a ped
+	// interpolated 100 ms late, and the answer would be wrong.
+	//
+	// This is also what makes the flamethrower replayable. Its CShotInfo
+	// outlives the call that made it and lights fires for a second or more
+	// afterwards, and every one of those fires names the remote ped as its
+	// source, so refusing by culprit covers the whole thing where a guard
+	// around the call never could. combat.h, RemoteMayDamageLocalPlayer.
+	uint16_t attackerNetId = INVALID_NETID;
+	if (localPed && self == localPed && damagedBy && damagedBy != localPed &&
+	    RemotePlayerForPed(damagedBy, attackerNetId) &&
+	    !RemoteMayDamageLocalPlayer(static_cast<uint8_t>(method)))
+		return false;
+
 	uint16_t victimNetId = INVALID_NETID;
 	if (self && RemotePlayerForPed(self, victimNetId)) {
 		// Somebody else's player. Their health is theirs.

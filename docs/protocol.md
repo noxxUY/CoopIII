@@ -252,6 +252,20 @@ it the other way, by simply letting the replayed shot damage the local player,
 would mean the question "did A hit B" is answered by B's machine, using A's
 position interpolated 100 ms late. People would be shot around corners.
 
+The flamethrower used to be on that list, and the reason it was there still
+stands: `CWeapon::FireAreaEffect` hands the shot to `CShotInfo`, whose slot
+lives for the weapon's `m_fLifespan` and keeps lighting fires every frame
+until it expires, long after the replay call returned. What changed is that
+the guard is no longer the call. §1.10.1's detour refuses anything a remote
+player's ped tries to take off the local player's health, which holds for the
+whole life of the `CShotInfo` and every `CFire` it starts, because
+`CFire::ProcessFire` passes its `m_pSource` straight into `InflictDamage`
+(`src/core/Fire.cpp:70-80`) and that source is the remote ped.
+
+So the flame comes out and nobody here decides who burns. Syncing the fires
+themselves is `docs/roadmap.md` §5.7, and until it exists burning is cosmetic
+on an observer and damaging only on the machine that lit it.
+
 Explosions are the exception, and not an inconsistency. §1.9.3's explosion is
 replayed at a fixed world position that its owner chose, so "is B standing in
 it" is a question about B, answered on B's machine, with no stale data
@@ -261,12 +275,11 @@ authority is a *place* and a bullet's is a *ray* from somewhere only the shooter
 knows. Remote peds are therefore `bExplosionProof`; an observer must not apply
 the blast to *them*.
 
-Four weapons are deliberately not replayed:
+Three weapons are deliberately not replayed:
 
 | Weapon | Why not |
 |---|---|
 | `SNIPERRIFLE` | `CWeapon::FireSniper` returns immediately unless *this* machine's camera is in a first-person mode, and then fires along `TheCamera.Cams[ActiveCam].Front`, the observer's own view. It is unusable for anyone but the local player. |
-| `FLAMETHROWER` | `CShotInfo` keeps burning for as long as the shot lives and damages through `WEAPONTYPE_FLAMETHROWER` long after the replay call has returned, so the one-call bulletproof flip does not cover it. |
 | `DETONATOR` | Fires nothing; it sets off bombs already planted. A planted bomb is not synced, so replaying it would detonate a different machine's props. |
 | `UNARMED` / `BASEBALLBAT` | Melee is a damage event with no projectile and no flash. Everything visible about it is the animation, which the snapshot already carries. |
 
@@ -337,11 +350,47 @@ the id changed". An association with `ASSOC_DELETEFADEDOUT` and a negative
 `blendDelta` has been condemned by one of those two routes and gets blended
 again. `CAnimManager::BlendAnimation` revives an association it finds rather
 than making a second one, by recomputing the delta as
-`(1 - blendAmount) * delta` (`AnimManager.cpp:744-747`), so the revival is
-cheap and the phase is re-seeded from `animTime2` on the way through.
+`(1 - blendAmount) * delta` (`AnimManager.cpp:744-747`).
 
 The aim flag recovers on its own, because `SetAimFlag` is driven every frame
 the sender reports `PF_AIMING`.
+
+That was necessary and it was not sufficient, and the reason is the next
+section.
+
+#### 1.9.4.1 A weapon has one animation, not three
+
+This is the part that looked wrong on screen: a remote player firing showed
+the gun being *drawn*, cut off, drawn again, over and over, and never the
+firing part.
+
+The draw, the ready pose, the shot and the recovery are all frames of a single
+association, `ANIM_STD_WEAPON_HGUN_BODY` and its siblings. Which part you see
+is decided by two things, and the wire used to carry neither:
+
+- **whether it is running.** `CPed::PointGunAt` parks the association on
+  `m_fAnimLoopStart` and clears `ASSOC_RUNNING` (`PedFight.cpp:194-210`).
+  That frozen frame *is* the aim: gun up, ready, not moving. A new
+  association, on the other hand, is created running, because
+  `CAnimManager::AddAnimation` ends in `Start(0.0f)` for anything that is not
+  a movement animation (`AnimManager.cpp:675-698`). So a receiver that copies
+  only the id and the phase creates a running copy of a frozen pose. It plays
+  from the ready frame to the end of the animation, `ASSOC_FADEOUTWHENDONE`
+  deletes it, §1.9.4 revives it, and round it goes.
+- **where it loops.** While the trigger is held, `CPed::FireGun` wraps the
+  playhead back to `m_fAnimLoopStart` the moment it passes `m_fAnimLoopEnd`
+  (`PedFight.cpp:712-722`). A firing weapon cycles the middle of its
+  animation and never reaches the end at all.
+
+Consequence, and the test for it is not a theory but a comparison: **a remote
+player firing has to look the way your own player looks firing the same
+weapon.** So `PF_ANIM2_RUNNING` carries `ASSOC_RUNNING` in a spare bit of the
+flags byte that was already on the wire, and the receiver replicates the loop
+out of the weapon's own `CWeaponInfo` rather than re-seeding the phase off a
+snapshot that is only accurate 25 times a second.
+
+A frozen overlay never advances, so it can never reach the end, never be
+condemned and never restart. A running one loops where its owner's does.
 
 #### 1.9.5 `PF_FIRING` is `bIsShooting`, and `bIsShooting` draws nothing
 
