@@ -2148,6 +2148,70 @@ void TestTagDistanceCurve() {
 	Check(TAG_FADE_BAND_M * 5.0f == TAG_RANGE_M, "the fade band is a fifth of the range");
 }
 
+void TestTagSizeIsResolutionIndependent() {
+	std::printf("\nnametag size comes from the screen height and nothing else\n");
+
+	// A player about ten metres away, which is what the first in-game shot of
+	// this showed.
+	const float ten = PlanTag(10.0f).scale;
+
+	const TagMetrics small = MeasureTag(600.0f, ten);
+	const TagMetrics hd    = MeasureTag(1080.0f, ten);
+	const TagMetrics uhd   = MeasureTag(2160.0f, ten);
+
+	auto near = [](float a, float b) {
+		const float d = a > b ? a - b : b - a;
+		return d < 1.0e-4f;
+	};
+
+	// Same fraction of the screen on every one of them. This is the property
+	// that was asked for: change resolution and the tag moves with it.
+	Check(near(small.nameH / 600.0f, hd.nameH / 1080.0f) &&
+	          near(hd.nameH / 1080.0f, uhd.nameH / 2160.0f),
+	      "the name is the same fraction of the screen at 600, 1080 and 2160");
+	Check(near(small.icon / 600.0f, uhd.icon / 2160.0f),
+	      "and so is the weapon icon");
+	Check(near(small.headGap / 600.0f, uhd.headGap / 2160.0f),
+	      "and the gap above the player's head");
+	Check(near(small.columnH / 600.0f, uhd.columnH / 2160.0f),
+	      "and the block of text as a whole");
+
+	// Doubling the screen doubles every length, exactly.
+	Check(near(uhd.nameH, hd.nameH * 2.0f), "twice the screen is twice the tag");
+
+	// A glyph cell is 32*scaleX by 20*scaleY. Its shape must not change with
+	// the aspect ratio, which is what the old width-scaled version got wrong
+	// and what the installed widescreen fix exists to prevent.
+	const float cellAspect = (32.0f * hd.nameScaleX) / hd.nameH;
+	const float uhdAspect  = (32.0f * uhd.nameScaleX) / uhd.nameH;
+	Check(near(cellAspect, uhdAspect), "letters keep their shape at any size");
+	Check(cellAspect < 1.0f && cellAspect > 0.85f,
+	      "and it is the shape the game's own heading font has, not a stretched one");
+
+	// The absolute size, pinned so that shrinking it further or letting it
+	// creep back up is a deliberate act. At ten metres the name is about two
+	// percent of the screen height.
+	const float fraction = hd.nameH / 1080.0f;
+	Check(fraction > 0.016f && fraction < 0.024f,
+	      "at ten metres a name is about two percent of the screen height");
+
+	// The first in-game run had this three times too big. Pin the correction
+	// against the number it used to be.
+	const float wasScaleY = 1.10f;   // the old TAG_NAME_SCALE_Y
+	const float nowScaleY = TAG_FONT_SHAPE_Y * TAG_NAME_SIZE;
+	Check(wasScaleY / nowScaleY > 2.5f && wasScaleY / nowScaleY < 3.5f,
+	      "which is about a third of what the first in-game run drew");
+
+	// Proportions inside the tag.
+	Check(hd.hpH < hd.nameH, "the health line is smaller than the name");
+	Check(hd.icon < hd.columnH,
+	      "and the icon is shorter than the two lines it sits beside");
+	Check(hd.icon > hd.nameH,
+	      "but still taller than one line of it, so it reads as an icon");
+	Check(hd.shadow >= TAG_SHADOW_MIN_PX && hd.shadow < hd.nameH * 0.2f,
+	      "the drop shadow is visible without being a smear");
+}
+
 void TestProbeBudget() {
 	std::printf("\nline of sight probes are rationed\n");
 
@@ -2412,6 +2476,7 @@ int main() {
 	TestFriendlyFireReachesTheBridge();
 	TestLifeStateMachine();
 	TestTagDistanceCurve();
+	TestTagSizeIsResolutionIndependent();
 	TestProbeBudget();
 	TestOcclusionFade();
 	TestOcclusionAlpha();
