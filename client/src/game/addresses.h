@@ -514,6 +514,24 @@ constexpr uint8_t ENTITY_MELEE_PROOF          = 0x08;   // byte C
 constexpr uint8_t ENTITY_ZONE_CULLED          = 0x40;   // byte C
 constexpr uint8_t ENTITY_DRAW_LAST            = 0x20;   // byte D
 
+// bRemoveFromWorld, byte D bit 0. The one flag in the engine that makes
+// CWorld::Process delete an entity in the middle of its own walk over the
+// moving list, so it is the one flag an owner of a ped cannot afford to
+// ignore. CPed::FlagToDestroyWhenNextProcessed (0x004D6570, vtable slot 16)
+// opens by writing exactly this bit: `mov al,[ebx+54h] / and al,0FEh /
+// or al,1 / mov [ebx+54h],al`, then goes on to the bInVehicle work at +0x314
+// and +0x310 that re3 Ped.cpp:7658-7678 describes.
+constexpr uint8_t ENTITY_REMOVE_FROM_WORLD    = 0x01;   // byte D
+
+// CPhysical::m_movingListNode, the CPtrNode this entity holds in
+// CWorld::ms_listMovingEntityPtrs, or null when it isn't in the list.
+//
+// Read straight off both halves of the pair: CPhysical::AddToMovingList
+// (0x004958F0) ends `mov [ebx+0E8h], eax` with eax the new node, and
+// CPhysical::RemoveFromMovingList (0x00495940) opens
+// `mov ecx,[ebx+0E8h] / test ecx,ecx / je`.
+constexpr size_t MOVING_LIST_NODE = 0xE8;
+
 // CPed::m_pCurrentPhysSurface. IsEntityCullZoneVisible's PED case reads it
 // and tests that entity's bZoneCulled2 - the only other way a ped gets culled
 // before SetupEntityVisibility ever sees it.
@@ -2165,6 +2183,80 @@ constexpr uint8_t PEDPIECE_COUNT    = 7;
 // rather than dangerous, but it gets bounded anyway because it arrives off a
 // socket.
 constexpr uint8_t PED_DAMAGE_DIRECTIONS = 4;
+
+// ---- the moving entity list -----------------------------------------------
+//
+// CWorld::ms_listMovingEntityPtrs (0x008F433C) is a CPtrList of every physical
+// the engine still has to simulate, and CWorld::Process walks it four times a
+// frame. The very first of those walks, at 0x004B1B20, is three instructions:
+//
+//     mov ebp, [edi]        node->item, the entity
+//     mov edi, [edi+8]      node->next
+//     mov eax, [ebp+4Ch]    entity->m_rwObject
+//
+// so a node whose entity has been freed faults on the third one, at
+// 0x004B1B25, with nothing in the call stack to say who freed it. This block
+// exists because CoopIII destroys peds the engine is still holding, and
+// getting that wrong is invisible until it is fatal.
+
+// __thiscall void CPhysical::AddToMovingList(void).
+//
+//     push 0Ch / call CPtrNode::operator new
+//     test eax,eax / je +2 / mov [eax],ebx     node->item = this
+//     mov [ebx+0E8h], eax                      m_movingListNode = node
+//     ... links it at the head of [0x008F433C]
+//
+// Note what isn't there: any check for an entity that is already in the list.
+// Call it twice and the first node is simply forgotten by the entity while
+// staying in the list, which is the other way to end up at 0x004B1B25.
+constexpr uintptr_t CPhysical__AddToMovingList = 0x004958F0;
+
+// __thiscall void CPhysical::RemoveFromMovingList(void).
+//
+// The safe half of the pair: it opens `mov ecx,[ebx+0E8h] / test ecx,ecx /
+// je end`, so calling it on an entity that isn't in the list costs four
+// instructions and does nothing. That is what makes it usable as an
+// unconditional belt before a teardown.
+constexpr uintptr_t CPhysical__RemoveFromMovingList = 0x00495940;
+
+// CPed::FlagToDestroyWhenNextProcessed, vtable slot 16 (+0x40). Recorded for
+// the evidence rather than to be called: it is what CAutomobile::BlowUpCar,
+// CPed::SetDie's PED_DRIVING arm and CopPed all use to hand a ped to the
+// engine to destroy on its own schedule.
+constexpr uintptr_t CPed__FlagToDestroyWhenNextProcessed = 0x004D6570;
+constexpr size_t    VTABLE_FLAG_TO_DESTROY               = 16;
+
+// Will the engine's own CWorld::Remove take this entity out of the moving
+// list, or quietly leave it there?
+//
+// Both CWorld::Add (0x004AE930) and CWorld::Remove (0x004AE9D0) end with the
+// same three tests, byte for byte:
+//
+//     mov al,[ebx+50h] / and al,7
+//     cmp al,1 / je skip          ENTITY_TYPE_BUILDING
+//     cmp al,5 / je skip          ENTITY_TYPE_DUMMY
+//     mov al,[ebx+51h] / shr al,2 / and al,1      bIsStatic
+//     jne skip
+//     call AddToMovingList        (in Add)
+//     call RemoveFromMovingList   (in Remove)
+//
+// which also re-confirms ENTITY_FLAGS_A and ENTITY_IS_STATIC. The gate is
+// symmetric on paper and asymmetric in practice, because the flag can change
+// between the two calls: an entity linked in while it was moving, and static
+// by the time it is removed, never gets unlinked. ~CPed's first statement is
+// CWorld::Remove(this), so that is the path every ped teardown takes.
+inline bool WorldRemoveUnlinksFromMovingList(uint8_t entityFlagsA) {
+	return (entityFlagsA & offs::ENTITY_IS_STATIC) == 0;
+}
+
+// Does this entity need the unlink doing by hand before it is destroyed?
+//
+// `linked` is m_movingListNode != null. The dangerous combination is the one
+// this returns true for: still in the list, and static, so the engine's own
+// teardown will walk straight past it.
+inline bool NeedsMovingListUnlink(uint8_t entityFlagsA, bool linked) {
+	return linked && !WorldRemoveUnlinksFromMovingList(entityFlagsA);
+}
 
 // ---- helpers --------------------------------------------------------------
 

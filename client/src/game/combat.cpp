@@ -322,12 +322,19 @@ using AddExplosionFn = bool(__cdecl *)(void *, void *, int, const float *, uint3
 
 bool __cdecl HookedAddExplosion(void *explodingEntity, void *culprit, int type,
                                 const float *pos, uint32_t lifetime) {
-	// While replaying somebody else's shot, this machine isn't allowed to
-	// decide an explosion at all (see g_replaying). The refusal gets
-	// reported as "no explosion was added," which is exactly what the
-	// engine's own out-of-slots answer looks like - and every caller already
-	// handles that case.
-	if (g_replaying)
+	// While replaying somebody else's shot, this machine doesn't get to
+	// decide where their projectile went off (see g_replaying). The refusal
+	// is reported as "no explosion was added", the same answer the engine
+	// gives when it is out of slots, and every caller already handles it.
+	//
+	// Only the projectile's own three types, though. This used to refuse
+	// every explosion in the world for the length of the call, which is a
+	// much bigger claim than §1.9.3 makes: a replayed bullet is a real
+	// bullet in this world, and a car it sets off has to be allowed to go
+	// up. Swallowing that left CAutomobile::BlowUpCar half done, with the
+	// car wrecked, its occupants flagged bRemoveFromWorld and no blast, and
+	// a half-torn-down car full of peds is not a state to leave the engine in.
+	if (g_replaying && type >= 0 && IsProjectileExplosion(static_cast<uint8_t>(type)))
 		return false;
 
 	const bool added = g_explode.Original<AddExplosionFn>()(explodingEntity, culprit,

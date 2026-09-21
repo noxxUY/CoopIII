@@ -1576,6 +1576,51 @@ void TestDamageDecisions() {
 	Check(!IsKnownDamageDirection(4), "and no fifth");
 }
 
+// The check that would have caught the crash at 0x004B1B25.
+//
+// That was a CPtrNode left in CWorld::ms_listMovingEntityPtrs pointing at a
+// ped CoopIII had just destroyed, dereferenced by CWorld::Process on the next
+// frame. No unit test can walk the engine's own list, so what gets pinned
+// here is the decision that leads to it: whether the engine's teardown is
+// going to do the unlink, or whether it has to be done by hand first.
+//
+// Writing this table out is the check. The gate is invisible when you read
+// CWorld::Add and CWorld::Remove as a pair, because they look symmetric and
+// the asymmetry is in the flag changing between them - and "an entity freed
+// while something in the engine still points at it" is now the second crash
+// this project has shipped into the game.
+void TestMovingListTeardown() {
+	std::printf("\nwho unlinks an entity from the moving list\n");
+
+	constexpr uint8_t MOVING = 0;
+	constexpr uint8_t STATIC = offs::ENTITY_IS_STATIC;
+
+	// CWorld::Remove is `if (!bIsStatic) RemoveFromMovingList()`, verified
+	// byte for byte at 0x004AEA84.
+	Check(WorldRemoveUnlinksFromMovingList(MOVING),
+	      "a moving entity gets unlinked by the engine");
+	Check(!WorldRemoveUnlinksFromMovingList(STATIC),
+	      "a static one does not, and that is the whole bug");
+
+	// Other flags in the same byte must not change the answer. bIsStatic is
+	// bit 2; bUsesCollision and bIsInSafePosition share the byte and move
+	// constantly.
+	Check(WorldRemoveUnlinksFromMovingList(offs::ENTITY_USES_COLLISION |
+	                                       offs::ENTITY_IS_IN_SAFE_POSITION),
+	      "the neighbouring flags in byte A are not read");
+	Check(!WorldRemoveUnlinksFromMovingList(STATIC | offs::ENTITY_USES_COLLISION),
+	      "and do not mask it either");
+
+	// The only combination that needs a hand: still in the list, and static.
+	Check(NeedsMovingListUnlink(STATIC, /*linked=*/true),
+	      "static and still linked has to be unlinked by hand");
+	Check(!NeedsMovingListUnlink(STATIC, /*linked=*/false),
+	      "static and already unlinked needs nothing");
+	Check(!NeedsMovingListUnlink(MOVING, /*linked=*/true),
+	      "moving and linked is the engine's job");
+	Check(!NeedsMovingListUnlink(MOVING, /*linked=*/false), "and so is neither");
+}
+
 void TestDeathAnimChoice() {
 	std::printf("\nwhich animation a death plays\n");
 
@@ -1682,6 +1727,7 @@ int main() {
 	TestCombatFromAStranger();
 	TestLocalCombatIsDrainedNotSampled();
 	TestDamageDecisions();
+	TestMovingListTeardown();
 	TestDeathAnimChoice();
 	TestDamageOnlyLandsOnUs();
 	TestDeathKillsTheirPed();

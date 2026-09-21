@@ -512,6 +512,15 @@ handed the clump a death animation, and there is no undo for any of that. So
 `S_Respawn` destroys the ped and the ordinary two-phase spawn (§1.6) builds a
 new one.
 
+Destroying a ped is the one thing in CoopIII that has to agree with the engine
+about every list the engine is holding it in, and the moving list is the one
+that bites. `CWorld::Remove`, which `~CPed` calls first, only unlinks an entity
+from `CWorld::ms_listMovingEntityPtrs` when `bIsStatic` is clear
+(`src/core/World.cpp:91`), and a remote ped whose owner stood still for ten
+frames is static. So the teardown does that unlink by hand first;
+`client/src/game/addresses.h` carries the disassembly and the predicate, and
+`tools/clienttest` pins the truth table.
+
 The transform is on the wire because the two ends of a respawn are half a city
 apart. A ped rebuilt from the snapshot stream alone would be born where its
 owner died and then snap to the hospital once the interpolation buffer caught

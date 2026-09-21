@@ -291,6 +291,18 @@ void DespawnRemoteVehicle(RemoteVehicle &vehicle) {
 		return;
 	}
 
+	// By hand, before CWorld::Remove, because CWorld::Remove will not do it
+	// for a vehicle that has gone static and a parked one always has
+	// (addresses.h, WorldRemoveUnlinksFromMovingList). Leave the node behind
+	// and the next CWorld::Process reads m_rwObject off a freed pool slot.
+	// RemoveFromMovingList checks m_movingListNode itself, so this is free
+	// when the car was never in the list.
+	if (NeedsMovingListUnlink(Field<uint8_t>(v, offs::ENTITY_FLAGS_A),
+	                          Field<void *>(v, offs::MOVING_LIST_NODE) != nullptr))
+		Log("bridge: vehicle %u went static while still in the moving list; "
+		    "unlinking it by hand", vehicle.netId);
+	Func<void(__thiscall *)(void *)>(CPhysical__RemoveFromMovingList)(v);
+
 	Func<RemoveFn>(CWorld__Remove)(v);
 	Func<RefsFn>(CWorld__RemoveReferencesToDeletedObject)(v);
 

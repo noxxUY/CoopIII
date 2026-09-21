@@ -282,6 +282,48 @@ bool LookupRemotePed(const void *ped, uint16_t &netId) {
 //
 // The vtable check below is the second net: for a slot that somehow still
 // resolves but no longer holds our ped.
+// Destroy a ped CoopIII created, the way COMMAND_DELETE_CHAR does, plus the
+// one thing the engine's own teardown is allowed to skip.
+//
+// DELETE_CHAR's whole teardown is three steps - RemoveReferencesToDeletedObject,
+// the deleting destructor through vtable slot 0, and --ms_nTotalMissionPeds -
+// and it leaves the world lists to ~CPed, whose first statement is
+// CWorld::Remove(this). That is enough for the script, and it was not enough
+// here.
+//
+// CWorld::Remove only unlinks an entity from ms_listMovingEntityPtrs when
+// bIsStatic is clear (addresses.h has the three instructions that prove it).
+// A ped that has gone to sleep still holds its node, so destroying it leaves
+// that node in the list pointing at a pool slot that has just been freed, and
+// CWorld::Process reads m_rwObject straight off it on the next frame. The
+// crash lands at 0x004B1B25 with nothing in the stack to say who did it.
+//
+// A remote ped is exactly the entity this happens to. Its velocity is written
+// from the wire every frame, so a remote player who stands still hands
+// CPhysical::ProcessControl ten quiet frames in a row and gets put to sleep.
+//
+// RemoveFromMovingList is guarded by m_movingListNode, so calling it
+// unconditionally costs four instructions when the ped was never linked.
+void DestroyRemotePed(void *ped) {
+	using ThisFn       = void(__thiscall *)(void *);
+	using RemoveRefsFn = void(__cdecl *)(void *);
+	using DtorFn       = void(__thiscall *)(void *, int);
+
+	if (NeedsMovingListUnlink(Field<uint8_t>(ped, offs::ENTITY_FLAGS_A),
+	                          Field<void *>(ped, offs::MOVING_LIST_NODE) != nullptr))
+		Log("bridge: a remote ped went static while still in the moving list; "
+		    "unlinking it by hand, because CWorld::Remove would have walked past it");
+	Func<ThisFn>(CPhysical__RemoveFromMovingList)(ped);
+
+	Func<RemoveRefsFn>(CWorld__RemoveReferencesToDeletedObject)(ped);
+
+	void *const *vtable  = *reinterpret_cast<void *const *const *>(ped);
+	auto         deleter = reinterpret_cast<DtorFn>(vtable[VTABLE_DELETING_DTOR]);
+	deleter(ped, 1);   // 1 = also free the memory
+
+	--Global<uint32_t>(CPopulation__ms_nTotalMissionPeds);
+}
+
 void *ResolveRemote(RemotePlayer &player) {
 	if (player.poolHandle < 0)
 		return nullptr;
@@ -289,8 +331,32 @@ void *ResolveRemote(RemotePlayer &player) {
 	using GetPedFn = void *(__cdecl *)(int32_t);
 	void *ped      = Func<GetPedFn>(CPools__GetPed)(player.poolHandle);
 
-	if (ped && Field<uintptr_t>(ped, offs::VTABLE) == CCivilianPed__vtable)
+	if (ped && Field<uintptr_t>(ped, offs::VTABLE) == CCivilianPed__vtable) {
+		// The engine has decided this ped has to go. bRemoveFromWorld is the
+		// only flag that lets it delete a ped from inside CWorld::Process's
+		// own walk over the moving list, and CoopIII would find out a frame
+		// later, from a node pointing at freed memory.
+		//
+		// It gets set by things that have nothing to do with us:
+		// CAutomobile::BlowUpCar flags a car's driver and passengers,
+		// CPed::SetDie flags a non-player ped it finds in PED_DRIVING, and
+		// CPed::ProcessControl flags any ped whose m_pMyVehicle has gone.
+		//
+		// So the ped is taken back and destroyed here, on our terms, in
+		// PreFrame, before CGame::Process gets a chance. Clearing the handle
+		// re-arms the two-phase spawn, so the player comes back.
+		if (Field<uint8_t>(ped, offs::ENTITY_FLAGS_D) & offs::ENTITY_REMOVE_FROM_WORLD) {
+			Log("bridge: the engine flagged %s's ped for destruction; taking it back "
+			    "before CWorld::Process does",
+			    player.nick.c_str());
+			DestroyRemotePed(ped);
+			player.poolHandle   = -1;
+			player.spawnPending = true;
+			ForgetRemotePed(player);
+			return nullptr;
+		}
 		return ped;
+	}
 
 	// Losing a ped isn't fatal, but it can never be silent - docs/compat.md
 	// §2.5. Clearing the handle also re-arms the two-phase spawn in
@@ -527,26 +593,21 @@ bool SpawnRemote(RemotePlayer &player) {
 	return true;
 }
 
-// Mirrors COMMAND_DELETE_CHAR: drop the world's references, then invoke the
-// deleting destructor through vtable slot 0, which is how the engine frees a
-// ped back to the pool.
+// COMMAND_DELETE_CHAR's teardown, through DestroyRemotePed above.
+//
+// Resolving first is what makes this safe to call on a player whose ped the
+// engine already took: ResolveRemote says so, clears the handle, and returns
+// null. It can also destroy the ped itself, for a ped the engine has flagged,
+// in which case there is nothing left to do here.
 void DespawnRemote(RemotePlayer &player) {
 	void *ped = ResolveRemote(player);
 	player.poolHandle   = -1;
 	player.spawnPending = false;
 	ForgetRemotePed(player);
 	if (!ped)
-		return;   // engine already destroyed it, ResolveRemote already said so
+		return;   // already gone, and ResolveRemote already said why
 
-	using RemoveRefsFn = void(__cdecl *)(void *);
-	Func<RemoveRefsFn>(CWorld__RemoveReferencesToDeletedObject)(ped);
-
-	using DtorFn         = void(__thiscall *)(void *, int);
-	void *const *vtable  = *reinterpret_cast<void *const *const *>(ped);
-	auto         deleter = reinterpret_cast<DtorFn>(vtable[VTABLE_DELETING_DTOR]);
-	deleter(ped, 1);   // 1 = also free the memory
-
-	--Global<uint32_t>(CPopulation__ms_nTotalMissionPeds);
+	DestroyRemotePed(ped);
 }
 
 // ---- animation, weapon and aim on a remote ped ----------------------------

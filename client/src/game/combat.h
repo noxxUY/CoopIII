@@ -58,6 +58,19 @@ inline bool IsKnownExplosionType(uint8_t type) {
 	return type < EXPLOSION_TYPE_COUNT;
 }
 
+// Is this one of the three explosions a thrown or fired projectile makes?
+//
+// The other seven are things the local world decided on its own: a car, a
+// barrel, a heli. That difference matters while an observer is replaying
+// somebody else's shot. A replayed bullet is still a real bullet in this
+// world, and if it sets a parked car on fire that car's explosion belongs
+// here and has to happen. Only the projectile's own explosion is the
+// thrower's to decide (§1.9.3).
+inline bool IsProjectileExplosion(uint8_t type) {
+	return type == EXPLOSION_GRENADE || type == EXPLOSION_MOLOTOV ||
+	       type == EXPLOSION_ROCKET;
+}
+
 // May an observer replay this weapon through the engine's own CWeapon::Fire?
 //
 // Five get refused, each for its own reason - docs/protocol.md §1.9.2 has
