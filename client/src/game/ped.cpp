@@ -955,10 +955,32 @@ void ApplyOverlay(RemotePlayer &player, void *clump, int pedGroup) {
 		return;
 	}
 
+	const bool running = (player.last.flags & PF_ANIM2_RUNNING) != 0;
+
 	// Start it, or revive it if something has condemned it behind our back:
 	// ASSOC_FADEOUTWHENDONE when it ran to the end, or CPed::SetMoveAnim's
 	// purge of every partial on a change of move state.
 	void *assoc = FindAnimById(clump, want);
+
+	// With one exception, and the rocket launcher is what it is for.
+	//
+	// An animation that has finished and is fading, whose owner has also
+	// stopped running theirs, is an animation that is *supposed* to be
+	// ending. Reviving it holds a pose its owner is already blending out of.
+	//
+	// Every weapon that loops gets out of this by never finishing:
+	// CPed::FireGun wraps it at m_fAnimLoopEnd while the trigger is held.
+	// The rocket launcher does not loop. weapon.dat gives it an
+	// m_fAnimLoopEnd of 99 frames, 3.3 seconds, longer than the animation
+	// itself, and CPed::FireGun's other arm for ending an attack is switched
+	// off for projectile weapons: `!IsRunning() && m_eWeaponFire !=
+	// WEAPON_FIRE_PROJECTILE`. So a rocket's animation plays once, finishes,
+	// fades, and goes, which is the whole of how a rocket launcher looks.
+	// Reviving it turned that into a pose held until the sender stopped
+	// naming it.
+	if (assoc && AnimIsCondemned(assoc) && !running)
+		return;
+
 	if (!assoc || AnimIsCondemned(assoc)) {
 		if (!BlendRemoteAnim(player, clump, pedGroup, want, player.last.animTime2,
 		                     1.0f, false))
@@ -969,8 +991,7 @@ void ApplyOverlay(RemotePlayer &player, void *clump, int pedGroup) {
 	}
 	player.appliedAnimId2 = want;
 
-	const bool running = (player.last.flags & PF_ANIM2_RUNNING) != 0;
-	int32_t   &flags   = Field<int32_t>(assoc, ANIM_FLAGS);
+	int32_t &flags = Field<int32_t>(assoc, ANIM_FLAGS);
 	if (running)
 		flags |= ASSOC_RUNNING;
 	else

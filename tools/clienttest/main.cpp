@@ -1786,6 +1786,43 @@ void TestAnimClumpLimit() {
 	      "and seventeen has to lose enough to get back under");
 }
 
+// Weapons whose animation does not loop, and the numbers that say so.
+//
+// Taken from the game's own data\weapon.dat, which CWeaponInfo::LoadWeaponData
+// divides by 30 to get seconds. The rocket launcher's row is
+// `WEAPON_sniper null 0 99 14 0 175 804`: loop start 0, loop end 99 frames.
+void TestNonLoopingWeapons() {
+	std::printf("\nweapons whose animation plays once\n");
+
+	// 99 frames is 3.3 seconds, longer than the animation, so the wrap that
+	// CPed::FireGun does at m_fAnimLoopEnd never comes. A rocket plays once
+	// and fades, and that is what it is supposed to look like.
+	constexpr float ROCKET_LOOP_START = 0.0f;
+	constexpr float ROCKET_LOOP_END   = 99.0f / 30.0f;
+	Check(!WeaponAnimShouldLoop(0.5f, ROCKET_LOOP_START, ROCKET_LOOP_END),
+	      "the rocket launcher does not wrap mid-animation");
+	Check(!WeaponAnimShouldLoop(3.0f, ROCKET_LOOP_START, ROCKET_LOOP_END),
+	      "nor near the end of any real animation");
+
+	// The pistol's row is `WEAPON_hgun_body RBLOCK_Cshoot 8 15 9 9 173 192`,
+	// so it wraps half a second in, over and over, which is what holding the
+	// trigger looks like.
+	constexpr float PISTOL_LOOP_START = 8.0f / 30.0f;
+	constexpr float PISTOL_LOOP_END   = 15.0f / 30.0f;
+	Check(WeaponAnimShouldLoop(0.55f, PISTOL_LOOP_START, PISTOL_LOOP_END),
+	      "the pistol wraps at fifteen frames");
+	Check(!WeaponAnimShouldLoop(0.30f, PISTOL_LOOP_START, PISTOL_LOOP_END),
+	      "and not before it");
+
+	// The sniper rifle shares WEAPON_sniper with the rocket launcher and has
+	// a completely different loop, `0 10 3 0`. Reading the bounds off the
+	// weapon rather than off the animation id is what keeps those apart.
+	constexpr float SNIPER_LOOP_END = 10.0f / 30.0f;
+	Check(WeaponAnimShouldLoop(0.5f, 0.0f, SNIPER_LOOP_END),
+	      "the same animation loops for the sniper, which is why the bounds "
+	      "come from the weapon and not from the id");
+}
+
 void TestWeaponAnimLoop() {
 	std::printf("\nthe firing loop of a weapon animation\n");
 
@@ -2466,6 +2503,7 @@ int main() {
 	TestMovingListTeardown();
 	TestMovingListNodeSanity();
 	TestAnimClumpLimit();
+	TestNonLoopingWeapons();
 	TestWeaponAnimLoop();
 	TestRemoteDamageToTheLocalPlayer();
 	TestDeathAnimChoice();
