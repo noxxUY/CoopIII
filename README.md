@@ -11,6 +11,14 @@ run.
 Still being built. Networking and vehicles work and players can see each other
 in the city; there's more detail at the bottom.
 
+<hr>
+
+## Demostration
+
+<p align="center">
+  <video src="docs/assets/vid.mp4" width="800" controls></video>
+</p>
+
 ## Disclaimer
 
 Unofficial mod, requires a legitimate copy of GTA III. No Rockstar files or
