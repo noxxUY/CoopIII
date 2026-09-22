@@ -2336,6 +2336,279 @@ void TestProjectileWeapons() {
 	Check(!IsKnownExplosionType(255), "and neither is a byte of garbage");
 }
 
+// ---- where a replayed projectile starts, and which way it points -----------
+//
+// The rocket that arrived as an explosion and never flew. The whole of it is
+// one arm of CProjectileInfo::AddProjectile that ignores its `pos` argument,
+// and the whole of the fix is knowing which arm that is, so that is what gets
+// pinned here rather than the effect.
+
+void TestProjectileSpawnPoint() {
+	std::printf("\nwhich projectiles the engine puts somewhere we did not ask for\n");
+
+	// 0x0055B4A6: `matrix = ped->GetMatrix()`, then straight on to the
+	// velocity. The pos argument is never read, so the rocket is born at the
+	// thrower's own origin, inside their collision.
+	Check(ProjectileSpawnsAtThrower(WEAPONTYPE_ROCKETLAUNCHER),
+	      "a rocket from a ped that is not the player starts inside that ped");
+
+	// 0x0055B11C and 0x0055B25B: both add pos into the matrix, field for
+	// field. These two were never broken and must not be 'fixed'.
+	Check(!ProjectileSpawnsAtThrower(WEAPONTYPE_GRENADE),
+	      "a grenade starts where it was thrown from");
+	Check(!ProjectileSpawnsAtThrower(WEAPONTYPE_MOLOTOV),
+	      "and so does a molotov");
+	Check(!ProjectileSpawnsAtThrower(WEAPONTYPE_UZI),
+	      "a weapon with no projectile has no spawn point to get wrong");
+}
+
+void TestProjectileBasis() {
+	std::printf("\nthe matrix rows a projectile flies with\n");
+
+	auto len = [](const Vec3 &v) {
+		return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+	};
+	auto dot = [](const Vec3 &a, const Vec3 &b) {
+		return a.x * b.x + a.y * b.y + a.z * b.z;
+	};
+	auto closeTo = [](float a, float b) { return std::fabs(a - b) < 1.0e-4f; };
+	auto sameVec = [&](const Vec3 &a, const Vec3 &b) {
+		return closeTo(a.x, b.x) && closeTo(a.y, b.y) && closeTo(a.z, b.z);
+	};
+
+	// An orthonormal frame or nothing. A matrix that is neither is what
+	// reaches RenderWare's frame and the projectile's own collision box.
+	auto orthonormal = [&](const Vec3 &d) {
+		Vec3 r{}, f{}, u{};
+		if (!ProjectileBasis(d, r, f, u))
+			return false;
+		return closeTo(len(r), 1.0f) && closeTo(len(f), 1.0f) && closeTo(len(u), 1.0f) &&
+		       closeTo(dot(r, f), 0.0f) && closeTo(dot(f, u), 0.0f) && closeTo(dot(u, r), 0.0f);
+	};
+
+	Check(orthonormal(Vec3{0.0f, 1.0f, 0.0f}), "due north is an orthonormal frame");
+	Check(orthonormal(Vec3{0.6f, -0.3f, 0.2f}), "and so is an arbitrary aim");
+
+	// A rocket launcher points straight up perfectly happily, and that is
+	// exactly where Cross(worldUp, dir) collapses to nothing. If the fallback
+	// reference is missing this is the case that produces a zero row.
+	Check(orthonormal(Vec3{0.0f, 0.0f, 1.0f}), "straight up still has a frame");
+	Check(orthonormal(Vec3{0.0f, 0.0f, -1.0f}), "so does straight down");
+
+	Vec3 r{}, f{}, u{};
+	Check(ProjectileBasis(Vec3{0.0f, 4.0f, 0.0f}, r, f, u) &&
+	          sameVec(f, Vec3{0.0f, 1.0f, 0.0f}),
+	      "forward is the direction, normalised - the wire carries dir and speed "
+	      "separately and only dir belongs in the matrix");
+
+	// CProjectileInfo::AddProjectile's player arm is
+	// `right = CrossProduct(Up, Front)`, and what comes out of here has to
+	// obey the same identity or a replayed rocket is mirrored against the
+	// one its owner is looking at.
+	Check(ProjectileBasis(Vec3{0.3f, 0.5f, -0.8f}, r, f, u) &&
+	          sameVec(Vec3{u.y * f.z - u.z * f.y, u.z * f.x - u.x * f.z,
+	                       u.x * f.y - u.y * f.x},
+	                  r),
+	      "right is CrossProduct(up, forward), the engine's own handedness");
+
+	// Everything below is a direction that is not one, and each of them can
+	// arrive off a socket. A NaN row in an entity matrix does not fault where
+	// it is written; it faults in collision, a frame or two later.
+	Check(!ProjectileBasis(Vec3{0.0f, 0.0f, 0.0f}, r, f, u),
+	      "a zero direction is refused rather than normalised by zero");
+
+	const float nan = std::numeric_limits<float>::quiet_NaN();
+	const float inf = std::numeric_limits<float>::infinity();
+	Check(!ProjectileBasis(Vec3{nan, 0.0f, 0.0f}, r, f, u), "a NaN is refused");
+	Check(!ProjectileBasis(Vec3{0.0f, inf, 0.0f}, r, f, u), "an infinity is refused");
+	Check(!ProjectileBasis(Vec3{1.0e-9f, 0.0f, 0.0f}, r, f, u),
+	      "and so is a direction too short to normalise without exploding");
+}
+
+// ---- aiming somebody else's shot --------------------------------------------
+
+namespace aim {
+
+float Len(const Vec3 &v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
+float Dot(const Vec3 &a, const Vec3 &b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+bool  Close(float a, float b, float eps = 1.0e-4f) { return std::fabs(a - b) < eps; }
+bool  SameVec(const Vec3 &a, const Vec3 &b, float eps = 1.0e-4f) {
+	 return Close(a.x, b.x, eps) && Close(a.y, b.y, eps) && Close(a.z, b.z, eps);
+}
+
+} // namespace aim
+
+void TestInstantHitWeapons() {
+	std::printf("\nwhich shots are a line the engine traces\n");
+
+	// CWeapon::Fire's jump table, arms 2/3/5 (FireInstantHit), 4 (FireShotgun)
+	// and 6 (M16). These five are the ones whose direction the replay can
+	// steer, because they are the ones that reach CWeapon::DoDoomAiming.
+	Check(IsInstantHitWeapon(WEAPONTYPE_COLT45) && IsInstantHitWeapon(WEAPONTYPE_UZI) &&
+	          IsInstantHitWeapon(WEAPONTYPE_AK47) && IsInstantHitWeapon(WEAPONTYPE_M16),
+	      "the four ordinary guns trace a ray");
+	Check(IsInstantHitWeapon(WEAPONTYPE_SHOTGUN),
+	      "and so does the shotgun, five times per trigger pull");
+
+	// Each of these would be a log line about a shot that has no line, every
+	// time somebody fired one.
+	Check(!IsInstantHitWeapon(WEAPONTYPE_FLAMETHROWER),
+	      "the flamethrower traces nothing - CShotInfo is a volume, not a line");
+	Check(!IsInstantHitWeapon(WEAPONTYPE_ROCKETLAUNCHER) &&
+	          !IsInstantHitWeapon(WEAPONTYPE_GRENADE) &&
+	          !IsInstantHitWeapon(WEAPONTYPE_MOLOTOV),
+	      "a projectile is an entity with a velocity, not a ray");
+	Check(!IsInstantHitWeapon(WEAPONTYPE_SNIPERRIFLE),
+	      "the sniper traces one and is never replayed, so it is left out on purpose");
+	Check(!IsInstantHitWeapon(WEAPONTYPE_UNARMED) &&
+	          !IsInstantHitWeapon(WEAPONTYPE_BASEBALLBAT) &&
+	          !IsInstantHitWeapon(255),
+	      "melee and garbage trace nothing");
+}
+
+void TestFlatHeadingDirection() {
+	std::printf("\nthe direction the engine derives from a ped's matrix\n");
+
+	// FireInstantHit does heading = Atan2(-fwd.x, fwd.y) and then uses
+	// (-Sin(heading), Cos(heading)), which is (fwd.x, fwd.y) normalised in 2D.
+	// If this disagrees with the engine, the rotation below turns the shot
+	// from the wrong starting point and the trail lands somewhere new rather
+	// than somewhere right.
+	Vec3 out{};
+	Check(FlatHeadingDirection(Vec3{0.0f, 1.0f, 0.0f}, out) &&
+	          aim::SameVec(out, Vec3{0.0f, 1.0f, 0.0f}),
+	      "due north stays due north");
+	Check(FlatHeadingDirection(Vec3{3.0f, 4.0f, 0.0f}, out) &&
+	          aim::SameVec(out, Vec3{0.6f, 0.8f, 0.0f}),
+	      "and an unnormalised row comes back unit");
+
+	// A ped leaning on a slope still shoots along its heading: the engine
+	// throws the z away and so must this.
+	Check(FlatHeadingDirection(Vec3{0.0f, 0.8f, 0.6f}, out) &&
+	          aim::SameVec(out, Vec3{0.0f, 1.0f, 0.0f}),
+	      "the forward row's z is dropped, not projected");
+
+	Check(!FlatHeadingDirection(Vec3{0.0f, 0.0f, 1.0f}, out),
+	      "a forward with no horizontal component is refused rather than divided by zero");
+	const float nan = std::numeric_limits<float>::quiet_NaN();
+	Check(!FlatHeadingDirection(Vec3{nan, 1.0f, 0.0f}, out), "and so is a NaN");
+}
+
+void TestRotateOnto() {
+	std::printf("\nturning the engine's proposal onto the shooter's own line\n");
+
+	Vec3 out{};
+
+	// The single-bullet case, which is the whole fix: the engine proposes a
+	// flat ray along the ped's heading, at the weapon's range, and what comes
+	// back has to be the same length along the wire's direction. 30 m is a
+	// pistol's range.
+	const Vec3 nominal{0.0f, 1.0f, 0.0f};
+	const Vec3 wire{0.0f, 0.8f, 0.6f};   // aimed up at a rooftop
+	Check(RotateOnto(nominal, wire, Vec3{0.0f, 30.0f, 0.0f}, out) &&
+	          aim::SameVec(out, Vec3{0.0f, 24.0f, 18.0f}, 1.0e-3f),
+	      "a flat 30 m ray becomes a 30 m ray along the aim, pitch and all");
+	Check(aim::Close(aim::Len(out), 30.0f, 1.0e-3f), "and it is still 30 m long");
+
+	// Length is the thing that must never change: it is the weapon's range,
+	// which the engine worked out from its own CWeaponInfo and which an
+	// observer has no business adjusting.
+	for (const Vec3 &d : {Vec3{1.0f, 0.0f, 0.0f}, Vec3{-0.3f, 0.5f, 0.8f},
+	                      Vec3{0.0f, 0.0f, 1.0f}, Vec3{0.0f, 0.0f, -1.0f}}) {
+		Vec3 turned{};
+		Check(RotateOnto(nominal, d, Vec3{0.0f, 40.0f, 0.0f}, turned) &&
+		          aim::Close(aim::Len(turned), 40.0f, 1.0e-3f),
+		      "a rotation preserves the ray's length whatever it is turned onto");
+	}
+
+	// The shotgun. Five pellets, 7.5 degrees apart, built as the heading plus
+	// an offset - so the rotation has to move the cone and keep the spread. A
+	// replacement instead of a rotation would stack all five on one another,
+	// and a shotgun that fires a single pellet is a visible regression on the
+	// machine that did not fire it.
+	{
+		const float deg = 7.5f * 3.14159265f / 180.0f;
+		const Vec3  pellet{std::sin(deg) * 30.0f, std::cos(deg) * 30.0f, 0.0f};
+		Vec3        centre{}, edge{};
+		Check(RotateOnto(nominal, wire, Vec3{0.0f, 30.0f, 0.0f}, centre) &&
+		          RotateOnto(nominal, wire, pellet, edge),
+		      "both the middle pellet and an outer one turn");
+
+		Vec3 uc{}, ue{};
+		Check(UnitDirection(centre, uc) && UnitDirection(edge, ue), "both are directions");
+		const float apart = std::acos(aim::Dot(uc, ue)) * 57.2957795f;
+		Check(aim::Close(apart, 7.5f, 0.05f),
+		      "and they are still 7.5 degrees apart afterwards - the spread survives");
+	}
+
+	// Nothing to turn. The engine's proposal is already right, which is what
+	// happens when the shooter was aiming along their own heading.
+	Check(RotateOnto(nominal, nominal, Vec3{0.0f, 30.0f, 0.0f}, out) &&
+	          aim::SameVec(out, Vec3{0.0f, 30.0f, 0.0f}),
+	      "a shot already on the right line is left alone");
+
+	// The undefined case: every axis perpendicular to `from` is a valid
+	// rotation and they give different answers, so the vector is laid along
+	// `to` at its own length instead of picking one at random. Losing a
+	// shotgun's spread for one shot beats losing its direction.
+	Check(RotateOnto(nominal, Vec3{0.0f, -1.0f, 0.0f}, Vec3{0.0f, 30.0f, 0.0f}, out) &&
+	          aim::SameVec(out, Vec3{0.0f, -30.0f, 0.0f}, 1.0e-3f),
+	      "a shot fired exactly backwards still comes out backwards at full length");
+
+	// Everything below arrives off a socket or out of an engine struct, and
+	// the result of any of them is a target position, which becomes a
+	// subscript into CWorld::ms_aSectors.
+	const float nan = std::numeric_limits<float>::quiet_NaN();
+	const float inf = std::numeric_limits<float>::infinity();
+	Check(!RotateOnto(Vec3{0.0f, 0.0f, 0.0f}, wire, Vec3{0.0f, 30.0f, 0.0f}, out),
+	      "a zero nominal is refused");
+	Check(!RotateOnto(nominal, Vec3{0.0f, 0.0f, 0.0f}, Vec3{0.0f, 30.0f, 0.0f}, out),
+	      "a zero wire direction is refused");
+	Check(!RotateOnto(nominal, Vec3{nan, 0.0f, 0.0f}, Vec3{0.0f, 30.0f, 0.0f}, out),
+	      "a NaN direction is refused");
+	Check(!RotateOnto(nominal, wire, Vec3{0.0f, inf, 0.0f}, out),
+	      "and so is an infinite proposal from the engine");
+	Check(!RotateOnto(nominal, wire, Vec3{nan, 0.0f, 0.0f}, out),
+	      "and a NaN one");
+}
+
+void TestShotDirectionIsAveraged() {
+	std::printf("\nthe direction a discharge puts on the wire\n");
+
+	// What the sampler does: sum the unit direction of every ray this
+	// discharge traced, then normalise. Unit, because a shotgun's five rays
+	// are each truncated at whatever they hit - summing the raw vectors would
+	// weight the pellet that happened to fly furthest and put the wire's
+	// direction off to one side of the cone, which is the bug being fixed
+	// rather than a fix for it.
+	const float deg = 7.5f * 3.14159265f / 180.0f;
+	Vec3        sum{0.0f, 0.0f, 0.0f};
+	for (int i = -2; i <= 2; ++i) {
+		const float a = deg * static_cast<float>(i);
+		// A pellet that hit a wall at 2 m and one that flew the full 40.
+		const float reach = (i == -2) ? 2.0f : 40.0f;
+		Vec3        unit{};
+		Check(UnitDirection(Vec3{std::sin(a) * reach, std::cos(a) * reach, 0.0f}, unit),
+		      "each pellet is a direction");
+		sum.x += unit.x;
+		sum.y += unit.y;
+		sum.z += unit.z;
+	}
+
+	Vec3 mean{};
+	Check(UnitDirection(sum, mean), "five pellets average to a direction");
+	Check(aim::Close(mean.x, 0.0f, 1.0e-4f) && aim::Close(mean.y, 1.0f, 1.0e-4f),
+	      "and the average is the middle of the cone, not the pellet that flew furthest");
+
+	// One ray is the ordinary case and has to come through untouched.
+	Vec3 single{};
+	Check(UnitDirection(Vec3{0.0f, 26.0f, 13.0f}, single) &&
+	          aim::Close(aim::Len(single), 1.0f),
+	      "a single ray normalises to itself");
+	Check(single.z > 0.4f,
+	      "and keeps its pitch - the whole point, since the engine's own answer has none");
+}
+
 // ---- time of day and weather ------------------------------------------------
 
 void TestClockDriftIsCircular() {
@@ -3460,6 +3733,12 @@ int main() {
 	TestAngleWrap();
 	TestReplayableWeapons();
 	TestProjectileWeapons();
+	TestProjectileSpawnPoint();
+	TestProjectileBasis();
+	TestInstantHitWeapons();
+	TestFlatHeadingDirection();
+	TestRotateOnto();
+	TestShotDirectionIsAveraged();
 	TestShotNeedsAPed();
 	TestShotIsReplayedOncePerPacket();
 	TestOurOwnShotsAreNotReplayed();

@@ -3543,11 +3543,30 @@ constexpr uintptr_t CWorld__GetIsLineOfSightSectorClear    = 0x004B2000;
 constexpr uintptr_t CWorld__GetIsLineOfSightSectorListClear = 0x004B2160;
 constexpr uintptr_t CWorld__ClearScanCodes                 = 0x004B1F60;
 
-// Recorded because the next person to want a ray will find it first and it is
-// the wrong one for a yes-or-no question. 11 arguments, `add esp,2Ch` at all
-// 45 of its call sites, and it contains the same inlined AdvanceCurrentScanCode
-// at 0x004B0DE6.
-constexpr uintptr_t CWorld__ProcessLineOfSight = 0x004B0DE0;
+// **Refuted, 2026-09-22.** This line used to read
+// `CWorld__ProcessLineOfSight = 0x004B0DE0`, on the evidence that the function
+// takes 11 arguments (`add esp,2Ch` at every call site) and opens with the
+// same inlined AdvanceCurrentScanCode. Both are true and neither separates it
+// from `CWorld::ProcessVerticalLine`, which also takes 11
+// (point1, z2, point, entity, six bools, poly) and also advances the scan
+// code. Three things say it is the vertical one:
+//
+//   - it reads its *first* argument only and derives one sector from it
+//     (`mov esi,[esp+50h] / fld [esi] / fmul 0.025 / fadd 50.0 / fistp`, then
+//     the same for [esi+4]). A line between two points needs the sector of
+//     both ends and a walk between them; a vertical line needs one;
+//   - its frame is 0x40 bytes with three saved registers. The real
+//     ProcessLineOfSight's is 0x260 with four, the size the sector walk needs
+//     and the same shape as GetIsLineOfSightClear above;
+//   - CWeapon::ProcessLineOfSight (0x00564C00) forwards eleven of its
+//     thirteen arguments to 0x004AF970 and to nothing else, and re3
+//     Weapon.cpp:2301-2304 says that call is CWorld::ProcessLineOfSight.
+//
+// Nothing in the tree had used the old constant, so this is a trap that was
+// never sprung rather than a bug that was fixed. The names are now what the
+// functions are.
+constexpr uintptr_t CWorld__ProcessVerticalLine = 0x004B0DE0;
+constexpr uintptr_t CWorld__ProcessLineOfSight  = 0x004AF970;
 
 // The camera's own position, for casting from. CCamera derives from
 // CPlaceable, so it is the matrix position at the usual offs::POSITION:
@@ -3749,6 +3768,125 @@ constexpr float     RADAR_RANGE_AT_SPEED_M  = 350.0f;
 // which is why BLIP_DISPLAY_BOTH and BLIP_DISPLAY_BLIP_ONLY look identical in
 // a normal game and why asking for BLIP_ONLY costs nothing.
 constexpr uintptr_t CTheScripts__DbgFlag = 0x0095CD87;
+// ---- where a bullet goes, and the trail it leaves -------------------------
+//
+// Four symbols, and they exist because of one report: a remote player's
+// bullet trail is drawn in a different place on each screen. The question
+// "does the trail come from the source CoopIII hands the engine, or from the
+// muzzle of the ped it happens to be rendering" is answered here, and the
+// answer is the first one - which is why the fix is about the *direction*.
+//
+// The trail is CBulletTraces, and it is world-space from end to end. Nothing
+// in it reads a screen dimension: AddTrace stores two CVectors, CBulletTrace
+// ::Update walks the near end toward the far one by 0.8 m a frame, and Render
+// builds the quad's width as CrossProduct(TheCamera.GetForward(), sup - inf)
+// normalised and divided by 20 - a fixed 5 cm half-width in metres. A trail
+// cannot move with the resolution. Only its thickness in pixels can.
+//
+//   CBulletTraces::AddTrace   0x00518E90   __cdecl(CVector *start, CVector *target)
+//     `xor eax,eax` then `cmp eax,10h / cmp byte [ebx+72B1D0h],0 / add ebx,1Ch`
+//     is the free-slot search: sixteen entries, 28 bytes each, m_bInUse at
+//     +0x18. `lea ebx,[eax+eax*8] / lea ebx,[ebx+ebx*2] / add ebx,eax` is that
+//     28 again as a multiply. It then copies three floats to +0x00 and three
+//     to +0x0C, sets +0x18, clears +0x19 and finishes
+//     `call CGeneral::GetRandomNumber / and al,1Fh / add al,19h` into +0x1A,
+//     which is re3 SpecialFX.cpp:284-298's `m_lifeTime = 25 + rand % 32`
+//     exactly. Six call sites, and they are re3's six: two in DoBulletImpact,
+//     two in FireShotgun, two in FireInstantHitFromCar.
+//
+//     Retail agrees with re3's NUMBULLETTRACES (16) here. It does not always
+//     agree - the animation node array is twelve where re3 declares sixteen,
+//     and that one crashed the game - so the fact is the `cmp eax,10h`, not
+//     the header.
+//
+//   CWeapon::ProcessLineOfSight  0x00564C00  __cdecl, 13 arguments
+//     A thunk and nothing else: it re-pushes eleven of its thirteen arguments
+//     and drops argument 5 (type) and argument 6 (shooter) on the way to
+//     CWorld::ProcessLineOfSight, which is re3 Weapon.cpp:2301-2304 statement
+//     for statement. `add esp,2Ch` inside, `add esp,34h` at every call site.
+//     Seven call sites and all seven are weapon fire: four in FireInstantHit
+//     (its four branches), one each in FireShotgun, FireM16_1stPerson and
+//     FireInstantHitFromCar. That makes it the one place in the engine where
+//     every instant-hit path states the line it is about to test, before
+//     anything has decided what the line hit.
+//
+//   CWeapon::DoBulletImpact      0x0055F950  __thiscall, `ret 1Ch`
+//     (shooter, victim, source, target, point, ahead.x, ahead.y) - seven
+//     stack dwords, which is the 1Ch, with `this` in ecx. Opens
+//     `push ebx/esi/edi/ebp / sub esp,128h`, then GetWeaponInfo(m_eWeaponType)
+//     off [ecx], then `cmp [esp+144h],0` for `if (victim)`, then
+//     CGlass::WasGlassHitByBullet with the col point's three floats, then
+//     `push eax / push ebx / call 00518E90` - AddTrace(source, &traceTarget).
+//     re3 Weapon.cpp:855-1124.
+//
+//   CWeapon::DoDoomAiming        0x00562EB0  __cdecl(CEntity*, CVector*, CVector*)
+//     `ret` with no immediate, so the caller cleans: re3 declares it static
+//     (Weapon.h:54) and the binary agrees. Its fingerprint is the unused
+//     `CEntity entity;` re3 keeps under #ifndef FIX_BUGS - a stack CEntity
+//     constructed at 0x00473C30 and destructed at 0x00473E40 with nothing in
+//     between. Then `[ebx+50h] and 7 cmp 3` (IsPed) and `[ebx+158h] shr 3
+//     and 1` (bCrouchWhenShooting) for the early return, then
+//     `(*target - *source).Magnitude()` for FindObjectsInRange. Exactly two
+//     call sites, which are re3's two: FireInstantHit (0x0055DAA4) and
+//     FireShotgun (0x00560E20). Everything it does is write `target->z`.
+//
+// **The two facts the whole tracer fix rests on**, both read out of
+// FireInstantHit's fourth branch - the one every ped that is not the local
+// player takes, and therefore the one every remote player takes:
+//
+//   1. The shot's direction is the ped's own matrix forward, flattened.
+//      0x0055D9AC is `fld [ebp+14h] / fchs / fld [ebp+18h] / fpatan`, i.e.
+//      Atan2(-fwd.x, fwd.y), and the sin/cos of that back out to exactly
+//      normalise2D(fwd). Nothing in that branch reads an aim, a look
+//      direction or a camera.
+//
+//   2. The shot is flat. 0x0055DA47 is `mov eax,[esp+98h]` (source.z) and
+//      0x0055DA6F is `mov [esp+8Ch],eax` (target.z) - a dword copy, not an
+//      arithmetic. Only DoDoomAiming above ever puts a slope on it, and that
+//      is this machine's auto-aim at whatever ped it can see, not the
+//      shooter's aim.
+//
+// Which is the whole bug: an observer replaying somebody else's shot got the
+// origin off the wire and then derived the direction from a ped that is
+// interpolated, whose heading is not their aim, and whose pitch is never
+// applied at all (docs/protocol.md 1.8.3). DoDoomAiming is the seam that
+// fixes it, because it is handed `target` as a pointer and the engine's own
+// purpose for it is "move this shot".
+//
+// **And one retail bug found on the way**, which is what the shooter sees on
+// their own screen. FireInstantHit's third branch - the local player using
+// the 3rd-person mouse camera - calls ProcessLineOfSight with its own `src`
+// and `trgt` locals (0x0055D898: `lea eax,[esp+0E8h] / lea edi,[esp+0F4h]`)
+// and never writes the `target` local at [esp+84h]. The shared tail at
+// 0x0055F709 then does `lea eax,[esp+84h]` and passes it to DoBulletImpact,
+// whose no-victim arm is `AddTrace(source, target)`. So a mouse-aimed shot
+// that hits nothing draws its trail from the muzzle to whatever was left in
+// that stack slot. The other three branches all pass `&target` to
+// ProcessLineOfSight itself (branch 1 at 0x0055D79D, its else at 0x0055D859,
+// branch 4 at 0x0055DACD, all `lea ...,[esp+84h]` once the pushes are
+// accounted for), so pointer identity between "the point2 the engine tested"
+// and "the target it is about to draw" is an exact test for whether the
+// branch that ran wrote it.
+constexpr uintptr_t CBulletTraces__AddTrace     = 0x00518E90;
+constexpr uintptr_t CBulletTraces__aTraces      = 0x0072B1B8;
+constexpr size_t    SIZEOF_BULLETTRACE          = 0x1C;
+constexpr int       NUM_BULLET_TRACES           = 16;
+constexpr uintptr_t CWeapon__ProcessLineOfSight = 0x00564C00;
+constexpr uintptr_t CWeapon__DoBulletImpact     = 0x0055F950;
+constexpr uintptr_t CWeapon__DoDoomAiming       = 0x00562EB0;
+
+// Cross-confirmation for a ped offset this file already had, from a function
+// that had nothing to do with how it was first found. FireInstantHit's first
+// branch is `[ebp+50h] and 7 cmp 3` (IsPed) then `cmp dword [ebp+49Ch],0`
+// (m_pPointGunAt), and then it dereferences that pointer as a CEntity: type
+// byte at +0x50, position at +0x34, and +0x1F0 handed to
+// CPedIK::GetComponentPosition - which is offs::PED_IK, already in this file.
+// The byte below it at +0x49B is m_wepAccuracy (`movzx eax,byte [ebp+49Bh]`
+// then `100 - eax`), so the run m_currentWeapon / m_maxWeaponTypeAllowed /
+// m_wepSkills / m_wepAccuracy / m_pPointGunAt lands on 0x498..0x49C exactly
+// as re3 Ped.h:480-484 declares it.
+static_assert(offs::PED_POINT_GUN_AT == 0x49C,
+              "m_pPointGunAt, witnessed again by CWeapon::FireInstantHit");
 
 // ---- helpers --------------------------------------------------------------
 

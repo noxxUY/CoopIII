@@ -33,12 +33,24 @@ namespace {
 //                                     one place to learn that it tried
 //   CPed::SetDie                      and the one place the engine decides
 //                                     which animation a death plays
+//   CWeapon::ProcessLineOfSight       the one place every instant-hit path
+//                                     states the line it is about to test,
+//                                     which is the only honest answer to
+//                                     "where did this shot actually go"
+//   CWeapon::DoBulletImpact           and the one place the trail's far end
+//                                     is chosen, which retail gets wrong for
+//                                     one branch out of four
+//   CWeapon::DoDoomAiming             the engine's own seam for moving a shot
+//                                     that has been aimed and not yet traced
 
 Detour g_fire;
 Detour g_explode;
 Detour g_removeProjectile;
 Detour g_inflictDamage;
 Detour g_setDie;
+Detour g_lineOfSight;
+Detour g_bulletImpact;
+Detour g_doomAiming;
 
 // What S_Welcome said about friendly fire (docs/roadmap.md §5.2). Off until
 // a session says otherwise, which is also the right answer for a client that
@@ -132,6 +144,30 @@ bool g_saidShotReplayed     = false;
 bool g_saidNoProjectile     = false;
 bool g_saidProjectileFlying = false;
 bool g_saidProjectileEnded  = false;
+
+// And once more for where the bullet went, which is this round's report:
+// "el que dispara ve el trail de las balas hacia un lado y el otro player
+// tambien las ve pero un poco corridas de lugar".
+//
+// Four lines, and between them they say which half of the trail was wrong:
+//
+//   aimed      the first replayed shot we pointed along its owner's own line,
+//              and by how many degrees that differed from where this
+//              machine's copy of their ped was facing. That number is the
+//              size of the bug, measured rather than argued about.
+//   notAsked   the engine never called DoDoomAiming for a replayed shot, so
+//              it took a branch that does not ask - the shot went along the
+//              ped's heading and there was nothing we could do about it
+//   noDir      the wire carried something that is not a direction
+//   noRay      our own shot traced no line, so the direction we put on the
+//              wire is the old ped-forward fallback rather than the aim
+//   repaired   retail drew one of our own trails to an uninitialised point
+//              and we gave it the ray's far end instead
+bool g_saidAimApplied    = false;
+bool g_saidAimNotAsked   = false;
+bool g_saidAimNoDir      = false;
+bool g_saidNoLocalRay    = false;
+bool g_saidTrailRepaired = false;
 
 // One flag per gate rather than one for all of them, because the gates are
 // not alternatives. "No ped yet" is normal in the first second of a session
@@ -385,6 +421,215 @@ void EndTrackedFor(uint8_t playerId) {
 			EndTracked(i);
 }
 
+// ---- where a shot actually went -------------------------------------------
+//
+// docs/protocol.md 1.9.7 is the design. The short version:
+//
+// The origin was always right - it is CWeapon::Fire's own fireSource and it
+// has been on the wire since M3. The direction never was. For every ped that
+// is not the local player, CWeapon::FireInstantHit builds the shot's target
+// out of the *ped's matrix forward*, flattened to 2D, with target.z copied
+// from source.z as a dword (addresses.h has both instructions). So a replayed
+// shot on an observer's machine:
+//
+//   - has no pitch at all. Someone firing up at a rooftop draws a horizontal
+//     tracer on every screen but their own;
+//   - has the yaw of an interpolated ped's *body*, which is neither their aim
+//     nor current. At 25 Hz a running player turns several degrees between
+//     snapshots, and the aim can be a long way off the body in any case.
+//
+// Both halves of the report, and neither is the resolution: a trail is two
+// world-space points from end to end (addresses.h, CBulletTraces).
+//
+// So the direction goes on the wire, sampled from the line the shooter's own
+// engine traced, and an observer turns the engine's proposal onto it inside
+// CWeapon::DoDoomAiming - the one function the fire path hands a writable
+// target, whose entire job in retail is to move a shot that has been aimed
+// and not yet traced.
+
+// The ray the local player's own engine is testing, for the shot it is in the
+// middle of firing.
+//
+// `sampling` is only true between the entry and the exit of the local
+// player's own CWeapon::Fire, so the detour costs one predictable branch for
+// every other ped in the city.
+//
+// The sum is of *unit* directions, one per ray, because one trigger pull is
+// not always one ray: a shotgun traces five, 7.5 degrees apart and symmetric
+// about the aim, and each one is truncated at whatever it hit, so averaging
+// the raw vectors would weight the pellet that flew furthest. Averaging the
+// unit directions puts the middle of the cone on the wire, which is what the
+// observer's own five pellets then spread around.
+struct LocalRay {
+	bool         sampling = false;
+	int          rays     = 0;
+	Vec3         sum{};
+	// The far end of the last ray, and the pointer the engine handed us for
+	// it. The pointer is the evidence, not the value - see HookedDoBulletImpact.
+	const float *point2  = nullptr;
+	Vec3         farEnd{};
+};
+
+LocalRay g_localRay;
+
+// Where a shot we are replaying for somebody else is supposed to go.
+//
+// `nominal` is what this machine's engine is about to use on its own - the
+// remote ped's flattened forward - and it is read before the fire path runs
+// rather than re-derived inside it, because by then it is buried in the x87
+// stack. The rotation from nominal to dir is what gets applied.
+struct ReplayAim {
+	void *ped     = nullptr;
+	Vec3  dir{};
+	Vec3  nominal{};
+	int   applied = 0;
+};
+
+ReplayAim g_replayAim;
+
+// __cdecl bool CWeapon::ProcessLineOfSight(CVector const &point1,
+//     CVector const &point2, CColPoint &point, CEntity *&entity,
+//     eWeaponType type, CEntity *shooter, bool x7).
+//
+// Read-only. It never changes an argument and never skips the original: this
+// is the sampler, and the only thing it is allowed to do is notice.
+//
+// The bools are uint32_t rather than bool so they are forwarded as the exact
+// dwords the caller pushed. The engine reads each as a byte, so it would not
+// matter either way, and "would not matter" is not a thing to be relying on
+// in a function that is called for every shot in the city.
+using LineOfSightFn = bool(__cdecl *)(const float *, const float *, void *, void **,
+                                      uint32_t, void *, uint32_t, uint32_t, uint32_t,
+                                      uint32_t, uint32_t, uint32_t, uint32_t);
+
+bool __cdecl HookedProcessLineOfSight(const float *point1, const float *point2,
+                                      void *point, void **entity, uint32_t type,
+                                      void *shooter, uint32_t buildings,
+                                      uint32_t vehicles, uint32_t peds, uint32_t objects,
+                                      uint32_t dummies, uint32_t seeThrough,
+                                      uint32_t someObjects) {
+	if (g_localRay.sampling && point1 && point2) {
+		Vec3 unit;
+		if (UnitDirection(Vec3{point2[0] - point1[0], point2[1] - point1[1],
+		                       point2[2] - point1[2]},
+		                  unit)) {
+			g_localRay.sum.x += unit.x;
+			g_localRay.sum.y += unit.y;
+			g_localRay.sum.z += unit.z;
+			++g_localRay.rays;
+		}
+		g_localRay.point2 = point2;
+		g_localRay.farEnd = Vec3{point2[0], point2[1], point2[2]};
+	}
+
+	return g_lineOfSight.Original<LineOfSightFn>()(point1, point2, point, entity, type,
+	                                               shooter, buildings, vehicles, peds,
+	                                               objects, dummies, seeThrough,
+	                                               someObjects);
+}
+
+// __thiscall void CWeapon::DoBulletImpact(CEntity *shooter, CEntity *victim,
+//     CVector *source, CVector *target, CColPoint *point, CVector2D ahead).
+//
+// Here for one reason, and it is a retail bug rather than a CoopIII one.
+//
+// FireInstantHit's 3rd-person-mouse-camera branch traces its ray through its
+// own `src`/`trgt` locals and never writes the `target` local. The shared
+// tail passes `&target` here anyway, and the no-victim arm of this function
+// is `CBulletTraces::AddTrace(source, target)`. So every mouse-aimed shot
+// that hits nothing draws its trail from the muzzle to whatever the last
+// caller happened to leave in that stack slot - which is most likely a target
+// from an earlier shot, i.e. a trail that points somewhere the player was
+// aiming a moment ago. "El que dispara ve el trail de las balas hacia un
+// lado", exactly.
+//
+// The test for it is exact rather than a tolerance, which is the only reason
+// this detour is here at all. Three of FireInstantHit's four branches hand
+// `&target` to ProcessLineOfSight themselves, so the pointer the sampler above
+// recorded *is* the pointer arriving here. The fourth hands it `&trgt`. So:
+// same pointer means the branch that ran wrote it, different pointer means
+// nothing did. No distance, no epsilon, no guess.
+//
+// Strictly cosmetic. The far end written here has already been traced; only
+// the line that gets drawn changes.
+using ImpactThisFn = void(__thiscall *)(void *, void *, void *, float *, float *, void *,
+                                        float, float);
+using ImpactHookFn = void(__fastcall *)(void *, void *, void *, void *, float *, float *,
+                                        void *, float, float);
+
+void __fastcall HookedDoBulletImpact(void *self, void * /*edx*/, void *shooter,
+                                     void *victim, float *source, float *target,
+                                     void *point, float aheadX, float aheadY) {
+	if (g_localRay.sampling && !victim && target && g_localRay.rays > 0 &&
+	    static_cast<const float *>(target) != g_localRay.point2) {
+		target[0] = g_localRay.farEnd.x;
+		target[1] = g_localRay.farEnd.y;
+		target[2] = g_localRay.farEnd.z;
+
+		if (!g_saidTrailRepaired) {
+			g_saidTrailRepaired = true;
+			Log("combat: retail was about to draw one of our own bullet trails to an "
+			    "uninitialised point - CWeapon::FireInstantHit's mouse-camera branch "
+			    "traces its own locals and never writes the target the tail draws. "
+			    "Gave it the far end of the ray it actually tested, (%.1f %.1f %.1f). "
+			    "This one is single player's bug too, and it is why the shooter's own "
+			    "trail wanders",
+			    g_localRay.farEnd.x, g_localRay.farEnd.y, g_localRay.farEnd.z);
+		}
+	}
+
+	g_bulletImpact.Original<ImpactHookFn>()(self, nullptr, shooter, victim, source,
+	                                        target, point, aheadX, aheadY);
+}
+
+// __cdecl void CWeapon::DoDoomAiming(CEntity *shooter, CVector *source,
+//                                    CVector *target).
+//
+// The write seam, and the whole fix on the observer's side.
+//
+// For a shot we are replaying, the original is not called at all. Everything
+// it does is nudge target->z toward a ped *this* machine found near the
+// shooter, which is this machine deciding where somebody else's bullet goes -
+// the same rule that stops an observer deciding damage, applied to the shot
+// that would cause it. The owner's own engine already ran its own auto-aim,
+// or its camera, or its lock-on, and the answer to all three is on the wire.
+//
+// Every other caller - every ped in the city, and the local player - goes
+// straight through.
+using DoomAimingFn = void(__cdecl *)(void *, float *, float *);
+
+void __cdecl HookedDoDoomAiming(void *shooter, float *source, float *target) {
+	if (g_replayAim.ped && shooter == g_replayAim.ped && source && target) {
+		Vec3 turned;
+		if (RotateOnto(g_replayAim.nominal, g_replayAim.dir,
+		               Vec3{target[0] - source[0], target[1] - source[1],
+		                    target[2] - source[2]},
+		               turned)) {
+			target[0] = source[0] + turned.x;
+			target[1] = source[1] + turned.y;
+			target[2] = source[2] + turned.z;
+			++g_replayAim.applied;
+
+			if (!g_saidAimApplied) {
+				g_saidAimApplied = true;
+				const float dot = vec::Dot(g_replayAim.nominal, g_replayAim.dir);
+				const float clamped = dot > 1.0f ? 1.0f : (dot < -1.0f ? -1.0f : dot);
+				Log("combat: pointed our first replayed shot along its owner's own line "
+				    "instead of along our copy of their ped. The two were %.1f degrees "
+				    "apart - their line is (%.2f %.2f %.2f), their ped here is facing "
+				    "(%.2f %.2f %.2f). Anything more than about a degree is a trail in "
+				    "the wrong street",
+				    std::acos(clamped) * 57.2957795f, g_replayAim.dir.x,
+				    g_replayAim.dir.y, g_replayAim.dir.z, g_replayAim.nominal.x,
+				    g_replayAim.nominal.y, g_replayAim.nominal.z);
+			}
+			return;
+		}
+	}
+
+	g_doomAiming.Original<DoomAimingFn>()(shooter, source, target);
+}
+
 // ---- sampling the local player --------------------------------------------
 
 // The muzzle, as the engine computed it.
@@ -437,7 +682,29 @@ void RecordLocalShot(const void *weapon, const void *shooter,
 	    const_cast<void *>(weapon), offs::WEAPON_TYPE));
 	ev.shot.speed  = 0.0f;
 	ReadFireSource(fireSource, shooter, ev.shot.origin);
+
+	// The fallback, and until this round it was the only thing `dir` ever
+	// carried for a bullet: the shooter's body forward. It is what the
+	// observer's engine would have derived for itself anyway, so falling back
+	// to it costs exactly the behaviour this change is fixing and never less.
 	ReadForward(shooter, ev.shot.dir);
+
+	// The line the engine actually traced, averaged over however many rays
+	// this discharge was. This is the aim - the camera's, the lock-on's or the
+	// hand bone's, whichever branch ran - and no branch logic of our own was
+	// needed to get it, which is the point of sampling rather than deriving.
+	if (IsInstantHitWeapon(ev.shot.weapon)) {
+		Vec3 aim;
+		if (g_localRay.rays > 0 && UnitDirection(g_localRay.sum, aim)) {
+			ev.shot.dir = aim;
+		} else if (!g_saidNoLocalRay) {
+			g_saidNoLocalRay = true;
+			Log("combat: our own shot with weapon %u traced no line we could read, so "
+			    "the direction on the wire is our ped's body heading rather than our "
+			    "aim. Everyone watching will draw the trail flat",
+			    ev.shot.weapon);
+		}
+	}
 
 	if (IsProjectileWeapon(ev.shot.weapon)) {
 		const uint32_t created = InUseMask() & ~before;
@@ -520,10 +787,28 @@ bool __fastcall HookedFire(void *self, void * /*edx*/, void *shooter,
 	                Field<uint32_t>(self, offs::WEAPON_TYPE)));
 	const uint32_t before = projectile ? InUseMask() : 0u;
 
+	// This is the window the ray sampler runs in, and it has to be opened
+	// before the original rather than after it, because the ray is traced and
+	// forgotten inside the call. Only the local player's own trigger pull: a
+	// replayed shot is already somebody else's line being drawn, and a city
+	// NPC's is nobody's business.
+	const bool ours = !g_replaying && shooter && shooter == PlayerPed();
+	if (ours) {
+		g_localRay          = LocalRay{};
+		g_localRay.sampling = true;
+	}
+
 	const bool fired =
 	    g_fire.Original<FireHookFn>()(self, nullptr, shooter, fireSource);
 
-	if (fired && !g_replaying && shooter && shooter == PlayerPed())
+	// Closed only by whoever opened it. Nothing nests today - the replay is
+	// driven from the net drain, not from inside a local shot - and a window
+	// that closes itself from a call it did not open is how that stops being
+	// true quietly.
+	if (ours)
+		g_localRay.sampling = false;
+
+	if (fired && ours)
 		RecordLocalShot(self, shooter, fireSource, before);
 
 	return fired;
@@ -818,6 +1103,8 @@ bool InstallCombatHooks() {
 		t = Tracked{};
 	g_head = g_count = 0;
 	g_dropped        = 0;
+	g_localRay       = LocalRay{};
+	g_replayAim      = ReplayAim{};
 
 	struct Spec {
 		const char *name;
@@ -834,6 +1121,12 @@ bool InstallCombatHooks() {
 	    {"CPed::InflictDamage", CPed__InflictDamage,
 	     reinterpret_cast<void *>(&HookedInflictDamage), &g_inflictDamage},
 	    {"CPed::SetDie", CPed__SetDie, reinterpret_cast<void *>(&HookedSetDie), &g_setDie},
+	    {"CWeapon::ProcessLineOfSight", CWeapon__ProcessLineOfSight,
+	     reinterpret_cast<void *>(&HookedProcessLineOfSight), &g_lineOfSight},
+	    {"CWeapon::DoBulletImpact", CWeapon__DoBulletImpact,
+	     reinterpret_cast<void *>(&HookedDoBulletImpact), &g_bulletImpact},
+	    {"CWeapon::DoDoomAiming", CWeapon__DoDoomAiming,
+	     reinterpret_cast<void *>(&HookedDoDoomAiming), &g_doomAiming},
 	};
 
 	bool all = true;
@@ -869,14 +1162,20 @@ void RemoveCombatHooks() {
 	g_removeProjectile.Remove();
 	g_inflictDamage.Remove();
 	g_setDie.Remove();
+	g_lineOfSight.Remove();
+	g_bulletImpact.Remove();
+	g_doomAiming.Remove();
 	g_count = g_head = 0;
-	g_friendlyFire = false;
+	g_friendlyFire   = false;
+	g_localRay       = LocalRay{};
+	g_replayAim      = ReplayAim{};
 }
 
 bool CombatHooksInstalled() {
 	return g_fire.IsInstalled() && g_explode.IsInstalled() &&
 	       g_removeProjectile.IsInstalled() && g_inflictDamage.IsInstalled() &&
-	       g_setDie.IsInstalled();
+	       g_setDie.IsInstalled() && g_lineOfSight.IsInstalled() &&
+	       g_bulletImpact.IsInstalled() && g_doomAiming.IsInstalled();
 }
 
 void SetFriendlyFire(bool enabled) { g_friendlyFire = enabled; }
@@ -973,10 +1272,58 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
 	const bool projectile = IsProjectileWeapon(shot.weapon);
 	const uint32_t before = projectile ? InUseMask() : 0u;
 
+	// Point the shot where its owner pointed it (docs/protocol.md 1.9.7).
+	//
+	// `nominal` is read here rather than inside the detour because this is the
+	// last moment it is a field: by the time FireInstantHit calls
+	// DoDoomAiming, the heading it derived is three x87 registers deep.
+	g_replayAim = ReplayAim{};
+	if (IsInstantHitWeapon(shot.weapon)) {
+		Vec3 wire, nominal;
+		if (UnitDirection(shot.dir, wire) &&
+		    FlatHeadingDirection(ReadVec3(ped, offs::MATRIX_FWD), nominal)) {
+			g_replayAim.ped     = ped;
+			g_replayAim.dir     = wire;
+			g_replayAim.nominal = nominal;
+		} else if (!g_saidAimNoDir) {
+			g_saidAimNoDir = true;
+			Log("combat: a shot from player net %u carried (%.2f %.2f %.2f), which is "
+			    "not a direction, so it goes wherever our copy of their ped is facing",
+			    player.netId, shot.dir.x, shot.dir.y, shot.dir.z);
+		}
+	}
+
+	// A ped with a gun target takes FireInstantHit's first branch, which aims
+	// at that target and never calls DoDoomAiming - so the correction above
+	// would silently do nothing. Nothing in CoopIII sets this on a remote ped;
+	// the engine's own AI can, and a remote player's shot is not the engine's
+	// to aim. Put back immediately afterwards, same value, so the reference
+	// the target registered on this field is untouched.
+	void *const pointGunAt = Field<void *>(ped, offs::PED_POINT_GUN_AT);
+	if (pointGunAt)
+		Field<void *>(ped, offs::PED_POINT_GUN_AT) = nullptr;
+
 	{
 		ReplayGuard guard;
 		Func<FireThisFn>(CWeapon__Fire)(weapon, ped, source);
 	}
+
+	if (pointGunAt)
+		Field<void *>(ped, offs::PED_POINT_GUN_AT) = pointGunAt;
+
+	// The engine never asked us where the shot was going. That means it took
+	// a branch that does not call DoDoomAiming, and the shot went along the
+	// remote ped's body heading - which is the bug this is here to fix, so it
+	// says so rather than looking like success.
+	if (g_replayAim.ped && g_replayAim.applied == 0 && !g_saidAimNotAsked) {
+		g_saidAimNotAsked = true;
+		Log("combat: replayed a shot for player net %u with weapon %u and the engine "
+		    "never called CWeapon::DoDoomAiming, so we could not aim it. It went along "
+		    "their ped's heading here. Either the hook is not installed (the lines "
+		    "above say) or FireInstantHit took a branch that skips it",
+		    player.netId, shot.weapon);
+	}
+	g_replayAim = ReplayAim{};
 
 	if (localPed && !wasProof)
 		Field<uint8_t>(localPed, offs::ENTITY_FLAGS_C) = static_cast<uint8_t>(
@@ -985,8 +1332,10 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
 	if (!g_saidShotReplayed) {
 		g_saidShotReplayed = true;
 		Log("combat: replayed our first remote shot through the engine's own "
-		    "CWeapon::Fire - player net %u, weapon %u, from (%.1f %.1f %.1f)",
-		    player.netId, shot.weapon, shot.origin.x, shot.origin.y, shot.origin.z);
+		    "CWeapon::Fire - player net %u, weapon %u, from (%.1f %.1f %.1f) along "
+		    "(%.2f %.2f %.2f)",
+		    player.netId, shot.weapon, shot.origin.x, shot.origin.y, shot.origin.z,
+		    shot.dir.x, shot.dir.y, shot.dir.z);
 	}
 
 	if (!projectile)

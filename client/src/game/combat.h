@@ -87,9 +87,126 @@ inline Vec3 Cross(const Vec3 &a, const Vec3 &b) {
 	return Vec3{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
 }
 
+inline float Dot(const Vec3 &a, const Vec3 &b) {
+	return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
 inline float LengthSq(const Vec3 &v) { return v.x * v.x + v.y * v.y + v.z * v.z; }
 
 } // namespace vec
+
+// ---- which shots are a ray the engine traces ------------------------------
+//
+// CWeapon::Fire's jump table at 0x00603184, arms 2/3/5 and 4 and 6: the five
+// weapons whose discharge ends in CWeapon::ProcessLineOfSight, and therefore
+// the five whose direction the fix below can steer.
+//
+// The sniper is deliberately absent even though FireSniper traces a ray too.
+// It is not replayed at all (IsReplayableWeapon, and the reason is in the
+// comment there), so there is nothing to aim; including it would only make
+// the local sampler log about a shot nobody replays.
+//
+// The flamethrower is absent because it traces nothing: FireAreaEffect hands
+// the shot to CShotInfo, which is a moving volume rather than a line, and it
+// has no trail and no impact point. Its direction still comes off the remote
+// ped's heading on an observer's machine, which is a known residual rather
+// than an oversight.
+inline bool IsInstantHitWeapon(uint8_t weapon) {
+	switch (weapon) {
+	case WEAPONTYPE_COLT45:
+	case WEAPONTYPE_UZI:
+	case WEAPONTYPE_SHOTGUN:
+	case WEAPONTYPE_AK47:
+	case WEAPONTYPE_M16:
+		return true;
+	default:
+		return false;
+	}
+}
+
+// ---- aiming a shot that belongs to somebody else --------------------------
+//
+// A unit vector, or false if `v` is not a direction. Same guards as
+// ProjectileBasis below and for the same reason: every one of these arrives
+// off a socket or out of an engine struct, and a NaN that reaches a target
+// position becomes a NaN subscript into CWorld::ms_aSectors.
+inline bool UnitDirection(const Vec3 &v, Vec3 &out) {
+	const float len2 = vec::LengthSq(v);
+	// Negated so a NaN, which compares false against everything, is refused
+	// by both halves rather than sneaking through one of them.
+	if (!(len2 > 1.0e-8f) || !(len2 < 1.0e8f))
+		return false;
+	const float inv = 1.0f / std::sqrt(len2);
+	out             = Vec3{v.x * inv, v.y * inv, v.z * inv};
+	return true;
+}
+
+// The direction the engine itself derives from a ped's matrix when that ped
+// fires: the forward row, flattened to 2D and normalised.
+//
+// Not an approximation of it - it is the same number. FireInstantHit takes
+// `heading = Atan2(-fwd.x, fwd.y)` and then uses `(-Sin(heading),
+// Cos(heading))`, and sin(atan2(-x,y)) is -x/r with cos y/r, so the pair is
+// (x/r, y/r) with r the 2D length. addresses.h carries the disassembly.
+//
+// False for a forward row with no horizontal component at all, which a ped
+// standing on the ground does not have.
+inline bool FlatHeadingDirection(const Vec3 &forward, Vec3 &out) {
+	return UnitDirection(Vec3{forward.x, forward.y, 0.0f}, out);
+}
+
+// `v` turned by the rotation that takes the unit vector `from` onto the unit
+// vector `to`, preserving its length.
+//
+// Why a rotation rather than "replace the direction": one trigger pull of a
+// shotgun is five separate rays, 7.5 degrees apart, and the engine builds each
+// one as the ped's heading plus an offset. Rotating the engine's own proposal
+// keeps that spread and moves the whole cone onto the shooter's line;
+// replacing it would stack all five pellets on one another.
+//
+// Rodrigues, written so the axis is never normalised: with k = from x to and
+// s2 = |k|^2, the usual v*cos + (n x v)*sin + n*(n.v)*(1-cos) becomes
+// v*c + (k x v) + k*(k.v)*(1-c)/s2, which has one division and no square
+// root.
+//
+// Two degenerate cases, and they are not the same:
+//   from ~= to    nothing to turn. v comes back unchanged.
+//   from ~= -to   the axis is undefined - every axis perpendicular to `from`
+//                 is a valid answer and they give different results. Rather
+//                 than pick one, the whole vector is laid along `to` at its
+//                 own length. A shotgun fired while its owner's ped faces
+//                 the other way loses its spread for that one shot, which is
+//                 a great deal better than losing its direction.
+inline bool RotateOnto(const Vec3 &from, const Vec3 &to, const Vec3 &v, Vec3 &out) {
+	Vec3 f, t;
+	if (!UnitDirection(from, f) || !UnitDirection(to, t))
+		return false;
+
+	const float len2 = vec::LengthSq(v);
+	if (!(len2 >= 0.0f) || !(len2 < 1.0e12f))
+		return false;   // a NaN or an absurd length in the engine's proposal
+
+	const Vec3  k  = vec::Cross(f, t);
+	const float s2 = vec::LengthSq(k);
+	const float c  = vec::Dot(f, t);
+
+	if (!(s2 > 1.0e-12f)) {
+		if (c > 0.0f) {
+			out = v;   // already pointing the same way
+			return true;
+		}
+		const float len = std::sqrt(len2);
+		out             = Vec3{t.x * len, t.y * len, t.z * len};
+		return true;
+	}
+
+	const Vec3  kxv   = vec::Cross(k, v);
+	const float scale = vec::Dot(k, v) * (1.0f - c) / s2;
+	out               = Vec3{v.x * c + kxv.x + k.x * scale,
+                             v.y * c + kxv.y + k.y * scale,
+                             v.z * c + kxv.z + k.z * scale};
+	return true;
+}
 
 // The three matrix rows for a projectile flying along `dir`, or false if
 // `dir` isn't a direction.

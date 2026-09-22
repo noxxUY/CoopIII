@@ -230,6 +230,13 @@ local `CPlayerPed`, and `MoveLimb` drags the torso back toward that zero at
 a twitch, not an aim. Doing it properly means detouring `AimGun`; that belongs
 with M3, where the pitch has to agree with the shot vector anyway.
 
+**Update (§1.9.7).** The shot vector no longer waits for this. A replayed shot
+is aimed by correcting the *target* the fire path is about to trace, not by
+aiming the ped, so a remote player's bullets go up and down correctly while
+their arms stay level. What is left for an `AimGun` detour is the arms
+themselves, which is now a cosmetic mismatch on the ped rather than a wrong
+bullet.
+
 ### 1.9 Combat: a shot is an event, a trigger is a state, a projectile is an entity
 
 Three different things get called "firing" and they need three different
@@ -505,6 +512,113 @@ that slot to `WEAPONSTATE_READY` before each shot. A remote player's clip is not
 a thing anyone can see; what it *can* do is make `CWeapon::Fire` refuse
 (`if (m_nAmmoInClip <= 0) return false`) and silently stop rendering their
 shots. Syncing the real count would buy nothing and add a failure mode.
+
+#### 1.9.7 The direction goes on the wire, and the observer aims with it
+
+Reported from a live two-client session: both machines draw a bullet trail and
+they draw it in different places. The shooter's goes one way, the observer's is
+displaced.
+
+**It is not the resolution**, which was the first guess and is ruled out by
+what a trail is. `CBulletTraces::AddTrace` (`0x00518E90`) stores two
+world-space `CVector`s; `CBulletTrace::Update` walks the near end toward the
+far one by 0.8 m a frame; `CBulletTraces::Render` builds the quad from those
+two points and takes its *width* from
+`CrossProduct(TheCamera.GetForward(), sup - inf)` normalised and divided by 20
+— a fixed 5 cm half-width in metres. Nothing in the path reads a screen
+dimension. A different resolution draws the same segment thinner, not
+elsewhere.
+
+**It is the direction, and until now the direction was not on the wire in any
+usable sense.** `ShotBody` carried `dir`, and §1.9's own note said the receiver
+did not aim with it. The receiver replayed through `CWeapon::Fire`, and for
+every ped that is not the local player `CWeapon::FireInstantHit` takes its
+fourth branch, which does two things (`client/src/game/addresses.h` carries
+both instructions):
+
+1. derives the shot's yaw from the **ped's own matrix forward**, flattened to
+   2D — `Atan2(-fwd.x, fwd.y)` at `0x0055D9AC`, whose sin/cos back out to
+   exactly `normalise2D(fwd)`. Not the aim: the body. And the body is an
+   interpolated copy of a ped that was somewhere else 100 ms ago;
+2. copies `target.z` from `source.z` as a **dword move** (`0x0055DA47` loads
+   it, `0x0055DA6F` stores it). The shot is flat. A player firing up at a
+   rooftop or down off one draws a horizontal tracer on every screen except
+   their own.
+
+Then `CWeapon::DoDoomAiming` puts a slope back on it — aimed at whatever ped
+*the observer's* machine finds near the shooter. That is an observer deciding
+where somebody else's bullet goes, which is the same rule §1.10 applies to
+damage, broken one layer down.
+
+So:
+
+**Sampling.** `dir` is now the unit direction of the line the shooter's own
+engine traced, read from `CWeapon::ProcessLineOfSight` (`0x00564C00`) while the
+local player's `CWeapon::Fire` is running. That function is a thunk with seven
+call sites and all seven are weapon fire, so it is the one place every
+instant-hit path states its line — whichever branch produced it, the camera's,
+a lock-on's or the hand bone's. Nothing about the branching has to be
+re-implemented to read it. A shotgun traces five rays 7.5° apart and symmetric
+about the aim; the unit directions are averaged, so `dir` is the middle of the
+cone.
+
+**Applying.** The observer turns the engine's own proposal onto that line
+inside `CWeapon::DoDoomAiming` (`0x00562EB0`), which is handed `target` as a
+pointer and whose entire purpose in retail is to move a shot that has been
+aimed and not yet traced. It is a *rotation*, not a replacement, so the
+shotgun's five-pellet spread survives and moves with the cone. The original is
+not called for a replayed shot: its auto-aim is this machine's opinion about
+somebody else's bullet.
+
+Because the target is corrected before `ProcessLineOfSight` runs, everything
+downstream follows one ray — the trail, the impact decal, the sparks, the
+glass. A remote ped's `m_pPointGunAt` is cleared for the length of the call and
+put back afterwards, because a ped with a gun target takes the *first* branch
+and never calls `DoDoomAiming` at all.
+
+**No wire layout change, and `PROTOCOL_VERSION` stays 8.** `ShotBody` is the
+same 29 bytes with the same fields in the same order. What changed is what gets
+written into `dir` for an instant-hit weapon, and the old meaning is exactly
+the behaviour this replaced — so a client built before the change still
+interoperates, at the old quality.
+
+**What is left over, honestly.**
+
+- *The 3rd-person mouse camera's offset.* The shooter's own ray starts on the
+  camera ray at the point nearest the muzzle
+  (`CCamera::Find3rdPersonCamTargetVector` does `source += Dot(pos - source,
+  target) * target`), while the trail is drawn from the muzzle. The two are a
+  few tens of centimetres apart laterally and converge with distance, so the
+  observer's reconstruction of the segment is right at the near end and can
+  differ by a few centimetres at the far end of a long shot. Sub-degree.
+- *Interpolation.* The origin is on the wire, so a stale ped no longer moves
+  the trail at all. What is still stale is the ped the trail comes *out of*:
+  the muzzle flash particles are placed at the wire origin, but the hand
+  holding the gun is wherever the interpolation has that ped. At 25 Hz a
+  sprinting player covers about 25 cm between snapshots, and `InterpBuffer`'s
+  100 ms delay is the dominant term — call it a quarter of a metre between the
+  drawn hand and the drawn trail, for a player at a dead run. Standing still it
+  is zero.
+- *Aim pitch on the ped itself.* §1.8.3 still stands: `CPed::AimGun` hard-codes
+  zero pitch for anything that is not the local `CPlayerPed`, so a remote
+  player's arms stay level while their tracer now goes up or down correctly.
+  That is a detour on `AimGun` and it lives with the ped work, not here — the
+  shot's geometry no longer depends on it, because the origin comes off the
+  wire and the direction is applied to the target rather than to the ped.
+- *The flamethrower.* `FireAreaEffect` traces no line and never calls
+  `DoDoomAiming`; its flame still comes off the remote ped's heading.
+- *Retail's own bug, which is the shooter's half of the report.*
+  `FireInstantHit`'s 3rd-person-mouse-camera branch traces through its own
+  `src`/`trgt` locals and **never writes the `target` local**, and the shared
+  tail passes `&target` to `DoBulletImpact` anyway, whose no-victim arm is
+  `AddTrace(source, target)`. So a mouse-aimed shot that hits nothing draws its
+  trail to whatever was left in that stack slot — most often a target from an
+  earlier shot, which looks exactly like a trail veering off to one side.
+  CoopIII repairs it in a `DoBulletImpact` detour, by an *exact* test rather
+  than a tolerance: the other three branches hand `&target` to
+  `ProcessLineOfSight` themselves, so if the pointer arriving at
+  `DoBulletImpact` is not the `point2` the engine just traced, nothing wrote
+  it. Strictly cosmetic — the ray had already been traced either way.
 
 ### 1.10 Damage, death and respawn: the attacker decides the hit, the victim decides the health
 

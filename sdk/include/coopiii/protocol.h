@@ -448,12 +448,27 @@ struct S_VehicleState {
 // dir and speed mean different things depending on weapon type, which is
 // really the whole reason this struct exists:
 //
-//   instant hit (pistol, uzi, shotgun, AK, M16): dir is the shooter's forward
-//     vector at the moment of firing, speed is 0. The receiver doesn't
-//     actually aim with dir. It replays through the engine's own
-//     CWeapon::Fire, which aims off the ped's matrix, and the pose stream
-//     already keeps that close enough. Sent anyway since the owner's aim is
-//     the only correct one, and M3's damage model will want it.
+//   instant hit (pistol, uzi, shotgun, AK, M16): dir is the unit direction of
+//     the line the shooter's own engine traced, speed is 0. Not the ped's
+//     forward vector, which is what this field used to carry and what the
+//     receiver would have derived for itself anyway - it is the aim, whether
+//     that came from the camera, a lock-on or the hand bone, sampled at
+//     CWeapon::ProcessLineOfSight so no branch of the fire path has to be
+//     re-implemented to read it. A shotgun traces five rays and dir is the
+//     middle of that cone.
+//
+//     The receiver aims with it now, which it did not before. It turns the
+//     engine's own proposal onto this line inside CWeapon::DoDoomAiming, so
+//     the trail, the impact decal and the line-of-sight all follow the
+//     shooter rather than an interpolated ped's heading, and a shot fired up
+//     or down is no longer flat on every screen but the shooter's.
+//     docs/protocol.md 1.9.7.
+//
+//     **The layout did not change and PROTOCOL_VERSION did not move.** The
+//     field is the same three floats in the same place; only what is written
+//     into it did. A client built before this change interoperates: it sends
+//     the body forward, the receiver aims along the body forward, and that is
+//     precisely the behaviour this replaced.
 //
 //   projectile (rocket, molotov, grenade): dir is the unit direction of the
 //     projectile's initial CPhysical::m_vecMoveSpeed, speed its magnitude.
