@@ -394,6 +394,23 @@ bool LocalPlayerInVehicle() {
 	return PlayerVehicle() != nullptr;
 }
 
+// The pool ref of the car the local player is in, or -1.
+//
+// This is what tells a late joiner that the car it just got into is one the
+// session already knows about. Without it the claim goes out with
+// INVALID_NETID, the server hands back a second netId for a car it already
+// has, and the joiner ends up driving one copy while observing the other -
+// wheels turning, engine running, car pinned in place by the correction that
+// puts an observed car back where the session last saw it.
+//
+// A ref rather than a pointer for the reason every handle here is a ref:
+// CPool::GetAt tests the slot's free flag, so this stops resolving the
+// instant the engine deletes the car, reused slot or not.
+int32_t SampleLocalVehicleHandle() {
+	void *const vehicle = PlayerVehicle();
+	return vehicle ? VehicleRef(vehicle) : -1;
+}
+
 bool SampleLocalVehicleIdentity(VehicleIdentity &out) {
 	void *const vehicle = PlayerVehicle();
 	if (!vehicle)

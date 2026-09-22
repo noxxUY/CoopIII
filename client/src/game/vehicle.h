@@ -45,6 +45,7 @@ void *ResolveRemoteVehicle(RemoteVehicle &vehicle);
 // joined the colours at protocol 9, and "add another reference argument" was
 // already the wrong shape at four.
 bool SampleLocalVehicleIdentity(VehicleIdentity &out);
+int32_t SampleLocalVehicleHandle();
 
 // Fills `out` from the vehicle the local player is driving. False when the
 // player is on foot, is a passenger rather than the driver, or there's no

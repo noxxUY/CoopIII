@@ -1825,6 +1825,7 @@ WorldBridge MakeWorldBridge() {
 	b.SpawnRemoteVehicle   = &SpawnRemoteVehicle;
 	b.DespawnRemoteVehicle = &DespawnRemoteVehicle;
 	b.SampleLocalVehicleIdentity = &SampleLocalVehicleIdentity;
+	b.SampleLocalVehicleHandle   = &SampleLocalVehicleHandle;
 	b.ApplyRemoteVehicle   = &ApplyRemoteVehicle;
 	b.CorrectRemoteVehicle = &CorrectRemoteVehicle;
 	b.SeatRemotePed        = &SeatRemotePed;
