@@ -763,6 +763,34 @@ void FadeOutPartial(void *clump, uint16_t animId) {
 	});
 }
 
+// Fade out every partial on a clump, without needing to know their ids.
+//
+// A seated ped carries partials CoopIII never added and has no record of.
+// CPed::ProcessControl blends ANIM_STD_CAR_DRIVE_LEFT and its siblings off
+// the car's own m_fSteerAngle (re3 Ped.cpp:2880-2945), and those are
+// ASSOC_PARTIAL. Once the ped is out of the car, nothing maintains them and
+// nothing removes them: FadeOutPartial only knows the id CoopIII applied, so
+// the steering pose stays on a ped standing in the street at whatever weight
+// it had. It used to clear itself when the player jumped, because a change
+// of move state makes CPed::SetMoveAnim purge the partials for its own
+// reasons.
+//
+// Safe to do wholesale at the moment a seat is given up: whatever overlay
+// the wire wants gets re-driven on the next frame anyway, since the seat
+// also clears appliedAnimId2.
+int FadeOutAllPartials(void *clump) {
+	int n = 0;
+	ForEachAnim(clump, [&](void *assoc) {
+		const int32_t flags = Field<int32_t>(assoc, ANIM_FLAGS);
+		if (!(flags & ASSOC_PARTIAL))
+			return;
+		Field<float>(assoc, ANIM_BLEND_DELTA) = -4.0f;
+		Field<int32_t>(assoc, ANIM_FLAGS)     = flags | ASSOC_DELETEFADEDOUT;
+		++n;
+	});
+	return n;
+}
+
 // How many animations are on this clump right now.
 //
 // This is the number RpAnimBlendClumpUpdateAnimations is about to index its
@@ -1651,6 +1679,27 @@ void UnseatRemotePed(RemotePlayer &player) {
 	// Nothing driven into this ped survived the trip - the seat changed its
 	// state and its animations, and the weapon model may have gone with them.
 	// Forgetting what was applied makes the next frame re-drive all of it.
+	//
+	// Forgetting is not enough for the partials, though. The steering
+	// animation belonged to the engine rather than to us, so there is no id
+	// here to fade and ApplyOverlay would leave it running forever. See
+	// FadeOutAllPartials.
+	if (void *const clump = ClumpOf(ped)) {
+		const int dropped = FadeOutAllPartials(clump);
+
+		// Once, because a stuck steering pose is exactly the kind of thing
+		// that gets reported as "sometimes the driving animation stays on
+		// forever" and is impossible to place afterwards.
+		static bool said = false;
+		if (dropped > 0 && !said) {
+			said = true;
+			Log("bridge: %s left a seat still carrying %d partial animation(s); "
+			    "faded them out, because the engine's steering pose is not one "
+			    "we applied and nothing else would have removed it",
+			    player.nick.c_str(), dropped);
+		}
+	}
+
 	player.appliedWeapon  = 0xFFFF;
 	player.appliedAnimId  = ANIM_NONE;
 	player.appliedAnimId2 = ANIM_NONE;
