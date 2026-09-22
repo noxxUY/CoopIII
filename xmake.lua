@@ -32,46 +32,6 @@ target("client")
     add_deps("sdk")
     add_packages("minhook")
 
--- AgentPad.asi, a SEPARATE standalone plugin. Lets an external process drive
--- the game's input by writing CPad's composed state from inside the process,
--- which is the only route that works: synthetic input (keybd_event,
--- PostMessage of WM_KEYDOWN, SendInput with scancodes, synthetic mouse) never
--- reaches GTA III, because it reads DirectInput device state directly.
---
--- Shares nothing with the client at runtime. It reuses client/src/game/verify
--- (same image guard), client/src/hook (same detour helper) and client/src/log
--- because those solve the same problems, not because the mods are coupled.
-target("agentpad")
-    set_kind("shared")
-    set_basename("AgentPad")
-    set_extension(".asi")
-    add_files("agentpad/src/*.cpp",
-              "client/src/hook/*.cpp",
-              "client/src/game/verify.cpp",
-              "client/src/log.cpp")
-    add_includedirs("agentpad/src", "client/src")
-    add_packages("minhook")
-
--- Shared-memory protocol, state encoding and the mouse budget, with no game
--- and no hook. Creates and opens a real named section in-process, and since
--- the section name now carries the pid, running this while GTA III is up no
--- longer attaches to the live game's section (which it used to, and then wrote
--- a pressed button into it).
---
--- intro.cpp and cdstream.cpp are here because the decisions in them (which
--- gGameState transitions are safe to force, and what name this process's
--- streaming semaphore gets) are arithmetic, and arithmetic should not need
--- the game to be tested. Only the parts that touch the process live in
--- functions this cannot reach.
-target("padtest")
-    set_kind("binary")
-    set_default(false)
-    add_files("tools/padtest/*.cpp",
-              "agentpad/src/protocol.cpp", "agentpad/src/channel.cpp",
-              "agentpad/src/settings.cpp", "agentpad/src/intro.cpp",
-              "agentpad/src/cdstream.cpp")
-    add_includedirs("agentpad/src")
-
 -- Standalone authoritative server process.
 target("server")
     set_kind("binary")

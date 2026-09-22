@@ -249,10 +249,9 @@ constexpr uintptr_t CWeather__Update          = 0x00522C10;
 // re3 makes with a literal. 3 and 5 are reached via `++gGameState` instead, so
 // they never show up as an immediate.
 //
-// agentpad/ uses this as its readiness signal, and it's worth knowing why
-// instead of just copying it: it's the only "the game is up" indicator that
-// doesn't go through CTimer, and CTimer is disputed (see the long note in
-// game/frame.cpp). WinMain sets gGameState itself, so reaching GS_FRONTEND
+// Worth knowing as a readiness signal: it's the only "the game is up"
+// indicator that doesn't go through CTimer, and CTimer is disputed (see the
+// long note in game/frame.cpp). WinMain sets gGameState itself, so GS_FRONTEND
 // means its loop is turning and every plugin's DllMain is long finished.
 constexpr uintptr_t gGameState = 0x008F5838;
 
@@ -286,8 +285,8 @@ constexpr uintptr_t CMenuManager__m_bMenuActive = 0x008F5AE9;
 // The whole input surface, verified 2026-09-21 against the retail image
 // rather than trusted off re3's declarations - re3 said where to look, the
 // binary said whether it was true. Provenance is below for each fact, since
-// agentpad/ writes into these structures every frame and a wrong offset here
-// means a write into a neighbouring global.
+// anything writing into these structures does it every frame, and a wrong
+// offset here means a write into a neighbouring global.
 //
 // CPad::GetPad (0x00492F60) is sixteen bytes and gives two facts at once:
 //

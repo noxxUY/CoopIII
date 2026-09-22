@@ -178,8 +178,8 @@ inline bool IsInventoryWeapon(uint8_t weaponType) {
 // is the worst possible thing to diagnose.
 //
 // Vec3 accessors on a game object. Live here rather than in addresses.h
-// because they need the protocol's Vec3, and AgentPad includes addresses.h
-// on purpose without linking the sdk.
+// because they need the protocol's Vec3, and addresses.h is meant to stay
+// includable without linking the sdk.
 inline Vec3 ReadVec3(void *object, size_t offset) {
 	const float *v = &Field<float>(object, offset);
 	return Vec3{v[0], v[1], v[2]};
