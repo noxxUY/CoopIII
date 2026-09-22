@@ -397,6 +397,9 @@ struct WorldBridge {
 	// false.
 	bool (*LocalIsPassenger)() = nullptr;
 
+	// Get out. The same key that got us in.
+	bool (*UnseatLocalPlayer)() = nullptr;
+
 	// Put a remote ped in a seat, and take them out again.
 	//
 	// Seat returns false when it couldn't be done *yet* - the ped or the

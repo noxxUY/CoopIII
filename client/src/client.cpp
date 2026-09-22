@@ -697,7 +697,7 @@ void Client::UpdateLocalLife(const PlayerStateBody &body) {
 // anywhere else in this file.
 // How close you have to be to ask for a seat. GTA III's own enter key reaches
 // about this far, so a passenger seat asks for the same standing.
-constexpr float SEAT_RANGE_M = 5.0f;
+constexpr float SEAT_RANGE_M = 8.0f;
 
 void Client::TickPassengerSeat() {
 	const bool riding = m_bridge.LocalIsPassenger && m_bridge.LocalIsPassenger();
@@ -716,8 +716,15 @@ void Client::TickPassengerSeat() {
 		return;
 	if (!m_bridge.LocalWantsSeatToggle())
 		return;
-	if (riding || m_localVehicleNetId != INVALID_NETID)
-		return;   // already in something; the exit key is the way out
+	// Riding already: the same key gets us out. Driving is not ours to undo -
+	// that is the engine's key and the engine's business.
+	if (riding) {
+		if (m_bridge.UnseatLocalPlayer)
+			m_bridge.UnseatLocalPlayer();
+		return;   // the exit packet goes on the next tick, once the seat reads empty
+	}
+	if (m_localVehicleNetId != INVALID_NETID)
+		return;
 
 	PlayerStateBody me{};
 	if (!m_bridge.SampleLocalPlayer || !m_bridge.SampleLocalPlayer(me))

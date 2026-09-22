@@ -44,11 +44,11 @@ bool LocalWantsSeatToggle();
 // and the engine's business; this is only ever the seat beside it.
 int32_t SeatLocalPlayerIn(int32_t vehicleHandle);
 
-// Getting out is not here on purpose. The player is a real occupant of a
-// real car, so GTA III's own exit key already works on them and plays its own
-// animation; adding a second way out would mean writing the engine's seat
-// teardown by hand for the one ped whose state the engine is entitled to
-// manage. The client notices the seat is empty and tells the session.
+// Get out of the car we are riding in. The same key does both, because the
+// game's own exit could not be shown to work on a warped-in passenger and a
+// seat you cannot leave is worse than no seat. Returns false if we were not
+// riding in anything.
+bool UnseatLocalPlayer();
 
 // Is the local player a passenger right now - in a car, but not driving it?
 bool LocalIsPassenger();
