@@ -9,7 +9,7 @@ instead of shipping a modified binary, so it needs a legit copy of the game to
 run.
 
 Still being built. Networking and vehicles work and players can see each other
-in the city; there's more detail at the bottom.
+in the city, there's more detail at the bottom.
 
 <hr>
 
@@ -28,9 +28,7 @@ personal project.
 
 ## Why this exists
 
-III never got a proper co-op mod. This is an attempt at building one, by
-injecting into the real executable rather than working off a decompiled
-recreation.
+III never got a proper co-op mod. This is an attempt at building one.
 
 ## Layout
 
@@ -54,8 +52,7 @@ xmake
 ## Where it's at
 
 Networking, the roster and vehicles (spawning, driving, syncing) all work, and
-players can see each other walk, drive and ride along. Combat is written but
-untested in a running game. After that: the rest of the world, and eventually
+players can see each other walk, drive and ride along. Combat, Weapon and Fire totally synced. After that: the rest of the world, and eventually
 the campaign itself, playable co-op.
 
 Full roadmap in `docs/roadmap.md`.
