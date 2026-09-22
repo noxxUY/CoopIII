@@ -149,6 +149,16 @@ int main(int argc, char **argv) {
 	bool rocketFlag = false;
 	bool burnFlag   = false;
 	bool farFlag    = false;
+	// -blowup: blow the ghost's car up on a cycle, so the whole destruction
+	// path can be watched in a live game. There is no other way to reach it -
+	// the observer half runs the engine's own CAutomobile::BlowUpCar on a
+	// CAutomobile CoopIII built by hand, and nothing headless can touch that.
+	bool blowUpFlag = false;
+	// -extras A,B: the extra components the ghost claims its car has, which
+	// is how the extras sync gets looked at. Default is "none on either
+	// slot", because 0/0 would quietly fit component 0 twice and look like a
+	// working sync whether or not anything crossed the wire.
+	int8_t extra1 = -1, extra2 = -1;
 	for (int i = 1; i < argc; ++i) {
 		if (std::strcmp(argv[i], "-car") == 0)
 			carFlag = true;
@@ -168,6 +178,22 @@ int main(int argc, char **argv) {
 			burnFlag = true;
 		if (std::strcmp(argv[i], "-far") == 0)
 			farFlag = true;
+		if (std::strcmp(argv[i], "-blowup") == 0)
+			blowUpFlag = true;
+		if (std::strcmp(argv[i], "-extras") == 0 && i + 1 < argc) {
+			int a = -1, b = -1;
+			if (std::sscanf(argv[i + 1], "%d,%d", &a, &b) >= 1) {
+				extra1 = static_cast<int8_t>(a);
+				extra2 = static_cast<int8_t>(b);
+			}
+			++i;
+		}
+	}
+
+	// Both car modes need a car.
+	if (blowUpFlag && !carFlag) {
+		carFlag = true;
+		std::printf("-blowup implies -car, since it is the car it blows up\n");
 	}
 
 	// -far and -car cannot both be what is being watched. A seated player's
@@ -279,6 +305,21 @@ int main(int argc, char **argv) {
 	const uint32_t OUT_MS  = 4000;    // on foot for four
 	bool     ridingNow     = true;
 	uint32_t nextSwitchMs  = 0;       // set when the car is first claimed
+
+	// -blowup. Eight seconds of ordinary driving, then the car explodes, and
+	// then the ghost claims a fresh one - which is the only way to see the
+	// second half of the rule, that a wreck is never respawned as a new car
+	// but a genuinely new claim still is.
+	//
+	// A wreck also has to be left alone for long enough to watch the engine
+	// clear it away by itself about 60 seconds later
+	// (VEH_WRECK_REMOVAL_MS), so the pause afterwards is deliberately long.
+	const bool     wantBlowUp    = blowUpFlag;
+	const uint32_t DRIVE_MS      = 8000;
+	const uint32_t WRECK_MS      = 75000;
+	uint32_t       nextBlowUpMs  = 0;
+	uint32_t       reclaimAtMs   = 0;   // 0 = not waiting to reclaim
+	bool           carIsWrecked  = false;
 
 	uint8_t  targetId  = 0xFF;
 	uint16_t targetNetId = INVALID_NETID;
@@ -393,6 +434,7 @@ int main(int argc, char **argv) {
 				if (e->playerId == myId && myVehicleNetId == INVALID_NETID) {
 					myVehicleNetId = e->body.netId;
 					nextSwitchMs   = WallClock::NowMs() + IN_MS;
+					nextBlowUpMs   = WallClock::NowMs() + DRIVE_MS;
 					std::printf("our car is net %u\n", myVehicleNetId);
 				}
 			}
@@ -613,11 +655,40 @@ int main(int argc, char **argv) {
 						claim.body.modelId = carModel;
 						claim.body.colour1 = 6;
 						claim.body.colour2 = 6;
+						// Explicit, not left at the struct's zero: a 0 here
+						// would fit component 0 on both slots, which is a
+						// plausible-looking car whether or not the field
+						// crossed the wire at all. -1 is "nothing fitted",
+						// which is what the engine itself passes.
+						claim.body.extra1  = extra1;
+						claim.body.extra2  = extra2;
 						claim.body.pos     = target;
 						claim.body.rot     = Quat{0.0f, 0.0f, 0.0f, 1.0f};
 						client.Send(claim, CH_EVENT);
 						carClaimSent = true;
-						std::printf("claiming a car (model %u)\n", carModel);
+						std::printf("claiming a car (model %u, extras %d/%d)\n",
+						            carModel, static_cast<int>(extra1),
+						            static_cast<int>(extra2));
+					}
+				} else if (carIsWrecked) {
+					// Nothing. A wreck's driver has stopped sending, and
+					// that is not laziness on the ghost's part - it is what
+					// the real client does, and it is the case the observer
+					// has to hold the wreck in place through.
+					//
+					// After long enough to watch the engine clear the wreck
+					// away by itself, claim a fresh car. Two things get
+					// looked at that way round: that an empty pool slot left
+					// by a wreck is never respawned, and that a genuinely new
+					// claim still is.
+					if (reclaimAtMs != 0 && WallClock::NowMs() >= reclaimAtMs) {
+						reclaimAtMs    = 0;
+						carIsWrecked   = false;
+						carClaimSent   = false;
+						myVehicleNetId = INVALID_NETID;
+						ridingNow      = true;
+						std::printf("the wreck has had its minute; claiming a "
+						            "fresh car\n");
 					}
 				} else {
 					// Kept in front of the player rather than orbiting them.
@@ -663,6 +734,32 @@ int main(int argc, char **argv) {
 					v.body.gas    = 0.8f;
 					v.body.flags  = VEH_ENGINE_ON | VEH_LIGHTS;
 					client.Send(v, CH_SNAPSHOT);
+
+					// Blow it up, at the position the last snapshot put it.
+					// The real client reads the transform off the car inside
+					// the BlowUpCar detour; this is the nearest a ghost can
+					// get, and it is the same claim - "this is where my car
+					// ended up" - so an observer that puts the wreck anywhere
+					// else is wrong in a way that shows.
+					//
+					// Sent whether or not the ghost is currently "riding":
+					// the server only takes a blast from the player it
+					// believes is driving, so with -inout as well this also
+					// exercises the server refusing one, which should print
+					// nothing and change nothing.
+					if (wantBlowUp && WallClock::NowMs() >= nextBlowUpMs) {
+						C_VehicleBlowUp up{};
+						InitHeader(up, WallClock::NowMs());
+						up.body.netId = myVehicleNetId;
+						up.body.pos   = v.body.pos;
+						up.body.rot   = v.body.rot;
+						client.Send(up, CH_EVENT);
+						carIsWrecked = true;
+						reclaimAtMs  = WallClock::NowMs() + WRECK_MS;
+						std::printf("blowing up car %u at (%.1f %.1f %.1f)\n",
+						            myVehicleNetId, v.body.pos.x, v.body.pos.y,
+						            v.body.pos.z);
+					}
 
 					// Get out, and later get back in. The car keeps weaving
 					// either way - that's the point, the two halves need to

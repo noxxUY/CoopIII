@@ -36,9 +36,23 @@ namespace coopiii {
 //    joined mid-session got a different world from everyone who had been
 //    there. S_PlayerJoin grew health, armour, weapon, a flags byte and the
 //    death animation; S_VehicleSpawn grew health and flags; VehicleFlags
-//    grew VEH_WRECKED. No new opcodes - every one of these is a field on a
-//    packet the backfill already sent. docs/protocol.md §2.8.
-constexpr uint16_t PROTOCOL_VERSION = 9;
+//    grew VEH_WRECKED. No new opcodes. docs/protocol.md 2.8.
+// 10: two vehicle changes, both about two machines ending up with the same
+//    car. docs/protocol.md 1.11 and 1.12. Landed alongside 9 rather than
+//    after it - both were built in parallel and both claimed 9, so the pair
+//    was reconciled here into one number.
+//
+//    - A car's destruction travels. C_VehicleBlowUp / S_VehicleBlowUp added
+//      (opcodes 0x36/0x37), because a car exploding is an event and
+//      m_fHealth is only a number - writing zero into an observer's copy
+//      never ran the engine's destruction path, so the blast and the wreck
+//      happened on one screen and not the other.
+//    - A car's extras travel, next to its colours and for the same reason
+//      the colours are there. EnterVehicleBody's spare `pad` byte became
+//      `extra1`/`extra2`, and S_VehicleSpawn grew the same pair. The engine
+//      rolls them per machine at spawn, so without this each player sees
+//      extras the other does not.
+constexpr uint16_t PROTOCOL_VERSION = 10;
 constexpr uint16_t DEFAULT_PORT     = 2001;
 constexpr uint8_t  MAX_PLAYERS      = 8;
 constexpr uint8_t  SNAPSHOT_HZ      = 25;   // docs/protocol.md §1.2
@@ -91,6 +105,8 @@ enum Opcode : uint8_t {
 	OP_S_EXIT_VEHICLE    = 0x33,
 	OP_S_VEHICLE_SPAWN   = 0x34,
 	OP_S_VEHICLE_DESPAWN = 0x35,
+	OP_C_VEHICLE_BLOWUP  = 0x36,
+	OP_S_VEHICLE_BLOWUP  = 0x37,
 
 	OP_S_WORLD_STATE     = 0x40,
 	OP_C_WORLD_STATE     = 0x41,
@@ -630,7 +646,25 @@ struct EnterVehicleBody {
 
 	uint16_t modelId;
 	uint8_t  colour1, colour2;
-	uint8_t  pad;
+
+	// The extra components fitted to this car: CVehicle::m_aExtras, -1 for
+	// "nothing in that slot". Here for the same reason the colours are: the
+	// engine chooses them at spawn, per machine, from
+	// CVehicleModelInfo::ChooseComponent - so two machines rolling
+	// independently give two players cars with different bits bolted on.
+	//
+	// Unlike a colour these cannot be applied after the fact. They are
+	// RwAtomics cloned into the clump while the car is being constructed, so
+	// the receiving machine has to force them through the engine's own
+	// CVehicleModelInfo::ms_compsToUse override BEFORE it calls the
+	// constructor. client/src/game/addresses.h, "a vehicle's extra
+	// components", is the mechanism and the two traps in it.
+	//
+	// Signed on purpose and clamped on arrival: the engine's subscript into
+	// m_comps[6] checks only for -1, so a wire value it does not expect is a
+	// read off the end of a model info.
+	int8_t   extra1, extra2;
+
 	Vec3     pos;
 	Quat     rot;
 };
@@ -678,6 +712,7 @@ struct S_VehicleSpawn {
 	Vec3     pos;
 	Quat     rot;
 	uint8_t  colour1, colour2;   // CVehicle::m_currentColour1/2
+	int8_t   extra1, extra2;     // CVehicle::m_aExtras, -1 for none
 	float    health;             // CVehicle::m_fHealth, 1000 = full
 	uint8_t  flags;              // VehicleFlags, same bits the snapshot uses
 };
@@ -686,6 +721,35 @@ struct S_VehicleDespawn {
 	static constexpr uint8_t OPCODE = OP_S_VEHICLE_DESPAWN;
 	PacketHeader hdr;
 	uint16_t netId;
+};
+
+// A car was destroyed. Sent by the machine driving it, replayed by everyone
+// else through the engine's own CAutomobile::BlowUpCar. docs/protocol.md
+// §1.11 is the design; the short version is that health is a number and
+// destruction is an event, and only one of those was on the wire.
+//
+// The transform travels with it because BlowUpCar is where the wreck is
+// decided as well as the blast: whatever the observer's own physics had the
+// car doing, this is where its owner says it ended up. Both machines put the
+// car here first and then blow it up, so both end up with the same wreck in
+// the same street rather than one wreck and one empty road.
+struct VehicleBlowUpBody {
+	uint16_t netId;
+	Vec3     pos;
+	Quat     rot;
+};
+
+struct C_VehicleBlowUp {
+	static constexpr uint8_t OPCODE = OP_C_VEHICLE_BLOWUP;
+	PacketHeader      hdr;
+	VehicleBlowUpBody body;
+};
+
+struct S_VehicleBlowUp {
+	static constexpr uint8_t OPCODE = OP_S_VEHICLE_BLOWUP;
+	PacketHeader      hdr;
+	uint8_t           playerId;   // whose car it was, for the log
+	VehicleBlowUpBody body;
 };
 
 // ---- world (CH_EVENT) ----------------------------------------------------
@@ -770,13 +834,22 @@ static_assert(sizeof(C_WorldState)    == 9,  "world state layout");
 static_assert(sizeof(S_WorldState)    == 10, "world state layout");
 
 // 2 netId + 1 seat + 1 jack + 2 model + 1 + 1 colour + 1 pad + 12 pos + 16 rot
-static_assert(sizeof(EnterVehicleBody) == 37, "enter-vehicle layout");
-static_assert(sizeof(C_EnterVehicle)  == 42, "enter-vehicle layout");
-static_assert(sizeof(S_EnterVehicle)  == 43, "enter-vehicle layout");
-// 5 hdr + 2 net + 2 model + 12 pos + 16 rot + 2 colour = 39 identity, then
-// 4 health + 1 flags = 5 condition.
-static_assert(sizeof(S_VehicleSpawn)  == 44, "vehicle spawn layout");
-static_assert(offsetof(S_VehicleSpawn, health) == 39, "condition follows identity");
+// 2 netId + 1 seat + 1 jack + 2 modelId + 2 colours + 2 extras + 12 pos
+// + 16 rot. The two extras took the place of one `pad` byte, so this grew by
+// one rather than by two.
+static_assert(sizeof(EnterVehicleBody) == 38, "enter-vehicle layout");
+static_assert(sizeof(C_EnterVehicle)  == 43, "enter-vehicle layout");
+static_assert(sizeof(S_EnterVehicle)  == 44, "enter-vehicle layout");
+
+// 5 hdr + 2 net + 2 model + 12 pos + 16 rot + 2 colour + 2 extras = 41
+// identity, then 4 health + 1 flags = 5 condition.
+static_assert(sizeof(S_VehicleSpawn)  == 46, "vehicle spawn layout");
+static_assert(offsetof(S_VehicleSpawn, health) == 41, "condition follows identity");
+
+// 2 netId + 12 pos + 16 rot
+static_assert(sizeof(VehicleBlowUpBody) == 30, "vehicle blow-up layout");
+static_assert(sizeof(C_VehicleBlowUp)   == 35, "vehicle blow-up layout");
+static_assert(sizeof(S_VehicleBlowUp)   == 36, "vehicle blow-up layout");
 static_assert(sizeof(C_PlayerModel)   == 7,  "player model layout");
 static_assert(sizeof(S_PlayerModel)   == 8,  "player model layout");
 

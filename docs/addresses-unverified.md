@@ -293,3 +293,27 @@ is the way the three refuted addresses in this document were arrived at.
 | `CWorld::SetCarsOnFire` / its ped equivalent | `0x004B3D20`-ish, `0x004B3F00`-ish | function | low | Two of the six callers of `StartFire(entity, ...)` sit in these, at `0x004B3E3C` and `0x004B3F9C`. The function *starts* were never located, so the addresses above are the containing region and not entry points. Do not call either. |
 | `CShotInfo::Update` | contains `0x0055C232` | function | low | The flamethrower's own caller of `StartFire(entity, ...)`. Same problem: a call site inside it, not its start. |
 | `CPed::DoStuffToGoOnFire` | - | function | none | Named by re3 as what `ProcessFire` calls before spreading fire to the player. Never looked for. |
+
+## vehicle damage short of destruction (found 2026-09-22, alongside M2's blast)
+
+The destruction work (`protocol.md` §1.11) proved `CAutomobile::BlowUpCar`,
+`CBoat::BlowUpCar`, vtable slot 29, the five-second fire timer,
+`m_fFireBlowUpTimer`, `m_pSetOnFireEntity`, `m_nTimeOfDeath`,
+`bRenderScorched`, `STATUS_WRECKED`, `VEH_WRECK_REMOVAL_MS` and the extras
+mechanism; all of those are in `addresses.h` now with the disassembly that
+carries each one.
+
+These three came out of the same pass and are **not** proved. Each was read
+far enough to know its shape and its call sites, which is a long way short of
+matching a whole body against re3 — and reading a call site and calling it a
+function is precisely how the three refuted addresses at the top of this file
+were arrived at. They are the head start for panels/doors/lights/wheels
+(`roadmap.md` M2), not something to call.
+
+| Claim | Address | Kind | Confidence | How far it got |
+|---|---|---|---|---|
+| `CDamageManager::FuckCarCompletely` | `0x00545B70` | function | medium | `BlowUpCar`'s `lea ecx,[ebx+288h] / call` — so its `this` really is the damage manager. Its first seven instructions write `2` into `[ebx+5]` and `3` into the six consecutive bytes `[ebx+9]`..`[ebx+0Eh]`, then `push 10h / call 0x00545A00`. That is the right shape for "wreck every part" and it pins part of the `CDamageManager` layout, but the rest of the body was never read and neither was `0x00545A00`. |
+| a `CAutomobile` panel/door setter | `0x00530120` | function | medium | `BlowUpCar` calls it four times with `(id, status, 0)`: `(7,5,0)`, `(8,6,0)` and two more. It takes the **vehicle**, not the damage manager — `lea ecx,[ebp+288h] / call 0x005458E0` records the damage and then `[ebp+ebx*4+37Ch]` reaches an array of pointers and hides one. So both halves have to happen or a destroyed panel stays on screen. The name is unknown; re3 has several candidates with this shape. |
+| a `CDamageManager` engine-status setter | `0x00545940` | function | medium | Seven instructions: `mov [ecx+4], min(arg, 0FAh)`. A saturating byte write, so `+4` is the engine byte and 250 is its ceiling. `CVehicle::InflictDamage`'s "set on fire" arm pushes `0E1h` (225) into it at `0x00551BE1`, which is what "this car is burning" means in the engine. Only this function was read; nothing that reads `+4` was. |
+| `CAutomobile::m_aCarNodes` | `+0x37C` | offset | **low** | One subscript, `[ebp+ebx*4+37Ch]`, in the function above. Nothing else. A wrong node array does not crash, it writes into a neighbouring member — which is the failure mode that cost this project the car-on-its-side round. |
+| `CVehicle::InflictDamage` entry point | — | function | none | Its instructions at `0x00551BA5`..`0x00551C5A` were read and are transcribed in `addresses.h`, because they are what proves the health-is-not-destruction claim. The function *start* was never located and is deliberately not recorded anywhere: nothing CoopIII does needs to call it. |

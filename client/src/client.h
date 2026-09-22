@@ -135,6 +135,38 @@ struct CombatEvent {
 	uint16_t      deathAnimId = ANIM_NONE;
 };
 
+// The local player's own car blew up, and where it was when it did.
+//
+// Same reasoning as CombatEvent and the same seam shape: it comes off a
+// detour on CAutomobile::BlowUpCar rather than out of the 25 Hz sample,
+// because m_fHealth reaching zero is not what destroys a car - the engine
+// never looks at it that way (game/vehicle.h, docs/protocol.md §1.11).
+//
+// No netId: the detour only knows "the car the local player is driving".
+// Client is the half that knows what the session calls it.
+struct LocalVehicleBlast {
+	Vec3 pos{};
+	Quat rot{};
+};
+
+// Everything the session needs to build the same car somebody else is sitting
+// in: what it is, what colour it is, and which extra components are bolted to
+// it. EnterVehicleBody's identity half, read off the local player's car.
+//
+// `extra1`/`extra2` are CVehicle::m_aExtras, -1 for an empty slot. They are
+// here rather than being left to each machine because the engine rolls them at
+// spawn - see game/vehicle.h, "Extras", for why they are the one field on this
+// struct that cannot be applied after the car exists.
+struct VehicleIdentity {
+	uint16_t modelId = 0;
+	uint8_t  colour1 = 0;
+	uint8_t  colour2 = 0;
+	int8_t   extra1  = -1;
+	int8_t   extra2  = -1;
+	Vec3     pos{};
+	Quat     rot{0.0f, 0.0f, 0.0f, 1.0f};
+};
+
 // ---- our own life ----------------------------------------------------------
 //
 // Two decisions, pulled out of Client so tools/clienttest can reach them
@@ -218,6 +250,13 @@ struct RemoteVehicle {
 	uint8_t  driverPlayerId = 0xFF;
 	uint8_t  colour1 = 0, colour2 = 0;
 
+	// CVehicle::m_aExtras as the claimer's machine rolled them, -1 for an
+	// empty slot. Consumed by SpawnRemoteVehicle and only by it: they can
+	// only be applied while the car is being constructed (game/vehicle.h,
+	// "Extras"), so unlike the colours there is nothing useful to do with
+	// them afterwards.
+	int8_t   extra1 = -1, extra2 = -1;
+
 	// Transform history, sampled every frame rather than at the snapshot
 	// rate: the correction below has to undo a frame of local physics, so
 	// it needs to run on every frame physics ran, not just snapshot frames.
@@ -234,6 +273,17 @@ struct RemoteVehicle {
 	// deletes the vehicle, reused slot or not.
 	int32_t poolHandle   = -1;
 	bool    spawnPending = false;
+
+	// This car has been destroyed and is a wreck, here and everywhere else.
+	//
+	// It is not the same thing as "gone": the wreck stays in the street for a
+	// minute like any other. What it stops is the respawn. The engine clears
+	// a wreck away by itself about a minute after it died, through the one
+	// reaping path a locked mission car does not survive (addresses.h, "the
+	// reaping site that deletes a car BECAUSE it is locked"), and without
+	// this the roster would notice the empty pool slot and build a brand new,
+	// undamaged car in its place.
+	bool destroyed = false;
 
 	// Driven into the engine on change, not every frame.
 	uint8_t appliedFlags = 0xFF;   // not a flag set: "nothing applied yet"
@@ -304,9 +354,7 @@ struct WorldBridge {
 
 	// Identity of the vehicle the local player is driving, for the claim
 	// that introduces it to the session.
-	bool (*SampleLocalVehicleIdentity)(uint16_t &modelId, uint8_t &colour1,
-	                                   uint8_t &colour2, Vec3 &pos,
-	                                   Quat &rot) = nullptr;
+	bool (*SampleLocalVehicleIdentity)(VehicleIdentity &out) = nullptr;
 
 	// The engine's own reference (CPools::GetVehicleRef) for the car the
 	// local player is driving, or -1 on foot or as a passenger. The same
@@ -341,6 +389,25 @@ struct WorldBridge {
 	// roster, so it still does the right thing for a car the session has
 	// already forgotten about.
 	void (*UnseatRemotePed)(RemotePlayer &player) = nullptr;
+
+	// Hands over the blasts the local player's own car suffered since the
+	// last call, oldest first, and returns how many got written.
+	//
+	// By detour, not by sampling, for the same reason a shot is: a car
+	// exploding is an event, and m_fHealth - which *is* sampled - is only a
+	// number. Nothing in the engine watches health for zero, so an observer
+	// handed a zero gets an undamaged-looking car with no health rather than
+	// a wreck. docs/protocol.md §1.11.
+	uint8_t (*DrainLocalVehicleBlasts)(LocalVehicleBlast *out,
+	                                   uint8_t max) = nullptr;
+
+	// Replay somebody else's car blowing up, through the engine's own
+	// CAutomobile::BlowUpCar, at the transform they say it ended up at. One
+	// call because one call is what the engine does: the blast and the burnt
+	// shell are decided in the same function, so replaying it gets both, in
+	// the same place, without CoopIII inventing either.
+	bool (*BlowUpRemoteVehicle)(RemoteVehicle &vehicle, const Vec3 &pos,
+	                            const Quat &rot) = nullptr;
 
 	// ---- combat (M3) ------------------------------------------------------
 
@@ -466,6 +533,7 @@ private:
 	void OnVehicleSpawn(const S_VehicleSpawn &pkt);
 	void OnVehicleDespawn(const S_VehicleDespawn &pkt);
 	void OnVehicleState(const S_VehicleState &pkt);
+	void OnVehicleBlowUp(const S_VehicleBlowUp &pkt);
 	void OnEnterVehicle(const S_EnterVehicle &pkt);
 	void OnExitVehicle(const S_ExitVehicle &pkt);
 	void OnShot(const S_Shot &pkt);
@@ -518,6 +586,8 @@ private:
 	void CorrectRemoteVehicles();
 	void SendLocalState();
 	void SendLocalVehicle();
+	// One packet per car per life, off the BlowUpCar detour's queue.
+	void SendLocalVehicleBlasts();
 	// Every frame, not at the snapshot rate, and not rate-limited - these
 	// are discrete events on the reliable channel and there are only ever a
 	// handful per second.

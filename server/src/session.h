@@ -89,6 +89,14 @@ struct Vehicle {
 	uint16_t netId   = INVALID_NETID;
 	uint16_t modelId = 0;
 	uint8_t  colour1 = 0, colour2 = 0;
+
+	// CVehicle::m_aExtras, -1 for an empty slot. Part of the identity for the
+	// same reason the colours are: the engine rolls a car's extra components
+	// per machine at spawn, so a joiner told only the model builds a car with
+	// different bits on it from everybody else's. Set by the claim rather
+	// than by AddVehicle, to keep this out of Session's signature.
+	int8_t   extra1 = -1, extra2 = -1;
+
 	Vec3     pos = {};
 	Quat     rot = {0.0f, 0.0f, 0.0f, 1.0f};
 	uint8_t  driverPlayerId = INVALID_PLAYER;

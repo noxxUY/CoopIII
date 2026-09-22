@@ -273,6 +273,8 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 		spawn.rot     = v.rot;
 		spawn.colour1 = v.colour1;
 		spawn.colour2 = v.colour2;
+		spawn.extra1  = v.extra1;
+		spawn.extra2  = v.extra2;
 		spawn.health  = v.health;
 		spawn.flags   = v.flags;
 		out.vehicles.push_back(spawn);

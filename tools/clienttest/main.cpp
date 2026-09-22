@@ -132,6 +132,12 @@ struct Recorder {
 	// joiner's case, where the car in the street is one CoopIII made.
 	int32_t  localVehicleHandle = -1;
 
+	// The extras on the car the local player is driving, as its own engine
+	// rolled them. 3 and -1 rather than 0 and 0 so a claim that dropped them
+	// is distinguishable from one that carried them.
+	int8_t   localExtra1    = 3;
+	int8_t   localExtra2    = -1;
+
 	// Seating. `seatAttempts` counts calls, `seats` counts the ones that
 	// took - the difference is the whole point of the refusal case below.
 	int      seatAttempts    = 0;
@@ -178,6 +184,22 @@ struct Recorder {
 	uint16_t   lastKillAnim   = ANIM_NONE;
 	int        friendlyFireCalls = 0;
 	bool       friendlyFire      = false;
+	// A car blowing up. `blowUps` counts calls that reached the bridge at
+	// all, which is the number that matters: an event for a car we do not
+	// have has to be dropped rather than queued.
+	// The extras the roster had on the entry when the spawn was asked for.
+	int8_t   lastSpawnExtra1 = 0;
+	int8_t   lastSpawnExtra2 = 0;
+
+	int      blowUps          = 0;
+	uint16_t lastBlowUpNetId  = INVALID_NETID;
+	Vec3     lastBlowUpPos    = {};
+	// Makes BlowUpRemoteVehicle report that the car is no longer in the pool,
+	// which is a "not now" and must still leave the roster entry destroyed.
+	bool     blowUpFails      = false;
+	// What DrainLocalVehicleBlasts hands over next.
+	std::vector<LocalVehicleBlast> localBlasts;
+
 	// World. `world` is what this machine's engine would report; the rest is
 	// what the client asked to have done to it.
 	WorldState world{12, 0, 0, 0};
@@ -224,6 +246,11 @@ void RecApplyPose(RemotePlayer &p, const Pose &pose) {
 bool RecSpawnVehicle(RemoteVehicle &v) {
 	v.poolHandle = g_rec.nextVehicleHandle++;
 	++g_rec.vehicleSpawns;
+	// What the roster handed the spawn. The real one can only apply extras
+	// while it is constructing the car, so if they are not on the entry by
+	// the time this is called they are lost for that car's whole life.
+	g_rec.lastSpawnExtra1 = v.extra1;
+	g_rec.lastSpawnExtra2 = v.extra2;
 	return true;
 }
 
@@ -244,6 +271,24 @@ bool RecSeat(RemotePlayer &, RemoteVehicle &v, uint8_t seat) {
 }
 
 void RecUnseat(RemotePlayer &) { ++g_rec.unseats; }
+
+bool RecBlowUpVehicle(RemoteVehicle &v, const Vec3 &pos, const Quat &) {
+	++g_rec.blowUps;
+	g_rec.lastBlowUpNetId = v.netId;
+	g_rec.lastBlowUpPos   = pos;
+	if (g_rec.blowUpFails)
+		return false;
+	return true;
+}
+
+uint8_t RecDrainLocalBlasts(LocalVehicleBlast *out, uint8_t max) {
+	uint8_t n = 0;
+	while (n < max && !g_rec.localBlasts.empty()) {
+		out[n++] = g_rec.localBlasts.front();
+		g_rec.localBlasts.erase(g_rec.localBlasts.begin());
+	}
+	return n;
+}
 
 void RecReplayShot(RemotePlayer &p, const ShotBody &shot) {
 	++g_rec.shotsReplayed;
@@ -323,15 +368,16 @@ bool RecSampleLocalVehicle(VehicleStateBody &out) {
 	return true;
 }
 
-bool RecSampleLocalVehicleIdentity(uint16_t &modelId, uint8_t &c1, uint8_t &c2,
-                                   Vec3 &pos, Quat &rot) {
+bool RecSampleLocalVehicleIdentity(VehicleIdentity &out) {
 	if (!g_rec.drivingLocally)
 		return false;
-	modelId = g_rec.localModel;
-	c1      = 1;
-	c2      = 2;
-	pos     = Vec3{5.0f, 6.0f, 7.0f};
-	rot     = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+	out.modelId = g_rec.localModel;
+	out.colour1 = 1;
+	out.colour2 = 2;
+	out.extra1  = g_rec.localExtra1;
+	out.extra2  = g_rec.localExtra2;
+	out.pos     = Vec3{5.0f, 6.0f, 7.0f};
+	out.rot     = Quat{0.0f, 0.0f, 0.0f, 1.0f};
 	return true;
 }
 
@@ -357,6 +403,8 @@ WorldBridge RecordingBridge() {
 	b.CorrectRemoteVehicle       = &RecCorrectVehicle;
 	b.SeatRemotePed              = &RecSeat;
 	b.UnseatRemotePed            = &RecUnseat;
+	b.BlowUpRemoteVehicle        = &RecBlowUpVehicle;
+	b.DrainLocalVehicleBlasts    = &RecDrainLocalBlasts;
 
 	b.DrainLocalCombat    = &RecDrainLocalCombat;
 	b.ReplayRemoteShot    = &RecReplayShot;
@@ -404,6 +452,8 @@ S_VehicleSpawn MakeVehicleSpawn(uint16_t netId, uint16_t modelId = 90,
 	// that predates it keeps meaning what it meant; the ones that care say so.
 	s.health  = 1000.0f;
 	s.flags   = 0;
+	s.extra1  = 2;
+	s.extra2  = -1;
 	return s;
 }
 
@@ -865,6 +915,256 @@ void TestVehicleCorrectionStopsWithTheVehicle() {
 	c.Tick();
 	Check(g_rec.vehicleCorrections == before,
 	      "a despawned vehicle is not corrected into existence");
+}
+
+// ---- a car blowing up ------------------------------------------------------
+//
+// The rule these pin down is docs/protocol.md 1.11: destruction is an event,
+// it is decided by the machine driving the car, and an observer replays it
+// rather than working it out. None of the engine half is reachable from here,
+// so what is pinned is the decision that leads to it - which is the half that
+// was wrong, since the old code had no decision at all.
+
+S_VehicleBlowUp MakeVehicleBlowUp(uint16_t netId, uint8_t playerId = 1,
+                                  float x = 77.0f) {
+	S_VehicleBlowUp b;
+	InitHeader(b, 3000);
+	b.playerId   = playerId;
+	b.body.netId = netId;
+	b.body.pos   = {x, 5.0f, 9.0f};
+	b.body.rot   = {0.0f, 0.0f, 0.0f, 1.0f};
+	return b;
+}
+
+void TestVehicleBlowUpIsReplayed() {
+	std::printf("\na car blowing up is replayed, not worked out\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(41), CH_EVENT));
+	c.Tick();
+	Check(g_rec.vehicleSpawns == 1, "the car is there to begin with");
+
+	c.HandleMessage(Wrap(MakeVehicleBlowUp(41), CH_EVENT));
+	Check(g_rec.blowUps == 1, "the bridge is told to blow it up");
+	Check(g_rec.lastBlowUpNetId == 41, "and told which car");
+	Check(g_rec.lastBlowUpPos.x == 77.0f,
+	      "at the position its owner sent, not wherever we had it");
+
+	const RemoteVehicle *v = c.VehicleByNetId(41);
+	Check(v != nullptr && v->destroyed, "the roster knows it is a wreck");
+	Check(v != nullptr && v->driverPlayerId == 0xFF, "and that nobody drives it");
+
+	// Twice is once. The event is reliable, but a duplicate must not hand the
+	// occupants of that car to the engine a second time.
+	c.HandleMessage(Wrap(MakeVehicleBlowUp(41), CH_EVENT));
+	Check(g_rec.blowUps == 1, "a second blast for the same car does nothing");
+}
+
+void TestVehicleBlowUpForACarWeDoNotHave() {
+	std::printf("\na blast for a car we do not have\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+
+	// Dropped, not queued and not created from. The packet carries no model,
+	// so there is nothing to build, and a blast is not a reason to invent a
+	// car - same rule OnVehicleState follows.
+	c.HandleMessage(Wrap(MakeVehicleBlowUp(99), CH_EVENT));
+	Check(g_rec.blowUps == 0, "nothing reaches the bridge");
+	Check(c.VehicleCount() == 0, "and no vehicle is created");
+}
+
+void TestWreckIsNeverRespawned() {
+	std::printf("\na wreck is never respawned as a new car\n");
+	// The engine clears a wreck away by itself a minute after it dies, through
+	// the one reaping path that tests neither bIsLocked nor CanBeDeleted
+	// (addresses.h). The roster sees the empty pool slot; what it must not do
+	// is read that as "build another one".
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(42), CH_EVENT));
+	c.Tick();
+	Check(g_rec.vehicleSpawns == 1, "spawned to begin with");
+
+	c.HandleMessage(Wrap(MakeVehicleBlowUp(42), CH_EVENT));
+
+	// The engine takes the wreck away. ResolveRemoteVehicle does this for
+	// real; from here it is the same write it makes.
+	RemoteVehicle *v = const_cast<RemoteVehicle *>(c.VehicleByNetId(42));
+	Check(v != nullptr, "the entry is still there");
+	v->poolHandle = -1;
+
+	for (int i = 0; i < 10; ++i)
+		c.Tick();
+	Check(g_rec.vehicleSpawns == 1, "and it is not built again");
+}
+
+void TestWreckIgnoresLaterSnapshots() {
+	std::printf("\na wreck takes no more orders\n");
+	// The last snapshots its owner sent were sampled before the blast and are
+	// still in flight on an unreliable channel. Applying one would relight a
+	// burnt-out car and drag it away from its own explosion.
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(43), CH_EVENT));
+	c.Tick();
+
+	c.HandleMessage(Wrap(MakeVehicleBlowUp(43, 1, 77.0f), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleState(1, 43, 500.0f), CH_SNAPSHOT));
+
+	const RemoteVehicle *v = c.VehicleByNetId(43);
+	Check(v != nullptr && v->last.pos.x == 77.0f,
+	      "the wreck stays where the blast left it");
+	Check(v != nullptr && v->last.health == 0.0f, "with no health");
+}
+
+void TestBlowUpEmptiesTheCarFirst() {
+	std::printf("\neverybody gets out before the car goes up\n");
+	// Same ordering TestCarIsEmptiedBeforeItIsDestroyed pins for the despawn,
+	// and for a sharper reason here: CAutomobile::BlowUpCar hands every
+	// occupant to the engine to destroy on its own schedule, so a ped taken
+	// out afterwards is taken out of a car that has already let go of it.
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeVehicleSpawn(44), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 44), CH_EVENT));
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated(), "seated to begin with");
+
+	const int unseatsBefore = g_rec.unseats;
+	c.HandleMessage(Wrap(MakeVehicleBlowUp(44), CH_EVENT));
+	Check(g_rec.unseats == unseatsBefore + 1, "the rider is taken out");
+	Check(g_rec.blowUps == 1, "and then the car goes up");
+}
+
+void TestWreckIsStillHeldInPlace() {
+	std::printf("\na wreck is still held in place\n");
+	// Deliberately still corrected. Its owner has stopped sending, so the
+	// interpolator holds it at the blast position - which is the one place
+	// both machines agree on. Letting local physics own it instead is how the
+	// two wrecks end up in different streets.
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(45), CH_EVENT));
+	c.Tick();
+	c.HandleMessage(Wrap(MakeVehicleBlowUp(45, 1, 77.0f), CH_EVENT));
+
+	const int before = g_rec.vehicleCorrections;
+	c.Tick();
+	c.Tick();
+	Check(g_rec.vehicleCorrections == before + 2, "still corrected every frame");
+	Check(g_rec.lastCorrection.pos.x == 77.0f, "and held where the blast left it");
+}
+
+void TestVehicleModelIsAskedForAgainOnRespawn() {
+	std::printf("\na lost car asks for its model again\n");
+	// This is the half of the reported bug that made it permanent. Nothing
+	// else in the game holds a reference to a model only CoopIII's car was
+	// using, so once that car leaves the pool the streamer is free to throw
+	// the model out - and the respawn loop then waits on an IsModelReady that
+	// will never come true again. Reconnecting brought the car back because
+	// OnVehicleSpawn was the only place that ever asked.
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(46, 91), CH_EVENT));
+	c.Tick();
+	Check(g_rec.vehicleSpawns == 1, "spawned to begin with");
+
+	// The engine takes it away, and the streamer drops the model with it.
+	RemoteVehicle *v = const_cast<RemoteVehicle *>(c.VehicleByNetId(46));
+	Check(v != nullptr, "the entry survives");
+	v->poolHandle    = -1;
+	v->spawnPending  = true;
+	g_rec.modelReady = false;
+	g_rec.modelRequests.clear();
+
+	c.Tick();
+	Check(!g_rec.modelRequests.empty() && g_rec.modelRequests.back() == 91,
+	      "the model is asked for again rather than waited on");
+
+	g_rec.modelReady = true;
+	c.Tick();
+	Check(g_rec.vehicleSpawns == 2, "and the car comes back");
+}
+
+// ---- extras ---------------------------------------------------------------
+//
+// docs/protocol.md §1.12. Nothing about the engine half is reachable from
+// here: the fix is a write to CVehicleModelInfo::ms_compsToUse in the two
+// instructions before a constructor call. What is reachable, and what was
+// missing, is that the identity carries the extras at all and that they are on
+// the roster entry before the spawn asks for them - because the spawn is the
+// only moment they can be applied.
+
+void TestVehicleSpawnCarriesExtras() {
+	std::printf("\na car's extras reach the spawn\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+
+	// MakeVehicleSpawn sends 2 and -1: one fitted component and one empty
+	// slot, which is the mixed case. Zeroes would pass whether or not the
+	// field crossed the wire.
+	c.HandleMessage(Wrap(MakeVehicleSpawn(50), CH_EVENT));
+
+	const RemoteVehicle *v = c.VehicleByNetId(50);
+	Check(v != nullptr && v->extra1 == 2, "the first extra is on the roster");
+	Check(v != nullptr && v->extra2 == -1, "and an empty slot stays empty");
+
+	c.Tick();
+	Check(g_rec.vehicleSpawns == 1, "the car is built");
+	Check(g_rec.lastSpawnExtra1 == 2 && g_rec.lastSpawnExtra2 == -1,
+	      "and the spawn was handed both, since that is its only chance");
+}
+
+void TestExtrasAreClampedToTheModel() {
+	std::printf("\nan extra the model does not have is refused\n");
+	// CVehicleModelInfo::CreateInstance subscripts m_comps[6] with whatever
+	// it is given and checks only for -1 (addresses.h, 0x0051FCE5). These two
+	// bytes arrive over a socket. This is the same class of bug as the
+	// four-entry animation group and the twelve-slot node array, and it is
+	// the third time, so the bound is pinned here rather than trusted.
+	// Qualified because `using namespace coopiii::game` is further down this
+	// file than these tests are.
+	using game::ClampVehicleExtra;
+	constexpr int8_t NONE = game::VEHICLE_EXTRA_NONE;
+
+	Check(ClampVehicleExtra(0, 3) == 0, "a component the model has is kept");
+	Check(ClampVehicleExtra(2, 3) == 2, "and so is the last one");
+	Check(ClampVehicleExtra(3, 3) == NONE,
+	      "one past the end is not, because there is no bounds check downstream");
+	Check(ClampVehicleExtra(100, 3) == NONE, "nor is nonsense");
+	Check(ClampVehicleExtra(127, 6) == NONE,
+	      "nor is the largest a signed byte can hold");
+
+	Check(ClampVehicleExtra(-1, 3) == NONE,
+	      "-1 stays -1: it is the engine's own 'fit nothing'");
+	Check(ClampVehicleExtra(-2, 3) == NONE,
+	      "and so does -2, which is the *override's* sentinel and must never "
+	      "be mistaken for a component");
+
+	Check(ClampVehicleExtra(0, 0) == NONE,
+	      "a model with no components gets nothing fitted");
+	Check(ClampVehicleExtra(0, -1) == NONE,
+	      "and neither does a model that is not loaded at all");
+
+	// Six, and it is not a number from re3: m_comps runs from +0x1DC up to
+	// m_numComps at +0x1F4, which is 24 bytes, which is six pointers.
+	Check(game::MAX_VEHICLE_COMPS == 6, "m_comps holds six");
+	Check(ClampVehicleExtra(6, 100) == NONE,
+	      "and a model claiming more than six still cannot index past it");
 }
 
 void TestVehicleDespawn() {
@@ -3128,6 +3428,15 @@ int main() {
 	TestVehicleStateBeforeSpawn();
 	TestVehicleStateApplied();
 	TestVehicleDespawn();
+	TestVehicleBlowUpIsReplayed();
+	TestVehicleBlowUpForACarWeDoNotHave();
+	TestWreckIsNeverRespawned();
+	TestWreckIgnoresLaterSnapshots();
+	TestBlowUpEmptiesTheCarFirst();
+	TestWreckIsStillHeldInPlace();
+	TestVehicleModelIsAskedForAgainOnRespawn();
+	TestVehicleSpawnCarriesExtras();
+	TestExtrasAreClampedToTheModel();
 	TestDisconnectClearsVehicles();
 	TestVehicleClaimIsSentOnce();
 	TestRemoteDriverIsRecorded();

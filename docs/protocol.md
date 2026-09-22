@@ -801,6 +801,258 @@ somebody else's car, so a remote player who gets into a car stops burning
 here. Their own machine wrecks their own car and the result arrives on the
 vehicle's stream like everything else about it.
 
+### 1.11 A destroyed car: health is a number, destruction is an event
+
+Reported, in this order:
+
+> "cuando se explota un auto se desaparece"
+>
+> "el auto desaparece pero despues cuando volves a entrar despues como un late
+> joiner si aparece pero no se puede manejar ni nada, no aparece roto te podes
+> subir y todo"
+>
+> "parece que si se rompe porque aunque lo veia vivo y el late joiner lo
+> recibia no se podia mover"
+
+Three symptoms, three separate causes, and only the first of them is about
+destruction at all. §1.11.1, §1.11.4 and §1.11.5 take them one at a time.
+
+#### 1.11.1 Writing `m_fHealth` never destroyed anything
+
+`VehicleStateBody.health` has always been sampled off the driver's car and
+written straight into the observer's copy at `+0x200`. When a car blew up, the
+number that arrived was zero, and a car with zero health is not a destroyed
+car.
+
+The engine says so in three instructions. `CVehicle::InflictDamage` - the
+engine's own fatal path, the one that runs on the driver's machine - does this:
+
+```
+0x00551C10  mov dword [esi+200h],0        m_fHealth = 0
+   ... 69 bytes ...
+0x00551C55  mov ecx,esi / push ebp
+0x00551C5A  call dword [ebx+74h]          BlowUpCar(culprit)
+```
+
+The write and the destruction are two separate acts, and only the second one
+does anything. `CAutomobile::BlowUpCar` (`0x0053BC60`) is where the status
+becomes `STATUS_WRECKED`, where `bRenderScorched` is set, where
+`m_nTimeOfDeath` is stamped, where `CDamageManager::FuckCarCompletely` runs,
+where the wheel flies off, where the occupants are killed, and where
+`CExplosion::AddExplosion` is called with `EXPLOSION_CAR`. An observer handed a
+zero got none of it: an intact-looking car, with dead health, that the local
+engine had no reason to blow up.
+
+Nothing anywhere in the engine tests `m_fHealth` for zero. Exactly one place
+reads a raw `m_fHealth` and can end up destroying a car, and it is not a
+comparison against zero - see §1.11.3.
+
+#### 1.11.2 Who decides: the driver's machine, and only it
+
+A car's owner is its driver, which is already CoopIII's rule for its transform,
+its velocity and its controls (§2.1). Destruction is the same decision and goes
+the same way:
+
+- The driver's machine detours `CAutomobile::BlowUpCar` and `CBoat::BlowUpCar`.
+  When the car the local player is driving actually blows up - confirmed by
+  reading `STATUS_WRECKED` back off it afterwards, because `BlowUpCar` returns
+  without doing anything if `bCanBeDamaged` is clear - it sends
+  `C_VehicleBlowUp` with the transform the car had at that moment.
+- The server takes the packet **only** from the player it believes is driving
+  that car. It has no GTA III running, so it cannot tell a real explosion from
+  an invented one; refusing a player who is declaring somebody else's car
+  finished is the one useful thing it can check, and it is the same test
+  `OnVehicleState` already applies to a snapshot.
+- Every observer puts the car where the owner says it ended up and then runs
+  the engine's own `BlowUpCar` on it, through the object's vtable slot 29.
+
+One call, because one call is what the engine does. The blast and the burnt
+shell are decided in the same function, so replaying it gets both - in the same
+street, on every screen - without CoopIII inventing either. This reuses
+`CExplosion::AddExplosion`, which §1.9.3 already replays at an agreed position;
+it does not add a second mechanism beside it.
+
+Position first, then the blast, and the order matters: `BlowUpCar` reads
+`GetPosition()` for the explosion, the camera shake and the fire it starts.
+Correcting afterwards would put the wreck in the right place and leave the
+explosion where the observer's physics had guessed.
+
+**An observer is forbidden to decide.** The same detour refuses outright any
+`BlowUpCar` on a car another player is driving. A wreck is a place as well as
+an event and an observer has neither the moment nor the position its owner will
+pick; their machine is already deciding, and their `C_VehicleBlowUp` is what
+brings it here. This is §1.9.2's rule for damage and §2.1's rule for a
+transform, applied to one more decision.
+
+**A synced car with nobody driving it is nobody's**, and each machine keeps its
+ordinary behaviour for it - the same way untouched traffic already does. It has
+no owner, so there is nobody entitled to announce anything about it.
+
+#### 1.11.3 The five-second fire timer, and why an observer must not run it
+
+This is the one path from a health value copied off a socket to a car the local
+engine destroys. Inside `CAutomobile::ProcessControl`:
+
+```
+0x00534510  fld [ebp+200h] / fcomp [0x006005C0]   m_fHealth < 250.0f ?
+0x0053452A  mov cl,[ebp+50h] / shr cl,3 / cmp eax,5   ... and not WRECKED ?
+    ...
+0x00534768  fadd  [ebp+530h] / fstp [ebp+530h]   m_fFireBlowUpTimer += timestep
+0x0053477A  fcomp [0x00600730]                   5000.0f
+0x0053479B  call  0x004A15F0                     AwardMoneyForExplosion(player)
+0x005347AB  call  dword [ebx+74h]                BlowUpCar(m_pSetOnFireEntity)
+```
+
+Note what is **not** in the entry condition: no flag, no damage event, no
+culprit. Just a health below 250 and five seconds of frames. So an observer
+that copies a health of 249 arms this timer and, five seconds later, decides
+by itself that somebody else's car is finished - at a moment its owner did not
+choose, at whatever position local physics had it in, and paying the local
+player `AwardMoneyForExplosion` once per frame until it succeeds.
+
+So CoopIII holds `m_fFireBlowUpTimer` at zero for any car another player is
+driving. **Only the timer.** The flames and the smoke are drawn off `m_fHealth`
+in the same block and are left alone, so a burning car still burns here exactly
+as it does on its driver's screen. What is taken away is the decision, not the
+picture.
+
+The detour is the backstop for the two callers no timer can head off,
+`CVehicle::InflictDamage` and `CVehicle::ProcessDelayedExplosion`.
+
+#### 1.11.4 A wreck is never respawned, and that is why the car "disappeared"
+
+The observer's car vanishing for good was never one bug.
+
+`CCarCtrl::PossiblyRemoveVehicle` deletes any `STATUS_WRECKED` vehicle about 60
+seconds after `m_nTimeOfDeath`, and the branch that does it is reached
+*precisely because* a car is locked or not deletable - CoopIII's two
+registration gates route a car into it rather than protecting it from it. That
+is correct behaviour and it means a destroyed synced car leaves the pool by
+itself.
+
+`ResolveRemoteVehicle` then saw an empty pool slot and re-armed the spawn. Two
+things followed:
+
+- With `destroyed` unknown, it would build a **brand new, undamaged car** where
+  a burnt one had just been cleared away. `RemoteVehicle::destroyed` stops
+  that, and it is set from the wire event *and* from reading `STATUS_WRECKED`
+  off the car, so a wreck this machine's own engine made is caught by the same
+  test.
+- With the model no longer requested, the respawn waited forever. Nothing else
+  in the game holds a reference to a model only CoopIII's car was using, so the
+  moment that car left the pool the streamer was free to throw the model out,
+  and `UpdateRemoteVehicles` sat on an `IsModelReady` that would never come
+  true again. Reconnecting brought the car back, because `OnVehicleSpawn` was
+  the only place that ever asked. `RequestModel` is now called on every pass of
+  the respawn loop.
+
+A wreck is still **corrected every frame**, deliberately. Its owner has stopped
+sending, so the interpolator holds it at the blast position - which is the one
+place both machines agree on. Letting local physics own it instead is how two
+wrecks end up in different streets.
+
+And the snapshots still in flight when it blew up are dropped, on both ends.
+They were sampled before the blast; applying one would relight a burnt-out car
+and drag it away from its own explosion.
+
+#### 1.11.5 "no se puede manejar" was a different bug entirely
+
+A late joiner got a car it could not drive an inch. That is not about
+destruction and it would have happened to any claimed car.
+
+`CorrectRemoteVehicle` runs from `PostFrame`, **every frame**, after physics
+and before the frame draws - which is the whole point of it (§2.1). It ran for
+every car the session knew about, including one the local player had since got
+into. Sixty times a second the session's transform was written over whatever
+the player had just done with it.
+
+So the correction now stops the moment the local player is in the driver's
+seat. It tests the driver's seat and not "is the local player inside", because
+a passenger is not an owner - the same test `SampleLocalVehicle` uses to decide
+what this machine may send.
+
+This is a **guard, not the ownership handoff**. The session still believes
+somebody else's netId names that car, and the local claim makes a second netId
+for it. What the guard buys is that the car drives while that is being sorted
+out. `docs/roadmap.md` M2 has the handoff.
+
+#### 1.11.6 Packets
+
+`C_VehicleBlowUp` (0x36) and `S_VehicleBlowUp` (0x37), both `CH_EVENT`,
+reliable.
+
+```
+VehicleBlowUpBody   netId u16, pos Vec3, rot Quat          30 bytes
+C_VehicleBlowUp     hdr + body                             35
+S_VehicleBlowUp     hdr + playerId u8 + body               36
+```
+
+The transform travels with it because `BlowUpCar` decides the wreck as well as
+the blast: whatever the observer's own physics had the car doing, this is where
+its owner says it ended up.
+
+Everyone gets out before the car goes up, on the observer as well: `BlowUpCar`
+hands every occupant to the engine to destroy on its own schedule, so a ped
+taken out afterwards is being taken out of a car that has already let go of it.
+That is the same ordering `UnseatPlayer` exists for.
+
+A blast for a car the receiver has never heard of is dropped, not queued and
+not created from - the packet carries no model, and a blast is not a reason to
+invent a car.
+
+### 1.12 A car's extras, next to its colours
+
+> "Hay autos que a un player le aparecen con extras que el otro jugador no ve y
+> viceversa"
+
+GTA III picks a vehicle's extra components at spawn, on each machine
+independently, so two machines roll two different cars. This is the same family
+of bug as the paint job, which `EnterVehicleBody.colour1/2` already solved by
+carrying the claimer's own `m_currentColour1/2`. The extras join them.
+
+**It is not fixed the same way, and that is the only surprising part.** A
+colour is read by the renderer every frame, so writing `m_currentColour1/2`
+after construction changes the car. `CVehicle::m_aExtras` (`+0x19E`, `int8[2]`)
+is a *record* of a decision already taken: the components are RwAtomics that
+`CVehicleModelInfo::CreateInstance` cloned into the clump while the car was
+being built. Writing those two bytes afterwards changes the record and nothing
+on screen.
+
+So the choice is forced **before** the constructor, through the engine's own
+override, `CVehicleModelInfo::ms_compsToUse` (`0x005FF2EC`, `int8[2]`, `{-2,
+-2}` in the file). It is one-shot: `ChooseComponent` (`0x00520AB0`) either sees
+-2 and rolls, or takes the value and puts -2 back in the same nine
+instructions. The engine uses it for exactly this job - `CStoredCar::RestoreCar`
+sets it so a garage gives you back the car you put in.
+
+`CAutomobile`'s constructor calls `CVehicle::SetModelIndex` →
+`CEntity::SetModelIndex` → `CreateRwObject`, so `CreateInstance` runs *inside*
+the constructor call, which is why `SpawnRemoteVehicle` is the only place this
+can happen. The override is set immediately before and put back immediately
+after - unconditionally, because `CreateInstance`'s `m_numComps == 0` arm
+returns without consuming it, and a leaked override would be worn by the next
+car this machine creates, traffic included.
+
+**The wire value is clamped against the model.** `CreateInstance` subscripts
+`m_comps[6]` with whatever it is handed and checks only for -1:
+
+```
+0x0051FCE0  cmp ebx,-1 / je skip
+0x0051FCE5  mov eax,[ebp+ebx*4+1DCh]        m_comps[comp], no upper bound
+```
+
+Anything at or above `m_numComps` reads past a six-entry array and hands the
+result to `RpAtomicClone`. Anything CoopIII cannot prove the model has becomes
+-1, "fit nothing", which is the engine's own value for an empty slot and the
+one bound `CreateInstance` does check. This is the same class of bug as the
+four-entry animation group (§1.8.1) and the twelve-slot node array, and it is
+the third time, so it is a test rather than a comment.
+
+**Wire changes.** `EnterVehicleBody`'s spare `pad` byte became `extra1` and
+`extra2` (37 → 38 bytes), and `S_VehicleSpawn` gained the same pair (39 → 41),
+so a late joiner's backfilled car has them too. `Session::Vehicle` carries them
+between the claim and the backfill.
+
 ---
 
 ## 2. Design decisions
@@ -1117,10 +1369,11 @@ model that doesn't exist yet.
 | 0x25 | `C_RESPAWN` / 0x26 `S_RESPAWN` | 1 | spawn transform (§1.10.5) |
 | 0x27 | `C_EXPLOSION` / 0x28 `S_EXPLOSION` | 1 | type `u8`, pos `float[3]` (§1.9.3) |
 | 0x29 | `C_DEATH` | 1 | killer `netId`, anim `u16` (§1.10.4). Out of order because the block above was numbered before it was clear who announces a death |
-| 0x30 | `C_ENTER_VEHICLE` / 0x31 `S_ENTER_VEHICLE` | 1 | `netId`, seat `u8`, jack `bool`, plus the car's identity when `netId` is `INVALID_NETID`. A client that has got into one of the session's own cars claims it by that car's existing `netId` instead (§2.8.4). Every seat is recorded, not just the driver's (§2.8.2) |
+| 0x30 | `C_ENTER_VEHICLE` / 0x31 `S_ENTER_VEHICLE` | 1 | `netId`, seat `u8`, jack `bool`, plus the car's identity when `netId` is `INVALID_NETID`: model id, colours, extras `i8[2]` (§1.12) and transform. A client that has got into one of the session's own cars claims it by that car's existing `netId` instead (§2.8.4). Every seat is recorded, not just the driver's (§2.8.2) |
 | 0x32 | `C_EXIT_VEHICLE` / 0x33 `S_EXIT_VEHICLE` | 1 | `netId` |
-| 0x34 | `S_VEHICLE_SPAWN` | 1 | `netId`, model id, transform, colours, then condition: health `float`, flags `u8` including `VEH_WRECKED` (§2.8.1) |
-| 0x35 | `S_VEHICLE_DESPAWN` | 1 | `netId` |
+| 0x34 | `S_VEHICLE_SPAWN` | 1 | `netId`, model id, transform, colours, extras `i8[2]` (§1.12), then condition: health `float`, flags `u8` including `VEH_WRECKED` (§2.8.1) |
+| 0x35 | `S_VEHICLE_DESPAWN` | 1 | `netId`. Declared and never sent: nothing in the server removes a car from the session, and a wreck is a wreck rather than a removal (§1.11.4) |
+| 0x36 | `C_VEHICLE_BLOWUP` / 0x37 `S_VEHICLE_BLOWUP` | 1 | `netId`, pos `float[3]`, quat `float[4]`; `S_` also carries `playerId` (§1.11) |
 | 0x40 | `S_WORLD_STATE` | 1 | game hour/minute, both weather types, `hostPlayerId` (§2.7) |
 | 0x41 | `C_WORLD_STATE` | 1 | the host's own hour/minute and weather pair; dropped from anyone else |
 | 0x50 | `C_CHAT` / 0x51 `S_CHAT` | 1 | `playerId`, text |

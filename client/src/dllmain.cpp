@@ -18,6 +18,7 @@
 #include "game/pause.h"
 #include "game/ped.h"
 #include "game/radar.h"
+#include "game/vehicle.h"
 #include "game/verify.h"
 #include "game/world.h"
 #include "game/worldstate.h"
@@ -147,11 +148,21 @@ DWORD WINAPI Boot(LPVOID) {
 		Log("CoopIII: combat is not fully hooked; firing, explosions and damage "
 		    "may not reach other players");
 
+	// Same story for a car blowing up, and the same reason it is a detour
+	// rather than a field: nothing in the engine watches a car's health for
+	// zero, so an observer handed a health of zero gets an undamaged-looking
+	// car with no health instead of a wreck. Not fatal - without it the
+	// destruction neither travels nor gets held back, which is the behaviour
+	// this replaces, and the log says so.
+	if (!game::InstallVehicleHooks())
+		Log("CoopIII: a car exploding will not reach other players");
+
 	WorldBridge bridge = game::MakeWorldBridge();
 	// Clock and weather are wired here rather than inside MakeWorldBridge
 	// because they share nothing with the ped and vehicle code: different
 	// addresses, different file, no entities involved.
 	game::AddWorldToBridge(bridge);
+	game::AddVehicleBlastToBridge(bridge);
 
 	if (!g_client.Start(g_config.host, g_config.port, g_config.nick, bridge)) {
 		Log("CoopIII: the network client failed to start; the frame hook stays "
@@ -209,6 +220,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			// for somebody else, and that has to happen while the detour
 			// keeping them from exploding is still installed.
 			game::RemoveCombatHooks();
+			// Same reason, and it also puts CVehicleModelInfo::ms_compsToUse
+			// back to { -2, -2 }. Leaving a component override behind would
+			// have the game fit it to the next car it creates by itself, for
+			// the rest of the session, with CoopIII gone and nothing left to
+			// explain it.
+			game::RemoveVehicleHooks();
 			game::RemoveFrameHook();
 			HookShutdown();
 		}

@@ -991,7 +991,11 @@ constexpr size_t VEH_HANDLING           = 0x128;   // tHandlingData*
 constexpr size_t VEH_AUTOPILOT          = 0x12C;   // CAutoPilot, 0x70 bytes
 constexpr size_t VEH_COLOUR1            = 0x19C;   // uint8
 constexpr size_t VEH_COLOUR2            = 0x19D;   // uint8
-constexpr size_t VEH_EXTRAS             = 0x19E;   // int8[2]
+// int8[2]. Written in exactly one place in the engine, CVehicle::SetModelIndex
+// at 0x00551185/0x00551190, from CVehicleModelInfo::ms_compsUsed. It is a
+// record of a choice already made and writing it changes nothing on screen -
+// see "a vehicle's extra components" below, which is why.
+constexpr size_t VEH_EXTRAS             = 0x19E;
 constexpr size_t VEH_ALARM_STATE        = 0x1A0;   // int16
 constexpr size_t VEH_DRIVER             = 0x1A4;   // CPed*
 constexpr size_t VEH_PASSENGERS         = 0x1A8;   // CPed*[8]
@@ -1423,6 +1427,439 @@ constexpr int CARLOCK_LOCKED   = 2;
 constexpr uint8_t ENTITY_STATUS_SHIFT     = 3;
 constexpr uint8_t ENTITY_STATUS_ABANDONED = 4;
 constexpr uint8_t ENTITY_TYPE_VEHICLE     = 2;
+
+// STATUS_WRECKED == 5 because CAutomobile::BlowUpCar writes `or al,0x28`
+// (5 << 3) into the same bits, and CCarCtrl::PossiblyRemoveVehicle reads them
+// back with `shr dl,3 / cmp eax,5`. Both are transcribed below.
+constexpr uint8_t ENTITY_STATUS_WRECKED = 5;
+
+// ---- a car's destruction ---------------------------------------------------
+//
+// Verified 2026-09-21 against the retail image, re-verified instruction by
+// instruction 2026-09-22 (every transcription below was re-disassembled from
+// the file, and two of the notes in this block were wrong - see the
+// corrections marked "Corrected 2026-09-22"). Found from
+// CExplosion::AddExplosion (0x005591C0, already here from M3): the only call
+// site in the whole exe that chooses between EXPLOSION_CAR and
+// EXPLOSION_CAR_QUICK is the one inside CAutomobile::BlowUpCar, which is
+// re3 Automobile.cpp:3913-3915. From that call the function start falls out of
+// the vtable, and everything BlowUpCar writes on the way is a field.
+//
+// ############################################################################
+// # THE POINT OF THIS BLOCK: m_fHealth is a number, destruction is an event. #
+// #                                                                          #
+// # Writing m_fHealth does not destroy a car. The engine's own damage path   #
+// # proves it in three instructions: CVehicle::InflictDamage writes          #
+// # `mov dword [esi+200h],0` at 0x00551C10 and then, separately, calls       #
+// # `call dword [ebx+74h]` at 0x00551C55. The zero and the destruction are   #
+// # two acts, and only the second one blows anything up.                     #
+// #                                                                          #
+// # Every destruction goes through CAutomobile::BlowUpCar (a CBoat has its   #
+// # own, below), and the callers are:                                        #
+// #                                                                          #
+// #   CVehicle::InflictDamage        a damage *transition* - the write above #
+// #   CVehicle::ProcessDelayedExplosion   a bomb timer                       #
+// #   CAutomobile::ProcessControl    the five-second fire timer below        #
+// #   COMMAND_EXPLODE_CAR            the script (0x00442E08)                 #
+// #                                                                          #
+// # There is exactly ONE place in the engine that reads a raw m_fHealth and  #
+// # can end up destroying a car, and that is the fire timer below - it needs #
+// # health < 250 and then five seconds of ProcessControl. Nothing anywhere   #
+// # tests m_fHealth for zero.                                                #
+// #                                                                          #
+// # So an observer that writes a health of 0 straight into a remote car's    #
+// # m_fHealth gets a car with no health that is not destroyed. That is why   #
+// # a synced car blew up on its driver's screen and nowhere else, and it is  #
+// # why the fix is an event on the wire rather than another field.           #
+// #                                                                          #
+// # BlowUpCar is never called directly: a scan of .text for an E8/E9 rel32   #
+// # to 0x0053BC60 or to CBoat's 0x00541CB0 finds nothing at all. Every one   #
+// # of the callers above goes through vtable slot 29, which is why a detour  #
+// # on the function catches all of them and a detour on a call site would    #
+// # catch one.                                                               #
+// ############################################################################
+//
+// __thiscall void CAutomobile::BlowUpCar(CEntity *culprit).  ret 4.
+//
+//   0x0053BC60  push ebx/esi/edi/ebp ; mov ebx,ecx      this
+//   0x0053BC69  mov al,[ebx+1F7h] / shr al,6 / and al,1 / jne
+//                                                       if (!bCanBeDamaged) return
+//   0x0053BC80  fld [ebx+80h] / fadd [0x6007F8] / fstp  m_vecMoveSpeed.z += 0.13f
+//   0x0053BC92  mov al,[ebx+50h] / and al,7 / or al,28h SetStatus(STATUS_WRECKED)
+//   0x0053BC9C  mov al,[ebx+52h] / and al,0EFh / or al,10h   bRenderScorched = true
+//   0x0053BCA6  mov eax,[0x885B48] / mov [ebx+210h],eax m_nTimeOfDeath = time
+//   0x0053BCB1  lea ecx,[ebx+288h] / call 0x00545B70    Damage.FuckCarCompletely()
+//   0x0053BCBC  cmp word [ebx+5Ch],83h                  GetModelIndex() != MI_RCBANDIT
+//   ... bumper/door damage, the flying wheel, the dead occupants ...
+//   0x0053BF20  push 0 / push esi / push 3 / push [esp+28h] / push ebx
+//   0x0053BF2A  call 0x005591C0 / add esp,14h
+//                                    AddExplosion(this, culprit, EXPLOSION_CAR, pos, 0)
+//
+//     Corrected 2026-09-22: this line used to show three pushes and no
+//     `add esp`. It is five arguments, the same five M3 recorded for
+//     COMMAND_ADD_EXPLOSION. The arm at 0x0053BF15 pushes 4 instead of 3,
+//     which is what fixes EXPLOSION_CAR == 3 and EXPLOSION_CAR_QUICK == 4.
+//
+// re3 Automobile.cpp:3837-3925, statement for statement. Two offsets fall out
+// of it for free and both are new: m_nTimeOfDeath at +0x210 and
+// CDamageManager at +0x288, which is SIZEOF_VEHICLE, i.e. CAutomobile's first
+// member.
+constexpr uintptr_t CAutomobile__BlowUpCar = 0x0053BC60;
+
+// CBoat::BlowUpCar. A genuinely different function - its own prologue, its own
+// stack frame (`sub esp,28h` against CAutomobile's `sub esp,8`) - opening on
+// the same `mov al,[ebp+1F7h] / shr al,6 / and al,1` bCanBeDamaged test. It is
+// slot 29 of CBoat's vtable, which is how it was found: the constant
+// 0x00541CB0 appears exactly once in the whole file, at 0x00600F18 in .data,
+// i.e. 0x74 into the vtable at 0x00600EA4.
+//
+// It is hooked as well as CAutomobile's, because a detour on one function
+// catches only that function. Without it the local player's own boat exploding
+// says nothing to the session. Note that SpawnRemoteVehicle always constructs
+// a CAutomobile, so no *observed* vehicle is ever a CBoat today - see
+// docs/roadmap.md M2.
+constexpr uintptr_t CBoat__BlowUpCar = 0x00541CB0;
+
+// It is virtual, and going through the vtable is what makes a replay right for
+// whichever of the two the object actually is. Slot 29 in CAutomobile's vtable
+// (0x00600C1C + 0x74 == 0x0053BC60), in CBoat's (0x00600EA4 + 0x74 ==
+// 0x00541CB0) and in CVehicle's (0x006028A8 + 0x74 == 0x00444B10), where it is
+// the do-nothing base: four instructions, `mov [esp+4],ecx / ret 4`. The
+// engine calls it exactly this way - see the fire timer below, which ends on
+// `call dword [ebx+74h]`.
+constexpr size_t VTABLE_BLOW_UP_CAR = 29;
+
+// __thiscall void CVehicle::ProcessDelayedExplosion(void). The bomb timer, and
+// the second of BlowUpCar's callers. `mov ecx,ebp / call 0x00551C90` at
+// 0x005347E6, two instructions after the fire block below, which is re3
+// Automobile.cpp:1111 calling Vehicle.cpp:846. Its own tail is the third
+// `call dword [ebx+74h]` in the vehicle modules, at 0x00551D7C.
+constexpr uintptr_t CVehicle__ProcessDelayedExplosion = 0x00551C90;
+
+// CVehicle::InflictDamage is BlowUpCar's first caller and the one that settles
+// what this whole block is about. Its entry point is NOT recorded here: the
+// instructions below were read at their own addresses and nothing CoopIII does
+// needs to call the function, so recording a start address would be recording
+// something unproven next to things that are proved. Two arms, both reached
+// from the same 250.0f compare against the constant at 0x0060256C:
+//
+//   0x00551BA5  fld [esp+4] / fcomp [0x0060256C]      damage vs 250.0f
+//   0x00551BBA  fld [esi+200h] / fcomp [0x0060256C]   m_fHealth vs 250.0f
+//   0x00551BE1  lea ecx,[esi+288h] / push 0E1h / call 0x00545940
+//                                                     the "set on fire" arm
+//   0x00551BF3  mov [esi+574h],ebp                    m_pSetOnFireEntity
+//   ---- the fatal arm ----
+//   0x00551C10  mov dword [esi+200h],0                m_fHealth = 0
+//   0x00551C55  mov ecx,esi / push ebp / mov ebx,[ecx]
+//   0x00551C5A  call dword [ebx+74h]                  BlowUpCar(culprit)
+//
+// The write and the call are 69 bytes apart and neither implies the other.
+// That is the whole reason a health of zero on the wire produced an
+// intact-looking car with no health on the observer's screen.
+
+// ---- the five-second fire timer, and why an observer must not run it -------
+//
+// This is the only place in the engine that reads a raw m_fHealth and
+// destroys a car for it, which makes it the one path a health value copied
+// off the wire can reach. Inside CAutomobile::ProcessControl:
+//
+//   0x00534761  fild qword [esp+0D0h]                CTimer::GetTimeStepInMs()
+//   0x00534768  fadd  dword [ebp+530h]
+//   0x0053476E  fstp  dword [ebp+530h]               m_fFireBlowUpTimer += step
+//   0x00534774  fld   dword [ebp+530h]
+//   0x0053477A  fcomp dword [0x00600730]             5000.0f
+//   0x00534780  fnstsw ax / test ah,45h
+//   0x00534785  jne   0x005347BA                     not past 5000 yet
+//   0x00534787  movzx ecx,byte [0x0095CD61]          CWorld::PlayerInFocus
+//   0x0053478F  imul  ecx,ecx,13Ch / add ecx,9412F0h CWorld::Players[..]
+//   0x0053479B  call  0x004A15F0                     AwardMoneyForExplosion(this)
+//   0x005347A2  mov   eax,[ebp+574h]                 m_pSetOnFireEntity
+//   0x005347A8  mov   ebx,[ecx] / push eax
+//   0x005347AB  call  dword [ebx+74h]                BlowUpCar(m_pSetOnFireEntity)
+//   0x005347AE  jmp   0x005347BA
+//   0x005347B0  mov   dword [ebp+530h],0             the ELSE arm, see below
+//
+// And the entry test, 0x2A0 bytes earlier, which is what the timer hangs off:
+//
+//   0x00534510  fld [ebp+200h] / fcomp [0x006005C0]  m_fHealth vs 250.0f
+//   0x0053451E  and ah,5 / cmp ah,1
+//   0x00534524  jne 0x005347B0                       not damaged -> reset timer
+//   0x0053452A  mov cl,[ebp+50h] / shr cl,3
+//   0x00534533  cmp eax,5
+//   0x00534536  je  0x005347B0                       already wrecked -> reset
+//
+//     Corrected 2026-09-22: the old note called 0x005347B0 the "else" of the
+//     5000.0f compare. It is not - 0x005347AE jumps straight over it. It is
+//     the else of the *entry* test above, which is why holding the timer at
+//     zero from CoopIII works at all: the engine only resets it for a car
+//     that is healthy or already wrecked.
+//
+// re3 Automobile.cpp:1098-1106. m_fHealth at +0x200 is re-confirmed nine
+// instructions after the timer by the engine-damage arm (`fld [ebp+200h] /
+// fcomp [0x006005C0]` at 0x005347C1 against the same 250.0f), as is
+// m_bSirenOrAlarm at +0x22E two instructions after that (0x005347ED).
+//
+// Note what is NOT in the entry condition: any flag, any damage event, any
+// culprit. An observer that copies a health below 250 arms this timer, and
+// five seconds later its own engine decides that somebody else's car is
+// destroyed - at a moment its owner did not choose, at whatever position
+// local physics had it in, crediting a null culprit, and paying the observer
+// AwardMoneyForExplosion for it once per frame until it succeeds.
+//
+// vehicle.cpp holds this at zero for any car another player is driving, which
+// leaves the flames (those are drawn off m_fHealth, not off the timer) and
+// takes away the decision. The BlowUpCar detour is the backstop for the other
+// two callers.
+namespace offs {
+constexpr size_t AUTO_FIRE_BLOWUP_TIMER  = 0x530;   // float
+constexpr size_t AUTO_SET_ON_FIRE_ENTITY = 0x574;   // CEntity*
+constexpr size_t AUTO_DAMAGE_MANAGER     = 0x288;   // CDamageManager, == SIZEOF_VEHICLE
+constexpr size_t VEH_TIME_OF_DEATH       = 0x210;   // uint32, ms
+} // namespace offs
+
+static_assert(offs::AUTO_DAMAGE_MANAGER == offs::SIZEOF_VEHICLE,
+              "CDamageManager is CAutomobile's first member, so BlowUpCar's "
+              "`lea ecx,[ebx+288h]` re-states sizeof(CVehicle)");
+static_assert(offs::AUTO_FIRE_BLOWUP_TIMER < offs::SIZEOF_AUTOMOBILE &&
+                  offs::AUTO_SET_ON_FIRE_ENTITY < offs::SIZEOF_AUTOMOBILE,
+              "both live inside the object the pool actually strides for");
+static_assert(offs::VEH_TIME_OF_DEATH > offs::VEH_CHANGE_GEAR_TIME &&
+                  offs::VEH_TIME_OF_DEATH < offs::VEH_DOOR_LOCK,
+              "m_nTimeOfDeath sits between two offsets Area E already proved");
+
+constexpr float VEH_FIRE_HEALTH    = 250.0f;
+constexpr float VEH_FIRE_BLOWUP_MS = 5000.0f;
+
+// bRenderScorched is byte B (+0x52) bit 4, from BlowUpCar's
+// `and al,0EFh / or al,10h`. It shares that byte with bExplosionProof (bit 1),
+// which M3 found the same way and for the same reason - byte B is where the
+// flags that did not fit in byte A ended up, and guessing which byte a
+// CEntity flag lives in has cost this project two rounds.
+namespace offs {
+constexpr uint8_t ENTITY_RENDER_SCORCHED = 0x10;   // byte B
+} // namespace offs
+
+static_assert((offs::ENTITY_RENDER_SCORCHED & offs::ENTITY_EXPLOSION_PROOF) == 0,
+              "two different bits of byte B, whatever else they share");
+
+// ---- the reaping site that deletes a car BECAUSE it is locked --------------
+//
+// CCarCtrl::PossiblyRemoveVehicle's wreck branch, which begins at 0x00418726:
+//
+//   0x00418726  mov dl,[ebx+50h] / shr dl,3 / cmp eax,5 / jne out
+//                                             GetStatus() != STATUS_WRECKED
+//   0x00418738  mov eax,[ebx+210h] / test eax,eax / je out
+//                                             m_nTimeOfDeath == 0
+//   0x00418746  add eax,0EA60h                 + 60000 ms
+//   0x0041874B  cmp [0x885B48],eax / jbe out   CTimer::GetTimeInMilliseconds()
+//   0x00418757  call 0x00474CC0                GetIsOnScreen()
+//   0x00418763  call 0x004AAA00                IsEntityCullZoneVisible()
+//   0x004187B2  fcomp [0x005EC978]             distance from the player
+//   0x004187DC  call 0x00428260                IsPointWithinHideOutGarage()
+//   0x004187E7  call 0x004AE9D0                CWorld::Remove
+//               ... then the deleting destructor
+//
+// ############################################################################
+// # Corrected 2026-09-22. This block used to say, in bold, "there is no      #
+// # bIsLocked test and no CanBeDeleted call anywhere in it". That is wrong.  #
+// # Both are there, immediately above, and they are what JUMPS INTO the      #
+// # branch:                                                                  #
+// #                                                                          #
+// #   0x004186BF  shr al,3 / and al,1 / jne 0x00418726   bIsLocked -> wreck  #
+// #   0x004186C6  mov ecx,ebx / call 0x005511B0          CanBeDeleted()      #
+// #   0x004186CF  test al,al / je 0x00418726             !deletable -> wreck #
+// #   0x004186D4  call 0x00455350 / jne 0x00418726       in a mission -> ""  #
+// #                                                                          #
+// # So 0x00418726 is the ELSE of the two gates, not code that forgot them.   #
+// # The engine's reasoning is "this car cannot be recycled as traffic; is it #
+// # at least a minute-old wreck?" - and a minute-old wreck goes, gates and   #
+// # all. The conclusion CoopIII depends on is unchanged and now rests on     #
+// # the right reading: passing !bIsLocked && CanBeDeleted() does NOT keep a  #
+// # wrecked mission car in the pool, it is precisely what routes it here.    #
+// #                                                                          #
+// # The practical consequence, which is what matters: a destroyed synced car #
+// # leaves the pool about 60 seconds later, by itself, and CoopIII must not  #
+// # read that empty slot as "respawn it".                                    #
+// ############################################################################
+//
+// (re3 marks an added bIsLocked check as a FIX_BUGS at the top of the same
+// function, CarCtrl.cpp:719-722. That is a *different* test in a different
+// place, and reading it as this one is how the note above came to be wrong.
+// Four times now a re3 reading has had to be corrected against the binary.)
+constexpr uint32_t VEH_WRECK_REMOVAL_MS = 60000;
+
+// ---- a vehicle's extra components ------------------------------------------
+//
+// Verified 2026-09-22. The second half of the same family of bug as the paint
+// job: GTA III picks a car's extras at spawn, per machine, so two machines
+// independently roll different ones and each player sees a car the other does
+// not.
+//
+// ############################################################################
+// # Extras are NOT like the colours, and copying the colour fix would do     #
+// # nothing at all. m_currentColour1/2 are read by the renderer every frame, #
+// # so writing them after construction changes the car. m_aExtras is a       #
+// # *record* of a decision already taken: the components are RwAtomics that  #
+// # were cloned into the clump during construction, and writing the bytes    #
+// # afterwards changes the record and not one thing on screen.               #
+// #                                                                          #
+// # So an extra has to be forced BEFORE the constructor runs, through the    #
+// # engine's own override, and the engine has one because the garages need   #
+// # exactly this (re3 Garages.cpp:1905, CStoredCar::RestoreCar).             #
+// ############################################################################
+//
+// CVehicleModelInfo::ms_compsToUse - int8[2], the override. Both bytes are
+// 0xFE (-2) in the file at 0x005FF2EC, which is re3's initialiser
+// `{ -2, -2 }` (VehicleModelInfo.cpp:24). -2 means "choose at random".
+//
+// It is ONE-SHOT, and that is the whole mechanism. CVehicleModelInfo::
+// ChooseComponent (0x00520AB0) opens:
+//
+//   0x00520AB8  cmp byte [0x005FF2EC],0FEh
+//   0x00520AC1  je  0x00520AD7                  -2: fall through to the roll
+//   0x00520AC3  movsx eax,byte [0x005FF2EC]     otherwise: use it
+//   0x00520ACD  mov byte [0x005FF2EC],0FEh      and put it back to -2
+//   0x00520AD6  ret
+//
+// ChooseSecondComponent (0x00520BE0) is the same nine instructions against
+// 0x005FF2ED. Note `movsx`: the value is signed, so -1 ("no component")
+// survives the round trip and is what the engine itself passes for a car with
+// no extra fitted.
+constexpr uintptr_t CVehicleModelInfo__ms_compsToUse = 0x005FF2EC;
+
+// CVehicleModelInfo::ms_compsUsed - int8[2], what was actually chosen. Read
+// straight out of CVehicle::SetModelIndex (0x00551170), which is already in
+// this file and whose whole body is six instructions:
+//
+//   0x00551179  call 0x00473E70                 CEntity::SetModelIndex
+//   0x0055117E  mov dl,[0x0095CCB2]
+//   0x00551185  mov [ebp+19Eh],dl               m_aExtras[0] = ms_compsUsed[0]
+//   0x0055118B  mov al,[0x0095CCB3]
+//   0x00551190  mov [ebp+19Fh],al               m_aExtras[1] = ms_compsUsed[1]
+//   0x00551196  call 0x005219D0                 max passengers from door count
+//
+// which is re3 Vehicle.cpp:157-158 and the sixth independent confirmation of
+// offs::VEH_EXTRAS at 0x19E.
+constexpr uintptr_t CVehicleModelInfo__ms_compsUsed = 0x0095CCB2;
+
+constexpr int8_t VEHICLE_COMPS_RANDOM = -2;   // ms_compsToUse: roll for it
+constexpr int8_t VEHICLE_EXTRA_NONE   = -1;   // m_aExtras: nothing fitted
+
+// ---- why the write has to happen before the constructor --------------------
+//
+// CEntity::SetModelIndex (0x00473E70) is four instructions:
+//
+//   0x00473E70  mov eax,[esp+4]
+//   0x00473E75  mov [ecx+5Ch],ax                m_modelIndex
+//   0x00473E79  mov ebx,[ecx] / call dword [ebx+14h]   CreateRwObject(), slot 5
+//   0x00473E7F  ret 4
+//
+// and CVehicle::SetModelIndex is called from CAutomobile's constructor. So the
+// clump - and therefore CVehicleModelInfo::CreateInstance, which is what does
+// the choosing - is built INSIDE the constructor call. ms_compsToUse has to be
+// set before CoopIII calls the constructor, exactly as the garage does.
+constexpr uintptr_t CEntity__SetModelIndex = 0x00473E70;
+
+// ---- and why it has to be put back afterwards ------------------------------
+//
+// CVehicleModelInfo::CreateInstance, 0x0051FCB0. Found by scanning .text for
+// the two writes to ms_compsUsed (three sites each; the other one is
+// SetModelIndex above). It is re3 VehicleModelInfo.cpp:181-222 statement for
+// statement:
+//
+//   0x0051FCB9  call 0x004F8920                 CClumpModelInfo::CreateInstance
+//   0x0051FCC1  cmp dword [ebp+1F4h],0
+//   0x0051FCC8  je  0x0051FDA3                  if (m_numComps == 0) ...
+//   0x0051FCD9  call 0x00520AB0                 comp1 = ChooseComponent()
+//   0x0051FCE0  cmp ebx,-1 / je                 -1 means fit nothing
+//   0x0051FCE5  mov eax,[ebp+ebx*4+1DCh]        m_comps[comp1]   <-- UNCHECKED
+//   0x0051FD38  mov byte [0x0095CCB2],bl        ms_compsUsed[0] = comp1
+//   0x0051FD3E  call 0x00520BE0                 comp2 = ChooseSecondComponent()
+//   0x0051FD9B  mov byte [0x0095CCB3],bl        ms_compsUsed[1] = comp2
+//   0x0051FDA3  mov byte [0x0095CCB2],0FFh      the m_numComps == 0 arm:
+//   0x0051FDAA  mov byte [0x0095CCB3],0FFh      both used = -1 and RETURN
+//
+// ############################################################################
+// # Two traps, both in that listing.                                         #
+// #                                                                          #
+// # 1. `mov eax,[ebp+ebx*4+1DCh]` is the ONLY thing done with the chosen     #
+// #    index, and the only guard on it is `cmp ebx,-1`. There is no upper    #
+// #    bound. A component index off the wire goes straight into that         #
+// #    subscript and out of it into RpAtomicClone. m_comps is six pointers   #
+// #    (+0x1DC to +0x1F3, with m_numComps at +0x1F4 immediately after), so   #
+// #    anything at or above m_numComps reads another model's fields and      #
+// #    calls RenderWare on them. Bound it, in CoopIII, against m_numComps -  #
+// #    this is the same class of bug as the four-entry animation group and   #
+// #    the twelve-slot node array, which is three for three now.             #
+// #                                                                          #
+// # 2. The m_numComps == 0 arm at 0x0051FDA3 sets ms_compsUsed and NEVER     #
+// #    TOUCHES ms_compsToUse. So an override written for a model that has no #
+// #    components is not consumed, and the next car created on that machine  #
+// #    - traffic, a parked car, anything - picks it up instead. Put it back  #
+// #    to { -2, -2 } after the constructor returns, unconditionally.         #
+// ############################################################################
+namespace offs {
+constexpr size_t MODELINFO_COMPS      = 0x1DC;   // RpAtomic *[6]
+constexpr size_t MODELINFO_NUM_COMPS  = 0x1F4;   // int32
+constexpr size_t MODELINFO_COMP_RULES = 0x0EC;   // uint32
+} // namespace offs
+
+// Six, from the layout rather than from re3's declaration: m_comps starts at
+// +0x1DC and m_numComps, read by CreateInstance's own `cmp dword [ebp+1F4h]`,
+// sits at +0x1F4. (0x1F4 - 0x1DC) / 4 == 6. re3 agrees
+// (VehicleModelInfo.h:107) but it is not the source here.
+constexpr int MAX_VEHICLE_COMPS = 6;
+static_assert((offs::MODELINFO_NUM_COMPS - offs::MODELINFO_COMPS) /
+                      sizeof(void *) ==
+                  MAX_VEHICLE_COMPS,
+              "m_comps runs from +0x1DC up to m_numComps at +0x1F4");
+
+// MODELINFOSIZE. ms_modelInfoPtrs is 5500 pointers, which is proved twice over
+// by two separate walks of the array that both end on `cmp reg,157Ch / jl`:
+// 0x00401121 and 0x00406919. It is also, independently, the value already in
+// this file as STREAM_OFFSET_TXD - the streaming array puts txd ids straight
+// after the last model id, so the two numbers are the same number.
+constexpr uint32_t MODELINFO_SIZE = 0x157C;
+static_assert(MODELINFO_SIZE == STREAM_OFFSET_TXD,
+              "txd ids begin where model ids end");
+
+// ms_modelInfoPtrs[id], bounded. Null for a model that has never been loaded,
+// which every caller has to handle anyway.
+inline void *VehicleModelInfo(uint32_t modelId) {
+	if (modelId >= MODELINFO_SIZE)
+		return nullptr;
+	return reinterpret_cast<void **>(CModelInfo__ms_modelInfoPtrs)[modelId];
+}
+
+// How many extra components this model actually has, or 0 when the model is
+// not loaded - in which case nothing may be forced, because CreateInstance
+// would subscript m_comps on a model info that is not there.
+inline int VehicleModelCompCount(uint32_t modelId) {
+	void *const info = VehicleModelInfo(modelId);
+	if (!info)
+		return 0;
+	const int32_t n = *reinterpret_cast<const int32_t *>(
+	    reinterpret_cast<uint8_t *>(info) + offs::MODELINFO_NUM_COMPS);
+	if (n <= 0)
+		return 0;
+	return n > MAX_VEHICLE_COMPS ? MAX_VEHICLE_COMPS : static_cast<int>(n);
+}
+
+// The one gate between a byte off the wire and CreateInstance's unchecked
+// subscript. Pure arithmetic, so tools/clienttest covers it without the game.
+//
+// Anything that is not a component this model has becomes -1, "fit nothing".
+// -1 is the engine's own value for that and the `cmp ebx,-1` above is the one
+// bound CreateInstance does check, so it is the safe answer as well as the
+// honest one: better a car missing an extra than a call into RenderWare with
+// somebody else's pointer.
+inline int8_t ClampVehicleExtra(int8_t wire, int compCount) {
+	if (wire < 0 || compCount <= 0)
+		return VEHICLE_EXTRA_NONE;
+	if (wire >= compCount || wire >= MAX_VEHICLE_COMPS)
+		return VEHICLE_EXTRA_NONE;
+	return wire;
+}
 
 // ---- animation ------------------------------------------------------------
 //

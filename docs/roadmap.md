@@ -159,8 +159,56 @@ remove it. Somebody parked it, it is still there.
       `WarpPedIntoCar`, deliberately, to get the entity relationship right
       first; the animated version is the remaining piece here.
 - [ ] Passengers: several players in one car, with the driver owning physics.
-- [ ] Ownership handoff when the driver changes. This is the fiddly one.
-- [ ] Vehicle damage: panels, doors, lights, wheels, fire, explosion.
+- [x] Same car on every screen: colours **and extras**. `EnterVehicleBody` and
+      `S_VehicleSpawn` carry `m_aExtras`, forced on the receiving machine
+      through `CVehicleModelInfo::ms_compsToUse` before the constructor runs,
+      because they cannot be applied after it. `protocol.md` §1.12.
+- [ ] Ownership handoff when the driver changes. This is the fiddly one, and
+      it now has a **stopgap in front of it**: `CorrectRemoteVehicle` stops
+      correcting a car the local player is sitting in the driver's seat of.
+      Without that, a car another player claimed is a car you can get into and
+      cannot drive an inch, because the session's transform is written over
+      yours sixty times a second. The session still thinks the other netId
+      names it and the local claim makes a second one; the guard only buys
+      time. `protocol.md` §1.11.5.
+- [x] The car blows up on every screen. `C_VehicleBlowUp` / `S_VehicleBlowUp`
+      (0x36/0x37), decided by the driver's machine, replayed by every observer
+      through the engine's own `CAutomobile::BlowUpCar` at the owner's
+      transform. `protocol.md` §1.11.
+- [ ] **Vehicle damage short of destruction: panels, doors, lights, wheels.**
+      Deliberately left out of the destruction work, and the addresses proved
+      while doing it are the head start:
+
+      | Symbol | Address / offset | How it was proved |
+      |---|---|---|
+      | `CVehicle::m_damageManager` (`CDamageManager`) | `+0x288` | `BlowUpCar`'s `lea ecx,[ebx+288h]`; also `== SIZEOF_VEHICLE`, i.e. `CAutomobile`'s first member |
+      | `CDamageManager::FuckCarCompletely` | `0x00545B70` | the call `BlowUpCar` makes on that sub-object |
+      | a `CAutomobile` panel/door setter | `0x00530120` | `BlowUpCar` calls it four times with `(id, status, 0)` triples - `(7,5,0)`, `(8,6,0)`... It takes the **vehicle**, not the damage manager: `lea ecx,[ebp+288h] / call 0x005458E0` records the damage, then `[ebp+ebx*4+37Ch]` reaches what is almost certainly `m_aCarNodes` and hides the frame. Both halves have to happen or the panel stays on screen |
+      | `CDamageManager` engine-status setter | `0x00545940` | `mov [ecx+4], min(arg, 0FAh)`, a saturating byte write. `CVehicle::InflictDamage`'s "set on fire" arm pushes `0E1h` (225) into it, so `m_engineStatus >= 225` is what "this car is burning" means. `+4` is the engine byte and 250 is its cap |
+      | `CDamageManager` layout, partially | `+5`, `+9`..`+0E`, `+4` | `0x00545B70` writes 2 into `+5` and 3 into the six consecutive bytes `+9`..`+0E`, which is the wreck state for six separate parts |
+      | `m_nTimeOfDeath` | `+0x210` | `BlowUpCar`'s `mov eax,[0x885B48] / mov [ebx+210h],eax` |
+      | `bRenderScorched` | byte B (`+0x52`) bit 4 | `BlowUpCar`'s `and al,0EFh / or al,10h` |
+
+      Three things a reader of those should know before building on them.
+      Everything in the "how it was proved" column was read out of the binary
+      on 2026-09-22 and the three function addresses are in
+      `docs/addresses-unverified.md` rather than in `addresses.h`, because
+      what has been read is their *shape* and their call sites, not their
+      whole bodies matched against re3 - which is the standard the rest of
+      `addresses.h` is held to. Do not promote them without doing that.
+      Second: `m_aCarNodes` at `+0x37C` is a guess from one subscript and
+      nothing else, and a wrong node array is a write into a neighbouring
+      member rather than a crash. Third, and the design point: this is a
+      *state*, not an event. Unlike a blast it belongs in the snapshot beside
+      health, which means the snapshot grows and the wire changes again -
+      whereas destruction deliberately did not touch the snapshot at all.
+- [ ] Boats. `SpawnRemoteVehicle` always constructs a `CAutomobile`, whatever
+      the model is, so a synced boat is a `CAutomobile` wearing a boat.
+      `CBoat::CBoat` is already in `addresses.h` (`0x0053E3E0`) and
+      `COMMAND_CREATE_CAR`'s own boat branch is transcribed there.
+      `CBoat::BlowUpCar` (`0x00541CB0`) is hooked, so the send half already
+      works for the local player's own boat; the observe half is what the
+      constructor choice blocks.
 - [ ] Never use `STATUS_PLAYER_REMOTE`. It is RC-car mode and it detonates
       cars (`protocol.md` §1.4).
 - [x] Run in the game. A car spawns, renders upright, survives in the pool

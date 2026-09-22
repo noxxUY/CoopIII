@@ -166,6 +166,10 @@ private:
 			if (const auto *pkt = msg.as<C_ExitVehicle>())
 				OnExitVehicle(peer, *pkt);
 			break;
+		case OP_C_VEHICLE_BLOWUP:
+			if (const auto *pkt = msg.as<C_VehicleBlowUp>())
+				OnVehicleBlowUp(peer, *pkt);
+			break;
 		case OP_C_WORLD_STATE:
 			if (const auto *pkt = msg.as<C_WorldState>())
 				OnWorldState(peer, *pkt);
@@ -443,10 +447,14 @@ private:
 		// this car rather than a fresh one wearing its paint. A car that
 		// reports itself wrecked leaves the session's backfill here, and says
 		// so once rather than on every snapshot that follows.
-		Vehicle   *known      = m_session.FindVehicle(in.body.netId);
-		const bool wasWrecked = known && known->destroyed;
+		//
+		// A wreck takes no more updates either: its driver is dead, so anything
+		// still arriving for it was sampled before the blast.
+		Vehicle *known = m_session.FindVehicle(in.body.netId);
+		if (known && known->destroyed)
+			return;
 		m_session.NoteVehicleState(in.body);
-		if (known && known->destroyed && !wasWrecked)
+		if (known && known->destroyed)
 			std::printf("[coopiii] vehicle %u is wrecked; joiners will not be told "
 			            "about it\n", known->netId);
 
@@ -477,6 +485,13 @@ private:
 			if (!v)
 				return;   // the session is tracking as many as it will
 
+			// Set here rather than passed to AddVehicle, so Session's
+			// signature stays where the join/backfill work left it. The
+			// claimer's machine is the only one that knows which extras this
+			// car has - its own engine chose them. docs/protocol.md §1.12.
+			v->extra1 = in.body.extra1;
+			v->extra2 = in.body.extra2;
+
 			// Everyone else needs to spawn it. Claimer's excluded, obviously
 			// (it's a car from their own world, they've already got it).
 			//
@@ -495,10 +510,13 @@ private:
 			spawn.colour2 = v->colour2;
 			spawn.health  = v->health;
 			spawn.flags   = v->flags;
+			spawn.extra1  = v->extra1;
+			spawn.extra2  = v->extra2;
 			m_net.Broadcast(spawn, CH_EVENT, peer);
 
-			std::printf("vehicle %u claimed by %s (model %u)\n", v->netId,
-			            p->nick.c_str(), v->modelId);
+			std::printf("vehicle %u claimed by %s (model %u, extras %d/%d)\n",
+			            v->netId, p->nick.c_str(), v->modelId,
+			            static_cast<int>(v->extra1), static_cast<int>(v->extra2));
 		}
 
 		// Every seat, not just the driver's. A passenger's seat has one
@@ -516,6 +534,41 @@ private:
 		out.body        = in.body;
 		out.body.netId  = v->netId;
 		m_net.Broadcast(out, CH_EVENT);
+	}
+
+	// A car was destroyed, per the machine driving it.
+	//
+	// Who decides: the driver's, because that is the machine simulating it.
+	// The server checks that and nothing else - it has no GTA III running, so
+	// it cannot tell a real explosion from an invented one, and the only
+	// thing it can usefully refuse is a player declaring somebody else's car
+	// finished. Same test OnVehicleState uses to refuse a snapshot for a car
+	// the sender is not driving.
+	void OnVehicleBlowUp(PeerId peer, const C_VehicleBlowUp &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+
+		Vehicle *v = m_session.FindVehicle(in.body.netId);
+		if (!v || v->destroyed)
+			return;
+		if (v->driverPlayerId != p->id)
+			return;
+
+		v->destroyed      = true;
+		v->driverPlayerId = INVALID_PLAYER;
+		v->pos            = in.body.pos;
+		v->rot            = in.body.rot;
+		if (p->vehicleNetId == v->netId)
+			p->vehicleNetId = INVALID_NETID;
+
+		std::printf("vehicle %u blown up by %s\n", v->netId, p->nick.c_str());
+
+		S_VehicleBlowUp out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.body     = in.body;
+		m_net.Broadcast(out, CH_EVENT, peer);
 	}
 
 	void OnExitVehicle(PeerId peer, const C_ExitVehicle &in) {

@@ -122,6 +122,11 @@ void Client::PostFrame() {
 		return;
 	SendLocalModel();
 	SendLocalState();
+	// Blasts before the exit, and the order is load-bearing. Both are
+	// reliable and ordered, and the server only takes a blast from the player
+	// it believes is driving that car - so an exit that overtook it would
+	// have the server throw the blast away as coming from nobody.
+	SendLocalVehicleBlasts();
 	SendLocalVehicle();
 }
 
@@ -142,6 +147,8 @@ void Client::HandleMessage(const Message &msg) {
 		OnVehicleDespawn(*p);
 	} else if (const S_VehicleState *p = msg.as<S_VehicleState>()) {
 		OnVehicleState(*p);
+	} else if (const S_VehicleBlowUp *p = msg.as<S_VehicleBlowUp>()) {
+		OnVehicleBlowUp(*p);
 	} else if (const S_EnterVehicle *p = msg.as<S_EnterVehicle>()) {
 		OnEnterVehicle(*p);
 	} else if (const S_ExitVehicle *p = msg.as<S_ExitVehicle>()) {
@@ -670,6 +677,49 @@ void Client::UpdateLocalLife(const PlayerStateBody &body) {
 	Log("client: we respawned at %.1f %.1f %.1f", body.pos.x, body.pos.y, body.pos.z);
 }
 
+// Our own car blowing up, on its way out.
+//
+// Only ever our own: the detour that fills this queue checks the car against
+// the one the local player is driving, and a car we are not driving is not
+// ours to declare finished. docs/protocol.md §1.11.2 is the rule and why.
+void Client::SendLocalVehicleBlasts() {
+	if (!m_bridge.DrainLocalVehicleBlasts)
+		return;
+
+	constexpr uint8_t MAX_PER_FRAME = 4;
+	LocalVehicleBlast blasts[MAX_PER_FRAME];
+	const uint8_t     n = m_bridge.DrainLocalVehicleBlasts(blasts, MAX_PER_FRAME);
+	if (n == 0)
+		return;
+
+	// The netId is read here rather than in the detour because this is where
+	// it lives. If the session never gave our car a name - nobody else was
+	// connected when we got in, or the claim is still in flight - there is
+	// nothing to announce and the blast is purely local. Said out loud,
+	// because "the car exploded and nobody else saw it" is exactly the
+	// symptom this whole change is about and it must not have two silent
+	// causes.
+	if (m_localVehicleNetId == INVALID_NETID) {
+		Log("client: our car blew up before the session had a name for it, so "
+		    "nobody else will see it");
+		return;
+	}
+
+	for (uint8_t i = 0; i < n; ++i) {
+		C_VehicleBlowUp out;
+		InitHeader(out, WallClock::NowMs());
+		out.body.netId = m_localVehicleNetId;
+		out.body.pos   = blasts[i].pos;
+		out.body.rot   = blasts[i].rot;
+		m_net.Send(out, CH_EVENT);
+	}
+
+	// m_localVehicleNetId is deliberately left alone. SendLocalVehicle runs
+	// straight after this, sees the player is no longer in a car, and sends
+	// the ordinary C_ExitVehicle - which is what tells the session nobody is
+	// driving the wreck. Clearing it here would swallow that.
+}
+
 void Client::SendLocalCombat() {
 	if (!m_bridge.DrainLocalCombat)
 		return;
@@ -902,6 +952,11 @@ void Client::OnVehicleSpawn(const S_VehicleSpawn &pkt) {
 	v->modelId = pkt.modelId;
 	v->colour1 = pkt.colour1;
 	v->colour2 = pkt.colour2;
+	// Only useful before the car exists: SpawnRemoteVehicle forces them
+	// through the engine's override while it constructs the car, and nothing
+	// can change them afterwards. game/vehicle.h, "Extras".
+	v->extra1  = pkt.extra1;
+	v->extra2  = pkt.extra2;
 
 	// The spawn packet carries a position, so unlike a player join it's
 	// enough on its own to place the vehicle. Seeding `last` from it lets
@@ -926,8 +981,9 @@ void Client::OnVehicleSpawn(const S_VehicleSpawn &pkt) {
 	if (m_bridge.RequestModel)
 		m_bridge.RequestModel(pkt.modelId);
 
-	Log("client: vehicle %u joined (model %u, %.0f hp%s)", pkt.netId, pkt.modelId,
-	    pkt.health, (pkt.flags & VEH_WRECKED) ? ", wrecked" : "");
+	Log("client: vehicle %u joined (model %u, %.0f hp%s, extras %d/%d)", pkt.netId,
+	    pkt.modelId, pkt.health, (pkt.flags & VEH_WRECKED) ? ", wrecked" : "",
+	    static_cast<int>(pkt.extra1), static_cast<int>(pkt.extra2));
 }
 
 void Client::OnVehicleDespawn(const S_VehicleDespawn &pkt) {
@@ -962,9 +1018,67 @@ void Client::OnVehicleState(const S_VehicleState &pkt) {
 	// a car they've already stepped out of - which is exactly what the
 	// ghost's -inout mode does on purpose. The enter/exit pair
 	// is the only thing that decides who's in a seat, on either end.
+	// A wreck takes no more orders. Its owner is dead or out of it, so
+	// anything still arriving on this channel was sampled before the blast,
+	// and applying it would relight a burnt-out car.
+	if (v->destroyed)
+		return;
+
 	v->last      = pkt.body;
 	v->haveState = true;
 	v->interp.Push(pkt.hdr.sendTimeMs, pkt.body.pos, pkt.body.rot, pkt.body.moveSpeed);
+}
+
+// Somebody else's car blew up.
+//
+// The event is what carries it, not the health field, because health is a
+// number and destruction is an event - nothing in the engine watches
+// m_fHealth for zero, so an observer handed a zero gets an intact-looking car
+// with no health rather than a wreck. docs/protocol.md §1.11.
+//
+// Marked destroyed whether or not the replay lands. If the car isn't in the
+// pool right now, it was still destroyed, and the one thing that must not
+// happen is the roster deciding the empty slot means "respawn it".
+void Client::OnVehicleBlowUp(const S_VehicleBlowUp &pkt) {
+	RemoteVehicle *v = VehicleSlot(pkt.body.netId, /*createIfMissing=*/false);
+	if (!v) {
+		// Either a car we've never been told about or one we've already
+		// forgotten. Nothing to do, and nothing to create from: the packet
+		// carries no model.
+		Log("client: a car blast arrived for vehicle %u, which we do not have",
+		    pkt.body.netId);
+		return;
+	}
+
+	if (v->destroyed)
+		return;
+	v->destroyed = true;
+
+	// The wreck stays where the blast put it, so the interpolator stops here
+	// too - otherwise the next frame drags it back to wherever the last
+	// snapshot had it, which is a burning car sliding away from its own
+	// explosion.
+	v->last.pos    = pkt.body.pos;
+	v->last.rot    = pkt.body.rot;
+	v->last.health = 0.0f;
+	v->interp      = VehicleInterpBuffer{};
+
+	// Nobody is driving a wreck. Said before the blast, because
+	// CAutomobile::BlowUpCar hands every occupant to the engine to destroy
+	// and a ped taken out afterwards is a ped taken out of a car that has
+	// already let go of it - the same ordering UnseatPlayer exists for.
+	for (RemotePlayer &p : m_players)
+		if (p.active && p.seatedVehicleNetId == pkt.body.netId)
+			UnseatPlayer(p);
+	for (RemotePlayer &p : m_players)
+		if (p.active && p.seatVehicleNetId == pkt.body.netId)
+			p.seatVehicleNetId = INVALID_NETID;
+	v->driverPlayerId = 0xFF;
+
+	if (v->poolHandle >= 0 && m_bridge.BlowUpRemoteVehicle)
+		m_bridge.BlowUpRemoteVehicle(*v, pkt.body.pos, pkt.body.rot);
+
+	Log("client: vehicle %u blew up (player %u)", pkt.body.netId, pkt.playerId);
 }
 
 void Client::UpdateRemoteVehicles() {
@@ -974,6 +1088,17 @@ void Client::UpdateRemoteVehicles() {
 
 		if (v.poolHandle < 0 && v.spawnPending && v.haveState && m_bridge.IsModelReady &&
 		    m_bridge.SpawnRemoteVehicle) {
+			// Ask for the model again, every pass, not just on the join
+			// packet. Nothing else in the game is holding a reference to a
+			// model only CoopIII's car was using, so the moment that car
+			// leaves the pool the streamer is free to throw the model out -
+			// and then this loop waits on an IsModelReady that will never
+			// come true again and the car is simply gone for the rest of the
+			// session. Reconnecting brought it back, because OnVehicleSpawn
+			// is the one place that used to ask. RequestModel is idempotent
+			// and costs nothing when the model is already in.
+			if (m_bridge.RequestModel)
+				m_bridge.RequestModel(v.modelId);
 			if (m_bridge.IsModelReady(v.modelId) && m_bridge.SpawnRemoteVehicle(v)) {
 				v.spawnPending = false;
 				Log("client: spawned vehicle %u (handle %d)", v.netId, v.poolHandle);
@@ -1160,11 +1285,8 @@ void Client::SendLocalVehicle() {
 	if (!m_bridge.SampleLocalVehicle || !m_bridge.SampleLocalVehicleIdentity)
 		return;
 
-	uint16_t model = 0;
-	uint8_t  c1 = 0, c2 = 0;
-	Vec3     pos{};
-	Quat     rot{0.0f, 0.0f, 0.0f, 1.0f};
-	const bool driving = m_bridge.SampleLocalVehicleIdentity(model, c1, c2, pos, rot);
+	VehicleIdentity id{};
+	const bool      driving = m_bridge.SampleLocalVehicleIdentity(id);
 
 	if (!driving) {
 		if (m_localVehicleNetId != INVALID_NETID) {
@@ -1220,7 +1342,7 @@ void Client::SendLocalVehicle() {
 			// from here on - see the tail of this function.
 			ours->interp.Clear();
 			Log("client: got into the session's own vehicle %u (model %u); taking it "
-			    "over rather than registering it twice", ours->netId, model);
+			    "over rather than registering it twice", ours->netId, ours->modelId);
 			return;
 		}
 
@@ -1245,15 +1367,20 @@ void Client::SendLocalVehicle() {
 		out.body.netId   = INVALID_NETID;
 		out.body.seat    = 0;
 		out.body.jack    = 0;
-		out.body.modelId = model;
-		out.body.colour1 = c1;
-		out.body.colour2 = c2;
-		out.body.pad     = 0;
-		out.body.pos     = pos;
-		out.body.rot     = rot;
+		out.body.modelId = id.modelId;
+		out.body.colour1 = id.colour1;
+		out.body.colour2 = id.colour2;
+		// The extras go out with the colours and for the same reason: the
+		// engine rolls them per machine, so without them every observer
+		// builds a car with different bits on it. docs/protocol.md §1.12.
+		out.body.extra1  = id.extra1;
+		out.body.extra2  = id.extra2;
+		out.body.pos     = id.pos;
+		out.body.rot     = id.rot;
 		m_net.Send(out, CH_EVENT);
 		m_vehicleClaimPending = true;
-		Log("client: claiming the car we just got into (model %u)", model);
+		Log("client: claiming the car we just got into (model %u, extras %d/%d)",
+		    id.modelId, static_cast<int>(id.extra1), static_cast<int>(id.extra2));
 		return;
 	}
 
