@@ -158,7 +158,15 @@ remove it. Somebody parked it, it is still there.
       an instant warp. Currently seated via `SetObjective` +
       `WarpPedIntoCar`, deliberately, to get the entity relationship right
       first; the animated version is the remaining piece here.
-- [ ] Passengers: several players in one car, with the driver owning physics.
+- [x] Passengers: several players in one car, with the driver owning physics.
+      A key the original game has no binding for (`seatKey`, G by default)
+      puts the local player in the first free passenger seat of the nearest
+      of the session's own cars. The engine picks the slot - `WarpPedIntoCar`
+      takes the passenger arm for any objective that is not
+      `ENTER_CAR_AS_DRIVER` - and CoopIII reads back which one it got,
+      because that number is what the session is told. Getting out is the
+      game's own exit key; there is no CoopIII way out, and the client
+      notices the seat is empty. `client/src/game/seat.h`.
 - [x] Same car on every screen: colours **and extras**. `EnterVehicleBody` and
       `S_VehicleSpawn` carry `m_aExtras`, forced on the receiving machine
       through `CVehicleModelInfo::ms_compsToUse` before the constructor runs,
