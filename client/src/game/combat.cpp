@@ -59,6 +59,38 @@ struct ReplayGuard {
 	~ReplayGuard() { g_replaying = false; }
 };
 
+// Set while CoopIII is applying a hit that already came off the wire.
+//
+// ApplyRemoteDamage credits the attacker's own ped as the culprit, so the
+// engine's blood, its threat entity and CDarkel's kill register all point at
+// the player who did it rather than at nobody. That is the right thing to
+// pass and it collides head-on with the rule below, which refuses anything a
+// remote ped tries to take off the local player. This is how the one hit
+// that *is* authorised gets through the rule written to stop all the others.
+//
+// It cost a whole session to find: with it missing, the shooter converted the
+// hit, the server relayed it, the victim called InflictDamage, and the
+// victim's own detour threw it away. Nothing crashed and nothing logged.
+bool g_applyingRemoteDamage = false;
+
+struct RemoteDamageGuard {
+	RemoteDamageGuard() { g_applyingRemoteDamage = true; }
+	~RemoteDamageGuard() { g_applyingRemoteDamage = false; }
+};
+
+// One line the first time each thing happens, and nothing after that.
+//
+// Damage is four to ten events a second, so anything logged per hit would
+// drown the file. But a feature that silently does nothing is what cost this
+// round, and "no line either way" was indistinguishable from "not built". So
+// each outcome says itself once, and between them the log answers the only
+// question worth asking in one glance: did the shooter decide, did the wire
+// carry it, did the victim apply it.
+bool g_saidHitSent         = false;
+bool g_saidHitApplied      = false;
+bool g_saidHitRefused      = false;
+bool g_saidHitNotForwarded = false;
+
 void *PlayerPed() { return Func<void *(__cdecl *)()>(FindPlayerPed)(); }
 
 // ---- the local player's combat events, waiting for the next frame ---------
@@ -428,11 +460,22 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 	// afterwards, and every one of those fires names the remote ped as its
 	// source, so refusing by culprit covers the whole thing where a guard
 	// around the call never could. combat.h, RemoteMayDamageLocalPlayer.
+	// Except the one hit that is allowed: our own ApplyRemoteDamage, applying
+	// what the attacker's machine already decided. Without this exemption the
+	// rule refuses the packets the whole feature exists to deliver.
 	uint16_t attackerNetId = INVALID_NETID;
-	if (localPed && self == localPed && damagedBy && damagedBy != localPed &&
-	    RemotePlayerForPed(damagedBy, attackerNetId) &&
-	    !RemoteMayDamageLocalPlayer(static_cast<uint8_t>(method)))
+	if (!g_applyingRemoteDamage && localPed && self == localPed && damagedBy &&
+	    damagedBy != localPed && RemotePlayerForPed(damagedBy, attackerNetId) &&
+	    !RemoteMayDamageLocalPlayer(static_cast<uint8_t>(method))) {
+		if (!g_saidHitRefused) {
+			g_saidHitRefused = true;
+			Log("combat: refused a hit our own engine tried to land on us from "
+			    "player net %u with cause %u. That is the rule: their machine "
+			    "decides their hits and sends them, this one does not guess",
+			    attackerNetId, method);
+		}
 		return false;
+	}
 
 	uint16_t victimNetId = INVALID_NETID;
 	if (self && RemotePlayerForPed(self, victimNetId)) {
@@ -442,9 +485,22 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 		// city NPC shooting a remote player is a shot that happened in one
 		// simulation and not in the others (docs/protocol.md §3), and
 		// forwarding it would kill someone with a cop they can't see.
-		if (!g_replaying && damagedBy && damagedBy == localPed &&
-		    IsForwardableDamage(static_cast<uint8_t>(method)))
+		const bool ours = !g_replaying && damagedBy && damagedBy == localPed;
+		if (ours && IsForwardableDamage(static_cast<uint8_t>(method))) {
 			RecordLocalDamage(victimNetId, method, damage, piece, direction);
+			if (!g_saidHitSent) {
+				g_saidHitSent = true;
+				Log("combat: our first hit on a remote player, net %u for %.0f with "
+				    "cause %u, is on its way as C_Damage", victimNetId, damage, method);
+			}
+		} else if (ours && !g_saidHitNotForwarded) {
+			// Our own hit, on a real player, and not forwarded. Always a
+			// decision rather than a failure, but a decision worth seeing.
+			g_saidHitNotForwarded = true;
+			Log("combat: our hit on player net %u is not forwarded, because cause "
+			    "%u is not one the shooter gets to decide (combat.h, "
+			    "IsForwardableDamage)", victimNetId, method);
+		}
 
 		// False is "the ped did not die", which is what every caller of this
 		// function already handles for a hit that wasn't fatal.
@@ -776,8 +832,23 @@ void ApplyRemoteDamage(RemotePlayer *attacker, const DamageBody &body) {
 	// straight through for a ped that isn't a remote player, and the local
 	// player never is, so this reaches the engine either way - including on
 	// a build where the hook failed to install.
-	Func<InflictThisFn>(CPed__InflictDamage)(ped, culprit, body.weapon, amount,
-	                                         body.piece, direction);
+	//
+	// Guarded, because the culprit being the attacker's ped is exactly what
+	// the detour's remote-attacker rule refuses. That rule is for hits this
+	// machine invented; this one was decided by the machine entitled to
+	// decide it and has already crossed the network.
+	{
+		RemoteDamageGuard guard;
+		Func<InflictThisFn>(CPed__InflictDamage)(ped, culprit, body.weapon, amount,
+		                                         body.piece, direction);
+	}
+
+	if (!g_saidHitApplied) {
+		g_saidHitApplied = true;
+		Log("combat: took our first hit off the wire, %.0f from %s with cause %u",
+		    amount, attacker ? attacker->nick.c_str() : "someone we have no ped for",
+		    body.weapon);
+	}
 }
 
 void KillRemotePed(RemotePlayer &player, uint16_t animId) {

@@ -517,6 +517,19 @@ check nothing at all:
 Stating the rule once, in the detour, closes both. That is the actual fix; the
 flags are the belt.
 
+One exemption, and it is the whole feature. The detour also refuses anything a
+remote player's ped names itself the culprit of, which is what lets the
+flamethrower be replayed (§1.9.2). `ApplyRemoteDamage` names the attacker's
+ped as the culprit on purpose, so the engine's blood and its threat entity
+point at the player who did it, and without an exemption that rule refuses the
+hits this section exists to deliver. It cost a session: the shooter converted
+the hit, the server relayed it, the victim called `InflictDamage`, and the
+victim's own detour threw it away, silently, at every step.
+
+So every step says itself once now. Between the shooter's line, the victim's
+line and the two refusals, the log answers in one glance whether a hit was
+decided, carried, or dropped, and where.
+
 #### 1.10.3 Friendly fire is the server's, except for the one kind it never sees
 
 `docs/roadmap.md` §5.2: server-configurable, off by default. Off means the

@@ -429,10 +429,30 @@ void Client::OnDamage(const S_Damage &pkt) {
 	// The server sends this to the victim alone, but a relay is a relay.
 	// Applying somebody else's hit to ourselves because the netId didn't
 	// match would be the one failure this whole design exists to prevent.
-	if (m_localNetId == INVALID_NETID || pkt.body.victimNetId != m_localNetId)
+	//
+	// Both refusals say themselves once. Between these two lines and the
+	// pair in game/combat.cpp, the log answers the whole question in one
+	// glance: did the shooter decide a hit, did it reach the victim, did the
+	// victim apply it. A round was lost to a chain that did all of that
+	// silently and produced nothing.
+	if (m_localNetId == INVALID_NETID || pkt.body.victimNetId != m_localNetId) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			Log("client: a damage packet arrived for net %u and we are net %u, so it "
+			    "is not ours to apply", pkt.body.victimNetId, m_localNetId);
+		}
 		return;
-	if (!m_bridge.ApplyRemoteDamage)
+	}
+	if (!m_bridge.ApplyRemoteDamage) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			Log("client: damage is arriving but this build has no bridge to apply "
+			    "it with, so nothing will ever hurt");
+		}
 		return;
+	}
 
 	// Blame, where we can resolve it. A null attacker still hurts: their ped
 	// may not have streamed in, and the shot happened either way.
