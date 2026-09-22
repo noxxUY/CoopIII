@@ -336,6 +336,67 @@ observer may animate it, but it may not decide where it ends up.
   `CExplosion::AddExplosion` entirely. The engine frees the slot; nothing else
   changes.
 
+**The position in that first bullet is not optional, and for a while it was
+not written.** The code corrected the velocity and left the position where the
+engine put it, on the reasoning that `CProjectileInfo::AddProjectile` derives
+it from the thrower's matrix and the pose stream keeps that within half a metre
+of the truth. That is true of a grenade and a molotov and false of a rocket.
+
+`AddProjectile` (`0x0055B030`) builds a `CMatrix` per weapon and assigns it to
+the new `CProjectile` whole — rotation *and* translation — so whatever is in
+its position field is where the projectile is born. Three of the four arms put
+the `pos` argument there:
+
+| arm | where it adds `pos` |
+|---|---|
+| grenade | `0x0055B11C`, three `fld` / `fadd` / `fstp` |
+| molotov | `0x0055B25B`, the same three |
+| rocket, thrown by a player | `0x0055B3BC`, copied in whole after the camera basis |
+| rocket, thrown at a seek target | `0x0055B471`, `+= pos` |
+
+The fourth does not. A rocket from a ped that is neither the player nor
+chasing anybody is `matrix = ped->GetMatrix()` (`0x0055B4A6`) and then straight
+on to the velocity; `pos` is never read. The rocket is created **at the ped's
+own origin**, hip height inside their collision, and the fire source is thrown
+away.
+
+Every remote player is a `CCivilianPed` with no seek target, so that fourth arm
+is the one every replayed rocket takes — while on its owner's machine the same
+rocket takes the first and starts a metre out in front of them. Retail GTA III
+has no NPC who fires a rocket launcher, so nothing else in the game has ever
+run that arm, which is why it is wrong.
+
+Left uncorrected, the missile is then removed within a frame or two and in
+silence:
+
+- `CProjectileInfo::Update` (`0x0055B7C0`) removes a rocket outright if
+  `bHasCollided` is set (`0x0055B89E`, byte B bit 3), which is what a `CObject`
+  born inside a ped's collision gets on its first physics step;
+- and it sweeps a line from `m_vecPos` to the projectile's current position
+  every frame and removes anything whose sweep is not clear. The flags it
+  passes at `0x0055B8B5` are buildings, vehicles, **peds**, objects, and three
+  zeroes, and the only thing `CWorld::pIgnoreEntity` holds for that sweep is
+  the projectile itself — never the ped that threw it;
+- and the `RemoveProjectile` detour above blanks the weapon type on the way
+  past, so that removal makes no explosion and no sound.
+
+The owner's `C_Explosion` still arrives a second later and still plays in the
+right street. From the outside: the blast syncs, the rocket never flies.
+
+So the observer writes the position as well as the velocity, updates
+`CProjectileInfo::m_vecPos` to match (otherwise the first sweep runs from
+inside the thrower back out through them), and re-files the object —
+`CMatrix::UpdateRW`, `CEntity::UpdateRwFrame`, `CPhysical::RemoveAndAdd`, the
+same three `ped.cpp`'s `PlaceRemotePed` needs for the same reasons. The
+rotation is rebuilt from `dir` too, the way `AddProjectile`'s own player arm
+builds one from the camera, so the missile points where it is going instead of
+along the ped's flat heading.
+
+Grenades and molotovs were never affected by any of this. They take the two
+arms that add `pos`, and they are on a full `CProjectileInfo` life with
+gravity, a bounce and a two-second fuse rather than a one-second sprint
+through a line sweep.
+
 `C_Explosion` is sampled by detouring `CExplosion::AddExplosion`, which every
 explosion in the game funnels through, and forwarding the ones whose *culprit*
 is the local player ped. One seam for grenades, molotovs and rockets rather

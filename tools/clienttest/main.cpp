@@ -2011,6 +2011,95 @@ void TestProjectileWeapons() {
 	Check(!IsKnownExplosionType(255), "and neither is a byte of garbage");
 }
 
+// ---- where a replayed projectile starts, and which way it points -----------
+//
+// The rocket that arrived as an explosion and never flew. The whole of it is
+// one arm of CProjectileInfo::AddProjectile that ignores its `pos` argument,
+// and the whole of the fix is knowing which arm that is, so that is what gets
+// pinned here rather than the effect.
+
+void TestProjectileSpawnPoint() {
+	std::printf("\nwhich projectiles the engine puts somewhere we did not ask for\n");
+
+	// 0x0055B4A6: `matrix = ped->GetMatrix()`, then straight on to the
+	// velocity. The pos argument is never read, so the rocket is born at the
+	// thrower's own origin, inside their collision.
+	Check(ProjectileSpawnsAtThrower(WEAPONTYPE_ROCKETLAUNCHER),
+	      "a rocket from a ped that is not the player starts inside that ped");
+
+	// 0x0055B11C and 0x0055B25B: both add pos into the matrix, field for
+	// field. These two were never broken and must not be 'fixed'.
+	Check(!ProjectileSpawnsAtThrower(WEAPONTYPE_GRENADE),
+	      "a grenade starts where it was thrown from");
+	Check(!ProjectileSpawnsAtThrower(WEAPONTYPE_MOLOTOV),
+	      "and so does a molotov");
+	Check(!ProjectileSpawnsAtThrower(WEAPONTYPE_UZI),
+	      "a weapon with no projectile has no spawn point to get wrong");
+}
+
+void TestProjectileBasis() {
+	std::printf("\nthe matrix rows a projectile flies with\n");
+
+	auto len = [](const Vec3 &v) {
+		return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+	};
+	auto dot = [](const Vec3 &a, const Vec3 &b) {
+		return a.x * b.x + a.y * b.y + a.z * b.z;
+	};
+	auto closeTo = [](float a, float b) { return std::fabs(a - b) < 1.0e-4f; };
+	auto sameVec = [&](const Vec3 &a, const Vec3 &b) {
+		return closeTo(a.x, b.x) && closeTo(a.y, b.y) && closeTo(a.z, b.z);
+	};
+
+	// An orthonormal frame or nothing. A matrix that is neither is what
+	// reaches RenderWare's frame and the projectile's own collision box.
+	auto orthonormal = [&](const Vec3 &d) {
+		Vec3 r{}, f{}, u{};
+		if (!ProjectileBasis(d, r, f, u))
+			return false;
+		return closeTo(len(r), 1.0f) && closeTo(len(f), 1.0f) && closeTo(len(u), 1.0f) &&
+		       closeTo(dot(r, f), 0.0f) && closeTo(dot(f, u), 0.0f) && closeTo(dot(u, r), 0.0f);
+	};
+
+	Check(orthonormal(Vec3{0.0f, 1.0f, 0.0f}), "due north is an orthonormal frame");
+	Check(orthonormal(Vec3{0.6f, -0.3f, 0.2f}), "and so is an arbitrary aim");
+
+	// A rocket launcher points straight up perfectly happily, and that is
+	// exactly where Cross(worldUp, dir) collapses to nothing. If the fallback
+	// reference is missing this is the case that produces a zero row.
+	Check(orthonormal(Vec3{0.0f, 0.0f, 1.0f}), "straight up still has a frame");
+	Check(orthonormal(Vec3{0.0f, 0.0f, -1.0f}), "so does straight down");
+
+	Vec3 r{}, f{}, u{};
+	Check(ProjectileBasis(Vec3{0.0f, 4.0f, 0.0f}, r, f, u) &&
+	          sameVec(f, Vec3{0.0f, 1.0f, 0.0f}),
+	      "forward is the direction, normalised - the wire carries dir and speed "
+	      "separately and only dir belongs in the matrix");
+
+	// CProjectileInfo::AddProjectile's player arm is
+	// `right = CrossProduct(Up, Front)`, and what comes out of here has to
+	// obey the same identity or a replayed rocket is mirrored against the
+	// one its owner is looking at.
+	Check(ProjectileBasis(Vec3{0.3f, 0.5f, -0.8f}, r, f, u) &&
+	          sameVec(Vec3{u.y * f.z - u.z * f.y, u.z * f.x - u.x * f.z,
+	                       u.x * f.y - u.y * f.x},
+	                  r),
+	      "right is CrossProduct(up, forward), the engine's own handedness");
+
+	// Everything below is a direction that is not one, and each of them can
+	// arrive off a socket. A NaN row in an entity matrix does not fault where
+	// it is written; it faults in collision, a frame or two later.
+	Check(!ProjectileBasis(Vec3{0.0f, 0.0f, 0.0f}, r, f, u),
+	      "a zero direction is refused rather than normalised by zero");
+
+	const float nan = std::numeric_limits<float>::quiet_NaN();
+	const float inf = std::numeric_limits<float>::infinity();
+	Check(!ProjectileBasis(Vec3{nan, 0.0f, 0.0f}, r, f, u), "a NaN is refused");
+	Check(!ProjectileBasis(Vec3{0.0f, inf, 0.0f}, r, f, u), "an infinity is refused");
+	Check(!ProjectileBasis(Vec3{1.0e-9f, 0.0f, 0.0f}, r, f, u),
+	      "and so is a direction too short to normalise without exploding");
+}
+
 // ---- time of day and weather ------------------------------------------------
 
 void TestClockDriftIsCircular() {
@@ -2570,6 +2659,8 @@ int main() {
 	TestAngleWrap();
 	TestReplayableWeapons();
 	TestProjectileWeapons();
+	TestProjectileSpawnPoint();
+	TestProjectileBasis();
 	TestShotNeedsAPed();
 	TestShotIsReplayedOncePerPacket();
 	TestOurOwnShotsAreNotReplayed();

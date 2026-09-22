@@ -1,7 +1,7 @@
 // A synthetic second player.
 //
 //   ghost [host] [port] [nick] [-car] [-inout] [-shoot] [-throw] [-hurt]
-//         [-flame]
+//         [-flame] [-rocket]
 //
 // -car   also claims a vehicle and parks it in front of the player. Puts the
 //        real client through the vehicle pool, CAutomobile's constructor and
@@ -24,6 +24,22 @@
 //        copy ends silently instead of detonating wherever it feels like.
 //        A second fire in the wrong street means CProjectileInfo::RemoveProjectile
 //        isn't being suppressed.
+// -rocket the same two halves with a rocket launcher, and it exists because
+//        the rocket is the one projectile the engine places somewhere nobody
+//        asked for. CProjectileInfo::AddProjectile's rocket arm for a ped
+//        that is neither the player nor chasing anybody copies the ped's own
+//        matrix and never reads the fire source, so without the correction in
+//        combat.cpp the missile is born inside the remote player and is gone
+//        again before it is drawn - while the explosion still arrives and
+//        still lands in the right street. That is the exact thing that was
+//        reported, and one game plus this flag reproduces it.
+//
+//        The direction carries a deliberate upward tilt, because a rocket
+//        flying flat out of a ped's chest is what a lost pitch looks like and
+//        it should be obvious rather than arguable. The explosion follows at
+//        1200 ms, inside the missile's own 1400 ms deadline, so the thing
+//        that ends the flight is the owner saying so and not the clock
+//        running out.
 // -flame holds a flamethrower and keeps the trigger down. The shot goes
 //        through CWeapon::FireAreaEffect into CShotInfo, which keeps lighting
 //        fires for a second after the call returns, so this is the cheapest
@@ -99,8 +115,9 @@ int main(int argc, char **argv) {
 	bool inOutFlag = false;
 	bool shootFlag = false;
 	bool throwFlag = false;
-	bool hurtFlag  = false;
-	bool flameFlag = false;
+	bool hurtFlag   = false;
+	bool flameFlag  = false;
+	bool rocketFlag = false;
 	for (int i = 1; i < argc; ++i) {
 		if (std::strcmp(argv[i], "-car") == 0)
 			carFlag = true;
@@ -114,6 +131,15 @@ int main(int argc, char **argv) {
 			hurtFlag = true;
 		if (std::strcmp(argv[i], "-flame") == 0)
 			flameFlag = true;
+		if (std::strcmp(argv[i], "-rocket") == 0)
+			rocketFlag = true;
+	}
+
+	// -rocket and -throw are the same two halves with a different weapon, so
+	// they share one in-flight slot. Asking for both is asking for one.
+	if (rocketFlag && throwFlag) {
+		throwFlag = false;
+		std::printf("-rocket and -throw share one projectile; using the rocket\n");
 	}
 
 	// The flamethrower is a held trigger, not a burst, so it rides the same
@@ -159,9 +185,11 @@ int main(int argc, char **argv) {
 	// ped's hand from the snapshot and refuses to fire a gun the ped isn't
 	// holding. Correct order, and worth exercising.
 	constexpr uint8_t  WEAPON_UZI         = 3;
+	constexpr uint8_t  WEAPON_ROCKETLAUNCHER = 8;
 	constexpr uint8_t  WEAPON_FLAMETHROWER = 9;
 	constexpr uint8_t  WEAPON_MOLOTOV     = 10;
 	constexpr uint8_t  EXPLOSION_MOLOTOV_TYPE = 1;
+	constexpr uint8_t  EXPLOSION_ROCKET_TYPE  = 2;
 	constexpr uint32_t SHOT_PERIOD_MS  = 250;    // four rounds a second
 	constexpr uint32_t THROW_PERIOD_MS = 3000;
 	// Gap between a throw and its explosion. Roughly a molotov's own
@@ -169,11 +197,23 @@ int main(int argc, char **argv) {
 	// before it's told where it landed. Only way to see whether the bottle
 	// gets removed silently.
 	constexpr uint32_t FUSE_MS = 2000;
+	// A missile's own deadline is CTimer + 1400 (CProjectileInfo::AddProjectile,
+	// 0x0055B310). Staying inside it means the flight is ended by its owner
+	// saying where it went off, which is the half worth watching, rather than
+	// by the observer's clock running out on its own.
+	constexpr uint32_t ROCKET_FUSE_MS   = 1200;
+	constexpr uint32_t ROCKET_PERIOD_MS = 4000;
 
-	const uint8_t heldWeapon = throwFlag  ? WEAPON_MOLOTOV
+	const bool    wantProjectile = throwFlag || rocketFlag;
+	const uint8_t heldWeapon = rocketFlag ? WEAPON_ROCKETLAUNCHER
+	                           : throwFlag  ? WEAPON_MOLOTOV
 	                           : flameFlag ? WEAPON_FLAMETHROWER
 	                           : shootFlag ? WEAPON_UZI
 	                                       : 0;   // WEAPONTYPE_UNARMED
+	const uint8_t  blastType =
+	    rocketFlag ? EXPLOSION_ROCKET_TYPE : EXPLOSION_MOLOTOV_TYPE;
+	const uint32_t projPeriodMs = rocketFlag ? ROCKET_PERIOD_MS : THROW_PERIOD_MS;
+	const uint32_t projFuseMs   = rocketFlag ? ROCKET_FUSE_MS : FUSE_MS;
 	uint32_t nextShotMs      = 0;
 	uint32_t nextThrowMs     = 0;
 	uint32_t pendingBlastMs  = 0;   // 0 = nothing in the air
@@ -435,27 +475,38 @@ int main(int argc, char **argv) {
 				}
 			}
 
-			if (throwFlag && !ghostDead && nowMs >= nextThrowMs && pendingBlastMs == 0) {
-				nextThrowMs = nowMs + THROW_PERIOD_MS;
+			if (wantProjectile && !ghostDead && nowMs >= nextThrowMs &&
+			    pendingBlastMs == 0) {
+				nextThrowMs = nowMs + projPeriodMs;
 
 				C_Shot shot{};
 				InitHeader(shot, nowMs);
-				shot.body.weapon = WEAPON_MOLOTOV;
+				shot.body.weapon = heldWeapon;
 				shot.body.origin = Vec3{pkt.body.pos.x, pkt.body.pos.y,
 				                        pkt.body.pos.z + 0.6f};
-				// A lobbed arc toward the player, at roughly the speed
-				// CProjectileInfo::AddProjectile gives a half-charged throw.
 				const float dx = -std::sin(pkt.body.aimYaw);
 				const float dy = std::cos(pkt.body.aimYaw);
-				shot.body.dir   = Vec3{dx * 0.9f, dy * 0.9f, 0.436f};
-				shot.body.speed = 0.26f;
+				if (rocketFlag) {
+					// Toward the player and visibly upward, at the 1.25 the
+					// engine gives a rocket. The tilt is the point: if it ever
+					// stops arriving, the missile flies flat out of the ped's
+					// chest and that is unmistakable on screen rather than
+					// something to argue about afterwards.
+					shot.body.dir   = Vec3{dx * 0.94f, dy * 0.94f, 0.34f};
+					shot.body.speed = 1.25f;
+				} else {
+					// A lobbed arc toward the player, at roughly the speed
+					// CProjectileInfo::AddProjectile gives a half-charged throw.
+					shot.body.dir   = Vec3{dx * 0.9f, dy * 0.9f, 0.436f};
+					shot.body.speed = 0.26f;
+				}
 				client.Send(shot, CH_EVENT);
 
 				// Where the real thing would land, so the explosion the ghost
 				// sends later shows up somewhere plausible instead of right
 				// on top of it.
 				pendingBlastPos = Vec3{centre.x, centre.y, centre.z};
-				pendingBlastMs  = nowMs + FUSE_MS;
+				pendingBlastMs  = nowMs + projFuseMs;
 			}
 
 			if (pendingBlastMs != 0 && nowMs >= pendingBlastMs) {
@@ -463,11 +514,12 @@ int main(int argc, char **argv) {
 
 				C_Explosion blast{};
 				InitHeader(blast, nowMs);
-				blast.body.type = EXPLOSION_MOLOTOV_TYPE;
+				blast.body.type = blastType;
 				blast.body.pos  = pendingBlastPos;
 				client.Send(blast, CH_EVENT);
-				std::printf("molotov went off at (%.1f %.1f %.1f)\n",
-				            pendingBlastPos.x, pendingBlastPos.y, pendingBlastPos.z);
+				std::printf("%s went off at (%.1f %.1f %.1f)\n",
+				            rocketFlag ? "rocket" : "molotov", pendingBlastPos.x,
+				            pendingBlastPos.y, pendingBlastPos.z);
 			}
 
 			// ---- the car ---------------------------------------------------

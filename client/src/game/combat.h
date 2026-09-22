@@ -22,6 +22,7 @@
 
 #include <coopiii/protocol.h>
 
+#include <cmath>
 #include <cstdint>
 
 namespace coopiii::game {
@@ -34,6 +35,108 @@ namespace coopiii::game {
 inline bool IsProjectileWeapon(uint8_t weapon) {
 	return weapon == WEAPONTYPE_ROCKETLAUNCHER || weapon == WEAPONTYPE_MOLOTOV ||
 	       weapon == WEAPONTYPE_GRENADE;
+}
+
+// ---- where the engine puts a projectile it makes for a remote player ------
+//
+// Sounds like a detail, and it's the whole of the rocket bug.
+//
+// CProjectileInfo::AddProjectile (0x0055B030) builds a CMatrix per weapon and
+// then assigns that matrix to the new CProjectile whole - rotation *and*
+// translation - so whatever is in its position field is where the projectile
+// is born. Three of the four arms put the `pos` argument there:
+//
+//   grenade                     0x0055B11C  fld [esp+7Ch] / fadd [esp+0D4h] /
+//                                           fstp [esp+7Ch], and the same for
+//                                           y and z
+//   molotov                     0x0055B25B  the same three, field for field
+//   rocket, thrown by a player  0x0055B3BC  pos copied in whole, after the
+//                                           camera basis
+//   rocket, at a seek target    0x0055B471  matrix built from two angles, then
+//                                           += pos
+//
+// The fourth doesn't. A rocket from a ped that is neither the player nor
+// chasing anybody is all of this:
+//
+//   0055B4A6  lea  eax, [ebx+4]      &ped->m_matrix
+//   0055B4A9  lea  ecx, [esp+4Ch]    the local matrix
+//   0055B4AD  push eax
+//   0055B4AE  call 004B8F40          CMatrix::operator=
+//   0055B4B3  ...                    straight on to the velocity
+//
+// `pos` is never read on that path. The rocket is created at *the ped's own
+// origin* - hip height, inside their collision - and the fire source the
+// caller worked out is thrown away.
+//
+// Every remote player is a CCivilianPed with no seek target, so every
+// replayed rocket takes that fourth arm. On its owner's machine the same
+// rocket takes the first one and starts a metre out in front of them. That
+// asymmetry is why the bug is invisible in single player: retail GTA III has
+// no NPC who fires a rocket launcher, so nothing else in the game has ever
+// run this arm.
+//
+// Grenades and molotovs are *not* affected. Their arms are the two that add
+// `pos`, so an observer's bottle starts where the thrower's bottle started.
+inline bool ProjectileSpawnsAtThrower(uint8_t weapon) {
+	return weapon == WEAPONTYPE_ROCKETLAUNCHER;
+}
+
+namespace vec {
+
+inline Vec3 Cross(const Vec3 &a, const Vec3 &b) {
+	return Vec3{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+inline float LengthSq(const Vec3 &v) { return v.x * v.x + v.y * v.y + v.z * v.z; }
+
+} // namespace vec
+
+// The three matrix rows for a projectile flying along `dir`, or false if
+// `dir` isn't a direction.
+//
+// Not invented here: it's what AddProjectile's *player* arm does, which is
+// the one that looks right on the thrower's own screen. That arm takes the
+// camera's Front as forward, the camera's Up as up, and
+// CrossProduct(Up, Front) as right (0x0055B32D onward). An observer has no
+// camera for somebody else's shot, so world up stands in for the camera's,
+// and the handedness still agrees with the engine's: with f = (0,1,0) and
+// u = (0,0,1), Cross(u, f) is (-1,0,0), which is exactly what the engine
+// produces for a camera looking down +Y.
+//
+// The identity Cross(up, forward) == right holds for what comes out of here
+// too, since up is built as Cross(forward, right) and (f x r) x f == r for
+// orthonormal f and r. clienttest pins that rather than trusting it.
+//
+// False on a zero-length, NaN or infinite direction. The caller then leaves
+// the engine's own rotation where it is: a rocket pointing the wrong way is
+// a cosmetic problem, and a matrix with a NaN in it is a crash three
+// subsystems later.
+inline bool ProjectileBasis(const Vec3 &dir, Vec3 &right, Vec3 &forward, Vec3 &up) {
+	const float len2 = vec::LengthSq(dir);
+	// Negated so a NaN, which compares false against everything, is refused
+	// by both halves rather than sneaking through one of them.
+	if (!(len2 > 1.0e-8f) || !(len2 < 1.0e8f))
+		return false;
+
+	const float inv = 1.0f / std::sqrt(len2);
+	const Vec3  f{dir.x * inv, dir.y * inv, dir.z * inv};
+
+	// Cross(worldUp, f), which degenerates exactly when the shot is straight
+	// up or straight down - something a rocket launcher does. World forward
+	// stands in for the reference there, and the result is still orthonormal.
+	Vec3 r = vec::Cross(Vec3{0.0f, 0.0f, 1.0f}, f);
+	if (!(vec::LengthSq(r) > 1.0e-6f))
+		r = vec::Cross(Vec3{0.0f, 1.0f, 0.0f}, f);
+
+	const float rlen2 = vec::LengthSq(r);
+	if (!(rlen2 > 1.0e-12f))
+		return false;
+	const float rinv = 1.0f / std::sqrt(rlen2);
+
+	right   = Vec3{r.x * rinv, r.y * rinv, r.z * rinv};
+	forward = f;
+	up      = vec::Cross(forward, right);
+	return true;
 }
 
 // The eExplosionType a projectile of this weapon produces, or -1.

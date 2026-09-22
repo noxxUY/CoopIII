@@ -111,6 +111,53 @@ bool g_saidFireBurned  = false;
 bool g_saidFireNoMove  = false;
 bool g_saidFireRefused = false;
 
+// And the same idea again for the replay itself, because this round was lost
+// the same way: "la explosion del lanzacohetes llega pero no se syncean las
+// balas volando" - the blast arrived, nothing flew, and the log had not one
+// word to say about either. ReplayRemoteShot had five places it could return
+// without firing and none of them spoke.
+//
+// Four lines between them answer the only question worth asking about a
+// replayed shot, in one glance:
+//
+//   refused    the replay stopped before CWeapon::Fire, and which gate did it
+//   replayed   the engine's own fire path ran for somebody else's shot
+//   nothing    it ran, for a projectile weapon, and made nothing to fly
+//   flying     it made one, and here is where it was moved to
+//
+// Plus one more for the far end: how long the first one stayed in the air,
+// and whether this machine ended it or its owner did. Two frames and a full
+// second look identical on screen - they are opposite bugs.
+bool g_saidShotReplayed     = false;
+bool g_saidNoProjectile     = false;
+bool g_saidProjectileFlying = false;
+bool g_saidProjectileEnded  = false;
+
+// One flag per gate rather than one for all of them, because the gates are
+// not alternatives. "No ped yet" is normal in the first second of a session
+// and would otherwise be the only refusal ever reported, hiding a weapon
+// model that never streams for the rest of the hour.
+enum ShotGate {
+	GATE_WEAPON = 0,
+	GATE_NO_PED,
+	GATE_SEATED,
+	GATE_DEAD,
+	GATE_MODEL,
+	GATE_COUNT,
+};
+
+bool g_saidGate[GATE_COUNT] = {};
+
+void RefuseShot(ShotGate gate, const char *why, const RemotePlayer &player,
+                uint8_t weapon) {
+	if (g_saidGate[gate])
+		return;
+	g_saidGate[gate] = true;
+	Log("combat: did not replay a shot for player net %u with weapon %u, because %s. "
+	    "Their explosion, if the shot had one, still arrives on its own packet",
+	    player.netId, weapon, why);
+}
+
 void *PlayerPed() { return Func<void *(__cdecl *)()>(FindPlayerPed)(); }
 
 // How many of gFireManager's 40 slots are alight right now.
@@ -191,9 +238,19 @@ struct Tracked {
 	bool     active   = false;
 	uint8_t  playerId = 0xFF;
 	void    *source   = nullptr;
+	// CTimer ms at creation, so the one log line about a projectile ending
+	// can say how long it was in the air. "Two frames" and "the full second
+	// and a bit" are the same event from the outside and completely
+	// different bugs.
+	uint32_t bornMs   = 0;
 };
 
 Tracked g_tracked[NUM_PROJECTILES];
+
+// Set while CoopIII is ending a projectile on purpose, because its owner's
+// explosion arrived. Every other removal is this machine's engine deciding,
+// and the two have to read differently in the log.
+bool g_endingOurs = false;
 
 bool StillOurs(int slot) {
 	return g_tracked[slot].active && ProjInUse(slot) &&
@@ -228,7 +285,98 @@ void EndTracked(int slot) {
 		return;
 	}
 	using RemoveFn = void(__cdecl *)(void *, void *);
+	g_endingOurs   = true;
 	Func<RemoveFn>(CProjectileInfo__RemoveProjectile)(ProjInfo(slot), obj);
+	g_endingOurs = false;
+}
+
+// ---- putting somebody else's projectile where they threw it ---------------
+//
+// The velocity was always corrected here; the position and the rotation are
+// new, and the position is the one that was costing a whole weapon.
+//
+// combat.h's ProjectileSpawnsAtThrower carries the disassembly. The short
+// version: CProjectileInfo::AddProjectile's rocket arm for a ped that is
+// neither the player nor chasing anybody copies the *ped's* matrix and never
+// reads the fire source, so a replayed rocket is born inside the remote
+// player's own collision instead of a metre out in front of them. It is then
+// removed almost immediately and silently, because
+//
+//   - CProjectileInfo::Update (0x0055B7C0) sweeps a line from m_vecPos to the
+//     projectile's current position every frame and removes a rocket whose
+//     sweep is not clear. The seven flags it passes at 0x0055B8B5 are
+//     buildings, vehicles, peds, objects and three zeroes - peds included,
+//     and the only thing CWorld::pIgnoreEntity holds for that sweep is the
+//     projectile itself, never the ped that threw it;
+//   - the same function removes it outright if bHasCollided is set
+//     (0x0055B89E, byte B bit 3), which is what a CObject born inside a ped's
+//     collision gets on its first physics step;
+//   - and CoopIII's own RemoveProjectile detour blanks the weapon type on the
+//     way past, so that removal makes no explosion and no sound. It vanishes.
+//
+// The owner's C_Explosion still arrives a second later and still plays in the
+// right street, which is exactly what was reported: the blast syncs, the
+// rocket doesn't.
+//
+// Three writes plus three engine calls, and none of the three calls is
+// optional. ped.cpp's PlaceRemotePed has the long version of why: the CMatrix
+// and the RwFrame are separate memory after CEntity::CreateRwObject attached
+// them, and CWorld::Add files an entity into the sector grid once and never
+// re-reads its position.
+void PlaceRemoteProjectile(int slot, const ShotBody &shot) {
+	using ThisFn = void(__thiscall *)(void *);
+
+	void *const obj  = ProjObject(slot);
+	void *const info = ProjInfo(slot);
+	if (!obj)
+		return;
+
+	// Rotation first, so the position below is the last word on the matrix.
+	// A direction that isn't one leaves the engine's own rotation alone -
+	// the rocket then points along the thrower's heading, which is wrong to
+	// look at and safe to fly.
+	Vec3 right, forward, up;
+	if (ProjectileBasis(shot.dir, right, forward, up)) {
+		WriteVec3(obj, offs::MATRIX_RIGHT, right);
+		WriteVec3(obj, offs::MATRIX_FWD, forward);
+		WriteVec3(obj, offs::MATRIX_UP, up);
+	}
+
+	// Clamped for the usual reason: CPhysical::RemoveAndAdd below turns x and
+	// y into subscripts into CWorld::ms_aSectors with no bounds check
+	// (pedanim.h).
+	float *const p = &Field<float>(obj, offs::POSITION);
+	p[0]           = ClampToWorld(shot.origin.x);
+	p[1]           = ClampToWorld(shot.origin.y);
+	float z        = p[2];
+	FiniteOr(shot.origin.z, p[2], z);
+	p[2] = z;
+
+	// The velocity the thrower's own engine computed, not a re-derivation of
+	// it. AddProjectile's answer depends on the thrower's heading, whether
+	// they are the player, whether they have a seek target and how long the
+	// attack button was held, and an observer has none of that.
+	float *const velocity = &Field<float>(obj, offs::MOVE_SPEED);
+	float        speed    = 0.0f;
+	if (FiniteOr(shot.speed, 0.0f, speed) && speed > 0.0f) {
+		float d[3];
+		if (FiniteOr(shot.dir.x, 0.0f, d[0]) && FiniteOr(shot.dir.y, 0.0f, d[1]) &&
+		    FiniteOr(shot.dir.z, 0.0f, d[2])) {
+			velocity[0] = d[0] * speed;
+			velocity[1] = d[1] * speed;
+			velocity[2] = d[2] * speed;
+		}
+	}
+
+	Func<ThisFn>(CMatrix__UpdateRW)(reinterpret_cast<uint8_t *>(obj) + offs::MATRIX);
+	Func<ThisFn>(CEntity__UpdateRwFrame)(obj);
+	Func<ThisFn>(CPhysical__RemoveAndAdd)(obj);
+
+	// And the sweep's other end. AddProjectile set m_vecPos to wherever it
+	// put the object; leave it and the very first sweep runs from inside the
+	// thrower back out to here, through the ped, and ends the rocket before
+	// the frame it was created in is even drawn.
+	WriteVec3(info, PROJINFO_POS, Vec3{p[0], p[1], p[2]});
 }
 
 void EndTrackedFor(uint8_t playerId) {
@@ -423,6 +571,22 @@ using RemoveProjectileFn = void(__cdecl *)(void *, void *);
 void __cdecl HookedRemoveProjectile(void *info, void *projectile) {
 	const int slot = TrackedSlotOf(info);
 	if (slot >= 0) {
+		if (!g_saidProjectileEnded) {
+			g_saidProjectileEnded = true;
+			const uint32_t now =
+			    Global<uint32_t>(CTimer__m_snTimeInMilliseconds);
+			Log("combat: the first projectile we were animating for a remote player "
+			    "ended after %u ms, %s. Either way it leaves no explosion of ours - "
+			    "only its owner says where theirs went off",
+			    now - g_tracked[slot].bornMs,
+			    g_endingOurs
+			        ? "because their explosion arrived and we ended it"
+			        : "because this machine's engine removed it - it collided, or "
+			          "CProjectileInfo::Update swept it into a ped, a car or a wall. "
+			          "A few ms here means it was born somewhere it could not fly out "
+			          "of");
+		}
+
 		// The whole trick, and why this function got disassembled instead of
 		// just located: its explosion path is a three-way switch on
 		// m_eWeaponType that falls through into the teardown. Blank the type
@@ -730,28 +894,43 @@ uint8_t DrainLocalCombat(CombatEvent *out, uint8_t max) {
 // ---- replaying somebody else's shot ---------------------------------------
 
 void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
-	if (!IsReplayableWeapon(shot.weapon))
+	if (!IsReplayableWeapon(shot.weapon)) {
+		RefuseShot(GATE_WEAPON,
+		           "that weapon is not one an observer replays (combat.h, "
+		           "IsReplayableWeapon)", player, shot.weapon);
 		return;
+	}
 
 	void *const ped = ResolveRemotePed(player);
-	if (!ped)
+	if (!ped) {
+		RefuseShot(GATE_NO_PED, "we have no ped for them right now", player, shot.weapon);
 		return;
+	}
 
 	// A seated ped's gun is the car's business - drive-bys run through a
 	// different engine path (CWeapon::FireFromCar) that isn't synced. A
 	// dying ped has already stopped: CWeapon::Fire would still go through,
 	// and a muzzle flash out of a corpse looks worse than nothing at all.
-	if (Field<bool>(ped, offs::PED_IN_VEHICLE))
+	if (Field<bool>(ped, offs::PED_IN_VEHICLE)) {
+		RefuseShot(GATE_SEATED, "their ped is in a car and drive-bys are not synced",
+		           player, shot.weapon);
 		return;
+	}
 	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
-	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD) {
+		RefuseShot(GATE_DEAD, "their ped is dying or dead on this machine", player,
+		           shot.weapon);
 		return;
+	}
 
 	// Not yet: the weapon's model is still streaming. Dropped rather than
 	// retried, same as the shot itself - by the time it loads, this round
 	// is already over.
-	if (!GiveRemoteWeapon(player, ped, shot.weapon))
+	if (!GiveRemoteWeapon(player, ped, shot.weapon)) {
+		RefuseShot(GATE_MODEL, "their weapon's model has not finished streaming here",
+		           player, shot.weapon);
 		return;
+	}
 
 	void *const weapon = reinterpret_cast<uint8_t *>(ped) + offs::PED_WEAPONS +
 	                     static_cast<size_t>(shot.weapon) * offs::SIZEOF_WEAPON;
@@ -803,43 +982,71 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
 		Field<uint8_t>(localPed, offs::ENTITY_FLAGS_C) = static_cast<uint8_t>(
 		    Field<uint8_t>(localPed, offs::ENTITY_FLAGS_C) & ~offs::ENTITY_BULLET_PROOF);
 
+	if (!g_saidShotReplayed) {
+		g_saidShotReplayed = true;
+		Log("combat: replayed our first remote shot through the engine's own "
+		    "CWeapon::Fire - player net %u, weapon %u, from (%.1f %.1f %.1f)",
+		    player.netId, shot.weapon, shot.origin.x, shot.origin.y, shot.origin.z);
+	}
+
 	if (!projectile)
 		return;
 
-	// The projectile the engine just created, corrected to the arc its
-	// owner actually threw, then marked as ours to animate rather than end.
+	// The projectile the engine just created, moved to where its owner threw
+	// it, then marked as ours to animate rather than end.
 	const uint32_t created = InUseMask() & ~before;
+	int            slot    = -1;
 	for (int i = 0; i < NUM_PROJECTILES; ++i) {
 		if (!(created & (1u << i)))
 			continue;
 		if (Field<void *>(ProjInfo(i), PROJINFO_SOURCE) != ped)
 			continue;
-		void *const obj = ProjObject(i);
-		if (!obj)
+		if (!ProjObject(i))
 			continue;
-
-		// Velocity only - the position AddProjectile chose is left alone. It
-		// derives from this ped's matrix, which the pose stream keeps within
-		// one snapshot of the truth (half a metre, at a run), while the
-		// velocity isn't derivable here at all and is what decides the whole
-		// arc. Moving the object too would mean re-filing it in the sector
-		// grid - three more engine calls to fix half a metre.
-		float *const velocity = &Field<float>(obj, offs::MOVE_SPEED);
-		float        speed    = 0.0f;
-		if (FiniteOr(shot.speed, 0.0f, speed) && speed > 0.0f) {
-			float d[3];
-			if (FiniteOr(shot.dir.x, 0.0f, d[0]) && FiniteOr(shot.dir.y, 0.0f, d[1]) &&
-			    FiniteOr(shot.dir.z, 0.0f, d[2])) {
-				velocity[0] = d[0] * speed;
-				velocity[1] = d[1] * speed;
-				velocity[2] = d[2] * speed;
-			}
-		}
-
-		g_tracked[i].active   = true;
-		g_tracked[i].playerId = player.playerId;
-		g_tracked[i].source   = ped;
+		slot = i;
 		break;
+	}
+
+	if (slot < 0) {
+		// The fire path ran and made nothing to fly. Only two things in
+		// CWeapon::FireProjectile do that: its line-of-sight check failed, in
+		// which case it called RemoveNotAdd and the replay guard swallowed the
+		// blast, or all 32 CProjectileInfo slots are busy. Either way the
+		// owner's own explosion is still on its way and will still play, which
+		// is precisely the "the blast syncs, nothing flies" symptom - so it
+		// gets a line of its own rather than looking like the bug below.
+		if (!g_saidNoProjectile) {
+			g_saidNoProjectile = true;
+			Log("combat: replayed a projectile shot for player net %u with weapon %u "
+			    "and the engine created nothing to fly. CWeapon::FireProjectile only "
+			    "skips CProjectileInfo::AddProjectile when its line-of-sight check "
+			    "fails or all %d slots are in use. Their explosion still arrives on "
+			    "its own packet",
+			    player.netId, shot.weapon, NUM_PROJECTILES);
+		}
+		return;
+	}
+
+	PlaceRemoteProjectile(slot, shot);
+
+	g_tracked[slot].active   = true;
+	g_tracked[slot].playerId = player.playerId;
+	g_tracked[slot].source   = ped;
+	g_tracked[slot].bornMs   = Global<uint32_t>(CTimer__m_snTimeInMilliseconds);
+
+	if (!g_saidProjectileFlying) {
+		g_saidProjectileFlying = true;
+		const float *const p = &Field<float>(ProjObject(slot), offs::POSITION);
+		Log("combat: a remote player's projectile is in the air - weapon %u, slot %d, "
+		    "at (%.1f %.1f %.1f) heading (%.2f %.2f %.2f) at %.2f. %s",
+		    shot.weapon, slot, p[0], p[1], p[2], shot.dir.x, shot.dir.y, shot.dir.z,
+		    shot.speed,
+		    ProjectileSpawnsAtThrower(shot.weapon)
+		        ? "It had to be moved: CProjectileInfo::AddProjectile's rocket arm "
+		          "for a ped that is not the player ignores the fire source and "
+		          "leaves the missile inside the thrower"
+		        : "It was already close to right - this weapon's arm does read the "
+		          "fire source - and is now exactly where its owner had it");
 	}
 }
 
