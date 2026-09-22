@@ -102,6 +102,15 @@ a host-authoritative script (`campaign.md` §2).
       across the roster. Run in game 2026-09-22 and the size settled at
       nametagScale 1.35. See
       `client/src/game/nametag.h` for the design and the numbers.
+- [x] Remote players on the minimap. Not drawn by CoopIII at all: each player
+      gets an entry in the game's own `CRadar::ms_RadarTrace` through
+      `CRadar::SetEntityBlip(BLIP_CHAR, …)`, and `CHud::Draw`'s existing call
+      to `CRadar::DrawBlips` draws it. Green on foot and red in a car, which
+      are `ADD_BLIP_FOR_CHAR`'s and `ADD_BLIP_FOR_CAR`'s own colours, at
+      `ADD_BLIP_FOR_CHAR`'s own scale of 3. No detour, no protocol change.
+      The table is 32 slots with no bounds check on the far side, so CoopIII
+      counts the free ones itself and keeps a reserve for the campaign
+      script. Not yet run in game. See `client/src/game/radar.h`.
 - [x] Decide the streaming policy (§2.1). Settled, see §5.3.
 
 Done when: two players can see each other walk around Portland and it looks
@@ -340,6 +349,20 @@ budget.
 The consequence to get right is the transition. A player crossing into your
 radius must spawn smoothly rather than popping in mid-stride, and one leaving
 must despawn without leaving a corpse behind. The handoff is where the work is.
+
+**The blip half of this is already built** (M1, `client/src/game/radar.h`) and
+it was built so this would not need rebuilding. Today a remote player's blip is
+a `BLIP_CHAR` tracking their `CPed`; a player with no ped gets no blip, and
+that is one predicate, `BlipWanted`. When distant players land it becomes a
+`BLIP_COORD` created with `CRadar::SetCoordBlip` (recorded in `addresses.h`),
+drawn by the same `DrawBlips` loop with the same square, the same colour table
+and the same rim clamp — so the handover is invisible on screen, which is the
+whole reason the game's own blip was used rather than a sprite of our own. The
+slot accounting and the reserve are already blip-kind-agnostic. Two things are
+new: a coord blip carries no entity handle, so ownership has to come from the
+slot plus the generation rather than from `TraceIsOurs`; and no engine setter
+moves a coord blip, so CoopIII writes `m_vec2DPos`/`m_vecPos` itself each frame
+from the position already on the wire. `radar.h` says both at the bottom.
 
 ### 5.4 Mission failure on death - it fails, as in single player
 

@@ -17,6 +17,7 @@
 #include "game/nametag.h"
 #include "game/pause.h"
 #include "game/ped.h"
+#include "game/radar.h"
 #include "game/verify.h"
 #include "game/world.h"
 #include "game/worldstate.h"
@@ -50,6 +51,11 @@ void PreFrame() {
 	// whether to update the world. game/pause.h has the full reasoning.
 	game::ClearPauseForTheWorld();
 	g_client.PreFrame();
+
+	// Right after the roster, so the radar agrees with the peds that were
+	// just spawned or destroyed. Not from the HUD draw: game/radar.cpp says
+	// why a blip has to be released even on a frame with no radar on screen.
+	game::UpdateRemoteBlips();
 
 	// Last, after the roster has spawned and despawned whatever it was going
 	// to: look at the list CWorld::Process is about to walk and take out
@@ -162,6 +168,12 @@ DWORD WINAPI Boot(LPVOID) {
 	game::SetNametagScale(g_config.nametagScale);
 	game::InstallNametags(g_client);
 
+	// Blips need no detour at all - CHud::Draw already runs CRadar::DrawBlips
+	// over the game's own blip table every frame, so CoopIII only keeps the
+	// table right. This checks the table is really a blip table first, and
+	// refuses loudly rather than writing 32 slots of somebody else's memory.
+	game::InstallRadarBlips(g_client);
+
 	Log("CoopIII ready");
 	return 0;
 }
@@ -187,6 +199,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			// First, because the draw reads the roster straight out of the
 			// client and the client is about to be stopped.
 			game::RemoveNametags();
+			// Before the roster goes away, while the ped refs a blip is
+			// recognised by are still the ones we registered.
+			game::RemoveRadarBlips();
 			g_client.Stop();
 			game::RemovePausePolicy();
 			// Before the frame hook, and before MinHook goes away. Removing

@@ -1,7 +1,7 @@
 // A synthetic second player.
 //
 //   ghost [host] [port] [nick] [-car] [-inout] [-shoot] [-throw] [-hurt]
-//         [-flame] [-rocket] [-burn]
+//         [-flame] [-rocket] [-burn] [-far]
 //
 // -car   also claims a vehicle and parks it in front of the player. Puts the
 //        real client through the vehicle pool, CAutomobile's constructor and
@@ -83,6 +83,15 @@
 //        only way to see the observer half in a real game: a remote ped
 //        playing a death animation, staying a corpse, and then being rebuilt
 //        somewhere else. Shoot the ghost and watch it fall over.
+// -far   widens the orbit from four metres to a sweep between 20 and 200,
+//        out and back every minute. That is the radar's business: the radar
+//        reaches 120 m on foot, so the ghost's blip walks out to the rim,
+//        pins to it the way every GTA III blip does, and comes back in. It
+//        is also the one thing worth looking at twice, because it is the
+//        handover docs/roadmap.md §5.3 will need - a player that far away
+//        eventually stops having a ped, and the blip has to survive that.
+//        On foot only; with -car the blip follows the car and this would be
+//        testing the car.
 //
 // Connects like a real client, finds whoever else is in the session, and
 // walks a slow circle a few metres from them. The ghost itself isn't the
@@ -112,6 +121,15 @@ namespace {
 constexpr float ORBIT_RADIUS_M = 4.0f;
 constexpr float ORBIT_PERIOD_S = 12.0f;
 
+// -far. The radar reaches 120 m on foot (addresses.h, RADAR_RANGE_ON_FOOT_M),
+// so 20 to 200 m crosses the rim well inside it and well outside it. The
+// periods are long because the speed is the tangent of the orbit and a
+// 200 m circle in twelve seconds is 105 m/s, which is not a person.
+constexpr float FAR_NEAR_M    = 20.0f;
+constexpr float FAR_OUT_M     = 200.0f;
+constexpr float FAR_PERIOD_S  = 180.0f;   // once round: ~7 m/s at 200 m
+constexpr float FAR_BREATHE_S = 60.0f;    // out and back
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -130,6 +148,7 @@ int main(int argc, char **argv) {
 	bool flameFlag  = false;
 	bool rocketFlag = false;
 	bool burnFlag   = false;
+	bool farFlag    = false;
 	for (int i = 1; i < argc; ++i) {
 		if (std::strcmp(argv[i], "-car") == 0)
 			carFlag = true;
@@ -147,7 +166,22 @@ int main(int argc, char **argv) {
 			rocketFlag = true;
 		if (std::strcmp(argv[i], "-burn") == 0)
 			burnFlag = true;
+		if (std::strcmp(argv[i], "-far") == 0)
+			farFlag = true;
 	}
+
+	// -far and -car cannot both be what is being watched. A seated player's
+	// blip is drawn at their car's position, by the engine, so a ghost 200 m
+	// away in a car is testing the car's own sync and not the radar's rim.
+	if (farFlag && carFlag) {
+		farFlag = false;
+		std::printf("-far is the on-foot rim test; -car wins and the orbit stays "
+		            "close\n");
+	}
+	if (farFlag)
+		std::printf("-far: sweeping %.0f to %.0f m, so the blip leaves the radar's "
+		            "%.0f m rim and comes back\n",
+		            FAR_NEAR_M, FAR_OUT_M, 120.0f);
 
 	// -rocket and -throw are the same two halves with a different weapon, so
 	// they share one in-flight slot. Asking for both is asking for one.
@@ -372,8 +406,23 @@ int main(int argc, char **argv) {
 		// shouldn't be broadcasting a position at all.
 		if (client.IsConnected() && helloSent && haveTarget &&
 		    rate.Ready(WallClock::NowMs())) {
-			const float t     = (WallClock::NowMs() - startMs) / 1000.0f;
-			const float angle = 6.2831853f * (t / ORBIT_PERIOD_S);
+			const float t      = (WallClock::NowMs() - startMs) / 1000.0f;
+			const float period = farFlag ? FAR_PERIOD_S : ORBIT_PERIOD_S;
+			const float angle  = 6.2831853f * (t / period);
+
+			// -far breathes the orbit in and out across the radar's own rim
+			// (120 m on foot, RADAR_RANGE_ON_FOOT_M) instead of holding one
+			// radius. A fixed radius past the rim would pin the blip to the
+			// edge and leave it there, which tests the clamp and nothing
+			// else; what actually needs watching is the crossing in both
+			// directions, and it is the same handover docs/roadmap.md 5.3
+			// will need when a distant player stops having a ped at all.
+			float radius = ORBIT_RADIUS_M;
+			if (farFlag) {
+				const float phase = 6.2831853f * (t / FAR_BREATHE_S);
+				radius = FAR_NEAR_M +
+				         (FAR_OUT_M - FAR_NEAR_M) * 0.5f * (1.0f - std::cos(phase));
+			}
 
 			C_PlayerState pkt{};
 			InitHeader(pkt, WallClock::NowMs());
@@ -381,14 +430,18 @@ int main(int argc, char **argv) {
 			// Orbit the player we found. There's no "no target" case left to
 			// handle here - the send is already gated on haveTarget above.
 			const Vec3 centre = target;
-			pkt.body.pos.x    = centre.x + ORBIT_RADIUS_M * std::cos(angle);
-			pkt.body.pos.y    = centre.y + ORBIT_RADIUS_M * std::sin(angle);
+			pkt.body.pos.x    = centre.x + radius * std::cos(angle);
+			pkt.body.pos.y    = centre.y + radius * std::sin(angle);
 			pkt.body.pos.z    = centre.z;
 
 			// Face along the direction of travel, which is the tangent.
 			pkt.body.heading = angle + 1.5707963f;
 
-			const float speed      = 6.2831853f * ORBIT_RADIUS_M / ORBIT_PERIOD_S;
+			// Tangential only. The radial part of -far's sweep is slow enough
+			// next to this that leaving it out costs nothing, and moveSpeed
+			// is what the receiver picks a walk or a run from rather than
+			// anything it positions with.
+			const float speed      = 6.2831853f * radius / period;
 			pkt.body.moveSpeed.x   = -speed * std::sin(angle);
 			pkt.body.moveSpeed.y   = speed * std::cos(angle);
 			pkt.body.moveSpeed.z   = 0.0f;

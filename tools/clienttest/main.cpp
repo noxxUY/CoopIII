@@ -13,6 +13,7 @@
 #include "game/combat.h"
 #include "game/nametag.h"
 #include "game/pedanim.h"
+#include "game/radar.h"
 
 #include <cstdio>
 #include <cstring>
@@ -2695,6 +2696,174 @@ void TestEightTagsDoNotStack() {
 	Check(TagLift(b, &a, 1, 2.0f) == 0.0f, "a tag well clear of another stays put");
 }
 
+// ---- radar blips ----------------------------------------------------------
+//
+// No unit test can walk CRadar::ms_RadarTrace, so what these pin is the
+// decisions that lead there. The first one is the important one: it is the
+// bound this project has got wrong from a decompilation before, and the
+// consequence of getting it wrong here is not a missing blip.
+
+void TestBlipTableBounds() {
+	std::printf("\nthe blip table's size, read off the binary\n");
+
+	// SetEntityBlip's own free-slot loop: `add eax,30h / inc ecx / cmp
+	// byte [eax+006ED603h],0 / cmp ecx,20h / jb`. Confirmed twice more, by
+	// CRadar::Initialise's identical stride and count and by CReplay's
+	// `push 600h / push 006ED5E0h / call memcpy`.
+	Check(NUM_RADAR_BLIPS == 32, "32 slots, from `cmp ecx,20h` in SetEntityBlip");
+	Check(SIZEOF_RADAR_TRACE == 0x30, "0x30 apart, from `add eax,30h`");
+	Check(NUM_RADAR_BLIPS * SIZEOF_RADAR_TRACE == 0x600,
+	      "which is the 0x600 CReplay copies, so three witnesses agree");
+
+	// The reason none of this is allowed to be approximate. SetEntityBlip has
+	// no bounds check; with all 32 in use it writes the 33rd entry, and the
+	// 33rd entry is not spare memory.
+	Check(CRadar__ms_RadarTrace + NUM_RADAR_BLIPS * SIZEOF_RADAR_TRACE ==
+	          RADAR_TRACE_OVERFLOW_TARGET,
+	      "slot 32 lands exactly on CDarkel::RegisteredKills");
+	Check(RADAR_TRACE_OVERFLOW_TARGET == CDarkel__RegisteredKills,
+	      "which is a uint16[200] kill register, not padding");
+
+	// sRadarTrace, every offset witnessed by the instruction in SetEntityBlip
+	// that writes it. An offset four out here would write a blip type into a
+	// colour and nothing would crash.
+	Check(TRACE_COLOR == 0x00 && TRACE_BLIP_TYPE == 0x04 &&
+	          TRACE_ENTITY_HANDLE == 0x08,
+	      "colour, type and entity handle are the first three dwords");
+	Check(TRACE_IN_USE == 0x23 && TRACE_DIM == 0x22,
+	      "m_bInUse is the byte after m_bDim, not before it");
+	Check(TRACE_SCALE == 0x28 && TRACE_BLIP_DISPLAY == 0x2A &&
+	          TRACE_RADAR_SPRITE == 0x2C,
+	      "scale, display and sprite are the three words at the end");
+}
+
+void TestBlipSlotBudget() {
+	std::printf("\nCoopIII is a guest in the campaign script's blip table\n");
+
+	Check(MayTakeTraceSlot(int(NUM_RADAR_BLIPS), 0),
+	      "an empty table has room for a blip");
+	Check(!MayTakeTraceSlot(0, 0),
+	      "a full table does not, which is the whole guard: the engine would "
+	      "have written past the end");
+	Check(!MayTakeTraceSlot(1, 0),
+	      "nor does one free slot, with the reserve held back");
+
+	Check(MayTakeTraceSlot(RADAR_SCRIPT_RESERVE + 1, 0),
+	      "one more than the reserve is enough, because taking it leaves the "
+	      "reserve intact");
+	Check(!MayTakeTraceSlot(RADAR_SCRIPT_RESERVE, 0),
+	      "exactly the reserve is not, because taking it would eat into it");
+
+	Check(MayTakeTraceSlot(int(NUM_RADAR_BLIPS), RADAR_MAX_OUR_BLIPS - 1),
+	      "seven blips is the cap and the seventh is allowed");
+	Check(!MayTakeTraceSlot(int(NUM_RADAR_BLIPS), RADAR_MAX_OUR_BLIPS),
+	      "an eighth is not, however empty the table is");
+	Check(RADAR_MAX_OUR_BLIPS == MAX_PLAYERS - 1,
+	      "and the cap is one per other player, not a number of its own");
+
+	// A full lobby has to fit inside the budget on an empty-ish table, or the
+	// feature is only ever partly there.
+	Check(int(NUM_RADAR_BLIPS) - RADAR_SCRIPT_RESERVE >= RADAR_MAX_OUR_BLIPS,
+	      "seven players and the reserve both fit in 32 slots");
+}
+
+void TestBlipHandleEncoding() {
+	std::printf("\na blip handle is a slot and a generation\n");
+
+	const int32_t handle = int32_t(uint32_t(5) | (uint32_t(3) << 16));
+	Check(BlipSlot(handle) == 5, "the low word is the slot");
+	Check(BlipGeneration(handle) == 3, "the high word is m_BlipIndex");
+	Check(BlipHandleUsable(handle), "and that is a handle worth passing back");
+
+	Check(!BlipHandleUsable(NO_BLIP), "-1 is not a blip");
+
+	// GetActualBlipArrayIndex does `and eax,0FFFFh` and indexes the table
+	// with it, with no range check at all. A handle naming a slot that does
+	// not exist has to be refused here, because the engine will not refuse it.
+	const int32_t past = int32_t(uint32_t(NUM_RADAR_BLIPS) | (uint32_t(1) << 16));
+	Check(!BlipHandleUsable(past),
+	      "a handle for slot 32 is refused: the engine would index straight "
+	      "past the table");
+	Check(!BlipHandleUsable(int32_t(uint32_t(0xFFFF) | (uint32_t(1) << 16))),
+	      "so is slot 65535");
+
+	// GetNewUniqueBlipIndex returns 1 or more, never 0, so a zero generation
+	// is a handle that did not come from it.
+	Check(!BlipHandleUsable(int32_t(5)),
+	      "generation 0 is refused: nothing the engine returns looks like that");
+}
+
+void TestBlipOwnership() {
+	std::printf("\nwhether a slot is still ours is asked of the table\n");
+
+	const int32_t ourPed = 0x1234;
+
+	Check(TraceIsOurs(true, BLIP_CHAR, ourPed, ourPed),
+	      "in use, a BLIP_CHAR, and carrying our ped ref: ours");
+
+	// The three ways it stops being ours, each of which really happens.
+	Check(!TraceIsOurs(false, BLIP_CHAR, ourPed, ourPed),
+	      "not in use: ~CPed cleared it when the ped died, or CRadar::Initialise "
+	      "wiped the table on a game load");
+	Check(!TraceIsOurs(true, BLIP_COORD, ourPed, ourPed),
+	      "a coord blip in that slot: the script took it");
+	Check(!TraceIsOurs(true, BLIP_CHAR, 0x9999, ourPed),
+	      "a BLIP_CHAR for somebody else's ped: also the script's");
+
+	// The dangerous direction. A handle comparison would accept a slot whose
+	// generation happened to come back round; asking what is in the slot
+	// cannot, because nothing else in the game knows our ped ref.
+	Check(!TraceIsOurs(true, BLIP_CHAR, ourPed, -1),
+	      "and a player with no ped owns nothing, whatever the slot says");
+}
+
+void TestBlipTableSanity() {
+	std::printf("\nrefusing to write a table that is not a blip table\n");
+
+	Check(TraceEntrySane(true, BLIP_CHAR, BLIP_DISPLAY_BOTH, RADAR_SPRITE_NONE),
+	      "an ordinary entity blip is sane");
+	Check(TraceEntrySane(true, BLIP_COORD, BLIP_DISPLAY_BLIP_ONLY, RADAR_SPRITE_SAVE),
+	      "so is a save point");
+
+	// ClearBlip leaves m_nColor, m_wScale and both position vectors alone, so
+	// a free slot keeps the last tenant's junk. Requiring anything of it
+	// would fail on a healthy table.
+	Check(TraceEntrySane(false, 0xDEADBEEF, 0xFFFF, 0xFFFF),
+	      "a free slot is not inspected, because ClearBlip leaves junk behind");
+
+	Check(!TraceEntrySane(true, 0, BLIP_DISPLAY_BOTH, RADAR_SPRITE_NONE),
+	      "an in-use slot with BLIP_NONE in it is not a blip");
+	Check(!TraceEntrySane(true, 6, BLIP_DISPLAY_BOTH, RADAR_SPRITE_NONE),
+	      "nor is a type past BLIP_CONTACT_POINT");
+	Check(!TraceEntrySane(true, BLIP_CHAR, 4, RADAR_SPRITE_NONE),
+	      "nor a display mode past BOTH");
+	Check(!TraceEntrySane(true, BLIP_CHAR, BLIP_DISPLAY_BOTH, 21),
+	      "nor a sprite index past the last one, which DrawRadarSprite would "
+	      "dereference without checking");
+}
+
+void TestBlipLooksLikeTheGames() {
+	std::printf("\nwhat a remote player looks like on the radar\n");
+
+	// The two colours are not chosen, they are the two the game attaches to a
+	// meaning: ADD_BLIP_FOR_CHAR pushes 1, ADD_BLIP_FOR_CAR pushes 0.
+	Check(BlipColourFor(false) == RADAR_TRACE_GREEN && RADAR_TRACE_GREEN == 1,
+	      "on foot: green, which is ADD_BLIP_FOR_CHAR's own colour");
+	Check(BlipColourFor(true) == RADAR_TRACE_RED && RADAR_TRACE_RED == 0,
+	      "in a car: red, which is ADD_BLIP_FOR_CAR's");
+	Check(BlipColourFor(true) != BlipColourFor(false),
+	      "so a driving player reads differently without a new sprite");
+
+	Check(BlipWanted(true, true, true), "an active player with a pose and a ped");
+	Check(!BlipWanted(false, true, true), "an empty slot gets nothing");
+	Check(!BlipWanted(true, false, true),
+	      "nor does a player whose first snapshot has not arrived - a blip at "
+	      "the world origin is a blip in the water off Portland");
+	Check(!BlipWanted(true, true, false),
+	      "and no ped means no blip today, which is the one predicate "
+	      "docs/roadmap.md 5.3 has to change");
+}
+
 } // namespace
 
 int main() {
@@ -2765,6 +2934,12 @@ int main() {
 	TestTagHealthText();
 	TestTagNameIsSafeForCFont();
 	TestEightTagsDoNotStack();
+	TestBlipTableBounds();
+	TestBlipSlotBudget();
+	TestBlipHandleEncoding();
+	TestBlipOwnership();
+	TestBlipTableSanity();
+	TestBlipLooksLikeTheGames();
 	TestClockDriftIsCircular();
 	TestClockOnlyMovesWhenItIsWorthIt();
 	TestTheHostKeepsItsOwnClock();

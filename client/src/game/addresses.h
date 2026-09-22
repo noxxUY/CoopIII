@@ -3123,6 +3123,196 @@ constexpr uintptr_t CWorld__ProcessLineOfSight = 0x004B0DE0;
 // AudioLogic.cpp:3646 decides whether a sound is occluded with
 // GetIsLineOfSightClear(TheCamera.GetPosition(), soundPos, true, ...).
 
+// ---- the radar: CRadar's blip table ---------------------------------------
+//
+// Everything needed to put something on the minimap through the game's own
+// radar rather than by painting a sprite over the top of it. Verified
+// 2026-09-22 against the retail image and matched against reference/re3
+// src/core/Radar.cpp statement for statement.
+//
+// The route in was the usual one: walk the script opcode that already does
+// the thing. COMMAND_ADD_BLIP_FOR_CHAR is opcode 391, so the 300..399
+// dispatcher table at 0x005EEE30 (base opcode 304) entry 87 is the handler,
+// at 0x0044079E, and it is re3 Script3.cpp:1380-1390 call for call:
+//
+//     call 004382E0                     CollectParameters(&m_nIp, 1)
+//     mov  ecx,[008F2C60] / call 0043EB30   CPools::GetPedPool()->GetAt
+//     call 00438460 / call 004A41C0     the handler's own "useless call" to
+//                                       GetActualBlipArrayIndex
+//     push 3 / push 1 / push eax / push 2
+//     call 004A5640 / add esp,10h       SetEntityBlip(BLIP_CHAR, handle,
+//                                       RADAR_TRACE_GREEN, BOTH), __cdecl
+//     push 3 / push ebx / call 004A57E0 ChangeBlipScale(blip, 3)
+//
+// which is also where the game's own answer to "what does a person look like
+// on the radar" comes from: colour 1, scale 3, no sprite.
+//
+// ---- the array, and its size, measured three separate ways ----------------
+//
+// CRadar::SetEntityBlip (0x004A5640) opens with the free-slot search, and it
+// is the whole of the bound:
+//
+//     xor ecx,ecx / xor eax,eax
+//     add eax,30h / inc ecx                     stride 0x30
+//     cmp byte [eax + 006ED603h],0              m_bInUse
+//     je  found
+//     cmp ecx,20h / jb loop                     32 slots
+//
+// Confirmed twice more, independently:
+//
+//   - CRadar::Initialise (0x004A3EF0) clears the table with `add ebp,30h /
+//     cmp ebx,20h / jl`, the same stride and the same count;
+//   - CReplay's save and restore (0x0059632C, 0x00596874) both do
+//     `push 600h / push 006ED5E0h / call memcpy`, and 0x600 is 32 * 0x30.
+//
+// re3's NUMRADARBLIPS is also 32, so this is one of the few places the
+// decompilation and retail agree - but the number below is read off the
+// binary, not off re3. It had to be: the last fixed-size array this project
+// took from re3 was declared as 16 and was 12 in the retail build, and
+// writing past it corrupted the engine's own stack.
+//
+// ---- and the array has no bounds check ------------------------------------
+//
+// If all 32 slots are in use the search loop falls out with ecx == 32 and
+// SetEntityBlip writes the 33rd entry anyway. re3 guards that behind
+// #ifdef FIX_BUGS; retail does not, so the write lands at
+// 0x006ED5E0 + 32*0x30 = 0x006EDBE0, which is CDarkel::RegisteredKills - the
+// uint16[200] kill register, zeroed eight words at a time by the loop at
+// 0x00421310 and incremented per model id at 0x00421019. It does not crash.
+// It quietly rewrites the kill-frenzy counters, and GetNewUniqueBlipIndex
+// then hands back a handle for slot 32 that every later ChangeBlip* call
+// happily writes through.
+//
+// So nothing may call SetEntityBlip without counting the free slots first.
+// RADAR_TRACE_OVERFLOW_TARGET is here so a test can pin that arithmetic
+// rather than trusting a comment.
+constexpr uintptr_t CRadar__ms_RadarTrace = 0x006ED5E0;
+constexpr size_t    SIZEOF_RADAR_TRACE    = 0x30;
+constexpr size_t    NUM_RADAR_BLIPS       = 32;
+constexpr uintptr_t CDarkel__RegisteredKills        = 0x006EDBE0;   // uint16[200]
+constexpr uintptr_t RADAR_TRACE_OVERFLOW_TARGET     = 0x006EDBE0;
+
+// sRadarTrace, every member witnessed by the instruction that writes it
+// inside SetEntityBlip. The absolute address in each comment is what the
+// disassembly actually shows, since the retail build folds the base in.
+constexpr size_t TRACE_COLOR         = 0x00;   // mov [edx+006ED5E0h],eax  arg3
+constexpr size_t TRACE_BLIP_TYPE     = 0x04;   // mov [edx+006ED5E4h],eax  arg1
+constexpr size_t TRACE_ENTITY_HANDLE = 0x08;   // mov [edx+006ED5E8h],eax  arg2
+constexpr size_t TRACE_POS_2D        = 0x0C;   // CVector2D, coord blips only
+constexpr size_t TRACE_POS           = 0x14;   // CVector,   coord blips only
+constexpr size_t TRACE_BLIP_INDEX    = 0x20;   // GetNewUniqueBlipIndex's word
+constexpr size_t TRACE_DIM           = 0x22;   // mov byte [..006ED602h],1
+constexpr size_t TRACE_IN_USE        = 0x23;   // mov byte [..006ED603h],1
+constexpr size_t TRACE_RADIUS        = 0x24;   // mov dword [..006ED604h],3F800000h
+constexpr size_t TRACE_SCALE         = 0x28;   // mov word [..006ED608h],1
+constexpr size_t TRACE_BLIP_DISPLAY  = 0x2A;   // mov word [..006ED60Ah],ax  arg4
+constexpr size_t TRACE_RADAR_SPRITE  = 0x2C;   // mov word [..006ED60Ch],0
+static_assert(TRACE_RADAR_SPRITE + 2 <= SIZEOF_RADAR_TRACE,
+              "sRadarTrace members must fit the stride the engine strides by");
+
+// eBlipType. BLIP_CHAR is 2 and BLIP_CAR is 1, and both are witnessed in the
+// engine's own destructors rather than taken from re3's enum order:
+//   ~CPed     (0x004C50D0) does CWorld::Remove, then
+//             `mov ecx,[008F2C60h] / call 0043EB70`, then
+//             `push eax / push 2 / call 004A56C0`
+//   ~CVehicle (0x00551060) does `mov ecx,[009430DCh] / call 00429050`, then
+//             `push eax / push 1 / call 004A56C0`
+//
+// That pair also settles the thing that makes this feature nearly free.
+// CPools::GetPedRef (0x004A1A80) is *literally* `mov ecx,[008F2C60h] / call
+// 0043EB70 / ret`, the same pool and the same function ~CPed uses, so **the
+// handle a BLIP_CHAR entry holds is byte for byte what CPools::GetPedRef
+// returns** - which is exactly what RemotePlayer::poolHandle already is. And
+// the engine clears an entity's blip in the destructor, so a ped CoopIII
+// destroys takes its blip with it without being asked.
+constexpr uint32_t BLIP_NONE          = 0;
+constexpr uint32_t BLIP_CAR           = 1;
+constexpr uint32_t BLIP_CHAR          = 2;
+constexpr uint32_t BLIP_OBJECT        = 3;
+constexpr uint32_t BLIP_COORD         = 4;
+constexpr uint32_t BLIP_CONTACT_POINT = 5;
+
+// eBlipDisplay.
+constexpr uint16_t BLIP_DISPLAY_NEITHER     = 0;
+constexpr uint16_t BLIP_DISPLAY_MARKER_ONLY = 1;
+constexpr uint16_t BLIP_DISPLAY_BLIP_ONLY   = 2;
+constexpr uint16_t BLIP_DISPLAY_BOTH        = 3;
+
+// The trace colours, which are indices into GetRadarTraceColour and not
+// RGBA. 0..6, proved by that function's own jump table (`cmp eax,6 / ja` then
+// `jmp [eax*4 + 005F71F4h]`) and by the RGBA constants each arm returns,
+// which match re3 Radar.cpp:909-955 exactly - e.g. GREEN is 0x5FA06AFF when
+// m_bDim is set and 0x007F00FF when it is not.
+//
+// Note the inversion, which is easy to get backwards: GetRadarTraceColour's
+// second argument is m_bDim, and a *set* m_bDim selects the lighter of the
+// two. SetEntityBlip leaves m_bDim = 1, so the lighter pair is the default
+// and it is what every script blip in the game uses.
+constexpr uint32_t RADAR_TRACE_RED        = 0;
+constexpr uint32_t RADAR_TRACE_GREEN      = 1;
+constexpr uint32_t RADAR_TRACE_LIGHT_BLUE = 2;
+constexpr uint32_t RADAR_TRACE_GRAY       = 3;
+constexpr uint32_t RADAR_TRACE_YELLOW     = 4;
+constexpr uint32_t RADAR_TRACE_MAGENTA    = 5;
+constexpr uint32_t RADAR_TRACE_CYAN       = 6;
+
+// eRadarSprite. Only the four the draw special-cases are named, because the
+// retail proves those four and nothing else: DrawBlips' second loop opens
+// `mov bx,[ebp+006ED60Ch]` and then skips 2, 0x11, 0x12 and 0x14 - which is
+// BOMB, SAVE, SPRAY and WEAPON in re3's enum order, so the numbering holds.
+// A blip with RADAR_SPRITE_NONE is the plain coloured square, which is what
+// every mission target in the game looks like.
+constexpr uint16_t RADAR_SPRITE_NONE   = 0;
+constexpr uint16_t RADAR_SPRITE_BOMB   = 2;
+constexpr uint16_t RADAR_SPRITE_SAVE   = 17;
+constexpr uint16_t RADAR_SPRITE_SPRAY  = 18;
+constexpr uint16_t RADAR_SPRITE_WEAPON = 20;
+
+// All __cdecl. GetActualBlipArrayIndex is the gate every ChangeBlip* goes
+// through: it returns -1 unless `handle >> 16` still matches the slot's
+// m_BlipIndex, which is what makes a handle stale once the slot is reused.
+// It does NOT range-check the low half (`and eax,0FFFFh` and straight into
+// `[edx*8 + 006ED600h]`), so a fabricated handle reads and writes wherever
+// its low word points. Only ever pass one SetEntityBlip returned.
+constexpr uintptr_t CRadar__SetEntityBlip           = 0x004A5640;
+constexpr uintptr_t CRadar__SetCoordBlip            = 0x004A5590;
+constexpr uintptr_t CRadar__ClearBlip               = 0x004A5720;
+constexpr uintptr_t CRadar__ClearBlipForEntity      = 0x004A56C0;
+constexpr uintptr_t CRadar__ChangeBlipColour        = 0x004A5770;
+constexpr uintptr_t CRadar__ChangeBlipScale         = 0x004A57E0;
+constexpr uintptr_t CRadar__ChangeBlipDisplay       = 0x004A5810;
+constexpr uintptr_t CRadar__SetBlipSprite           = 0x004A5840;
+constexpr uintptr_t CRadar__GetActualBlipArrayIndex = 0x004A41C0;
+constexpr uintptr_t CRadar__GetNewUniqueBlipIndex   = 0x004A4180;
+constexpr uintptr_t CRadar__SetRadarMarkerState     = 0x004A5C60;
+constexpr uintptr_t CRadar__GetRadarTraceColour     = 0x004A5BB0;
+
+// Recorded rather than called. DrawMap and DrawBlips are the two halves of
+// the radar the HUD runs, in that order, from CHud::Draw (0x0050838D and
+// 0x00508499). Initialise is called from CGame::Initialise (0x0048C1DD),
+// CGame::ReInitialise (0x0048C4F6) and LoadAllRadarBlips (0x004A6F35), and
+// it wipes every m_bInUse in the table - which is why nothing may trust a
+// blip handle it is holding across a game load. Ask the table.
+constexpr uintptr_t CRadar__DrawMap     = 0x004A4200;
+constexpr uintptr_t CRadar__DrawBlips   = 0x004A42F0;
+constexpr uintptr_t CRadar__Initialise  = 0x004A3EF0;
+
+// How far the radar reaches, in metres, which is the distance at which
+// LimitRadarPoint (0x004A4F30) stops moving a blip and starts pinning it to
+// the rim. DrawMap computes it: 120.0f (0x42F00000, written at 0x004A426A
+// and 0x004A42B4) on foot, ramping to 350.0f (0x43AF0000 at 0x004A42A8) in a
+// car, over the speed band 0.3 to 0.9 at 0x005F70F8 and 0x005F70FC.
+constexpr uintptr_t CRadar__m_radarRange    = 0x008E281C;   // float
+constexpr float     RADAR_RANGE_ON_FOOT_M   = 120.0f;
+constexpr float     RADAR_RANGE_AT_SPEED_M  = 350.0f;
+
+// The byte DrawBlips tests before drawing the 3D marker half of a
+// BLIP_DISPLAY_BOTH or MARKER_ONLY blip: `cmp byte [0095CD87h],0 / je` at
+// 0x004A490A. It is CTheScripts::DbgFlag, and it is off in a retail build,
+// which is why BLIP_DISPLAY_BOTH and BLIP_DISPLAY_BLIP_ONLY look identical in
+// a normal game and why asking for BLIP_ONLY costs nothing.
+constexpr uintptr_t CTheScripts__DbgFlag = 0x0095CD87;
+
 // ---- helpers --------------------------------------------------------------
 
 template <class T>
