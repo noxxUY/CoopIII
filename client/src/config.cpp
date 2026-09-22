@@ -97,6 +97,17 @@ bool Config::ParseIni(const std::string &text) {
 			const double s = std::strtod(value.c_str(), nullptr);
 			if (s >= 0.25 && s <= 4.0)
 				nametagScale = static_cast<float>(s);
+		} else if (IEquals(key, "seatkey")) {
+			// One letter or digit, taken as its virtual-key code, which for
+			// A-Z and 0-9 is the uppercase character itself. Anything longer is
+			// a name we have no table for, so it is left alone rather than
+			// guessed at.
+			if (value.size() == 1) {
+				const char c = value[0];
+				if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				    (c >= '0' && c <= '9'))
+					seatKey = std::toupper(static_cast<unsigned char>(c));
+			}
 		}
 		// Unknown keys: ignored on purpose (see config.h).
 

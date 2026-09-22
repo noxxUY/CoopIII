@@ -18,6 +18,7 @@
 #include "game/pause.h"
 #include "game/ped.h"
 #include "game/radar.h"
+#include "game/seat.h"
 #include "game/vehicle.h"
 #include "game/verify.h"
 #include "game/world.h"
@@ -163,6 +164,8 @@ DWORD WINAPI Boot(LPVOID) {
 	// addresses, different file, no entities involved.
 	game::AddWorldToBridge(bridge);
 	game::AddVehicleBlastToBridge(bridge);
+	game::SetSeatKey(g_config.seatKey);
+	game::AddSeatToBridge(bridge);
 
 	if (!g_client.Start(g_config.host, g_config.port, g_config.nick, bridge)) {
 		Log("CoopIII: the network client failed to start; the frame hook stays "

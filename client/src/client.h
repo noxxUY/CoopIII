@@ -376,6 +376,27 @@ struct WorldBridge {
 	// where tools/clienttest can reach it with a stub instead of an engine.
 	int32_t (*SampleLocalVehicleHandle)() = nullptr;
 
+	// ---- riding in somebody else's car -----------------------------------
+	//
+	// GTA III has no passenger seat for the player: the enter key jacks the
+	// driver, because in single player nobody is driving a car you would want
+	// to ride in. This is the one control CoopIII adds that the original game
+	// does not have. game/seat.h has the whole of it.
+
+	// True once per press of the seat key, never while it is held.
+	bool (*LocalWantsSeatToggle)() = nullptr;
+
+	// Put the local player in the first free passenger seat of the car this
+	// pool ref names, and report which seat the engine gave them. -1 for no.
+	// The engine picks the slot; CoopIII only reads back the number, because
+	// that number is what the session has to be told.
+	int32_t (*SeatLocalPlayerIn)(int32_t vehicleHandle) = nullptr;
+
+	// In a car, and not driving it. How the exit is noticed: there is no
+	// CoopIII way out, the player uses the game's own exit key and this goes
+	// false.
+	bool (*LocalIsPassenger)() = nullptr;
+
 	// Put a remote ped in a seat, and take them out again.
 	//
 	// Seat returns false when it couldn't be done *yet* - the ped or the
@@ -586,6 +607,7 @@ private:
 	void CorrectRemoteVehicles();
 	void SendLocalState();
 	void SendLocalVehicle();
+	void TickPassengerSeat();
 	// One packet per car per life, off the BlowUpCar detour's queue.
 	void SendLocalVehicleBlasts();
 	// Every frame, not at the snapshot rate, and not rate-limited - these
@@ -669,6 +691,12 @@ private:
 	// which is what stops the claim from being resent 25 times a second
 	// while the round trip is in flight.
 	uint16_t m_localVehicleNetId   = INVALID_NETID;
+
+	// The car we are riding in as a passenger, if any. Separate from
+	// m_localVehicleNetId on purpose: that one means "we are driving this and
+	// its physics are ours to report", and a passenger reports nothing.
+	uint16_t m_localSeatNetId      = INVALID_NETID;
+	bool     m_saidSeatRefused     = false;
 	bool     m_vehicleClaimPending = false;
 
 	// Said once, the first time the local player gets into a car while this

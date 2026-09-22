@@ -2,6 +2,7 @@
 
 #include "log.h"
 
+#include <cmath>
 #include <cstring>
 
 namespace coopiii {
@@ -128,6 +129,7 @@ void Client::PostFrame() {
 	// have the server throw the blast away as coming from nobody.
 	SendLocalVehicleBlasts();
 	SendLocalVehicle();
+	TickPassengerSeat();
 }
 
 void Client::HandleMessage(const Message &msg) {
@@ -682,6 +684,91 @@ void Client::UpdateLocalLife(const PlayerStateBody &body) {
 // Only ever our own: the detour that fills this queue checks the car against
 // the one the local player is driving, and a car we are not driving is not
 // ours to declare finished. docs/protocol.md §1.11.2 is the rule and why.
+// Riding in somebody else's car.
+//
+// Two halves, and only the first one is CoopIII's doing. Getting in is a key
+// the original game has no binding for, so it is polled and acted on here.
+// Getting out is the game's own exit key on a ped the engine knows is in a
+// car, so there is nothing to intercept - the seat simply goes empty and the
+// session is told.
+//
+// Nothing about the car goes on the wire from a passenger. The driver owns
+// its physics, which is the same rule that decides who may report a car
+// anywhere else in this file.
+// How close you have to be to ask for a seat. GTA III's own enter key reaches
+// about this far, so a passenger seat asks for the same standing.
+constexpr float SEAT_RANGE_M = 5.0f;
+
+void Client::TickPassengerSeat() {
+	const bool riding = m_bridge.LocalIsPassenger && m_bridge.LocalIsPassenger();
+
+	// Out. Noticed rather than requested, because the way out is the game's.
+	if (m_localSeatNetId != INVALID_NETID && !riding) {
+		C_ExitVehicle out;
+		InitHeader(out, WallClock::NowMs());
+		out.netId = m_localSeatNetId;
+		m_net.Send(out, CH_EVENT);
+		Log("client: got out of vehicle %u", m_localSeatNetId);
+		m_localSeatNetId = INVALID_NETID;
+	}
+
+	if (!m_bridge.LocalWantsSeatToggle || !m_bridge.SeatLocalPlayerIn)
+		return;
+	if (!m_bridge.LocalWantsSeatToggle())
+		return;
+	if (riding || m_localVehicleNetId != INVALID_NETID)
+		return;   // already in something; the exit key is the way out
+
+	PlayerStateBody me{};
+	if (!m_bridge.SampleLocalPlayer || !m_bridge.SampleLocalPlayer(me))
+		return;
+
+	// The nearest of the session's own cars, and only the session's: a car
+	// nobody has claimed is local traffic, and seating somebody in one would
+	// put them in a vehicle the other machine has never heard of.
+	const RemoteVehicle *best     = nullptr;
+	float                bestDist = SEAT_RANGE_M;
+	for (const RemoteVehicle &v : m_vehicles) {
+		if (!v.active || !v.haveState || v.poolHandle < 0)
+			continue;
+		const float dx = v.last.pos.x - me.pos.x;
+		const float dy = v.last.pos.y - me.pos.y;
+		const float dz = v.last.pos.z - me.pos.z;
+		const float d  = std::sqrt(dx * dx + dy * dy + dz * dz);
+		if (d < bestDist) {
+			bestDist = d;
+			best     = &v;
+		}
+	}
+
+	if (!best) {
+		if (!m_saidSeatRefused) {
+			m_saidSeatRefused = true;
+			Log("client: asked for a passenger seat with none of the session's "
+			    "cars within %.0f m. Traffic does not count - a car nobody has "
+			    "claimed only exists on this machine",
+			    SEAT_RANGE_M);
+		}
+		return;
+	}
+
+	const int32_t seat = m_bridge.SeatLocalPlayerIn(best->poolHandle);
+	if (seat < 0)
+		return;   // game/seat.cpp said why
+
+	C_EnterVehicle out;
+	InitHeader(out, WallClock::NowMs());
+	out.body       = EnterVehicleBody{};
+	out.body.netId = best->netId;
+	out.body.seat  = static_cast<uint8_t>(seat);
+	out.body.jack  = 0;
+	m_net.Send(out, CH_EVENT);
+
+	m_localSeatNetId = best->netId;
+	Log("client: riding in vehicle %u, seat %d, %.1f m away when we asked",
+	    best->netId, seat, bestDist);
+}
+
 void Client::SendLocalVehicleBlasts() {
 	if (!m_bridge.DrainLocalVehicleBlasts)
 		return;

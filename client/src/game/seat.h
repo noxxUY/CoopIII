@@ -1,0 +1,58 @@
+#pragma once
+
+#include <cstdint>
+
+namespace coopiii {
+struct WorldBridge;
+}
+
+namespace coopiii::game {
+
+// Riding in somebody else's car.
+//
+// GTA III has no way for the player to be a passenger. Walk up to a car with
+// a driver in it and the enter key jacks them; there is no seat to ask for,
+// because in single player nobody is ever driving a car you would want to
+// ride in. A co-op mod is the first thing that wants one, so this is the one
+// place CoopIII adds a control the original game does not have.
+//
+// The seating itself is the engine's, not ours. CPed::WarpPedIntoCar branches
+// on the ped's objective: OBJECTIVE_ENTER_CAR_AS_DRIVER takes the driver's
+// seat, and anything on the other arm takes *the first free passenger slot*,
+// which the engine picks itself. So CoopIII does not choose a seat - it asks,
+// and then reads back which one it got, because that number is what the rest
+// of the session needs.
+//
+// See addresses.h, CPed__WarpPedIntoCar, for why the objective has to be set
+// first and what happens if it is not.
+
+// Which key asks for a seat. A virtual-key code; 'G' by default, settable
+// from CoopIII.ini before the feature is installed.
+void SetSeatKey(int virtualKey);
+
+// True once per press, never while held. Called from the client's own tick,
+// so the edge is per tick rather than per frame - a key held across two
+// frames of one tick is still one request.
+bool LocalWantsSeatToggle();
+
+// Put the local player in the first free passenger seat of the car this pool
+// ref names. Returns the seat index the engine gave it (1..8), or -1 if it
+// could not: no such car, no free seat, or the player is not in a state to
+// be seated.
+//
+// Never seats anyone in the driver's seat. Taking the wheel is the enter key
+// and the engine's business; this is only ever the seat beside it.
+int32_t SeatLocalPlayerIn(int32_t vehicleHandle);
+
+// Getting out is not here on purpose. The player is a real occupant of a
+// real car, so GTA III's own exit key already works on them and plays its own
+// animation; adding a second way out would mean writing the engine's seat
+// teardown by hand for the one ped whose state the engine is entitled to
+// manage. The client notices the seat is empty and tells the session.
+
+// Is the local player a passenger right now - in a car, but not driving it?
+bool LocalIsPassenger();
+
+void AddSeatToBridge(WorldBridge &bridge);
+
+} // namespace coopiii::game

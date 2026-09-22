@@ -31,6 +31,9 @@ target("client")
     add_includedirs("client/src")
     add_deps("sdk")
     add_packages("minhook")
+    -- user32 for the one key GTA III has no binding for: the passenger seat
+    -- (client/src/game/seat.cpp). Nothing else here talks to Windows.
+    add_syslinks("user32")
 
 -- Standalone authoritative server process.
 target("server")

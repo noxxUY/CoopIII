@@ -37,6 +37,12 @@ struct Config {
 	// the other.
 	float nametagScale = 1.0f;
 
+	// Which key asks for a passenger seat in somebody else's car. A single
+	// letter or digit in the ini, stored as its virtual-key code. GTA III has
+	// no binding of its own for this, so there is nothing to clash with inside
+	// the game - but plenty outside it, which is why it is settable.
+	int seatKey = 'G';
+
 	// Parses INI text. Unknown keys are ignored, not fatal, so a config from
 	// a newer build still loads. Returns false only if `text` is empty.
 	bool ParseIni(const std::string &text);
