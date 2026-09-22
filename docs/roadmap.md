@@ -99,7 +99,8 @@ a host-authoritative script (`campaign.md` §2).
       game's own `CFont` and its own `hud.txd` sprites from a detour on
       `CHud::Draw`. Fade out by 50 m and fade out behind walls, the second
       through one `CWorld::GetIsLineOfSightClear` per frame shared round robin
-      across the roster. Built and unit-tested, not yet run in-game. See
+      across the roster. Run in game 2026-09-22 and the size settled at
+      nametagScale 1.35. See
       `client/src/game/nametag.h` for the design and the numbers.
 - [x] Decide the streaming policy (§2.1). Settled, see §5.3.
 
@@ -248,7 +249,7 @@ Everything that has to travel, and where it stands. Sources are re3 members
 | Velocity | `m_vecMoveSpeed` | ✅ sent |
 | Vitals | `m_fHealth`, `m_fArmour` | ✅ sent |
 | State | `m_nPedState`, `m_nMoveState` | ✅ sent; `m_nMoveState` is also applied, so the engine picks the walk/run animation itself |
-| Animation | `AnimationId` + time, base **and** partial | ✅ sent and applied via `CAnimManager::BlendAnimation`. Needs an in-game run |
+| Animation | `AnimationId` + time, base **and** partial | ✅ sent and applied via `CAnimManager::BlendAnimation`. Run in game 2026-09-22, every weapon the owner tried |
 | Weapon | `m_weapons[]`, `m_currentWeapon` | ✅ sent and applied via `CPed::GiveWeapon` + `SetCurrentWeapon`, so the model is in the hand. Ammo is not on the wire (M3) |
 | Aim | yaw/pitch | ⚠️ both sent; yaw applied via `CPed::SetAimFlag`. Pitch is not applied: `CPed::AimGun` hard-codes 0 for non-player peds (`protocol.md` §1.8.3), so it needs a detour, and that belongs with M3 |
 | Shots | event | ✅ sent reliably and replayed through the real `CWeapon::Fire`, so impacts happen for real (`combat.cpp`) |
