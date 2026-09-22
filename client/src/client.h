@@ -40,6 +40,37 @@ struct RemotePlayer {
 	PlayerStateBody last{};
 	bool            haveState = false;
 
+	// Where the session said this player was when we were told about them,
+	// used until their own snapshots take over.
+	//
+	// It is not pushed into `interp`, and that is not fussiness. The buffer
+	// interpolates within one sender's timeline, and this timestamp is the
+	// *server's* clock while every snapshot in there carries the sender's -
+	// mixing the two would have the buffer interpolating between two numbers
+	// that don't measure the same thing. So it sits beside the buffer as a
+	// starting pose and is dropped the moment a real snapshot arrives.
+	//
+	// Why it exists at all: a remote ped is not created until we know where
+	// to put it, and the only thing that ever said where was a snapshot. A
+	// player in the frontend, on a loading screen or in a cutscene has no ped
+	// to sample and sends none, so before this a joiner could sit next to
+	// them and see nothing for as long as they stayed there.
+	Pose seedPose{};
+	bool haveSeedPose = false;
+
+	// Dead, as far as the session is concerned, and whether the engine has
+	// been told yet.
+	//
+	// Two fields rather than one call at the moment the news arrives, because
+	// the news can arrive before there is a ped to kill: a death during the
+	// model stream, or - the case this was written for - a join packet
+	// announcing somebody who has been lying in the road since before we
+	// connected. UpdateRemotes drives the second toward the first, the same
+	// shape as UpdateRemoteSeats.
+	bool     dead         = false;
+	uint16_t deathAnimId  = ANIM_NONE;
+	bool     deathApplied = false;
+
 	// Engine-side identity. -1 until Area B spawns a ped for this player.
 	// docs/protocol.md §1.5: local only, never goes on the wire.
 	int32_t poolHandle = -1;
@@ -277,6 +308,26 @@ struct WorldBridge {
 	                                   uint8_t &colour2, Vec3 &pos,
 	                                   Quat &rot) = nullptr;
 
+	// The engine's own reference (CPools::GetVehicleRef) for the car the
+	// local player is driving, or -1 on foot or as a passenger. The same
+	// number RemoteVehicle::poolHandle holds, so the two can be compared.
+	//
+	// This exists because of a question only a late joiner ever asks: is the
+	// car I have just got into one of *ours*? Everybody who was in the
+	// session when a car was claimed has it as a car from their own world;
+	// only somebody who joined afterwards has it as a CVehicle CoopIII
+	// created, and until this callback there was no way to notice. The claim
+	// therefore went out as a brand new car, the session handed back a second
+	// netId for a car it already knew, and the joiner ended up both driving
+	// that car and observing it - so CorrectRemoteVehicles pinned its
+	// transform every frame while its own driver pressed the accelerator.
+	// You could climb in and it would not move. See Client::SendLocalVehicle.
+	//
+	// A bare sample rather than a "is this that car?" predicate on purpose:
+	// the comparison is the decision, and the decision belongs in client.cpp
+	// where tools/clienttest can reach it with a stub instead of an engine.
+	int32_t (*SampleLocalVehicleHandle)() = nullptr;
+
 	// Put a remote ped in a seat, and take them out again.
 	//
 	// Seat returns false when it couldn't be done *yet* - the ped or the
@@ -399,6 +450,12 @@ public:
 		UpdateRemoteSeats();
 		CorrectRemoteVehicles();
 	}
+	// Test seam: the outgoing half of a frame, which PostFrame keeps behind
+	// a live socket. Send is a no-op while disconnected, so what this
+	// exercises is the decision - claim a new car, take over one the session
+	// already has, or report the one we are in - and the decision is where
+	// the bug was.
+	void TickLocalVehicle() { SendLocalVehicle(); }
 
 private:
 	void OnWelcome(const S_Welcome &pkt);
@@ -431,6 +488,21 @@ private:
 	// full, which isn't fatal - the vehicle just isn't shown, and the next
 	// despawn frees a slot.
 	RemoteVehicle *VehicleSlot(uint16_t netId, bool createIfMissing);
+
+	// Is this a car the local player is driving rather than watching?
+	//
+	// A row in m_vehicles is normally somebody else's car, but it does not
+	// have to stay that way: a car CoopIII spawned from the session backfill
+	// is a real car in the street and anyone can get into it. The moment the
+	// local player does, this machine owns it - it samples it, it sends its
+	// snapshots, and it must stop writing anybody else's idea of where it is
+	// on top of its own physics.
+	bool DrivenLocally(const RemoteVehicle &vehicle) const;
+
+	// The observed car the local player has just got into, if it is one of
+	// ours at all. Null when they are on foot, when they are in a car from
+	// their own world, or when the engine seam cannot tell us.
+	RemoteVehicle *ObservedVehicleWeAreDriving();
 
 	// Takes a player out of whatever seat we have them in, if any. Used
 	// wherever either half of the pair is about to stop existing.
@@ -528,6 +600,19 @@ private:
 	// while the round trip is in flight.
 	uint16_t m_localVehicleNetId   = INVALID_NETID;
 	bool     m_vehicleClaimPending = false;
+
+	// Said once, the first time the local player gets into a car while this
+	// machine is observing at least one of the session's, and the engine seam
+	// cannot tell the two apart.
+	//
+	// It is a log line rather than a refusal because refusing would mean not
+	// syncing the car at all, and because the only build that can reach it is
+	// one where WorldBridge::SampleLocalVehicleHandle was left null. But it
+	// must not be silent: what happens instead is a car registered twice,
+	// which looks like a duplicate on every other screen and like a car that
+	// will not move on this one - and that is exactly the bug this whole
+	// area was reported as.
+	bool     m_warnedNoVehicleHandle = false;
 
 	// The model index we last told the session we're wearing. 0xFFFF isn't
 	// a model - it means "nothing announced yet", which is what makes the

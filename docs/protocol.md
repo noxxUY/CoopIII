@@ -940,6 +940,126 @@ Receivers also pin `ForcedWeatherType`, without which the local rotation
 picks its own next type at the hour boundary and shows the wrong sky for the
 second before the next packet arrives.
 
+### 2.8 A late joiner has to end up in the same world, not a smaller one
+
+Someone who connects in the middle of a running session gets a *backfill*: a
+replay, on the reliable channel, of enough packets to put the session that was
+already happening onto their screen. Until protocol 9 that replay described
+every object by its **spawn identity** and left its **current condition** to
+the live stream, and the failure that follows from it is structural rather
+than accidental:
+
+> **Any state whose only carrier is an event is invisible to a late joiner by
+> construction.** An event announces a change. Somebody who missed the change
+> has no way to learn it happened.
+
+The owner found it through a car he had blown up, which came back to a late
+joiner in showroom condition: intact enough to climb into, and not drivable.
+
+#### 2.8.1 Condition rides the packet that already exists
+
+No new opcodes. Every field below went onto a packet the backfill was already
+sending, which also means the live announcement and the replayed one are the
+same packet built by the same function — so "what a player looks like on the
+wire" has one answer and the two can never drift apart.
+
+`S_PlayerJoin` grew `health`, `armour`, `weapon`, `deathAnimId` and a `flags`
+byte holding:
+
+| Flag | Meaning |
+|---|---|
+| `PJF_POS_VALID` | `pos`/`heading` are somewhere the session actually saw this player, not the zeroes a fresh slot starts with. Needed because the origin in GTA III is open water — the first remote ped this project ever created was born there and drowned in eight frames. A receiver without this bit cannot tell "at the origin" from "never heard from". |
+| `PJF_DEAD` | Dead and waiting to respawn, with `deathAnimId` from their own engine's `SetDie` so a backfilled corpse lies the way it fell. This is the flag the version is about: a death has exactly one carrier, `C_Death`, so before this a joiner arriving while somebody lay in the road got a live player, standing up, on zero health. |
+
+`S_VehicleSpawn` grew `health` and `flags`, the same flag byte the vehicle
+snapshot uses, plus one new bit:
+
+| Flag | Meaning |
+|---|---|
+| `VEH_WRECKED` | Destroyed. Not "on low health" — finished. Health alone does not carry it: writing zero into `m_fHealth` produces a car that reads dead and behaves brand new, because destroying a car is something the engine *does* (`BlowUpCar` and the status change with it), not a number it stores. So the sender says it outright and no receiver has to infer it from a float. |
+
+#### 2.8.2 A passenger's seat is state, not an announcement
+
+`EnterVehicleBody` has carried `seat` since protocol 3 and the client has
+carried it end to end since seating was written. The **session** only ever
+wrote down drivers, so a passenger's seat existed nowhere but in the
+`S_EnterVehicle` that announced it — and an event only reaches whoever was
+connected at the time. Everyone already in the session watched the passenger
+get in; the next player through the door was told about a car with an empty
+passenger seat and a player jogging along beside it. Nothing on the wire
+changed to fix this; the server writes the number down now.
+
+#### 2.8.3 Only the recorded driver may say what shape a car is in
+
+The gate on `C_VEHICLE_STATE` used to be "drop this if we think the sender is
+in some *other* car", which let a snapshot through whenever the session
+happened to think the sender was on foot. Waving a stray position through was
+survivable. Waving the condition fields through is not, because the same
+packet now carries `VEH_WRECKED`: the permissive branch was a way for any
+player in the session to delete any car from every future backfill. The gate
+is now "the sender is the driver this session has recorded for that car", and
+nothing else.
+
+#### 2.8.4 A car out of the backfill is a real car, and anyone can get into it
+
+The other half of the owner's report, and the half that explains
+"no se puede manejar ni nada".
+
+A synced car only ever exists as a `CVehicle` **CoopIII created** on a machine
+that was not in the session when the car was claimed — for everybody else it
+is a car from their own world that they happened to get into. So this is a
+late joiner's problem by construction, and with two clients started together
+it never happens at all.
+
+The joiner climbs into that car and the claim goes out as
+`C_ENTER_VEHICLE` with `netId == INVALID_NETID`, which means *a car the
+session has never seen*. The server dutifully allocates a second netId for a
+car it already had. Now every other machine spawns a duplicate on top of the
+original, and the joiner is simultaneously **driving** one netId and
+**observing** the other — the same physical vehicle. `CorrectRemoteVehicle`
+runs after `CGame::Process` on every frame and puts an observed car back where
+the session last saw it, so the engine turned the wheels, worked the
+suspension, played the engine note, and the car never went anywhere.
+
+Two rules, and the second is the converse of the observer rule in §1.2:
+
+- A client claims a car by the netId the session already has whenever the car
+  it just got into is one of ours. Identity is matched on the engine's own
+  `CPools::GetVehicleRef`, never on model and position — two identical parked
+  cars side by side are an ordinary sight in Liberty City.
+- **A driver decides where their own car ends up and nothing else may.** A car
+  the local player is driving is not corrected and is not written to, even
+  though the session still has a row for it. Its own reports go into that
+  row's interpolation buffer anyway, so the moment the driver steps out the
+  car is held where they parked it — which is where every other machine in the
+  session has it.
+
+#### 2.8.5 What is deliberately not carried, and why
+
+- **Transient motion.** `moveSpeed`, `turnSpeed`, `steer`, `gas`, `brake`,
+  `gear`, `moveState`, `pedState`, `aimYaw`/`aimPitch` and the animation
+  block. For anything that is sending snapshots these are 40 ms from being
+  right, and 40 ms of a car with the wrong gear is not worth a byte. For
+  anything that is *not* sending snapshots — a player in the frontend, on a
+  loading screen, in a cutscene — the zeroes describe a stationary idle ped,
+  which is what they are.
+- **Whether a player is on fire.** `CPed::bIsOnFire` is not synced at all, in
+  either direction, so there is no join-time gap to close: a player who was
+  here from the start sees no flame either. Fire becomes world state in
+  roadmap §5.7 phase two and gets a join-time carrier then.
+- **A car's extra components** (`CVehicle::m_aExtras`). Also not a late-joiner
+  gap: `CVehicle::SetModelIndex` copies `CVehicleModelInfo::ms_compsUsed` into
+  them at construction, so every machine picks its own set the moment it
+  spawns the car, and two players who joined together already disagree.
+  Roadmap §5.9.
+- **Chat history.** A joiner starts with an empty log. Nothing reconstructs a
+  conversation from a session it was not in, and no game in this category
+  tries.
+- **A wreck.** A destroyed car is kept as a session row so its netId stays
+  spoken for, and left out of the backfill entirely, because nothing on the
+  client can yet *build* a wreck. Reversible in one branch: the packet
+  already carries everything a receiver would need. See roadmap §5.8.
+
 ---
 
 ## 3. v1 sync scope
@@ -985,7 +1105,7 @@ model that doesn't exist yet.
 |---|---|---|---|
 | 0x01 | `C_HELLO` | 1 | protocol version, nickname, model id |
 | 0x02 | `S_WELCOME` | 1 | your `playerId`, your `netId`, server tick rate, world state, `hostPlayerId` (§2.7), session flags (§1.10.3) |
-| 0x03 | `S_PLAYER_JOIN` | 1 | `playerId`, `netId`, nickname, model id, spawn transform |
+| 0x03 | `S_PLAYER_JOIN` | 1 | `playerId`, `netId`, nickname, model id, transform, then condition: health `float`, armour `float`, weapon `u8`, flags `u8` (`PJF_POS_VALID`, `PJF_DEAD`), death anim `u16` (§2.8.1) |
 | 0x04 | `S_PLAYER_LEAVE` | 1 | `playerId`, reason |
 | 0x10 | `C_PLAYER_STATE` | 0 | pos `float[3]`, heading `float`, `m_vecMoveSpeed` `float[3]`, `m_nMoveState` `u8`, `m_nPedState` `u8`, anim `u16` + time `float` + speed `float`, partial anim `u16` + time `float`, health `float`, armour `float`, weapon `u8`, aim yaw/pitch `float[2]`, flags `u8` (64 bytes) |
 | 0x11 | `S_PLAYER_STATE` | 0 | `playerId` + the above |
@@ -997,9 +1117,9 @@ model that doesn't exist yet.
 | 0x25 | `C_RESPAWN` / 0x26 `S_RESPAWN` | 1 | spawn transform (§1.10.5) |
 | 0x27 | `C_EXPLOSION` / 0x28 `S_EXPLOSION` | 1 | type `u8`, pos `float[3]` (§1.9.3) |
 | 0x29 | `C_DEATH` | 1 | killer `netId`, anim `u16` (§1.10.4). Out of order because the block above was numbered before it was clear who announces a death |
-| 0x30 | `C_ENTER_VEHICLE` / 0x31 `S_ENTER_VEHICLE` | 1 | `netId`, seat `u8`, jack `bool` |
+| 0x30 | `C_ENTER_VEHICLE` / 0x31 `S_ENTER_VEHICLE` | 1 | `netId`, seat `u8`, jack `bool`, plus the car's identity when `netId` is `INVALID_NETID`. A client that has got into one of the session's own cars claims it by that car's existing `netId` instead (§2.8.4). Every seat is recorded, not just the driver's (§2.8.2) |
 | 0x32 | `C_EXIT_VEHICLE` / 0x33 `S_EXIT_VEHICLE` | 1 | `netId` |
-| 0x34 | `S_VEHICLE_SPAWN` | 1 | `netId`, model id, transform, colours |
+| 0x34 | `S_VEHICLE_SPAWN` | 1 | `netId`, model id, transform, colours, then condition: health `float`, flags `u8` including `VEH_WRECKED` (§2.8.1) |
 | 0x35 | `S_VEHICLE_DESPAWN` | 1 | `netId` |
 | 0x40 | `S_WORLD_STATE` | 1 | game hour/minute, both weather types, `hostPlayerId` (§2.7) |
 | 0x41 | `C_WORLD_STATE` | 1 | the host's own hour/minute and weather pair; dropped from anyone else |

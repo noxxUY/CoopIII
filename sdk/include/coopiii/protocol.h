@@ -31,7 +31,14 @@ namespace coopiii {
 // 8: time of day and weather follow the host's game instead of the server's
 //    synthetic clock. C_WorldState added, S_WorldState and S_Welcome carry
 //    hostPlayerId and the second weather type. docs/protocol.md §2.7.
-constexpr uint16_t PROTOCOL_VERSION = 8;
+// 9: late joiners. The backfill used to rebuild everything from its *spawn
+//    identity* and nothing from its *current condition*, so a player who
+//    joined mid-session got a different world from everyone who had been
+//    there. S_PlayerJoin grew health, armour, weapon, a flags byte and the
+//    death animation; S_VehicleSpawn grew health and flags; VehicleFlags
+//    grew VEH_WRECKED. No new opcodes - every one of these is a field on a
+//    packet the backfill already sent. docs/protocol.md §2.8.
+constexpr uint16_t PROTOCOL_VERSION = 9;
 constexpr uint16_t DEFAULT_PORT     = 2001;
 constexpr uint8_t  MAX_PLAYERS      = 8;
 constexpr uint8_t  SNAPSHOT_HZ      = 25;   // docs/protocol.md §1.2
@@ -166,6 +173,37 @@ struct S_Welcome {
 	uint8_t  flags;         // SessionFlags
 };
 
+// What a player is, and what condition they are currently in.
+//
+// Both halves matter, and the second one is version 9. A join packet used to
+// carry identity only, which is correct for the player it announces *as they
+// arrive* and wrong for the eight this same packet replays to a late joiner:
+// those eight have been playing for twenty minutes. Identity says who they
+// are, and the rest says whether they are on 12 health, holding an AK, or
+// lying dead in the road waiting for an ambulance.
+enum PlayerJoinFlags : uint8_t {
+	// `pos`/`heading` are somewhere the session actually saw this player,
+	// rather than the zeroes a Player starts life with.
+	//
+	// Without this bit there is no way to tell "at the origin" from "we have
+	// never heard from them", and the origin in GTA III is open water: the
+	// first remote ped CoopIII ever created was born there and drowned in
+	// eight frames. So a receiver that cannot tell waits, and a receiver
+	// that can spawn them where they are. Set on every backfilled player the
+	// session has had one snapshot from; clear on the live announcement of
+	// someone who has this instant connected.
+	PJF_POS_VALID = 1 << 0,
+	// Dead and waiting to respawn. Their own machine said so (C_Death) and
+	// the session has been holding it ever since.
+	//
+	// This is the bit the whole version is about. Death arrives as an event,
+	// an event only reaches whoever was connected at the time, and there is
+	// no second carrier - so before version 9 a player who joined while
+	// somebody was lying in the road got a live one, standing up, on zero
+	// health, until the corpse got up by itself.
+	PJF_DEAD = 1 << 1,
+};
+
 struct S_PlayerJoin {
 	static constexpr uint8_t OPCODE = OP_S_PLAYER_JOIN;
 	PacketHeader hdr;
@@ -175,6 +213,23 @@ struct S_PlayerJoin {
 	uint16_t modelId;
 	Vec3     pos;
 	float    heading;
+
+	// ---- condition, not identity (version 9) ------------------------------
+	//
+	// These duplicate fields that ride the 25 Hz snapshot, and that is the
+	// point rather than an oversight: a snapshot is 40 ms away for a player
+	// who is *sending* one. A player on a loading screen, in the frontend or
+	// mid-cutscene has no ped to sample and sends nothing at all, so for them
+	// the snapshot is never. This packet is the only thing the session can
+	// promise a joiner.
+	float    health;
+	float    armour;
+	uint8_t  weapon;        // eWeaponType
+	uint8_t  flags;         // PlayerJoinFlags
+	// The animation their own engine picked when they died, kept from their
+	// C_Death so a backfilled corpse lies the same way on every screen.
+	// ANIM_NONE when they are alive, or when the sender had none to give.
+	uint16_t deathAnimId;
 };
 
 struct S_PlayerLeave {
@@ -317,6 +372,23 @@ enum VehicleFlags : uint8_t {
 	VEH_ENGINE_ON = 1 << 0,   // CVehicle::bEngineOn
 	VEH_SIREN     = 1 << 1,   // CVehicle::m_bSirenOrAlarm
 	VEH_LIGHTS    = 1 << 2,
+
+	// This car has been destroyed. Not "is on low health" - blown up, wrecked,
+	// finished.
+	//
+	// Health alone does not carry it, and that is a measured fact rather than
+	// caution: an observer that writes zero into m_fHealth gets a car that
+	// reads as dead and still looks and behaves brand new, because in GTA III
+	// destroying a car is something the engine *does* (CVehicle::BlowUpCar and
+	// the status change that goes with it), not a number it stores. The owner
+	// found this from the other end - a car he had blown up came back to a
+	// late joiner intact enough to climb into and too dead to drive.
+	//
+	// So the sender says it outright, the session remembers it, and no
+	// receiver has to infer it from a float. Whose job it is to act on it
+	// belongs to the vehicle seam (client/src/game/vehicle.cpp); this is only
+	// the wire agreeing that there is something to act on.
+	VEH_WRECKED = 1 << 3,
 };
 
 struct VehicleStateBody {
@@ -589,6 +661,15 @@ struct S_ExitVehicle {
 	uint16_t netId;
 };
 
+// Create this car, in the condition the session last saw it.
+//
+// The condition half is version 9, and it is the packet the owner's bug was
+// actually about. A spawn used to describe a car the way a showroom describes
+// one - model and paint - and the receiver filled in the rest with "brand
+// new". That is right for the car being claimed this second and wrong for
+// every car in the backfill, which have been driven, shot at and in one case
+// blown up. `health` and `flags` are the difference between rebuilding the
+// car's *identity* and rebuilding the car.
 struct S_VehicleSpawn {
 	static constexpr uint8_t OPCODE = OP_S_VEHICLE_SPAWN;
 	PacketHeader hdr;
@@ -597,6 +678,8 @@ struct S_VehicleSpawn {
 	Vec3     pos;
 	Quat     rot;
 	uint8_t  colour1, colour2;   // CVehicle::m_currentColour1/2
+	float    health;             // CVehicle::m_fHealth, 1000 = full
+	uint8_t  flags;              // VehicleFlags, same bits the snapshot uses
 };
 
 struct S_VehicleDespawn {
@@ -676,6 +759,12 @@ static_assert(sizeof(S_VehicleState)  == 78, "vehicle snapshot layout");
 static_assert(sizeof(C_Hello)         == 33, "hello layout");
 static_assert(sizeof(S_Welcome)       == 17, "welcome layout");
 
+// 5 hdr + 1 id + 2 net + 24 nick + 2 model + 12 pos + 4 heading = 50 identity,
+// then 4 health + 4 armour + 1 weapon + 1 flags + 2 deathAnim = 12 condition.
+static_assert(sizeof(S_PlayerJoin)    == 62, "player join layout");
+static_assert(offsetof(S_PlayerJoin, health) == 50, "condition follows identity");
+static_assert(offsetof(S_PlayerJoin, flags)  == 59, "join flags");
+
 static_assert(sizeof(WorldStateBody)  == 4,  "world state layout");
 static_assert(sizeof(C_WorldState)    == 9,  "world state layout");
 static_assert(sizeof(S_WorldState)    == 10, "world state layout");
@@ -684,7 +773,10 @@ static_assert(sizeof(S_WorldState)    == 10, "world state layout");
 static_assert(sizeof(EnterVehicleBody) == 37, "enter-vehicle layout");
 static_assert(sizeof(C_EnterVehicle)  == 42, "enter-vehicle layout");
 static_assert(sizeof(S_EnterVehicle)  == 43, "enter-vehicle layout");
-static_assert(sizeof(S_VehicleSpawn)  == 39, "vehicle spawn layout");
+// 5 hdr + 2 net + 2 model + 12 pos + 16 rot + 2 colour = 39 identity, then
+// 4 health + 1 flags = 5 condition.
+static_assert(sizeof(S_VehicleSpawn)  == 44, "vehicle spawn layout");
+static_assert(offsetof(S_VehicleSpawn, health) == 39, "condition follows identity");
 static_assert(sizeof(C_PlayerModel)   == 7,  "player model layout");
 static_assert(sizeof(S_PlayerModel)   == 8,  "player model layout");
 

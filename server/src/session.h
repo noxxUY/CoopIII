@@ -20,7 +20,36 @@ struct Player {
 	uint16_t    modelId = 0;
 	Vec3        pos     = {};
 	float       heading = 0.0f;
-	uint16_t    vehicleNetId = INVALID_NETID;   // vehicle being driven, if any
+	// The car this player is in, and where in it, or INVALID_NETID for on
+	// foot. Not "the car they are driving": a passenger is in a car too.
+	//
+	// `seat` used to be dropped on the floor, and dropping it is the bug this
+	// area is about in its purest form. A passenger's seat has exactly one
+	// carrier, the S_EnterVehicle that announced it, and an event only ever
+	// reaches whoever was connected when it was sent. So everybody already in
+	// the session saw the passenger get in, and the next player through the
+	// door was told about a car with an empty passenger seat and a player
+	// jogging along beside it. Nothing was wrong with the client - it has
+	// carried `seat` end to end since protocol 3 - the session simply never
+	// wrote the number down.
+	uint16_t    vehicleNetId = INVALID_NETID;
+	uint8_t     seat         = 0;               // 0 is the driver
+
+	// Purely so the refusal in OnVehicleState says itself once per player
+	// rather than once per dropped snapshot. Cleared when they get into a
+	// car, because at that point the old complaint is about a car they are
+	// no longer anywhere near.
+	bool        warnedVehicleAuthority = false;
+
+	// Whether `pos`/`heading` mean anything yet.
+	//
+	// A Player is born at the origin because a struct has to start somewhere,
+	// and the origin in Liberty City is the water off Portland. Announcing
+	// that as a position would have every joiner create a ped there and watch
+	// it drown, which is a bug this project has already had once and paid for
+	// (AGENTS.md, "the ped was born in water"). So the session says whether
+	// it knows, and the packet carries a bit for it.
+	bool        havePos = false;
 
 	// Whether this player has told us they're dead.
 	//
@@ -28,8 +57,24 @@ struct Player {
 	// their own machine and nowhere else (docs/protocol.md §1.10). What it's
 	// for is refusing to relay a hit onto somebody who is already on the
 	// floor, so a burst that arrives a moment after a death doesn't get
-	// applied to a corpse and count as a second kill.
+	// applied to a corpse and count as a second kill - and, since version 9,
+	// telling a joiner that the body in the road is a body.
 	bool        alive = true;
+	// The animation their engine chose for that death, straight off their
+	// C_Death, so a backfilled corpse lies the way it fell.
+	uint16_t    deathAnimId = ANIM_NONE;
+
+	// Condition, kept off the snapshot stream purely so a joiner can be told
+	// it. Nothing on the server reads these; they exist to be replayed.
+	//
+	// Keeping a copy is what makes a join packet describe a player who is
+	// *not currently sending snapshots* - the frontend, a loading screen, a
+	// cutscene. For everyone else it saves the joiner one snapshot interval
+	// of wrongness, which matters more than it sounds: the ped is created
+	// from this, so 40 ms of "wrong" is a ped born with the wrong health.
+	float       health = 100.0f;
+	float       armour = 0.0f;
+	uint8_t     weapon = 0;      // eWeaponType
 };
 
 // A vehicle the session knows about, meaning one a player has actually been
@@ -47,6 +92,38 @@ struct Vehicle {
 	Vec3     pos = {};
 	Quat     rot = {0.0f, 0.0f, 0.0f, 1.0f};
 	uint8_t  driverPlayerId = INVALID_PLAYER;
+
+	// ---- condition ---------------------------------------------------------
+	//
+	// The identity above is what the car *is*; this is what has happened to
+	// it. The session used to keep only the first, so the backfill rebuilt
+	// every car showroom-fresh no matter what it had been through - which is
+	// the bug this whole area came from.
+	float    health = 1000.0f;   // CVehicle::m_fHealth, 1000 = full
+	uint8_t  flags  = 0;         // VehicleFlags, as the driver last reported
+
+	// Blown up. Kept as a row rather than deleted so the netId stays spoken
+	// for: a snapshot still in flight for a car that has just exploded must
+	// not be able to register a *second* car under the same number.
+	//
+	// A destroyed car is left out of the backfill entirely. That is a
+	// decision and it is reversible in one branch - see BuildBackfill.
+	bool     destroyed = false;
+};
+
+// Everything a player who joins a session already in progress has to be told
+// to end up with the same world as the people who were here first.
+//
+// Returned as data rather than sent, because the interesting question - what
+// goes in it - is worth testing without a socket, and because "which packets"
+// is a session decision while "how to send them" is not. Order is significant
+// and it is the order of the members: a seat needs both a player and a car to
+// already exist on the far side, and all three ride the reliable ordered
+// channel so the order they leave in is the order they arrive in.
+struct Backfill {
+	std::vector<S_PlayerJoin>   players;
+	std::vector<S_VehicleSpawn> vehicles;
+	std::vector<S_EnterVehicle> seats;
 };
 
 // The session's idea of the time of day.
@@ -140,6 +217,65 @@ public:
 	                    const Vec3 &pos, const Quat &rot);
 
 	const std::vector<Vehicle> &Vehicles() const { return m_vehicles; }
+
+	// ---- keeping the session's copy current --------------------------------
+	//
+	// Three notes, one per stream that changes something a joiner would
+	// otherwise never hear about. They live here rather than in main.cpp so
+	// the rule ("what does the session remember from this packet") is the
+	// thing under test, not the relay around it.
+
+	// A player's own report of themselves. Records the condition fields the
+	// backfill replays, and the position, and marks the position real.
+	void NotePlayerState(Player &p, const PlayerStateBody &body);
+
+	// A driver's report of the car they're in. Records where it is and what
+	// shape it's in, and notices a car that has been destroyed.
+	void NoteVehicleState(const VehicleStateBody &body);
+
+	// May `playerId` tell the session what condition `netId` is in?
+	//
+	// Only its recorded driver, and that is stricter than it used to be on
+	// purpose. The old gate was "drop this if we think they are in some
+	// *other* car", which let the snapshot through whenever the session
+	// happened to think the sender was on foot - a real window, since a
+	// client can get one more snapshot away after an exit.
+	//
+	// Waving a stray position through was survivable. Waving the condition
+	// fields through is not: as of version 9 the same packet carries
+	// VEH_WRECKED, so the permissive branch was a way for any player in the
+	// session to delete any car from every future backfill. A snapshot is
+	// believed because of who sent it, not because nothing contradicts it.
+	bool MayReportVehicle(uint8_t playerId, uint16_t netId) const;
+
+	// A player got into a car, in a seat, or got out of one. The only place
+	// the session writes down who is sitting where, so the backfill and the
+	// live fan-out cannot disagree about it. NoteExitVehicle is safe to call
+	// for a car they were never in.
+	void NoteEnterVehicle(Player &p, Vehicle &v, uint8_t seat);
+	void NoteExitVehicle(Player &p, uint16_t netId);
+
+	// "That car is finished." The one way a vehicle becomes destroyed, so
+	// there is one place to look and one place for the vehicle seam's own
+	// destruction event to land when it arrives (see the report and
+	// docs/roadmap.md §5.8). Takes the driver out of it on the way.
+	void DestroyVehicle(uint16_t netId);
+
+	// A player died, or came back. Both clear the seat, because a dead player
+	// is taken out of their car on every machine that was watching and the
+	// session has to agree or the next joiner gets told to put them back in.
+	void NotePlayerDied(Player &p, uint16_t deathAnimId);
+	void NotePlayerRespawned(Player &p, const Vec3 &pos, float heading);
+
+	// The announcement for one player: who they are, and what condition
+	// they're in. Used both for the live "someone joined" fan-out and for
+	// every entry in a backfill, so the two can never disagree about the
+	// shape of a player.
+	S_PlayerJoin MakeJoin(const Player &p, uint32_t sendTimeMs) const;
+
+	// Everything `joinerId` has to be told about the session that was already
+	// running. Excludes the joiner themselves.
+	Backfill BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const;
 
 private:
 	std::vector<Player>  m_players;

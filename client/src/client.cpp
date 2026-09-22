@@ -219,7 +219,40 @@ void Client::OnJoin(const S_PlayerJoin &pkt) {
 	nick[NICK_LEN - 1] = '\0';   // wire field isn't guaranteed to be terminated
 	p.nick             = nick;
 
-	Log("client: %s joined as player %u", p.nick.c_str(), p.playerId);
+	// The condition half of the packet (protocol 9). This is the same
+	// announcement whether it is somebody arriving now or somebody who has
+	// been in the session for twenty minutes being replayed to us, and the
+	// difference between those two is entirely in these fields.
+	p.dead        = (pkt.flags & PJF_DEAD) != 0;
+	p.deathAnimId = p.dead ? pkt.deathAnimId : ANIM_NONE;
+
+	if (pkt.flags & PJF_POS_VALID) {
+		// Enough to create the ped from, before a single snapshot has
+		// arrived. `last` is what SpawnRemote reads to decide where the ped
+		// is born and what health it is born on, so it has to be coherent -
+		// a half-filled one would put a player in a T-pose on zero health.
+		p.last            = PlayerStateBody{};
+		p.last.pos        = pkt.pos;
+		p.last.heading    = pkt.heading;
+		p.last.health     = pkt.health;
+		p.last.armour     = pkt.armour;
+		p.last.weapon     = pkt.weapon;
+		// No animation was reported and none should be guessed at. Zero is
+		// ANIM_STD_WALK, which would have a stationary player walking on the
+		// spot until their first snapshot; ANIM_NONE is the wire's way of
+		// saying "nothing in this slot" and leaves the engine's own choice
+		// alone (docs/protocol.md §1.8).
+		p.last.animId     = ANIM_NONE;
+		p.last.animId2    = ANIM_NONE;
+		p.haveState       = true;
+		p.seedPose.pos     = pkt.pos;
+		p.seedPose.heading = pkt.heading;
+		p.haveSeedPose     = true;
+	}
+
+	Log("client: %s joined as player %u (%.0f hp, weapon %u%s%s)", p.nick.c_str(),
+	    p.playerId, pkt.health, pkt.weapon, p.dead ? ", dead" : "",
+	    (pkt.flags & PJF_POS_VALID) ? "" : ", position unknown");
 
 	// Two-phase spawn (docs/protocol.md §1.6): ask now, create later.
 	if (m_bridge.RequestModel) {
@@ -274,10 +307,13 @@ void Client::OnPlayerModel(const S_PlayerModel &pkt) {
 		p.poolHandle = -1;
 	}
 
-	// A new ped starts with none of this applied, same as the first spawn.
+	// A new ped starts with none of this applied, same as the first spawn -
+	// including the death, if they were dead when they changed model. The
+	// corpse we just destroyed was the thing carrying it.
 	p.appliedAnimId  = ANIM_NONE;
 	p.appliedAnimId2 = ANIM_NONE;
 	p.appliedWeapon  = 0xFFFF;
+	p.deathApplied   = false;
 
 	p.spawnPending = true;
 	if (m_bridge.RequestModel)
@@ -294,6 +330,12 @@ void Client::OnPlayerState(const S_PlayerState &pkt) {
 
 	p.last      = pkt.body;
 	p.haveState = true;
+	// Their own timeline has started, so the session's starting guess is done
+	// with. Dropped here rather than left as a fallback on purpose: falling
+	// back to it during a later stall would yank the ped back to wherever
+	// they were standing when we joined, which is a teleport and not a
+	// recovery.
+	p.haveSeedPose = false;
 	p.interp.Push(pkt.hdr.sendTimeMs, pkt.body.pos, pkt.body.heading, pkt.body.moveSpeed);
 }
 
@@ -319,8 +361,19 @@ void Client::UpdateRemotes() {
 		// health at 14667, PED_DEAD by 14727. Every position written after
 		// that landed on a corpse - which is why the ped got scanned,
 		// accepted by the renderer, and still drew nothing at all.
-		Pose       pose;
-		const bool havePose = p.interp.SampleDelayed(nowMs, pose);
+		Pose pose;
+		bool havePose = p.interp.SampleDelayed(nowMs, pose);
+
+		// Nothing from them yet, but the session told us where it last saw
+		// them. That is a real position somebody actually stood at, which is
+		// the whole difference between this and the origin - see
+		// RemotePlayer::seedPose. Lets a player who is loading, in the
+		// frontend or in a cutscene exist for a joiner instead of being
+		// invisible for as long as they stay there.
+		if (!havePose && p.haveSeedPose) {
+			pose     = p.seedPose;
+			havePose = true;
+		}
 
 		// Finish the two-phase spawn once the streamer has the model AND we
 		// know where to put it.
@@ -332,10 +385,26 @@ void Client::UpdateRemotes() {
 			}
 		}
 
-		if (p.poolHandle < 0 || !m_bridge.ApplyRemotePose)
+		if (p.poolHandle < 0)
 			continue;
 
-		if (havePose)
+		// A ped that exists and a player the session says is dead: kill it,
+		// once, on whichever frame both of those first become true.
+		//
+		// Driven from here rather than from the packet because the packet is
+		// routinely early. A death can arrive while the ped is still
+		// streaming in, and a *join* can announce somebody who has been dead
+		// since before we connected - in both cases OnDeath's "if there is a
+		// ped, kill it" simply drops the death and leaves a corpse walking
+		// around on zero health. Same argument as UpdateRemoteSeats: drive
+		// the state, don't handle the event.
+		if (p.dead && !p.deathApplied && m_bridge.KillRemotePed) {
+			m_bridge.KillRemotePed(p, p.deathAnimId);
+			p.deathApplied = true;
+			Log("client: %s laid out dead (anim %u)", p.nick.c_str(), p.deathAnimId);
+		}
+
+		if (havePose && m_bridge.ApplyRemotePose)
 			m_bridge.ApplyRemotePose(p, pose);
 	}
 }
@@ -491,8 +560,14 @@ void Client::OnDeath(const S_Death &pkt) {
 	// behind the wheel on the very next frame.
 	p.seatVehicleNetId = INVALID_NETID;
 
-	if (p.poolHandle >= 0 && m_bridge.KillRemotePed)
-		m_bridge.KillRemotePed(p, pkt.animId);
+	// Recorded, not carried out. UpdateRemotes does the killing, on the first
+	// frame there is a ped to kill - which is this one when their ped is
+	// already up, and a later one when the death caught them mid-stream. The
+	// old "if there is a ped, kill it" simply lost the death in that second
+	// case and left a player walking around on zero health.
+	p.dead         = true;
+	p.deathAnimId  = pkt.animId;
+	p.deathApplied = false;
 }
 
 // And they're back. The corpse is destroyed and a fresh ped built the same
@@ -514,12 +589,23 @@ void Client::OnRespawn(const S_Respawn &pkt) {
 		m_bridge.DespawnRemote(p);
 	p.poolHandle = -1;
 
+	// Alive again, and the ped about to be built for them must not be killed
+	// on the frame it appears. Clearing `deathApplied` too so a *second*
+	// death later is not mistaken for one that has already been carried out.
+	p.dead         = false;
+	p.deathAnimId  = ANIM_NONE;
+	p.deathApplied = false;
+
 	// The old life's snapshots are half a city away from the new one. Keeping
 	// them would have the rebuilt ped rendered at the place its owner died
 	// for the length of the interpolation delay, then snapped to the
 	// hospital - so the buffer starts empty and the ped appears once real
 	// positions arrive, about a snapshot and a delay later.
 	p.interp.Clear();
+	// And the session's starting guess for them is older still: it is where
+	// they were standing when *we* joined. With the buffer empty it would be
+	// the only pose on offer, so the rebuilt ped would appear back there.
+	p.haveSeedPose = false;
 
 	p.last.pos     = pkt.body.pos;
 	p.last.heading = pkt.body.heading;
@@ -785,6 +871,29 @@ RemoteVehicle *Client::VehicleSlot(uint16_t netId, bool createIfMissing) {
 	return nullptr;
 }
 
+bool Client::DrivenLocally(const RemoteVehicle &vehicle) const {
+	return m_localVehicleNetId != INVALID_NETID && vehicle.netId == m_localVehicleNetId;
+}
+
+RemoteVehicle *Client::ObservedVehicleWeAreDriving() {
+	if (!m_bridge.SampleLocalVehicleHandle)
+		return nullptr;
+
+	const int32_t handle = m_bridge.SampleLocalVehicleHandle();
+	if (handle < 0)
+		return nullptr;
+
+	// Matched on the engine's own reference, not on model and position.
+	// Identity has to be exact here: two identical parked cars side by side
+	// are an ordinary sight in Liberty City, and picking the wrong one
+	// would register the session's car under a second netId and leave the
+	// real one pinned - the same bug, arrived at more cleverly.
+	for (RemoteVehicle &v : m_vehicles)
+		if (v.active && v.poolHandle >= 0 && v.poolHandle == handle)
+			return &v;
+	return nullptr;
+}
+
 void Client::OnVehicleSpawn(const S_VehicleSpawn &pkt) {
 	RemoteVehicle *v = VehicleSlot(pkt.netId, /*createIfMissing=*/true);
 	if (!v)
@@ -798,17 +907,27 @@ void Client::OnVehicleSpawn(const S_VehicleSpawn &pkt) {
 	// enough on its own to place the vehicle. Seeding `last` from it lets
 	// the spawn happen before the first state snapshot arrives, without
 	// repeating the ped mistake of creating an entity at the origin.
-	v->last.netId = pkt.netId;
-	v->last.pos   = pkt.pos;
-	v->last.rot   = pkt.rot;
-	v->last.health = 1000.0f;
+	//
+	// Health and flags come off the packet as of protocol 9, and used to be
+	// the constant 1000 and nothing. That constant is the bug the owner
+	// found from the other end: a car he had blown up came back to a late
+	// joiner in showroom condition, drivable-looking and not drivable,
+	// because this line said the car was fine and the live stream then wrote
+	// the real health onto a model that had already been built healthy. The
+	// spawn has to describe the car's condition, not just its identity.
+	v->last.netId  = pkt.netId;
+	v->last.pos    = pkt.pos;
+	v->last.rot    = pkt.rot;
+	v->last.health = pkt.health;
+	v->last.flags  = pkt.flags;
 	v->haveState   = true;
 	v->spawnPending = true;
 
 	if (m_bridge.RequestModel)
 		m_bridge.RequestModel(pkt.modelId);
 
-	Log("client: vehicle %u joined (model %u)", pkt.netId, pkt.modelId);
+	Log("client: vehicle %u joined (model %u, %.0f hp%s)", pkt.netId, pkt.modelId,
+	    pkt.health, (pkt.flags & VEH_WRECKED) ? ", wrecked" : "");
 }
 
 void Client::OnVehicleDespawn(const S_VehicleDespawn &pkt) {
@@ -864,6 +983,14 @@ void Client::UpdateRemoteVehicles() {
 		if (v.poolHandle < 0 || !v.haveState || !m_bridge.ApplyRemoteVehicle)
 			continue;
 
+		// Not onto a car we are driving ourselves. The row is still here
+		// because the car is still in the session, but its condition is ours
+		// to report now, and writing the last driver's health, gear and
+		// engine flag back onto it every snapshot would be this machine
+		// arguing with itself.
+		if (DrivenLocally(v))
+			continue;
+
 		// Controls, health and flags only. Transform isn't written here -
 		// anything written before CGame::Process is just what local physics
 		// starts from, not what actually gets drawn. See CorrectRemoteVehicles.
@@ -879,6 +1006,23 @@ void Client::CorrectRemoteVehicles() {
 
 	for (RemoteVehicle &v : m_vehicles) {
 		if (!v.active || v.poolHandle < 0)
+			continue;
+
+		// The car we are driving is not a car we are watching.
+		//
+		// This is the line that fixes "te podes subir y todo, no se puede
+		// manejar ni nada". A car that arrived in the backfill is a real car
+		// in the street and a joiner can get into it; the row for it stayed
+		// active, and this loop went on writing the session's last known
+		// transform onto it after every single frame of physics. The engine
+		// turned the wheels, the suspension worked, the engine note changed,
+		// and the car never went anywhere, because the last thing before the
+		// frame drew was CoopIII putting it back.
+		//
+		// An observer may animate what it is watching and may not decide
+		// where it ends up (vehicle.h). The converse is this: a driver decides
+		// where their own car ends up, and nothing else may.
+		if (DrivenLocally(v))
 			continue;
 
 		VehicleTransform at;
@@ -974,6 +1118,13 @@ void Client::UpdateRemoteSeats() {
 		                          : nullptr;
 		if (!v || v->poolHandle < 0)
 			want = INVALID_NETID;
+		// And a corpse sits in nothing. OnDeath already drops the standing
+		// instruction, so this only catches a seating the session hands us
+		// for somebody it also says is dead - which the server no longer
+		// does, and which would be a warp into a car everybody else watched
+		// them die outside of.
+		if (p.dead)
+			want = INVALID_NETID;
 
 		if (p.seatedVehicleNetId == want)
 			continue;
@@ -1033,6 +1184,62 @@ void Client::SendLocalVehicle() {
 	if (m_localVehicleNetId == INVALID_NETID) {
 		if (m_vehicleClaimPending)
 			return;
+
+		// First: is this one of the session's cars rather than one of ours?
+		//
+		// It can only ever be for somebody who was not here when it was
+		// claimed - a late joiner - because for everyone else the car in the
+		// street is a car their own engine made. That asymmetry is why this
+		// went unnoticed: with two clients started together it never happens,
+		// and the first person to restart their game hits it immediately.
+		//
+		// Claiming by the netId the session already has is the whole fix.
+		// Sent with INVALID_NETID instead, the server has no way to know it
+		// is the same car and allocates a second number for it: everybody
+		// else spawns a duplicate on top of the original, and this machine
+		// ends up driving one netId while still observing the other, which is
+		// the same physical CVehicle. See CorrectRemoteVehicles.
+		if (RemoteVehicle *ours = ObservedVehicleWeAreDriving()) {
+			C_EnterVehicle out;
+			InitHeader(out, WallClock::NowMs());
+			// Zeroed rather than left alone: the identity half of this body
+			// is what introduces an unknown car, the server ignores it once
+			// the netId names one it has, and a packed struct off the stack
+			// would otherwise put whatever was there on the wire.
+			out.body       = EnterVehicleBody{};
+			out.body.netId = ours->netId;
+			out.body.seat  = 0;
+			out.body.jack  = 0;
+			m_net.Send(out, CH_EVENT);
+			m_vehicleClaimPending = true;
+
+			// Its history is somebody else's and it is over. Left in place,
+			// the buffer would still have a pose to hand back the moment we
+			// stepped out again, and the car we just parked would jump to
+			// wherever its previous driver left it. Our own reports go in
+			// from here on - see the tail of this function.
+			ours->interp.Clear();
+			Log("client: got into the session's own vehicle %u (model %u); taking it "
+			    "over rather than registering it twice", ours->netId, model);
+			return;
+		}
+
+		// No match, and no way to look for one. Say so, once, and only when
+		// there is actually one of the session's cars standing around for us
+		// to have got into - a build with that callback left null registers
+		// the car twice, and the symptom is a long way from the cause.
+		if (!m_bridge.SampleLocalVehicleHandle && !m_warnedNoVehicleHandle) {
+			for (const RemoteVehicle &v : m_vehicles) {
+				if (!v.active || v.poolHandle < 0)
+					continue;
+				m_warnedNoVehicleHandle = true;
+				Log("client: WorldBridge::SampleLocalVehicleHandle is not set, so we "
+				    "cannot tell whether this is one of the session's own cars - if it "
+				    "is, it is about to be registered a second time and will not drive");
+				break;
+			}
+		}
+
 		C_EnterVehicle out;
 		InitHeader(out, WallClock::NowMs());
 		out.body.netId   = INVALID_NETID;
@@ -1060,6 +1267,16 @@ void Client::SendLocalVehicle() {
 	InitHeader(pkt, WallClock::NowMs());
 	pkt.body = body;
 	m_net.Send(pkt, CH_SNAPSHOT);
+
+	// If this is one of the session's cars that we have taken over, our own
+	// reports go into its buffer too. Nothing reads them while we are
+	// driving - CorrectRemoteVehicles skips a car we drive - but the moment
+	// we step out they are the history that holds the car where we parked it,
+	// which is the same place every other machine in the session has it. Skip
+	// this and a car handed back to observation has an empty buffer and
+	// drifts on local physics alone, on this screen and no other.
+	if (RemoteVehicle *ours = VehicleSlot(m_localVehicleNetId, /*createIfMissing=*/false))
+		ours->interp.Push(pkt.hdr.sendTimeMs, body.pos, body.rot, body.moveSpeed);
 }
 
 } // namespace coopiii

@@ -256,13 +256,13 @@ Everything that has to travel, and where it stands. Sources are re3 members
 |---|---|---|
 | Transform | `m_matrix` position, `m_fRotationCur` | ✅ sent |
 | Velocity | `m_vecMoveSpeed` | ✅ sent |
-| Vitals | `m_fHealth`, `m_fArmour` | ✅ sent |
+| Vitals | `m_fHealth`, `m_fArmour` | ✅ sent, and on the join packet as well as the snapshot, so a late joiner creates a ped on the health it really has (`protocol.md` §2.8.1) |
 | State | `m_nPedState`, `m_nMoveState` | ✅ sent; `m_nMoveState` is also applied, so the engine picks the walk/run animation itself |
 | Animation | `AnimationId` + time, base **and** partial | ✅ sent and applied via `CAnimManager::BlendAnimation`. Run in game 2026-09-22, every weapon the owner tried |
 | Weapon | `m_weapons[]`, `m_currentWeapon` | ✅ sent and applied via `CPed::GiveWeapon` + `SetCurrentWeapon`, so the model is in the hand. Ammo is not on the wire (M3) |
 | Aim | yaw/pitch | ⚠️ both sent; yaw applied via `CPed::SetAimFlag`. Pitch is not applied: `CPed::AimGun` hard-codes 0 for non-player peds (`protocol.md` §1.8.3), so it needs a detour, and that belongs with M3 |
 | Shots | event | ✅ sent reliably and replayed through the real `CWeapon::Fire`, so impacts happen for real (`combat.cpp`) |
-| Damage / death | event | ✅ sent by the shooter, applied by the victim through `CPed::InflictDamage`, with the one exemption that lets an authorised hit past the remote-attacker rule. Run end to end in game 2026-09-21 |
+| Damage / death | event | ✅ sent by the shooter, applied by the victim through `CPed::InflictDamage`, with the one exemption that lets an authorised hit past the remote-attacker rule. Run end to end in game 2026-09-21. Death is also **held by the session** and replayed on the join packet, so somebody who joins while a player is lying in the road gets a corpse rather than a live player on zero health (`protocol.md` §2.8.1) |
 | Enter/exit vehicle | event | ⚠️ the remote ped is now seated (`SeatRemotePed`), but through `WarpPedIntoCar` rather than `SetEnterCar`, so no animation plays yet |
 | Wanted level | `CPlayerInfo::m_pWanted` | ❌ design settled (§5.1), not implemented |
 
@@ -279,7 +279,9 @@ nothing else. The address is no longer the obstacle.
 | Controls | `m_fSteerAngle` `0x1E8`, `m_fGasPedal` `0x1EC`, `m_fBrakePedal` `0x1F0`, `m_nCurrentGear` `0x204` | ✅ sent and applied |
 | Health / state | `m_fHealth` `0x200` (1000 = full), `bEngineOn` `0x1F5` bit 4, `m_bSirenOrAlarm` `0x22E` | ✅ sent and applied; flags on change only, so the siren does not restart every frame |
 | Appearance | `m_currentColour1/2` `0x19C`/`0x19D` | ✅ carried by the spawn packet, so both machines get the same car rather than two random paint jobs |
-| Occupants | `pDriver` `0x1A4`, `pPassengers[8]` `0x1A8`, `m_nNumMaxPassengers` `0x1CC` | ✅ the driver is sent and seated (`SeatRemotePed`); ❌ passengers are not |
+| Occupants | `pDriver` `0x1A4`, `pPassengers[8]` `0x1A8`, `m_nNumMaxPassengers` `0x1CC` | ✅ every seat is sent, seated (`SeatRemotePed`) and, since `protocol.md` §2.8.2, remembered by the session so a late joiner is told about passengers and not just drivers |
+| Destroyed | `VEH_WRECKED` on the wire | ⚠️ sent and remembered when it comes from the car's driver, and a wreck is then left out of the backfill. A car destroyed while **parked** has nobody to report it at all — §5.8 |
+| Extra components | `m_aExtras[2]` `0x19E` | ❌ each machine picks its own at construction — §5.9 |
 | Spawn / despawn | `CREATE_CAR` path, `sizeof(CAutomobile)` `0x5A8` | ✅ run in the game, both deletion gates shut |
 | Damage model | panels, doors, lights, wheels | ❌ not designed. `CDamageManager` is the first `CAutomobile` member, at `+0x288` |
 
@@ -575,6 +577,66 @@ Script fires (`CFireManager::StartScriptFire`, `0x00479E60`) are the other
 loose end and they belong to Area D: only the host runs the script, so a
 script fire exists on one machine today. It is the one fire kind with an owner
 and no explosion behind it.
+
+### 5.8 A car nobody is driving has nobody to report it. Named work.
+
+Found while making the join path late-joiner safe (`protocol.md` §2.8) and
+**not fixed**, because the half that matters is somebody else's file.
+
+`C_VEHICLE_STATE` is sent by one machine and one only: the driver's. So a
+synced car that is parked receives no updates at all, and its row in the
+session freezes at whatever its last driver said. Everything the backfill now
+carries about a car's condition — health, engine, siren, `VEH_WRECKED` — can
+therefore only ever arrive **from inside it**.
+
+Which leaves the commonest way a car is destroyed with no carrier: you blow up
+a parked one. Nobody is in it, nobody reports it, the session keeps a healthy
+row for it forever, and every joiner from then on is handed a pristine car
+standing where a burnt-out shell is on every other screen. That is very
+probably the exact path the owner's car took.
+
+It is deliberately open rather than half-built, for two reasons:
+
+1. **The detection does not exist yet.** Whether the engine can be asked "is
+   this car destroyed" — and what it actually does when `m_fHealth` hits zero,
+   since writing the field does not destroy the car — is live work in
+   `client/src/game/vehicle.*`. Building a wire path on top of a detector
+   nobody has written would be a protocol bump that carries nothing.
+2. **The authority question has an answer already and it should be reused.**
+   An ownerless world entity is the host's, exactly as the clock and the sky
+   became the host's in §2.7. The host reports the destruction of a synced car
+   that the session records no driver for; `Session::DestroyVehicle` is
+   already the single place that lands in, and `MayReportVehicle` is already
+   the single gate that would have to make an exception for it. Opcodes 0x60
+   to 0x6F are free.
+
+The shape to build, when the detector lands: one reliable
+`C_VEHICLE_DESTROYED`/`S_VEHICLE_DESTROYED` pair carrying a `netId`, accepted
+from the driver or, for a car with no driver, from the host and nobody else.
+Not a new field on the snapshot — a parked car has no snapshot to put it on,
+which is the whole problem.
+
+### 5.9 A car's extra components are picked per machine. Named work.
+
+`CVehicle::SetModelIndex` (`0x00551170`) copies
+`CVehicleModelInfo::ms_compsUsed` into `m_aExtras[2]` at construction, and the
+model info picks those at random. So every machine that spawns a given car
+chooses its own set: one player sees a Mule with a roof rack, another sees the
+same Mule without one.
+
+**This is not a late-joiner gap** and that is why it is here rather than in
+the join work. Two players who connected together already disagree, because
+each of their engines picked independently the moment the car was created. It
+is the same class as the paint job, which *is* carried — the colours went onto
+the spawn packet for exactly this reason.
+
+Cheap when somebody wants it. `m_aExtras` is two bytes sitting immediately
+after `m_currentColour2` in `CVehicle` (the `static_assert` in `addresses.h`
+pins all four as consecutive), `S_VehicleSpawn` has room, and
+`EnterVehicleBody` already reserves a spare `pad` byte in precisely that slot
+next to the colours. Both halves are in `client/src/game/vehicle.*`: the
+claimer samples them beside the colours, the receiver writes them after
+construction and before the model is set up.
 
 ---
 

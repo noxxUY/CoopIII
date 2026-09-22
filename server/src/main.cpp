@@ -215,75 +215,36 @@ private:
 		welcome.flags        = m_session.FriendlyFire() ? SESSION_FRIENDLY_FIRE : 0;
 		m_net.SendTo(peer, welcome, CH_EVENT);
 
-		// Tell the newcomer who's already here...
-		for (const Player &other : m_session.Players()) {
-			if (!other.active || other.id == p->id)
-				continue;
-			m_net.SendTo(peer, MakeJoin(other), CH_EVENT);
-		}
-		// ...and tell everyone else about the newcomer.
-		m_net.Broadcast(MakeJoin(*p), CH_EVENT, peer);
-
-		// Newcomer also needs every car the session is tracking, at its
-		// current position, not wherever it got claimed. Skip this and player
-		// two watches player one drive around in an invisible car.
-		for (const Vehicle &v : m_session.Vehicles()) {
-			if (!v.active)
-				continue;
-			S_VehicleSpawn spawn;
-			InitHeader(spawn, NowMs());
-			spawn.netId   = v.netId;
-			spawn.modelId = v.modelId;
-			spawn.pos     = v.pos;
-			spawn.rot     = v.rot;
-			spawn.colour1 = v.colour1;
-			spawn.colour2 = v.colour2;
+		// Everything the session was already doing before this peer turned up.
+		//
+		// The decision about *what* goes in here lives in Session, where
+		// sessiontest can reach it without a socket - a late joiner is a pure
+		// state question and it is the one part of this that is worth testing
+		// harder than the relay around it. Order is the struct's order and it
+		// matters: a seat needs both its player and its car to exist on the
+		// far side first, and CH_EVENT is reliable and ordered, so the order
+		// they leave in is the order they arrive in.
+		const Backfill back = m_session.BuildBackfill(p->id, NowMs());
+		for (const S_PlayerJoin &join : back.players)
+			m_net.SendTo(peer, join, CH_EVENT);
+		for (const S_VehicleSpawn &spawn : back.vehicles)
 			m_net.SendTo(peer, spawn, CH_EVENT);
-		}
-
-		// And who's actually sitting in which car. The spawn above puts the
-		// car on screen, this puts the driver inside it. Need both, or the
-		// newcomer sees the car driving itself while its owner jogs on the
-		// roof.
-		for (const Player &other : m_session.Players()) {
-			if (!other.active || other.id == p->id ||
-			    other.vehicleNetId == INVALID_NETID)
-				continue;
-			const Vehicle *v = m_session.FindVehicle(other.vehicleNetId);
-			if (!v)
-				continue;
-
-			S_EnterVehicle seat;
-			InitHeader(seat, NowMs());
-			seat.playerId     = other.id;
-			seat.body         = EnterVehicleBody{};
-			seat.body.netId   = v->netId;
-			seat.body.seat    = 0;   // only the driver is tracked per player
-			seat.body.modelId = v->modelId;
-			seat.body.colour1 = v->colour1;
-			seat.body.colour2 = v->colour2;
-			seat.body.pos     = v->pos;
-			seat.body.rot     = v->rot;
+		for (const S_EnterVehicle &seat : back.seats)
 			m_net.SendTo(peer, seat, CH_EVENT);
-		}
 
-		std::printf("[coopiii] %s joined (slot %u, net %u)\n", p->nick.c_str(),
-		            p->id, p->netId);
+		// ...and tell everyone else about the newcomer. Same packet shape,
+		// built the same way, so "what a player looks like on the wire" has
+		// one answer. Their position bit is clear: nobody has heard from them
+		// yet, and the origin is water.
+		m_net.Broadcast(m_session.MakeJoin(*p, NowMs()), CH_EVENT, peer);
+
+		std::printf("[coopiii] %s joined (slot %u, net %u); backfilled %zu player(s), "
+		            "%zu vehicle(s), %zu seat(s)\n",
+		            p->nick.c_str(), p->id, p->netId, back.players.size(),
+		            back.vehicles.size(), back.seats.size());
 		if (m_session.HostId() == p->id)
 			std::printf("[coopiii] %s is the host; the session's clock is theirs\n",
 			            p->nick.c_str());
-	}
-
-	S_PlayerJoin MakeJoin(const Player &p) const {
-		S_PlayerJoin join;
-		InitHeader(join, NowMs());
-		join.playerId = p.id;
-		join.netId    = p.netId;
-		CopyText(join.nick, NICK_LEN, p.nick);
-		join.modelId = p.modelId;
-		join.pos     = p.pos;
-		join.heading = p.heading;
-		return join;
 	}
 
 	// Player changed model. We store it, not just relay it, because the join
@@ -387,7 +348,11 @@ private:
 		if (!p || !p->alive)
 			return;
 
-		p->alive = false;
+		// Remembered, not just relayed. A death is an event and an event only
+		// reaches whoever was connected when it happened, so without this the
+		// next player in is the one machine in the session that thinks the
+		// body in the road is standing up.
+		m_session.NotePlayerDied(*p, in.animId);
 
 		const Player *killer = m_session.FindByNetId(in.killerNetId);
 		std::printf("[coopiii] %s died%s%s\n", p->nick.c_str(),
@@ -409,17 +374,11 @@ private:
 		if (!p)
 			return;
 
-		p->alive   = true;
-		p->pos     = in.body.pos;
-		p->heading = in.body.heading;
-
-		// A dead player was taken out of their car on every other machine
+		// Alive, over there, on a full bar, and out of whatever car they were
+		// in - a dead player was taken out of theirs on every other machine
 		// before their ped was killed, so the session has to agree or the
 		// next joiner gets told to put them back in it.
-		if (Vehicle *v = m_session.FindVehicle(p->vehicleNetId))
-			if (v->driverPlayerId == p->id)
-				v->driverPlayerId = INVALID_PLAYER;
-		p->vehicleNetId = INVALID_NETID;
+		m_session.NotePlayerRespawned(*p, in.body.pos, in.body.heading);
 
 		S_Respawn out;
 		InitHeader(out, in.hdr.sendTimeMs);
@@ -433,8 +392,11 @@ private:
 		if (!p)
 			return;
 
-		p->pos     = in.body.pos;
-		p->heading = in.body.heading;
+		// Position for the next joiner, and the condition fields that go with
+		// it. A snapshot is the only thing that ever tells the session what
+		// health somebody is on, and a joiner creating a ped needs that
+		// before their first snapshot arrives, not after it.
+		m_session.NotePlayerState(*p, in.body);
 
 		S_PlayerState out;
 		InitHeader(out, in.hdr.sendTimeMs);
@@ -448,16 +410,45 @@ private:
 		if (!p)
 			return;
 
-		// Client-authoritative, but only over the vehicle it actually drives.
-		if (p->vehicleNetId != INVALID_NETID && in.body.netId != p->vehicleNetId)
+		// Client-authoritative, but only over the vehicle it actually drives,
+		// and "actually" is the session's own record rather than the absence
+		// of a contradiction. See Session::MayReportVehicle for why that
+		// distinction started mattering at version 9.
+		if (!m_session.MayReportVehicle(p->id, in.body.netId)) {
+			// Logged only when the sender is recorded as driving *something
+			// else*, and once per player at that.
+			//
+			// Silence for the other case is deliberate rather than lazy.
+			// Enter and exit are reliable while snapshots are not, and they
+			// ride different channels, so one snapshot arriving either side
+			// of its own enter or exit is ordinary and costs nothing. A
+			// client claiming a car it is not in while it sits in another is
+			// not ordinary, and that is the one worth a line.
+			if (p->vehicleNetId != INVALID_NETID && !p->warnedVehicleAuthority) {
+				p->warnedVehicleAuthority = true;
+				if (p->vehicleNetId == in.body.netId)
+					std::printf("[coopiii] dropping %s's snapshots for vehicle %u - "
+					            "they are in seat %u of it, not driving it\n",
+					            p->nick.c_str(), in.body.netId, p->seat);
+				else
+					std::printf("[coopiii] dropping %s's snapshots for vehicle %u - "
+					            "the session has them in vehicle %u\n", p->nick.c_str(),
+					            in.body.netId, p->vehicleNetId);
+			}
 			return;
+		}
 
 		// Remember where it is so a later joiner spawns it here, not back
-		// where it was first claimed.
-		if (Vehicle *v = m_session.FindVehicle(in.body.netId)) {
-			v->pos = in.body.pos;
-			v->rot = in.body.rot;
-		}
+		// where it was first claimed - and what shape it is in, so they spawn
+		// this car rather than a fresh one wearing its paint. A car that
+		// reports itself wrecked leaves the session's backfill here, and says
+		// so once rather than on every snapshot that follows.
+		Vehicle   *known      = m_session.FindVehicle(in.body.netId);
+		const bool wasWrecked = known && known->destroyed;
+		m_session.NoteVehicleState(in.body);
+		if (known && known->destroyed && !wasWrecked)
+			std::printf("[coopiii] vehicle %u is wrecked; joiners will not be told "
+			            "about it\n", known->netId);
 
 		S_VehicleState out;
 		InitHeader(out, in.hdr.sendTimeMs);
@@ -488,6 +479,12 @@ private:
 
 			// Everyone else needs to spawn it. Claimer's excluded, obviously
 			// (it's a car from their own world, they've already got it).
+			//
+			// Condition rides this too, even though a freshly claimed car is
+			// usually a healthy one: "usually" is doing no work here, since a
+			// player is perfectly entitled to climb into a car they have
+			// already shot to pieces, and the defaults in Vehicle are only
+			// right until the first snapshot corrects them.
 			S_VehicleSpawn spawn;
 			InitHeader(spawn, in.hdr.sendTimeMs);
 			spawn.netId   = v->netId;
@@ -496,16 +493,20 @@ private:
 			spawn.rot     = v->rot;
 			spawn.colour1 = v->colour1;
 			spawn.colour2 = v->colour2;
+			spawn.health  = v->health;
+			spawn.flags   = v->flags;
 			m_net.Broadcast(spawn, CH_EVENT, peer);
 
 			std::printf("vehicle %u claimed by %s (model %u)\n", v->netId,
 			            p->nick.c_str(), v->modelId);
 		}
 
-		if (in.body.seat == 0) {
-			v->driverPlayerId = p->id;
-			p->vehicleNetId   = v->netId;
-		}
+		// Every seat, not just the driver's. A passenger's seat has one
+		// carrier on the wire and that is this packet, so a session that does
+		// not write it down is a session that cannot tell the next joiner
+		// about it - see Player::seat.
+		m_session.NoteEnterVehicle(*p, *v, in.body.seat);
+		p->warnedVehicleAuthority = false;
 
 		// Broadcast includes the claimer this time. It's the only way they
 		// find out what netId the server gave their car.
@@ -523,10 +524,7 @@ private:
 			return;
 
 		// Car stays in the session. Somebody just parked it, it's still there.
-		if (Vehicle *v = m_session.FindVehicle(in.netId))
-			if (v->driverPlayerId == p->id)
-				v->driverPlayerId = INVALID_PLAYER;
-		p->vehicleNetId = INVALID_NETID;
+		m_session.NoteExitVehicle(*p, in.netId);
 
 		S_ExitVehicle out;
 		InitHeader(out, in.hdr.sendTimeMs);
@@ -619,9 +617,18 @@ int main(int argc, char **argv) {
 		return 2;
 	}
 
-	// Line-buffered so logs still show up when stdout is redirected to a file
-	// or pipe and the process gets killed instead of exiting cleanly.
-	std::setvbuf(stdout, nullptr, _IOLBF, 4096);
+	// Unbuffered, so logs show up when stdout is redirected to a file or a
+	// pipe and the process is killed rather than exiting cleanly.
+	//
+	// This said `_IOLBF` and did nothing. The MSVC CRT documents `_IOLBF` as
+	// meaning full buffering on Win32 - it is accepted, it is not line
+	// buffering, and the only difference from the default is the buffer size.
+	// Measured: a server started with `> server.log`, driven through a whole
+	// session and then killed leaves an empty file, while the same server run
+	// to a console prints everything. Every diagnostic the server has was
+	// invisible to anyone capturing its output, which for a dedicated server
+	// is everyone.
+	std::setvbuf(stdout, nullptr, _IONBF, 0);
 
 	std::signal(SIGINT, OnSignal);
 	std::signal(SIGTERM, OnSignal);
