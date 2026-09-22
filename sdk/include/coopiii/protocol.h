@@ -231,6 +231,25 @@ enum PlayerFlags : uint8_t {
 	//
 	// Costs nothing: a spare bit in a byte that was already on the wire.
 	PF_ANIM2_RUNNING = 1 << 2,
+
+	// CPed::m_pFire != nil - this player is on fire right now.
+	//
+	// A ped being alight is a boolean with a lifetime, so it belongs in a
+	// flags byte and not in a packet of its own. It is another spare bit in
+	// a byte that was already being sent, which is why fire on a body cost
+	// no wire format change and no version bump (docs/roadmap.md §5.7,
+	// docs/protocol.md §1.10.7).
+	//
+	// It travels one way only: from the player who is burning, to everyone
+	// watching. The observer lights its own copy of the ped so the flames
+	// are there, and decides nothing at all about that player's health -
+	// their machine already did that, from a fire physically in their world.
+	//
+	// It rides the unreliable snapshot on purpose. A dropped packet is
+	// corrected 40 ms later by the next one, and the fire an observer starts
+	// carries its own extinguish time, so the worst a lost "no longer
+	// burning" can do is burn for another second.
+	PF_ON_FIRE = 1 << 3,
 };
 
 // Field sources are re3 CPed/CPhysical members, see docs/protocol.md §1.7.

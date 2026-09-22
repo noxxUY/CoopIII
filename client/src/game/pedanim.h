@@ -221,6 +221,74 @@ inline bool FiniteOr(float value, float fallback, float &out) {
 	return false;
 }
 
+// ---- fire on a remote player's body ---------------------------------------
+//
+// What to do this frame about a remote player's flames, as a decision rather
+// than as memory writes, so tools/clienttest can pin the whole truth table
+// without a running game.
+//
+// Three inputs and they mean three different things:
+//
+//   wantBurning  what the owner said in their last snapshot (PF_ON_FIRE).
+//                Their machine is where their fire actually is, so this is
+//                the only authority on whether that player is alight.
+//   ours         the fire currently on that ped is the one CoopIII lit for
+//                them. A remote ped can pick up a fire from the local engine
+//                instead - CShotInfo::Update does not check bFireProof
+//                (addresses.h) - and that fire arrives with SetFlee and
+//                PED_ON_FIRE attached, which is the one thing this whole
+//                feature is built to keep out of the pose stream.
+//   inControl    CPed::IsPedInControl, the engine's own gate. False for a
+//                seated, dying or dead ped, and the reason this is a loop
+//                and not an event handler.
+//
+// The rule in one line: **a remote ped's fire is ours and is burning a ped
+// the engine still controls, or it is wrong.**
+//
+// inControl gates keeping a fire and not just starting one, and that is not
+// symmetry for its own sake. CFire::ProcessFire's ped arm has a branch for a
+// burning ped who is *in a car*: it reads m_pMyVehicle and writes 75.0f into
+// the car's m_fHealth (`mov [edi+200h], 42960000h` at 0x00479959), which is
+// how getting into a car while alight wrecks it in single player. On an
+// observer that would be this machine deciding the health of somebody else's
+// car from a fire this machine started, which is the one thing this whole
+// feature is not allowed to do. A burning player who gets in a car stops
+// burning here; their own machine wrecks their own car and the result
+// arrives on the vehicle's stream like every other thing about it.
+enum class FireAction : uint8_t {
+	NOTHING,      // leave it alone - includes "asked to burn, can't yet"
+	LIGHT,        // start one, no AI
+	KEEP,         // ours and still wanted: push the extinguish time back
+	EXTINGUISH,   // CFire::Extinguish, and let the engine unwind its own state
+};
+
+inline FireAction PlanRemoteFire(bool wantBurning, bool haveFire, bool ours,
+                                 bool inControl) {
+	if (!haveFire)
+		return (wantBurning && inControl) ? FireAction::LIGHT : FireAction::NOTHING;
+
+	// Not ours, whatever the owner says. Putting it out is also how the
+	// engine's own burning-ped AI gets unwound: CFire::Extinguish calls
+	// CPed::RestorePreviousState, which pops the state CPed::SetFlee stored
+	// on the way in. CoopIII restores nothing by hand.
+	if (!ours)
+		return FireAction::EXTINGUISH;
+
+	return (wantBurning && inControl) ? FireAction::KEEP : FireAction::EXTINGUISH;
+}
+
+// How long an observer's copy of somebody else's fire may outlive the last
+// thing they said about it.
+//
+// Snapshots arrive at 25 Hz and the interpolation buffer extrapolates for at
+// most 250 ms past the newest one, so a burning player re-arms this roughly
+// every frame. It exists for the case where that stops: a stalled
+// connection, a client that went away without saying goodbye. The engine
+// gives a burning civilian ten seconds and a burning player 3333 ms; an
+// observer needs neither, because the owner is going to say so again in
+// 40 ms or not at all.
+constexpr uint32_t REMOTE_FIRE_MS = 1000;
+
 // A coordinate about to reach the sector grid.
 //
 // Writing a wild position into an entity's matrix is survivable - it's just

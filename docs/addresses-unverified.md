@@ -268,6 +268,15 @@ The fire work proved `gFireManager`, the table geometry, the `CFire` layout,
 `CVehicle::m_pCarFire`; all of those are in `addresses.h` now with the
 disassembly that carries each one.
 
+Phase three (2026-09-22) promoted two more out of the list below.
+`CPed::IsPedInControl` (`0x004CE6C0`) is in `addresses.h`: its body is three
+tests and two of the three fields are ones this file already had -
+`m_nPedState` at `0x224` and `m_fHealth` at `0x2C0` - which is what identifies
+it rather than its position at a call site. `CPed::IsPlayer` (`0x004D48E0`)
+went the same way, reading `m_nPedType` at `0x32C` and comparing it against
+0..3: it is the function that decides a burning ped's extinguish time, and
+`CShotInfo::Update` uses it to skip the flee block.
+
 These came out of the same pass and are **not** proved. Every one of them was
 identified from a single call site or from re3's statement order alone, which
 is the way the three refuted addresses in this document were arrived at.
@@ -276,8 +285,11 @@ is the way the three refuted addresses in this document were arrived at.
 |---|---|---|---|---|
 | `CFireManager::FindNearestFire(CVector, float*)` | `0x00479340` | function | medium | Only the argument shape: called from `0x004C3D29` with `push edx / push [eax+8] / push [eax+4] / push [eax]`, which is a `CVector` by value plus an out pointer, and re3 declares exactly one such member. The body was never read. |
 | `CFireManager::FindFurthestFire_NeverMindFireMen` | `0x00479430` | function | high | The body *was* read and it is the right shape - 40 slots, stride `0x30`, skips script fires, 2D distance, keeps the furthest, returns `&m_aFires[i]`. Its loop bound is one of the three witnesses `addresses.h` cites for `NUM_FIRES`, and that part stands on the bound rather than on the name. The name itself is re3's and unconfirmed. |
-| `CPed::RestorePreviousState` | `0x004C5E30` | function | medium | The call `CFire::Extinguish` makes on a burning ped immediately before nilling `m_pFire`, which is re3 `Fire.cpp` `Extinguish`'s only ped statement. Nothing else checked. |
-| `CPed::IsPedInControl` | `0x004CE6C0` | function | medium | The call `StartFire(entity, ...)` makes on a ped before deciding whether to light it, re3 `Fire.cpp` `StartFire`'s second ped guard. Returns a bool in `al`. Nothing else checked. |
+| `CPed::RestorePreviousState` | `0x004C5E30` | function | high | The call `CFire::Extinguish` makes on a burning ped immediately before nilling `m_pFire`, which is re3 `Fire.cpp` `Extinguish`'s only ped statement. The body has since been read and every field in it is one this project already had: `CanSetPedState` on `[+224h]`, then `[+314h]`/`[+310h]` -> `m_nPedState = 2Ch` (PED_DRIVING) and `m_nLastPedState = 0`, then a jump table on `[+228h]` (`PED_LAST_STATE`), with the zero arm testing `IsPlayer`, `CharCreatedBy` at `[+160h]` and `m_objective` at `[+164h]`. Not promoted because CoopIII never calls it directly - it reaches it through `CFire::Extinguish`, which is verified. |
+| `CPed::SetMoveState(eMoveState)` | `0x004C5A30` | function | medium | Called `__thiscall` with a single pushed argument from two places that are doing the same thing to a ped: `StartFire`'s AI arm pushes 4 (`PEDMOVE_SPRINT`) at `0x004796A9` and `CPed::SetFlee` pushes 3 (`PEDMOVE_RUN`) at `0x004D1DC5`, both immediately after touching `[ped+157h]`. The body was never read, and it is not simply `m_nMoveState = arg` - `PED_MOVE_STATE` is a plain dword at `0x22C` that a caller could write inline, so whatever else it does is unknown. |
+| `CPed::SetStoredState` | `0x004C5DB0` | function | medium | The call `CPed::SetFlee` makes immediately before `m_nPedState = 9`, which is where re3 saves `m_nLastPedState`. `CPed::RestorePreviousState` reading `[ped+228h]` (= `PED_LAST_STATE`) is the other half of the same story. Body not read. |
+| `CPed::SetIdle` | `0x004D0600` | function | low | Where `RestorePreviousState` goes for a ped whose `m_nLastPedState` is 0 and whose `CharCreatedBy` is `MISSION_CHAR` - i.e. every remote player whose fire goes out. Identified by position in that function and nothing else. Matters because it is one of the few engine paths that writes a remote ped's `m_nPedState` behind CoopIII's back. |
+| `CEventList::RegisterEvent` | `0x00475C50`, `0x00475E10` | function | low | Two arities, both `cdecl`-ish with `add esp,14h` after five pushes. `0x00475E10` is what `CFire::ReportThisFire` calls with `(7, x, y, z, 1000)`; `0x00475C50` is what `StartFire` calls with `(0Eh or 0Fh, 1, ped, fleeFrom, 10000)`. CoopIII reaches the first one through `ReportThisFire` and never calls either directly. |
 | `CWorld::SetCarsOnFire` / its ped equivalent | `0x004B3D20`-ish, `0x004B3F00`-ish | function | low | Two of the six callers of `StartFire(entity, ...)` sit in these, at `0x004B3E3C` and `0x004B3F9C`. The function *starts* were never located, so the addresses above are the containing region and not entry points. Do not call either. |
 | `CShotInfo::Update` | contains `0x0055C232` | function | low | The flamethrower's own caller of `StartFire(entity, ...)`. Same problem: a call site inside it, not its start. |
 | `CPed::DoStuffToGoOnFire` | - | function | none | Named by re3 as what `ProcessFire` calls before spreading fire to the player. Never looked for. |

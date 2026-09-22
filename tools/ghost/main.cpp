@@ -1,7 +1,7 @@
 // A synthetic second player.
 //
 //   ghost [host] [port] [nick] [-car] [-inout] [-shoot] [-throw] [-hurt]
-//         [-flame] [-rocket]
+//         [-flame] [-rocket] [-burn]
 //
 // -car   also claims a vehicle and parks it in front of the player. Puts the
 //        real client through the vehicle pool, CAutomobile's constructor and
@@ -57,6 +57,17 @@
 //        Either way the decision is made here, on this machine, about this
 //        player, from a fire this engine put in this street - docs/protocol.md
 //        §1.10.6. Nothing about it goes on the wire.
+// -burn  claims to be on fire for four seconds out of every eight, by setting
+//        PF_ON_FIRE in the snapshot the way a real client sets it from its own
+//        CPed::m_pFire. This is the only way to see roadmap §5.7 phase three
+//        without two real games and a rocket launcher: the ghost's ped should
+//        catch fire, burn, and go out again on the cycle, without ever
+//        fleeing, sprinting or breaking stride - the pose stream still owns
+//        where it goes. Two things to watch beyond the flames. Stand next to
+//        it: the fire should spread to you the way it does in single player,
+//        and your own machine decides what that costs you. And check the
+//        ghost's health does not move, because an observer's fire may not
+//        take health off the player it is drawn on.
 // -hurt  makes the shots real, in both directions. Needs the server started
 //        with -friendlyfire, or it does nothing at all and that is the gate
 //        working.
@@ -118,6 +129,7 @@ int main(int argc, char **argv) {
 	bool hurtFlag   = false;
 	bool flameFlag  = false;
 	bool rocketFlag = false;
+	bool burnFlag   = false;
 	for (int i = 1; i < argc; ++i) {
 		if (std::strcmp(argv[i], "-car") == 0)
 			carFlag = true;
@@ -133,6 +145,8 @@ int main(int argc, char **argv) {
 			flameFlag = true;
 		if (std::strcmp(argv[i], "-rocket") == 0)
 			rocketFlag = true;
+		if (std::strcmp(argv[i], "-burn") == 0)
+			burnFlag = true;
 	}
 
 	// -rocket and -throw are the same two halves with a different weapon, so
@@ -413,6 +427,16 @@ int main(int argc, char **argv) {
 				pkt.body.aimYaw = pkt.body.heading;
 				pkt.body.flags  = 0;
 			}
+
+			// -burn: catch fire for four seconds out of every eight.
+			//
+			// A real client sets this from its own CPed::m_pFire, so the only
+			// way to see it from here is to claim it. The cycle is the point:
+			// lighting a remote ped is one thing and putting it out again is
+			// another, and the second one is where an observer's fire would
+			// otherwise sit on somebody who stopped burning ten seconds ago.
+			if (burnFlag && std::fmod(t, 8.0f) < 4.0f)
+				pkt.body.flags |= PF_ON_FIRE;
 
 			client.Send(pkt, CH_SNAPSHOT);
 

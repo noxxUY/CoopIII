@@ -69,6 +69,13 @@ struct RemotePlayer {
 	uint8_t  seatIndex         = 0;           // 0 is the driver
 	uint16_t seatedVehicleNetId = INVALID_NETID;
 
+	// Which of gFireManager's 40 slots holds the fire CoopIII lit on this
+	// player's ped, or -1 for none. An index rather than a CFire*, for the
+	// same reason poolHandle is a pool reference: the slot outlives the
+	// fire, so the contents have to be asked whether it is still ours
+	// (docs/roadmap.md §5.7 phase three).
+	int8_t fireSlot = -1;
+
 	// A seated ped gets positioned by the engine, from the car, every frame.
 	// Nothing else should write its transform - see ApplyRemotePose.
 	bool Seated() const { return seatedVehicleNetId != INVALID_NETID; }

@@ -746,11 +746,60 @@ burns whoever walks into it". A molotov's leftover fire is started by
 `CExplosion::AddExplosion`, which nils `m_pSource`. It is still terrain and it
 still burns everyone. What is gated is the flame somebody is pointing at you.
 
-**What fire does not yet do.** A player on fire is on fire only on their own
-screen: `CFire`'s entity arm cannot be replicated without making a remote ped
-flee, sprint and enter `PED_ON_FIRE`, which fights the pose stream. Their
-health still drops, so from the outside it looks like damage with no cause.
-`docs/roadmap.md` §5.7 phase three.
+#### 1.10.7 A burning player burns for everyone, and it costs one bit
+
+Fire damage never goes on the wire (§1.10.6). The *fact* of burning does, one
+way, from the player who is alight to everyone watching: `PF_ON_FIRE`, a spare
+bit in the flags byte `PlayerStateBody` was already sending. No new packet, no
+layout change, no version bump. `PROTOCOL_VERSION` stays at **8**.
+
+The sender reads `CPed::m_pFire != nil` and nothing else - not the fire's
+position, not its strength, not who lit it. An entity fire has no position of
+its own to send: `CFire::ProcessFire` rewrites `m_vecPos` from the entity's
+matrix every frame, so on the receiver it is derived from a ped that is
+already synced (§5.7). A ped being alight really is just a boolean with a
+lifetime, which is exactly what a flags byte is for.
+
+**Why this is a replication and not a second authority.** The observer starts
+its own `CFire` on its own copy of that ped and decides nothing about that
+player's health. Two independent things make that true rather than intended:
+
+- `CPed::InflictDamage`'s arm for cause 9 is `bFireProof` and an immediate
+  `return false` (`0x004EA898`), and every remote ped is `bFireProof`
+  (§1.10.2). The observer's fire cannot take health off the ped it is drawn
+  on even if every other guard were removed.
+- The `InflictDamage` detour refuses anything aimed at another player's ped
+  before it looks at why (§1.10.1).
+
+**What the observer's fire *is* allowed to do** is spread. `CFire::ProcessFire`
+sets the local player alight if they are close enough and not already burning,
+which is single-player behaviour and is the thing a teammate standing next to a
+burning player should see. The damage that follows is then §1.10.6's, decided
+on the local player's machine from a fire in the local player's world, and
+gated by friendly fire through the fire's own `m_pSource`.
+
+**The source is the burning player's own ped, not whoever lit them.** Null
+would make it terrain, and terrain ignores friendly fire (the table above), so
+a teammate brushing past you in a session with friendly fire off would set you
+alight and burn you to death. For a fire spreading off somebody's body, their
+ped is both the honest answer and the one that routes the spread through the
+rule that already exists.
+
+**It is a reconciliation loop, not an event.** The flag rides the unreliable
+snapshot, `CFireManager::StartFire` refuses a ped that is not
+`IsPedInControl()`, and an observer's fire carries a one-second extinguish time
+that the owner re-arms while they are still burning. So every frame asks the
+same question - is this player alight, and is the fire on their ped ours - and
+every race falls out of that instead of needing a handler. A dropped packet
+costs 40 ms; a client that stops talking costs a second.
+
+**One thing an observer's fire may not do: be on a ped in a car.**
+`ProcessFire`'s ped arm writes `75.0f` into a burning ped's vehicle's
+`m_fHealth` (`0x00479959`), which is how catching fire wrecks the car you get
+into. On an observer that would be this machine deciding the health of
+somebody else's car, so a remote player who gets into a car stops burning
+here. Their own machine wrecks their own car and the result arrives on the
+vehicle's stream like everything else about it.
 
 ---
 

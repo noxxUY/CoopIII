@@ -1964,6 +1964,80 @@ void TestFireTable() {
 	      "the manager ends at 0x008F3954, and slot 40 would start there");
 }
 
+// Fire on a remote player's body - roadmap §5.7 phase three.
+//
+// Two things here and they are different kinds of claim. The slot arithmetic
+// is a round trip CoopIII does every frame and could get subtly wrong
+// forever without noticing, because a wrong index still points *somewhere*
+// inside a live fire table. The truth table is the design: what an observer
+// is allowed to do about somebody else's flames.
+void TestRemoteFire() {
+	std::printf("\nfire on a remote player's body\n");
+
+	// One spare bit in a byte that was already on the wire, which is the
+	// whole reason this cost no version bump. If it ever collides with
+	// another flag, both features break in ways that look like netcode.
+	Check(PF_ON_FIRE == 8, "PF_ON_FIRE is the fourth bit of the flags byte");
+	Check((PF_ON_FIRE & (PF_AIMING | PF_FIRING | PF_ANIM2_RUNNING)) == 0,
+	      "and does not overlap any flag that was already there");
+	Check(PROTOCOL_VERSION == 8, "adding a flag bit does not bump the protocol");
+	Check(sizeof(PlayerStateBody) == 65, "and does not change the snapshot's size");
+
+	// The slot round trip. An index is what gets remembered, so both
+	// directions have to agree at both ends of the table and nowhere else.
+	Check(FireSlot(0) == gFireManager + FIREMGR_FIRES, "slot 0 is the first fire");
+	Check(FireSlotIndex(reinterpret_cast<void *>(FireSlot(0))) == 0,
+	      "and comes back as 0");
+	Check(FireSlotIndex(reinterpret_cast<void *>(FireSlot(NUM_FIRES - 1))) ==
+	          static_cast<int>(NUM_FIRES) - 1,
+	      "the last slot round-trips too");
+	Check(FireSlotIndex(reinterpret_cast<void *>(FireSlot(NUM_FIRES))) == -1,
+	      "one past the end is not a slot, it is whatever follows the manager");
+	Check(FireSlotIndex(reinterpret_cast<void *>(gFireManager)) == -1,
+	      "and neither is m_nTotalFires, which sits four bytes before slot 0");
+	Check(FireSlotIndex(reinterpret_cast<void *>(FireSlot(3) + 4)) == -1,
+	      "a pointer into the middle of a fire is refused rather than rounded");
+
+	// The truth table. Reading the calls: want, haveFire, ours, inControl.
+	Check(PlanRemoteFire(true, false, false, true) == FireAction::LIGHT,
+	      "they are burning and their ped is free: light one");
+	Check(PlanRemoteFire(true, false, false, false) == FireAction::NOTHING,
+	      "they are burning but the ped is seated or dying: wait, do not force it");
+	Check(PlanRemoteFire(false, false, false, true) == FireAction::NOTHING,
+	      "nobody is burning and nothing is alight: nothing to do");
+	Check(PlanRemoteFire(true, true, true, true) == FireAction::KEEP,
+	      "our fire, still wanted: hold it open");
+	Check(PlanRemoteFire(false, true, true, true) == FireAction::EXTINGUISH,
+	      "our fire, no longer wanted: out it goes");
+
+	// The row this whole mechanism exists for. A fire CoopIII did not light
+	// arrived through a path that also ran CPed::SetFlee and wrote
+	// PED_ON_FIRE, which is the engine's burning-ped AI writing into the
+	// same pose stream CoopIII drives. It goes out even when the owner
+	// really is on fire, and gets relit as ours on the next frame.
+	Check(PlanRemoteFire(true, true, false, true) == FireAction::EXTINGUISH,
+	      "somebody else's fire on their ped goes out even while they burn");
+	Check(PlanRemoteFire(false, true, false, true) == FireAction::EXTINGUISH,
+	      "and so does one nobody asked for");
+
+	// A ped the engine has taken over holds no fire of ours, even while its
+	// owner is still alight. The reason is the car: CFire::ProcessFire drops
+	// a burning ped's vehicle to 75 health, and an observer does not get to
+	// decide that about somebody else's car.
+	Check(PlanRemoteFire(true, true, true, false) == FireAction::EXTINGUISH,
+	      "a burning player who gets in a car stops burning on this machine");
+	Check(PlanRemoteFire(false, true, true, false) == FireAction::EXTINGUISH,
+	      "and so does one who stopped burning on the way in");
+	Check(PlanRemoteFire(true, false, false, false) == FireAction::NOTHING,
+	      "and is never handed a new one while the engine has them");
+
+	// The cap is a failsafe against a client that stopped talking, not a
+	// lifetime. It has to be comfortably longer than the interpolation
+	// buffer's own reach or a burning player flickers on a busy network.
+	Check(REMOTE_FIRE_MS >= 500 && REMOTE_FIRE_MS <= 3333,
+	      "the observer's fire outlives the last snapshot by about a second");
+}
+
 void TestDeathAnimChoice() {
 	std::printf("\nwhich animation a death plays\n");
 
@@ -2675,6 +2749,7 @@ int main() {
 	TestWeaponAnimLoop();
 	TestRemoteDamageToTheLocalPlayer();
 	TestFireTable();
+	TestRemoteFire();
 	TestDeathAnimChoice();
 	TestDamageOnlyLandsOnUs();
 	TestDeathKillsTheirPed();

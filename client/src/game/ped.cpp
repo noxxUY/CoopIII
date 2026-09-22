@@ -182,6 +182,13 @@ bool SampleLocalPlayer(PlayerStateBody &out) {
 		out.flags |= PF_FIRING;
 	if (partial.running)
 		out.flags |= PF_ANIM2_RUNNING;
+	// Are we alight? m_pFire is the engine's own answer, kept by CFire itself
+	// - StartFire writes it and Extinguish nils it - so there is no second
+	// piece of state to go stale. Nothing here looks at the fire's position,
+	// its strength or who lit it: an observer is being told that this player
+	// is burning, not where the fire is (docs/roadmap.md §5.7).
+	if (Field<void *>(ped, PED_FIRE))
+		out.flags |= PF_ON_FIRE;
 
 	out.aimYaw = WrapAngle(
 	    aiming ? Field<float>(ped, offs::PED_LOOK_DIRECTION)
@@ -318,6 +325,13 @@ bool LookupRemotePed(const void *ped, uint16_t &netId) {
 //
 // RemoveFromMovingList is guarded by m_movingListNode, so calling it
 // unconditionally costs four instructions when the ped was never linked.
+//
+// The fire table is the other engine container that can be holding this ped,
+// and that one the engine really does clean up itself: ~CPed opens with
+// `if (m_pFire) m_pFire->Extinguish()` at 0x004C51CF, and CFire::Extinguish
+// nils both the fire's m_pEntity and the ped's m_pFire. Worth stating rather
+// than assuming, since the last two crashes in this project were both a
+// container nobody had checked.
 void DestroyRemotePed(void *ped) {
 	using ThisFn       = void(__thiscall *)(void *);
 	using RemoveRefsFn = void(__cdecl *)(void *);
@@ -617,6 +631,11 @@ bool SpawnRemote(RemotePlayer &player) {
 	player.appliedAnimId  = ANIM_NONE;
 	player.appliedAnimId2 = ANIM_NONE;
 	player.appliedWeapon  = 0xFFFF;
+	// A brand new ped is not on fire, whatever the old one was doing. The
+	// old ped's fire, if it had one, was put out by ~CPed on the way down
+	// (0x004C51CF: `if (m_pFire) m_pFire->Extinguish()`), so this is
+	// forgetting a slot the engine has already handed back, not leaking one.
+	player.fireSlot = -1;
 
 	Log("bridge: spawned %s as a mission ped (ref %d, model %u, clump %p)",
 	    player.nick.c_str(), player.poolHandle, model, clump);
@@ -633,6 +652,7 @@ void DespawnRemote(RemotePlayer &player) {
 	void *ped = ResolveRemote(player);
 	player.poolHandle   = -1;
 	player.spawnPending = false;
+	player.fireSlot     = -1;
 	ForgetRemotePed(player);
 	if (!ped)
 		return;   // already gone, and ResolveRemote already said why
@@ -1281,6 +1301,197 @@ void ApplyAim(RemotePlayer &player, void *ped) {
 }
 
 
+// ---- fire on a remote player's body ---------------------------------------
+//
+// docs/roadmap.md §5.7 phase three, and one sentence covers the whole
+// design: **the owner says whether they are burning, every observer lights
+// its own copy, and nobody's fire but your own may cost you health.**
+//
+// The part §5.7 was worried about is the part that turned out not to exist.
+// Its objection was that CFireManager::StartFire's ped arm runs SetFlee,
+// SetMoveState(PEDMOVE_SPRINT), SetMoveAnim() and SetPedState(PED_ON_FIRE)
+// straight into the pose stream CoopIII overwrites every frame. All four are
+// real, and all four sit inside a branch the engine takes only for a ped
+// that is not FindPlayerPed() - for the player it jumps the lot and lands on
+// the shared tail (addresses.h has the six instructions). So the engine
+// already has a way to burn a ped whose movement is not its to decide, and
+// CoopIII does not have to invent one: LightRemoteFire below is that shared
+// tail, transcribed in its order, with the branch not taken.
+//
+// That is also the answer to "which way does the information travel". One
+// way, from the burning player outwards, as one bit in a flags byte that was
+// already on the wire. An observer's fire writes nothing into the ped it
+// burns: every frame ProcessFire reads the ped's matrix, asserts the
+// back-pointer and calls CPed::InflictDamage, and the only write it has left
+// is behind `if (InflictDamage(...))`. That call is refused twice over - by
+// bFireProof, which is the first and only thing the cause-9 arm of
+// InflictDamage tests, and by combat.cpp's detour, which refuses anything
+// aimed at a remote player's ped before it looks at why - so the write
+// behind it is unreachable by construction.
+
+uint32_t NowMs() {
+	return Global<uint32_t>(CTimer__m_snTimeInMilliseconds);
+}
+
+// Start a fire on this ped without waking the burning-ped AI.
+//
+// Every write here is one StartFire makes at 0x0047971E..0x00479884, in that
+// order, and there are no others - notably field_20 and m_nFiremenPuttingOut
+// keep whatever the last tenant of the slot left in them, because StartFire
+// does not touch them either and only CFire::CFire ever has.
+//
+// One thing in the shared part is deliberately not done: at 0x004796C7 the
+// engine registers an EVENT_PED_SET_ON_FIRE naming the entity that lit the
+// victim, when there is one. Ours would say the remote ped set itself on
+// fire, which is true of the pointer and false of the world. The ambient
+// reaction is covered anyway - ReportThisFire below registers an EVENT_FIRE
+// at the position, which is what makes bystanders notice a fire that is
+// really there.
+//
+// m_pSource is the burning ped itself rather than nil or whoever lit them.
+// Nil would make this terrain, and terrain ignores friendly fire: a teammate
+// brushing past you would set you alight and kill you in a session with
+// friendly fire off, because the fire ProcessFire spreads to the local
+// player inherits this exact pointer and combat.cpp gates on it. Their ped
+// is the honest answer for a fire spreading off their body, and it routes
+// the spread through the rule that already exists (§1.10.6) instead of
+// around it.
+void *LightRemoteFire(void *ped) {
+	using NextFreeFn = void *(__thiscall *)(void *);
+	void *fire = Func<NextFreeFn>(CFireManager__GetNextFreeFire)(
+	    reinterpret_cast<void *>(gFireManager));
+	if (!fire)
+		return nullptr;
+
+	const uint32_t now = NowMs();
+	const float   *pos = &Field<float>(ped, offs::POSITION);
+
+	Field<uint8_t>(fire, FIRE_ONGOING) = 1;
+	Field<uint8_t>(fire, FIRE_SCRIPT)  = 0;
+	Field<float>(fire, FIRE_POS + 0)   = pos[0];
+	Field<float>(fire, FIRE_POS + 4)   = pos[1];
+	Field<float>(fire, FIRE_POS + 8)   = pos[2];
+
+	// The engine picks 3333 ms for a player and ten seconds plus a random
+	// spread for anyone else. An observer wants neither: this is a cap on
+	// how long a fire may outlive the last snapshot that asked for it, and
+	// the owner re-arms it every frame they are still alight.
+	Field<uint32_t>(fire, FIRE_EXTINGUISH) = now + REMOTE_FIRE_MS;
+	Field<uint32_t>(fire, FIRE_START_TIME) = now + 400;
+
+	using RegisterFn = void(__thiscall *)(void *, void **);
+	Field<void *>(fire, FIRE_ENTITY) = ped;
+	Func<RegisterFn>(CEntity__RegisterReference)(ped, &Field<void *>(fire, FIRE_ENTITY));
+	Field<void *>(fire, FIRE_SOURCE) = ped;
+	Func<RegisterFn>(CEntity__RegisterReference)(ped, &Field<void *>(fire, FIRE_SOURCE));
+
+	using ReportFn = void(__thiscall *)(void *);
+	Func<ReportFn>(CFire__ReportThisFire)(fire);
+
+	Field<uint32_t>(fire, FIRE_NEXT_FLAMES) = 0;
+	Field<float>(fire, FIRE_STRENGTH)       = FIRE_PED_STRENGTH;
+	Field<uint8_t>(fire, FIRE_PROPAGATION)  = 1;
+	Field<uint8_t>(fire, FIRE_AUDIO_SET)    = 1;
+
+	// The two-way link the engine asserts on every ProcessFire: a fire whose
+	// entity has stopped pointing back at it puts itself out. StartFire
+	// writes this before the tail; so does this.
+	Field<void *>(ped, PED_FIRE) = fire;
+	return fire;
+}
+
+// Is the fire currently on this ped the one we lit for this player?
+//
+// Asked of the slot's contents rather than of a remembered pointer. A slot
+// gets re-let the moment its fire goes out, so "the fire at index N" is not
+// an identity - "the fire at index N that is alight and still points at our
+// ped" is.
+bool FireIsOurs(const RemotePlayer &player, void *ped, void *fire) {
+	if (!fire || player.fireSlot < 0)
+		return false;
+	if (reinterpret_cast<uintptr_t>(fire) != FireSlot(static_cast<size_t>(player.fireSlot)))
+		return false;
+	return Field<uint8_t>(fire, FIRE_ONGOING) != 0 &&
+	       Field<void *>(fire, FIRE_ENTITY) == ped;
+}
+
+// Four lines, one each, and between them the log answers the whole chain in
+// a glance: did the owner say it, did the engine let us act on it, did
+// anything else get there first, and did we run out of room. Same shape as
+// the damage chain, and for the same reason - the round before last was lost
+// to a path that failed silently at every step.
+bool g_saidLit      = false;
+bool g_saidNoSlot   = false;
+bool g_saidNotOurs  = false;
+bool g_saidWaiting  = false;
+
+void ApplyRemoteFire(RemotePlayer &player, void *ped) {
+	void      *fire = Field<void *>(ped, PED_FIRE);
+	const bool want = (player.last.flags & PF_ON_FIRE) != 0;
+	const bool ours = FireIsOurs(player, ped, fire);
+
+	using InControlFn = bool(__thiscall *)(void *);
+	const bool inControl = Func<InControlFn>(CPed__IsPedInControl)(ped);
+
+	switch (PlanRemoteFire(want, fire != nullptr, ours, inControl)) {
+	case FireAction::NOTHING:
+		if (want && !g_saidWaiting) {
+			g_saidWaiting = true;
+			Log("fire: %s is burning but their ped is not in control here "
+			    "(state %u, health %.0f), so there is nowhere to put the flame "
+			    "yet. Trying again every frame",
+			    player.nick.c_str(), Field<uint32_t>(ped, offs::PED_STATE),
+			    Field<float>(ped, offs::PED_HEALTH));
+		}
+		return;
+
+	case FireAction::LIGHT: {
+		void *lit = LightRemoteFire(ped);
+		if (!lit) {
+			player.fireSlot = -1;
+			if (!g_saidNoSlot) {
+				g_saidNoSlot = true;
+				Log("fire: all %u fire slots are taken, so %s burns on their own "
+				    "screen and not on this one",
+				    static_cast<unsigned>(NUM_FIRES), player.nick.c_str());
+			}
+			return;
+		}
+		player.fireSlot = static_cast<int8_t>(FireSlotIndex(lit));
+		if (!g_saidLit) {
+			g_saidLit = true;
+			Log("fire: %s is on fire, lit our own copy on their ped in slot %d. "
+			    "No flee, no sprint, no PED_ON_FIRE - their pose still comes off "
+			    "the wire and their health is still theirs to decide",
+			    player.nick.c_str(), static_cast<int>(player.fireSlot));
+		}
+		return;
+	}
+
+	case FireAction::KEEP:
+		// Push the cap back rather than rebuilding the fire. ProcessFire is
+		// already deriving its position from the ped's matrix every frame,
+		// so there is nothing else about it that goes stale.
+		Field<uint32_t>(fire, FIRE_EXTINGUISH) = NowMs() + REMOTE_FIRE_MS;
+		return;
+
+	case FireAction::EXTINGUISH: {
+		if (!ours && !g_saidNotOurs) {
+			g_saidNotOurs = true;
+			Log("fire: something in our own engine set %s's ped alight (ped state "
+			    "%u). That fire comes with SetFlee and PED_ON_FIRE attached, so it "
+			    "is going out; if they really are burning we relight it ourselves "
+			    "next frame",
+			    player.nick.c_str(), Field<uint32_t>(ped, offs::PED_STATE));
+		}
+		using ExtinguishFn = void(__thiscall *)(void *);
+		Func<ExtinguishFn>(CFire__Extinguish)(fire);
+		player.fireSlot = -1;
+		return;
+	}
+	}
+}
+
 // ---- seating a remote ped in a car ----------------------------------------
 //
 // COMMAND_WARP_CHAR_INTO_CAR's own order: SetObjective, then WarpPedIntoCar.
@@ -1456,6 +1667,13 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	// write its node array over its own return address, and the ped being
 	// seated or dead does not make that any less true.
 	EnforceAnimLimit(player, ClumpOf(ped));
+
+	// Also before every early return below, and for a reason of its own: a
+	// player who catches fire and then gets into a car, or dies, still has
+	// to stop burning here when they stop burning there. The reconciliation
+	// refuses to *start* a fire on a ped the engine has taken over
+	// (CPed::IsPedInControl), but putting one out is always allowed.
+	ApplyRemoteFire(player, ped);
 
 	// A seated ped belongs to the engine now. CPed::ProcessControl puts it
 	// back in its seat from the car's own matrix every frame, so everything

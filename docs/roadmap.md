@@ -478,29 +478,74 @@ holds for exactly the fire that sentence was written about.
 
 No wire change. `PROTOCOL_VERSION` is untouched.
 
-**Phase three, not built: a burning player is visible to everyone.**
+**Phase three, done: a burning player is visible to everyone.**
 
-The remaining gap, and it is the one an observer can see. A player who catches
-fire burns on their own screen only. Their health drops, so from the outside it
-looks like damage with no cause, and a teammate standing next to them does not
-catch fire the way they would in single player.
+`PF_ON_FIRE`, one spare bit in the flags byte the snapshot was already
+sending. No packet, no layout change, `PROTOCOL_VERSION` still **8**.
+`docs/protocol.md` §1.10.7 is the writeup.
 
-The mechanism is not the hard part — `CFireManager::StartFire(entity,
-fleeFrom, strength, propagation)` (`0x00479590`) is the engine's own way in,
-and a flag bit in the player snapshot is enough to drive it, with
-`CFire::Extinguish` (`0x00479D40`) on the way out. Two things make it a piece
-of work rather than an afternoon:
+**The argument this phase was deferred for turned out not to exist, and the
+engine is what says so.** Phase two's objection was real as far as it went:
+for a ped that is not the local player, `CFireManager::StartFire`'s entity arm
+calls `SetFlee`, `SetMoveState(PEDMOVE_SPRINT)`, `SetMoveAnim()` and
+`SetPedState(PED_ON_FIRE)`, straight into the stream `ApplyRemotePose`
+overwrites every frame. What phase two did not check is that all four sit
+inside one branch, and the engine skips it:
 
-- For a ped that is not the local player, `StartFire` calls `SetFlee`,
-  `SetMoveState(PEDMOVE_SPRINT)`, `SetMoveAnim()` and
-  `SetPedState(PED_ON_FIRE)`. `ApplyRemotePose` writes the move state and
-  re-blends animations every frame. Those two have to be made to agree, and
-  every previous fight between CoopIII and the engine over a remote ped's
-  state has cost a session — §1.8.1, §1.8.1.1 and the two crashes in
-  AGENTS.md are all the same argument.
-- It returns nil for a ped that is not `IsPedInControl()`, which a seated or
-  dying remote ped is not, so it is a reconciliation loop like
-  `UpdateRemoteSeats` rather than an event handler.
+```
+00479640  mov [ebp+4B4h], esi     ped->m_pFire = fire
+00479646  call 004A1150           FindPlayerPed()
+0047964B  cmp ebp, eax
+0047964F  je  00479890            -> jumps to 004796C7, past the whole AI
+```
+
+So GTA III already has a way to set a ped alight with no burning-ped AI
+attached, and it uses it for the one ped whose movement is not the engine's to
+decide. A remote player is that ped on this machine. CoopIII takes the same
+branch: `LightRemoteFire` in `client/src/game/ped.cpp` is StartFire's shared
+tail transcribed in its own order, with the branch not taken — and nothing
+else. The engine's AI is never started, so there is nothing to suppress,
+nothing to unwind, and no state for the two to fight over.
+
+The other half is that a fire, once lit, writes nothing to the ped at all.
+`CFire::ProcessFire` reads the ped's matrix, asserts the two-way link and
+calls `InflictDamage`. It never touches `m_nPedState`, `m_nMoveState` or the
+clump. **The AI was the whole of the risk and it was all in one branch.**
+
+**Nobody decides anybody's health.** The damage stayed exactly where phase two
+put it. An observer's fire on a remote ped is refused twice: `bFireProof` is
+the first and only thing `InflictDamage`'s cause-9 arm tests (`0x004EA898`),
+and the detour refuses anything aimed at another player's ped before it asks
+why. What the fire *is* allowed to do is spread to the local player, which is
+single-player behaviour and is §1.10.6's rule already — the local machine
+answering a question about itself from a fire in its own street.
+
+**Why an observer saw nothing before, precisely.** Not a missing feature, a
+working guard. `CWorld::SetPedsOnFire` tests `bFireProof` before lighting any
+ped (`0x004B3D9A`), and every remote player is `bFireProof`, so the replayed
+rocket that lights the victim on the victim's machine is refused on every
+other. Which is why the flame has to be replicated deliberately or not at all.
+
+**Two rules the reconciliation carries that are not tidiness:**
+
+- **A remote ped's fire is ours or it is wrong.** `CShotInfo::Update` does not
+  check `bFireProof` (`0x0055C1A8` gates on `IsPedInControl` and a distance),
+  so a replayed flamethrower can still light a remote ped locally — with its
+  own `SetFlee` before the call. A fire CoopIII did not light gets
+  extinguished, which is also how the engine's own state gets unwound:
+  `CFire::Extinguish` calls `CPed::RestorePreviousState`, which pops what
+  `SetFlee` stored. CoopIII restores nothing by hand.
+- **An observer's fire may not sit on a ped in a car.** `ProcessFire`'s ped
+  arm writes `75.0f` into a burning ped's vehicle's `m_fHealth`
+  (`0x00479959`) — that is how catching fire wrecks the car you get into, and
+  on an observer it would be this machine deciding the health of somebody
+  else's car. A burning player who gets in a car stops burning here.
+
+`CPed::IsPedInControl` (`0x004CE6C0`) is the gate for both starting and
+keeping, which is what makes this a loop like `UpdateRemoteSeats` rather than
+an event handler. `tools/ghost -burn` claims to be alight for four seconds out
+of every eight, which is the only way to exercise it without two games and a
+rocket launcher.
 
 Script fires (`CFireManager::StartScriptFire`, `0x00479E60`) are the other
 loose end and they belong to Area D: only the host runs the script, so a

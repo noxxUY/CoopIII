@@ -1673,6 +1673,12 @@ constexpr uintptr_t CPed__ClearAimFlag = 0x004C6A50;
 // CPed::IsPlayer(), called at the tail of ClearAimFlag. Recorded because it's
 // the cheap way to tell a remote player's CCivilianPed from the local
 // CPlayerPed, and that call site is the proof of it.
+//
+// The body was read on 2026-09-22 and agrees: `mov edx,[ecx+32Ch]` - which is
+// the `m_nPedType` this file already had - then 0, 1..2 and 3 in turn, i.e.
+// re3's four PEDTYPE_PLAYER values. It is a test on the ped *type* and not on
+// being FindPlayerPed(), which matters: CFireManager::StartFire decides the
+// AI arm on the latter and the extinguish time on this.
 constexpr uintptr_t CPed__IsPlayer = 0x004D48E0;
 
 // ---- rendering ------------------------------------------------------------
@@ -1970,10 +1976,23 @@ constexpr uintptr_t CPed__WarpPedIntoCar = 0x004D7D20;   // (CVehicle*)
 // arm and because M2's next piece needs the handoff directly.
 constexpr uintptr_t CVehicle__SetDriver = 0x00551F20;   // (CPed*)
 
-// CEntity::RegisterReference(CEntity**). Not called by CoopIII - it's here
-// because it's the reason despawning a seated ped is safe: WarpPedIntoCar
-// registers &pDriver, so CWorld::RemoveReferencesToDeletedObject (which the
-// despawn already calls) nils the car's pointer to the ped on its way out.
+// __thiscall void CEntity::RegisterReference(CEntity **ref)  [ret 4]
+//
+// An entity keeps a list of the pointers other objects hold to it and nils
+// every one of them when it is destroyed, which is the engine's own answer
+// to the crash class that has bitten this project twice. It is why
+// despawning a seated ped is safe: WarpPedIntoCar registers &pDriver, so
+// CWorld::RemoveReferencesToDeletedObject (which the despawn already calls)
+// nils the car's pointer to the ped on its way out.
+//
+//   004A7480  [ecx+50h] & 7 == 1 -> return            buildings never move
+//   004A7494  walk [ecx+60h], comparing node->ref     already registered?
+//   004A74B6  take a node from [0x008F1AF8] and link it
+//
+// CoopIII calls it directly in one place: the fire seam registers a fire's
+// &m_pEntity and &m_pSource the way CFireManager::StartFire does, so a
+// burning remote ped that gets deleted leaves the fire pointing at nothing
+// rather than at a freed pool slot (see the phase-three block below).
 constexpr uintptr_t CEntity__RegisterReference = 0x004A7480;
 
 // eObjective. Only these three, because only these three are named by the
@@ -2570,6 +2589,165 @@ inline uint32_t CountOngoingFires(ReadByte readByte) {
 			++n;
 	}
 	return n;
+}
+
+// ---- lighting a ped without waking its AI (roadmap §5.7 phase three) -------
+//
+// **Why an observer sees no flame on a burning remote player, exactly.** Not
+// a missing feature, a working guard. Everything in retail that sets peds
+// alight in a radius tests bFireProof first, and every remote player is
+// bFireProof:
+//
+//   004B3D9A  mov al,[ecx+53h] / shr al,1 / and al,1 / jne skip   the ped
+//             loop in CWorld::SetPedsOnFire, right after its m_pFire test
+//   004B3EFB  the same three instructions in the car loop
+//   004EA898  the same three, as InflictDamage's entry for cause 9
+//             (WEAPONTYPE_FLAMETHROWER, jump table 0x005F9EB8 entry 9):
+//             fire proof returns false before anything else happens
+//
+// So the rocket that lands between two players lights the victim's own ped
+// on the victim's machine and is refused by every observer, which is the
+// "observers never decide damage" rule doing its job. The flame has to be
+// replicated deliberately or not at all - and the same bFireProof test is
+// why replicating it cannot cost the remote ped any health.
+//
+// The one path that does *not* check bFireProof is CShotInfo::Update
+// (0x0055C1A8 gates on IsPedInControl and a distance and nothing else), so a
+// replayed flamethrower can still light a remote ped locally, with its own
+// SetFlee before the call. ped.cpp treats that as a fire that is not ours
+// and puts it out; see PlanRemoteFire.
+//
+// Verified 2026-09-22. §5.7 said the entity arm of StartFire "calls SetFlee,
+// SetMoveState(PEDMOVE_SPRINT), SetMoveAnim() and SetPedState(PED_ON_FIRE)"
+// and treated that as the price of a flame. It is not the price: it is one
+// branch of the function, and **the engine itself skips it**.
+//
+// CFireManager::StartFire(entity, fleeFrom, strength, propagation), the ped
+// arm, reads:
+//
+//   00479640  mov [ebp+4B4h], esi           ped->m_pFire = fire
+//   00479646  call 004A1150                 FindPlayerPed()
+//   0047964B  cmp ebp, eax
+//   0047964F  je  00479890                  ...which jumps straight to 004796C7
+//   -------- everything between is the AI, and only a non-player ped runs it
+//   0047965C  call 004D1D70 / 00479690 call 004D1C40    CPed::SetFlee
+//   004796A7  and al,0DFh                   clear bit 5 of [ped+157h]
+//   004796B1  call 004C5A30 (push 4)        CPed::SetMoveState(PEDMOVE_SPRINT)
+//   004796BA  call [vtable+48h]             CPed::SetMoveAnim()
+//   004796BD  mov [ebp+224h], 20h           m_nPedState = PED_ON_FIRE
+//   -------- 004796C7 onward is shared, and is nothing but field writes
+//
+// So there is a second, already-shipping way for a ped to be on fire in GTA
+// III with no burning-ped AI attached to it at all, and it is the way the
+// engine uses for the one ped whose movement is not the engine's to decide.
+// A remote player is exactly that ped on this machine. CoopIII takes the
+// same branch rather than inventing one: the writes below are the common
+// tail, transcribed, in its order.
+//
+//   0047971E  m_vecPos       = entity->GetPosition()      FIRE_POS
+//   00479739  m_bIsOngoing   = 1                          FIRE_ONGOING
+//   0047973C  m_bIsScriptFire= 0                          FIRE_SCRIPT
+//   00479764  call 004D48E0  CPed::IsPlayer -> m_nExtinguishTime is
+//             now + 0D05h (3333 ms) for a player ped, now + 2710h plus a
+//             random spread for anything else                FIRE_EXTINGUISH
+//   0047982E  m_nStartTime   = now + 190h (400 ms)         FIRE_START_TIME
+//   0047983D  m_pEntity      = entity                      FIRE_ENTITY
+//   00479844  call 004A7480  CEntity::RegisterReference(&m_pEntity)
+//   0047984D  m_pSource      = fleeFrom                    FIRE_SOURCE
+//   0047985F  call 004A7480  the same, for m_pSource, when it is not nil
+//   00479866  call 004798B0  CFire::ReportThisFire
+//   0047986B  m_nNextTimeToAddFlames = 0                   FIRE_NEXT_FLAMES
+//   00479872  m_fStrength    = strength                    FIRE_STRENGTH
+//   0047987D  m_bPropagationFlag = propagation             FIRE_PROPAGATION
+//   00479880  m_bAudioSet    = 1                           FIRE_AUDIO_SET
+//
+// What the tail does *not* write is as load-bearing as what it does:
+// field_20 (+0x20) and m_nFiremenPuttingOut (+0x28) keep whatever the slot's
+// last tenant left in them. Only CFire::CFire touches those, and it runs
+// once at startup, so a fire that "resets" them is doing something retail
+// never does. CoopIII writes exactly this list and nothing else.
+//
+// And the AI is the *only* thing StartFire puts on a ped. CFire::ProcessFire
+// writes nothing to a burning ped but the position it reads back out of it:
+// it asserts the m_pFire back-pointer, nudges m_vecPos.z, sets a burning
+// car's engine damage, and calls InflictDamage - which for a remote player
+// is refused twice over (below). Nothing in the per-frame path touches
+// m_nPedState, m_nMoveState or the clump. That is why this is a visual
+// replication and not a second authority over the pose stream.
+constexpr uint32_t PEDSTATE_ON_FIRE = 32;   // 20h, StartFire's own write
+
+// __thiscall bool CPed::IsPedInControl() - StartFire's gate for a ped, at
+// 0x004795C2, and the reason §5.7 called this a reconciliation loop rather
+// than an event handler: a seated, dying or dead remote ped is refused a
+// fire and has to be offered one again on a later frame.
+//
+//   004CE6C0  cmp dword [ecx+224h],22h / jg fail    m_nPedState <= 34
+//   004CE6C9  [ecx+155h] bit 3 / bit 4 set -> fail
+//   004CE6E3  fld [ecx+2C0h] / fcomp [0x5F8438]     m_fHealth > 0.0f
+//
+// Both field offsets are ones this file already had - PED_STATE at 0x224 and
+// PED_HEALTH at 0x2C0 - which is what identifies the function. PED_DRIVING
+// is 44 and PED_DIE/PED_DEAD are 48/49, so all three fail the first test.
+constexpr uintptr_t CPed__IsPedInControl = 0x004CE6C0;
+
+// __thiscall void CFire::ReportThisFire() - ten instructions, and both of
+// them matter:
+//
+//   004798B0  inc dword [0x008F31D0]                   m_nTotalFires++
+//   004798B6  push 3E8h / push [ecx+0Ch],[ecx+8],[ecx+4] / push 7
+//   004798C6  call 00475E10                            an EVENT_FIRE at m_vecPos
+//
+// The count is what CFire::Extinguish decrements, so skipping this call
+// would leave the manager's total drifting down every time a remote player
+// stopped burning. The event is the engine's own AI noticing a fire that is
+// really in this world, which it is.
+constexpr uintptr_t CFire__ReportThisFire = 0x004798B0;
+
+// StartFire registers both &m_pEntity and &m_pSource through
+// CEntity::RegisterReference (0x004A7480, recorded above with the seating
+// work), so a burning ped that gets deleted leaves the fire pointing at
+// nothing instead of at a freed pool slot. The fire seam does the same.
+
+// The rest of the CFire layout, from the same transcription. FIRE_ONGOING,
+// FIRE_SCRIPT, FIRE_POS, FIRE_ENTITY, FIRE_SOURCE, FIRE_EXTINGUISH and
+// FIRE_STRENGTH are above.
+constexpr size_t FIRE_PROPAGATION = 0x02;
+constexpr size_t FIRE_AUDIO_SET   = 0x03;
+constexpr size_t FIRE_START_TIME  = 0x1C;
+constexpr size_t FIRE_NEXT_FLAMES = 0x24;
+
+// 0.8f, and it is the same number three different ways: CFire::CFire's own
+// initialiser (3F4CCCCDh), the constant CWorld::SetPedsOnFire pushes
+// (0x005F7A50) and the one CShotInfo::Update pushes (0x00603028). There is
+// no second strength for a ped in retail 1.0.
+constexpr float FIRE_PED_STRENGTH = 0.8f;
+
+// Which slot a CFire pointer is, and where a slot lives. Pure arithmetic
+// over the table geometry, so tools/clienttest can check the round trip
+// without the game.
+//
+// CoopIII remembers the *index*, never the pointer, for the same reason
+// RemotePlayer::poolHandle is a pool reference and not a CPed* - the slot
+// outlives the tenant, and an index that has been re-let is a question the
+// contents can answer (m_pEntity still points at our ped) where a pointer
+// would just keep matching.
+inline uintptr_t FireSlot(size_t index) {
+	return gFireManager + FIREMGR_FIRES + index * SIZEOF_CFIRE;
+}
+
+// -1 for anything that is not the start of one of the 40 slots.
+inline int FireSlotIndex(const void *fire) {
+	const uintptr_t addr = reinterpret_cast<uintptr_t>(fire);
+	const uintptr_t base = gFireManager + FIREMGR_FIRES;
+	if (addr < base)
+		return -1;
+	const uintptr_t delta = addr - base;
+	if (delta % SIZEOF_CFIRE != 0)
+		return -1;
+	const uintptr_t index = delta / SIZEOF_CFIRE;
+	if (index >= NUM_FIRES)
+		return -1;
+	return static_cast<int>(index);
 }
 
 // ---- the moving entity list -----------------------------------------------
