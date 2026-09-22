@@ -167,12 +167,20 @@ screens.
 - [x] Shot events (reliable), replayed through the real `CWeapon::Fire` so
       impacts happen for real (`combat.cpp`, `C_Shot`, `CH_EVENT`). Muzzle
       flash not separately handled.
-- [ ] Damage application and death, through `InflictDamage` / `SetDie` /
-      `SetDead` rather than by writing health.
-- [ ] Respawn: hospital, weapon loss, the whole SP behaviour.
+- [x] Damage application and death, through `InflictDamage` / `SetDie` /
+      `SetDead` rather than by writing health. **Run end to end in game
+      2026-09-21**: the shooter's `C_Damage`, the victim applying it, the
+      death and the respawn all appear in the two logs for the same hit. See
+      `protocol.md` §1.10.2 for the exemption that makes it work, which is
+      the whole fix.
+- [x] Respawn. The engine's own, on the machine that died; what travels is
+      that it happened, and observers see the ped die and come back. Run in
+      game 2026-09-21. The clock jumping 12 hours on death comes free, since
+      that is `CGameLogic::PassTime(720)` and the host's clock is the
+      session's.
 - [ ] Arrest: police station, the same.
 - [ ] Melee.
-- [ ] Decide friendly fire. A co-op default of off, with a server option.
+- [x] Decide friendly fire. Settled in §5.2: off by default, server option.
 
 ### M4 - The world
 
@@ -244,7 +252,7 @@ Everything that has to travel, and where it stands. Sources are re3 members
 | Weapon | `m_weapons[]`, `m_currentWeapon` | ✅ sent and applied via `CPed::GiveWeapon` + `SetCurrentWeapon`, so the model is in the hand. Ammo is not on the wire (M3) |
 | Aim | yaw/pitch | ⚠️ both sent; yaw applied via `CPed::SetAimFlag`. Pitch is not applied: `CPed::AimGun` hard-codes 0 for non-player peds (`protocol.md` §1.8.3), so it needs a detour, and that belongs with M3 |
 | Shots | event | ✅ sent reliably and replayed through the real `CWeapon::Fire`, so impacts happen for real (`combat.cpp`) |
-| Damage / death | event | ❌ |
+| Damage / death | event | ✅ sent by the shooter, applied by the victim through `CPed::InflictDamage`, with the one exemption that lets an authorised hit past the remote-attacker rule. Run end to end in game 2026-09-21 |
 | Enter/exit vehicle | event | ⚠️ the remote ped is now seated (`SeatRemotePed`), but through `WarpPedIntoCar` rather than `SetEnterCar`, so no animation plays yet |
 | Wanted level | `CPlayerInfo::m_pWanted` | ❌ design settled (§5.1), not implemented |
 
@@ -269,7 +277,7 @@ nothing else. The address is no longer the obstacle.
 
 | What | Status |
 |---|---|
-| Clock | ✅ follows the host's `CClock`, not a clock the server keeps on its own. The host reports at 1 Hz; everyone else is moved only once they are more than 3 game minutes out, so the HUD clock and the sun do not stutter. Needs an in-game run |
+| Clock | ✅ follows the host's `CClock`, not a clock the server keeps on its own. The host reports at 1 Hz; everyone else is moved only once they are more than 3 game minutes out, so the HUD clock and the sun do not stutter. Run in game 2026-09-21, including a host handover mid-session and the 12-hour jump the engine makes on death |
 | Weather | ✅ follows the host's `CWeather`. Both ends of the blend are sent, since a single type describes where the sky is going and not where it is. Needs an in-game run |
 | Pickups | ❌ needs exclusive collection |
 | Garages / doors | ❌ |
