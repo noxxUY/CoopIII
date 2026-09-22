@@ -24,14 +24,23 @@
 //        copy ends silently instead of detonating wherever it feels like.
 //        A second fire in the wrong street means CProjectileInfo::RemoveProjectile
 //        isn't being suppressed.
-// -flame holds a flamethrower and keeps the trigger down. The only way to see
-//        the one weapon whose replay was refused until now: the shot goes
+// -flame holds a flamethrower and keeps the trigger down. The shot goes
 //        through CWeapon::FireAreaEffect into CShotInfo, which keeps lighting
-//        fires for a second after the call returns. Watch for flame coming
-//        out of the remote ped, and watch your own health: it must not move,
-//        because the fire that CShotInfo lights names the ghost's ped as its
-//        source and CPed::InflictDamage refuses anything a remote ped tries
-//        to take off you.
+//        fires for a second after the call returns, so this is the cheapest
+//        way to put a real fire in the world without a second game running.
+//        Watch for flame coming out of the remote ped, then go and stand in
+//        it. Your health is the test and the answer depends on the server:
+//
+//          started with -friendlyfire   you burn. The ghost's fire is the
+//                                       ghost's, and the session allows it.
+//          started without              you do not. The flame still comes
+//                                       out; only the damage is declined,
+//                                       and CoopIII.log says so in as many
+//                                       words rather than going quiet.
+//
+//        Either way the decision is made here, on this machine, about this
+//        player, from a fire this engine put in this street - docs/protocol.md
+//        §1.10.6. Nothing about it goes on the wire.
 // -hurt  makes the shots real, in both directions. Needs the server started
 //        with -friendlyfire, or it does nothing at all and that is the gate
 //        working.

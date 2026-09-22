@@ -377,7 +377,7 @@ Status: not yet implemented. It touches `client/src/dllmain.cpp` and
 
 ---
 
-### 5.7 Fire is world state, and it gets synced. Two phases.
+### 5.7 Fire is world state, and it gets synced. Three phases.
 
 Decided 2026-09-21, after a live run where a remote player held a flamethrower
 and nothing at all came out of it on the other screen.
@@ -405,33 +405,107 @@ still hurt the local player, because a blast is replayed at a fixed world
 position everyone agrees on, so "was I standing in it" is a question about us
 that we are entitled to answer.
 
-**Phase two, not built: fire is synced as world state, whatever lit it.**
+**Phase two, done: fire burns, whatever lit it, and nobody decides it for
+anybody else.**
 
-Not "flamethrower fire and molotov fire". Fire. Explosions, molotovs, the
-flamethrower, rockets, a car burning out, a ped alight, a script fire. Where
-it came from does not matter, which is what makes it tractable: the engine
-already treats fire as one flat table rather than as a property of the weapon
-that caused it.
+The two questions phase two was gated on are both answered, against the
+retail binary. They are recorded in full in `client/src/game/addresses.h`
+under `---- fire ----`; the short version and what each one settled:
 
-That table is `gFireManager`, a single global with a fixed `m_aFires[NUM_FIRES]`,
-each entry carrying `m_bIsOngoing`, `m_pEntity` and `m_vecPos`. The strongest
-hint that it is snapshot-shaped is that the engine's own replay system already
-treats it as a block: `CReplay` stores and restores the whole array plus
-`m_nTotalFires` with two `memcpy`s (re3 Replay.cpp:1176-1177, 1353-1356).
+**1. The array is fixed, and it is 40 entries of 48 bytes.** Three separate
+functions carry the bound and all three agree — `CFireManager::Update`
+(`cmp ebp,28h` at `0x00479336`), `GetNextFreeFire` (`cmp eax,28h` at
+`0x00479304`) and `FindFurthestFire_NeverMindFireMen` (`cmp ebx,28h` at
+`0x004794C4`) — and all three step by `30h`. `gFireManager` is at
+`0x008F31D0`, `m_nTotalFires` at `+0`, `m_aFires` at `+4`, so the whole thing
+ends at `0x008F3954`. re3's `NUM_FIRES` also says 40; that is a coincidence
+that was checked rather than a constant that was trusted, and given that the
+last three bugs in this project were all an re3 number that did not match
+retail, it is worth saying which of the two this is.
 
-Until it is built, burning is cosmetic on an observer and damaging only on the
-machine that lit it, and the fire a molotov leaves behind is terrain: it burns
-whoever walks into it, friendly fire or not.
+**2. Yes, a `CFire` can point at an entity — and the interesting part is what
+it does with it.** `CFire::ProcessFire` (`0x004798D0`) opens on
+`mov eax,[ebx+10h]`, and when `m_pEntity` is set it **rewrites `m_vecPos` from
+that entity's matrix every single frame** before doing anything else. So an
+entity fire's position is not state at all, it is derived; its life is tied to
+the entity; the engine keeps a two-way link (`CPed::m_pFire` at `+0x4B4`,
+`CVehicle::m_pCarFire` at `+0x1E4`) and asserts it every frame, extinguishing
+a fire whose entity no longer points back; and it cannot exist on a machine
+where that entity does not.
 
-Two things to settle first, neither of which is answerable from `re3` alone
-and both of which shape the design:
+That answers "snapshot or event stream" with **neither, and the split is by
+kind rather than by mechanism**:
 
-- whether the fire array is a fixed size in the retail build, and what that
-  size is;
-- whether a `CFire` entry can point at an entity (`m_pEntity`, a burning ped
-  or car) rather than just a position. A fire attached to a remote player's
-  ped is a different sync problem from a fire sitting on the pavement, and it
-  is the one that decides whether this is a snapshot or an event stream.
+- **A fire on the pavement** (`m_pEntity == nil`) is flat, ownerless state at
+  a fixed position. It turns out to need nothing at all, which is the other
+  finding: `CFireManager::StartFire(pos, size, propagation)` (`0x00479500`)
+  has **exactly one caller in the whole image**, at `0x0055957E` inside
+  `CExplosion::AddExplosion`. In retail 1.0, an explosion is the only thing
+  that puts an unowned fire on the ground, and CoopIII already replays every
+  player's explosion at a fixed world position every machine agrees on
+  (`protocol.md` §1.9.3). Pavement fires are therefore already the same on
+  every machine, for free, and a fire packet would have doubled them.
+- **A fire on an entity** is a property of an entity that is already synced,
+  so it belongs on that entity's own stream, not in a fire table snapshot.
+  That is phase three.
+
+And `CReplay`'s two `memcpy`s are not the precedent they looked like. Replay
+is one process, so `m_pEntity` and `m_pSource` still point at something on the
+way back in. Across the wire they are per-process pool pointers (§1.5), and
+half the array is them.
+
+**So who decides that a fire burned somebody? The victim, always.**
+`protocol.md` §1.10.6 is the writeup. Fire damage never goes on the wire in
+either direction — not because it was hard, but because a fire's authority is
+a *place* rather than a *ray*, and "am I standing in it" is a question about
+me that I answer from my own position this frame with nothing stale in it.
+Most fires have no owner to send it from anyway, and `CFire::ProcessFire` hits
+once per frame, so forwarding it would be sixty packets a second per burning
+player.
+
+The one predicate that had the flamethrower's fire refused now admits exactly
+one cause, `WEAPONTYPE_FLAMETHROWER`, and it is narrow because the binary
+makes it narrow: of the 21 `call CPed::InflictDamage` sites in the image,
+exactly two push `9` and both are inside `CFire::ProcessFire`. That cause
+cannot mean "a remote player shot me"; it can only mean "a fire is burning me
+and it remembers who lit it". Nothing interpolated goes into the decision.
+
+Friendly fire is decided by the fire's own `m_pSource`: null is terrain and
+burns anyone, a remote player's ped is their fire and is gated like their
+bullets. The molotov puddle is still terrain — `StartFire(pos, ...)` nils the
+source — so "it burns whoever walks into it, friendly fire or not" still
+holds for exactly the fire that sentence was written about.
+
+No wire change. `PROTOCOL_VERSION` is untouched.
+
+**Phase three, not built: a burning player is visible to everyone.**
+
+The remaining gap, and it is the one an observer can see. A player who catches
+fire burns on their own screen only. Their health drops, so from the outside it
+looks like damage with no cause, and a teammate standing next to them does not
+catch fire the way they would in single player.
+
+The mechanism is not the hard part — `CFireManager::StartFire(entity,
+fleeFrom, strength, propagation)` (`0x00479590`) is the engine's own way in,
+and a flag bit in the player snapshot is enough to drive it, with
+`CFire::Extinguish` (`0x00479D40`) on the way out. Two things make it a piece
+of work rather than an afternoon:
+
+- For a ped that is not the local player, `StartFire` calls `SetFlee`,
+  `SetMoveState(PEDMOVE_SPRINT)`, `SetMoveAnim()` and
+  `SetPedState(PED_ON_FIRE)`. `ApplyRemotePose` writes the move state and
+  re-blends animations every frame. Those two have to be made to agree, and
+  every previous fight between CoopIII and the engine over a remote ped's
+  state has cost a session — §1.8.1, §1.8.1.1 and the two crashes in
+  AGENTS.md are all the same argument.
+- It returns nil for a ped that is not `IsPedInControl()`, which a seated or
+  dying remote ped is not, so it is a reconciliation loop like
+  `UpdateRemoteSeats` rather than an event handler.
+
+Script fires (`CFireManager::StartScriptFire`, `0x00479E60`) are the other
+loose end and they belong to Area D: only the host runs the script, so a
+script fire exists on one machine today. It is the one fire kind with an owner
+and no explosion behind it.
 
 ---
 

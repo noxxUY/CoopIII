@@ -5,6 +5,8 @@
 #include "ped.h"
 #include "pedanim.h"
 
+#include <cstdio>
+
 namespace coopiii::game {
 
 namespace {
@@ -91,7 +93,39 @@ bool g_saidHitApplied      = false;
 bool g_saidHitRefused      = false;
 bool g_saidHitNotForwarded = false;
 
+// The same idea for fire, and it needs its own lines rather than sharing the
+// ones above.
+//
+// "el fuego no quema" was reported off a session where the flame was visibly
+// coming out of a remote player's flamethrower and nothing burned, and the
+// log had nothing at all to say about it - not because the chain broke
+// quietly, but because no step of it had ever been asked to speak. Fire hits
+// once per frame, so nothing here may log per hit; what it can do is say
+// which link of the chain it got to, once each.
+//
+//   burned      the rule let it through and health actually moved
+//   noMove      the rule let it through and health did not move, which is a
+//               different bug in a different place and has to look different
+//   refused     friendly fire is off and this was a player's own fire
+bool g_saidFireBurned  = false;
+bool g_saidFireNoMove  = false;
+bool g_saidFireRefused = false;
+
 void *PlayerPed() { return Func<void *(__cdecl *)()>(FindPlayerPed)(); }
+
+// How many of gFireManager's 40 slots are alight right now.
+//
+// Walked rather than read off m_nTotalFires, because that counter is not a
+// count: CFire::Extinguish only decrements it for a fire that is not a script
+// fire, and StartScriptFire never increments it at all (addresses.h). Forty
+// byte reads from a fixed global array, bounded by the engine's own loop
+// bound, so it is cheap enough to put in a log line and safe enough to run
+// from inside a detour.
+uint32_t BurningFires() {
+	return CountOngoingFires([](uintptr_t at) {
+		return *reinterpret_cast<const uint8_t *>(at) != 0;
+	});
+}
 
 // ---- the local player's combat events, waiting for the next frame ---------
 //
@@ -463,11 +497,29 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 	// Except the one hit that is allowed: our own ApplyRemoteDamage, applying
 	// what the attacker's machine already decided. Without this exemption the
 	// rule refuses the packets the whole feature exists to deliver.
-	uint16_t attackerNetId = INVALID_NETID;
-	if (!g_applyingRemoteDamage && localPed && self == localPed && damagedBy &&
-	    damagedBy != localPed && RemotePlayerForPed(damagedBy, attackerNetId) &&
-	    !RemoteMayDamageLocalPlayer(static_cast<uint8_t>(method))) {
-		if (!g_saidHitRefused) {
+	uint16_t   attackerNetId = INVALID_NETID;
+	const bool fromRemotePed = !g_applyingRemoteDamage && localPed &&
+	                           self == localPed && damagedBy &&
+	                           damagedBy != localPed &&
+	                           RemotePlayerForPed(damagedBy, attackerNetId);
+	const bool fire = IsFireDamage(static_cast<uint8_t>(method));
+
+	if (fromRemotePed &&
+	    !RemoteMayDamageLocalPlayer(static_cast<uint8_t>(method), g_friendlyFire)) {
+		// Fire refused is its own line. It is the only refusal here that is
+		// about the session's settings rather than about authority, and from
+		// the outside it looks exactly like the bug this round fixed, so it
+		// has to say which one it is.
+		if (fire) {
+			if (!g_saidFireRefused) {
+				g_saidFireRefused = true;
+				Log("combat: a fire lit by player net %u is burning us and we are "
+				    "refusing it, because this session has friendly fire off. The "
+				    "flame is real and so is the fire; only the damage is declined. "
+				    "%u fires are alight on this machine",
+				    attackerNetId, BurningFires());
+			}
+		} else if (!g_saidHitRefused) {
 			g_saidHitRefused = true;
 			Log("combat: refused a hit our own engine tried to land on us from "
 			    "player net %u with cause %u. That is the rule: their machine "
@@ -475,6 +527,54 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 			    attackerNetId, method);
 		}
 		return false;
+	}
+
+	// Fire is getting through. Say so once, and say whether it did anything.
+	//
+	// The second half is the part worth having. "The detour allowed it" and
+	// "the player's health went down" are two different claims and the gap
+	// between them is where the next round of this would be lost: a player
+	// MakePlayerSafe has made undamageable, a m_bCanBeDamaged of false, or a
+	// hit so small it rounds to nothing all look identical from here unless
+	// the health is read either side of the call. So it is.
+	if (fire && localPed && self == localPed &&
+	    (!g_saidFireBurned || !g_saidFireNoMove)) {
+		const float before = Field<float>(localPed, offs::PED_HEALTH);
+		const bool  died   = g_inflictDamage.Original<InflictHookFn>()(
+            self, nullptr, damagedBy, method, damage, piece, direction);
+		const float after  = Field<float>(localPed, offs::PED_HEALTH);
+
+		if (after < before) {
+			if (!g_saidFireBurned) {
+				g_saidFireBurned = true;
+
+				// Who lit it, from the fire's own m_pSource, which is what
+				// arrives here as damagedBy. Three answers and they mean
+				// three different things: a null source is terrain and
+				// ignores friendly fire, our own ped is our own flame, and a
+				// remote ped is the case this whole change is about.
+				char who[48];
+				if (!damagedBy)
+					std::snprintf(who, sizeof who, "nobody - this fire is terrain");
+				else if (damagedBy == localPed)
+					std::snprintf(who, sizeof who, "us, with our own flame");
+				else if (attackerNetId != INVALID_NETID)
+					std::snprintf(who, sizeof who, "player net %u", attackerNetId);
+				else
+					std::snprintf(who, sizeof who, "something local, not a player");
+
+				Log("combat: fire is burning us for real - %.2f health this frame, "
+				    "%.0f left, lit by %s, %u fires alight on this machine",
+				    before - after, after, who, BurningFires());
+			}
+		} else if (!g_saidFireNoMove) {
+			g_saidFireNoMove = true;
+			Log("combat: fire reached CPed::InflictDamage and took no health off "
+			    "(%.0f before, %.0f after, %.2f asked for). The rule is not what is "
+			    "stopping it - look at m_bCanBeDamaged, MakePlayerSafe, or armour",
+			    before, after, damage);
+		}
+		return died;
 	}
 
 	uint16_t victimNetId = INVALID_NETID;

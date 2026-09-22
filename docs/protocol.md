@@ -287,9 +287,11 @@ whole life of the `CShotInfo` and every `CFire` it starts, because
 `CFire::ProcessFire` passes its `m_pSource` straight into `InflictDamage`
 (`src/core/Fire.cpp:70-80`) and that source is the remote ped.
 
-So the flame comes out and nobody here decides who burns. Syncing the fires
-themselves is `docs/roadmap.md` §5.7, and until it exists burning is cosmetic
-on an observer and damaging only on the machine that lit it.
+So the flame comes out and nobody here decides who burns *for anybody else*.
+Since §5.7's phase two the fire that flame lights does burn the person
+standing in it, and that is not a relaxation of this rule either: §1.10.6 is
+the argument, and it is the explosion argument below with "place" in place of
+"ray".
 
 Explosions are the exception, and not an inconsistency. §1.9.3's explosion is
 replayed at a fixed world position that its owner chose, so "is B standing in
@@ -485,7 +487,7 @@ Which causes get forwarded, and why the rest do not:
 |---|---|---|
 | `UNARMED`, `BASEBALLBAT`, `COLT45`, `UZI`, `SHOTGUN`, `AK47`, `M16`, `SNIPERRIFLE`, `UZI_DRIVEBY` | yes | a ray or a melee reach the attacker's machine resolved |
 | `ROCKETLAUNCHER`, `MOLOTOV`, `GRENADE`, `EXPLOSION` | no | already handled, and handled better, by §1.9.3. A blast is replayed at a fixed world position, so "was I in it" is a question about the victim, answered on the victim's machine with nothing stale in it. Forwarding it as well would apply it twice |
-| `FLAMETHROWER` | no | `CShotInfo` keeps damaging for as long as the shot lives, so one trigger pull becomes a stream of packets, and the victim would burn with no flame on screen because the flamethrower is not replayed either |
+| `FLAMETHROWER` | no | never a shot. In retail 1.0 the only producer of this cause is `CFire::ProcessFire`, so it means "a fire is burning somebody", and the fire is already in the victim's world at a position their own engine computed. Deciding it here would decide it twice, and `ProcessFire` hits once per frame, so one trigger pull would be sixty packets a second. §1.10.6 |
 | `RAMMEDBYCAR`, `RUNOVERBYCAR` | no | a remote ped is teleported 25 times a second, which is not a motion any collision test was written for, and `CPed::KillPedWithCar`'s hit is a flat 1000 |
 | `DROWNING`, `FALL` | no | these happen to a player on their own machine, where they are already handled correctly |
 
@@ -619,6 +621,75 @@ v1 stops there. The corpse is not left lying around to be walked over, there is
 no wasted message for other players, and no kill feed. `killerNetId` is carried
 and logged by the server so a scoreboard has something to read when there is
 one.
+
+#### 1.10.6 Fire is terrain, and terrain is the victim's own business
+
+Nothing about fire goes on the wire, in either direction, and that is the
+decision rather than an omission. Fire damage is decided on the victim's
+machine, by the victim's own engine, about the victim.
+
+This is the opposite of §1.10.1's rule for a bullet and it is the same
+principle, applied to a different question. A bullet's authority is a **ray**,
+from a position, at an instant, along an aim that only the shooter has, so a
+victim asked to work it out is doing it off a ped 100 ms in the past and people
+get shot around corners. A fire's authority is a **place**. It sits still, it
+burns for ten seconds, and "is the local player standing in it" is a question
+about the local player, answered on the local player's machine, from the local
+player's position this frame. That is §1.9.2's explosion argument word for
+word, and fire is a better fit for it than the explosion is, because a fire
+does not even have to be replayed to be in the right place.
+
+Three reasons it could not have gone the other way:
+
+- **Most fires have nobody to send them.** A car burning out, a script fire,
+  the puddle a molotov leaves behind: `m_pSource` is null and there is no
+  machine entitled to decide. A rule that only works when a fire has an owner
+  is not a rule about fire, and §5.7 is explicit that fire means fire.
+- **Fire damage is continuous.** `CFire::ProcessFire` hits for
+  `1.2f * CTimer::GetTimeStep()` *every frame* for as long as the fire lives.
+  One trigger pull on a flamethrower is sixty packets a second per burning
+  player. `WEAPONTYPE_FLAMETHROWER` therefore stays off §1.10.1's forwardable
+  list, where it already was, for a better reason than the one written there.
+- **The health arithmetic is the victim's anyway** (§1.10). Armour,
+  `m_bCanBeDamaged` and the 0.33 multiplier a player gets and nobody else does
+  all live on the machine whose player it is.
+
+**How it reaches the victim without reopening the hole.** §1.10.2's rule -
+nothing a remote player's ped names itself the culprit of may take health off
+the local player - stays exactly as written, with one cause added to the
+exemption list it already had. The cause is `WEAPONTYPE_FLAMETHROWER`, and it
+is narrow because the binary makes it narrow: of the 21 `call
+CPed::InflictDamage` sites in retail 1.0, exactly two push `9`, and both are
+inside `CFire::ProcessFire` (`0x0047998D` and `0x004799B0`). There is no other
+producer. So that cause arriving at the seam cannot mean "a remote player shot
+us"; it means "a `CFire` is burning us, and it remembers who lit it".
+
+The remote ped is never read for the decision. It is carried as the culprit for
+the same reason `ApplyRemoteDamage` carries one: so the engine's blood, its
+threat entity and `CDarkel`'s kill register point at the player who lit the
+fire instead of at nobody.
+
+**Friendly fire, and why `m_pSource` is the right discriminator.** §1.10.3 says
+friendly fire is the server's except for the blast it never sees. Fire is now
+the second thing it never sees, and the fire's own source byte is what tells an
+attack apart from terrain:
+
+| `m_pSource` | Whose fire | Friendly fire |
+|---|---|---|
+| null | nobody's - an explosion, a burning car, a script fire | ignores it, burns anyone. Unchanged, and already what happened before this |
+| a remote player's ped | theirs, lit deliberately | gated, exactly like their bullets and their blast |
+
+That is not a retreat from "the fire a molotov leaves behind is terrain, it
+burns whoever walks into it". A molotov's leftover fire is started by
+`CFireManager::StartFire(pos, size, propagation)` from inside
+`CExplosion::AddExplosion`, which nils `m_pSource`. It is still terrain and it
+still burns everyone. What is gated is the flame somebody is pointing at you.
+
+**What fire does not yet do.** A player on fire is on fire only on their own
+screen: `CFire`'s entity arm cannot be replicated without making a remote ped
+flee, sprint and enter `PED_ON_FIRE`, which fights the pose stream. Their
+health still drops, so from the outside it looks like damage with no cause.
+`docs/roadmap.md` §5.7 phase three.
 
 ---
 

@@ -1583,10 +1583,10 @@ void TestReplayableWeapons() {
 	      "the sniper is refused: FireSniper fires along this machine's camera");
 	// The flamethrower used to be refused here, because CShotInfo keeps
 	// lighting fires long after the call that made it returned. It is
-	// replayed now, and the guard moved to where it can cover that: nothing
-	// a remote player's ped does may take health off the local player, for
-	// as long as the CShotInfo and its fires live. See
-	// TestRemoteDamageToTheLocalPlayer.
+	// replayed now, and the guard moved to where it can cover that: the
+	// culprit rule in CPed::InflictDamage, which holds for as long as the
+	// CShotInfo and its fires live. What that rule now lets through is fire
+	// and only fire - see TestRemoteDamageToTheLocalPlayer.
 	Check(IsReplayableWeapon(WEAPONTYPE_FLAMETHROWER),
 	      "the flamethrower is replayed, so the flame comes out");
 	Check(!IsReplayableWeapon(WEAPONTYPE_DETONATOR),
@@ -1623,7 +1623,8 @@ void TestDamageDecisions() {
 	Check(!IsForwardableDamage(WEAPONTYPE_EXPLOSION), "nor a generic blast");
 
 	// And these are the victim's own business, or nobody's.
-	Check(!IsForwardableDamage(WEAPONTYPE_FLAMETHROWER), "the flamethrower keeps burning");
+	Check(!IsForwardableDamage(WEAPONTYPE_FLAMETHROWER),
+	      "fire is decided where it burns, not where it was lit");
 	Check(!IsForwardableDamage(WEAPONTYPE_RAMMEDBYCAR), "a car is not a decision we get");
 	Check(!IsForwardableDamage(WEAPONTYPE_RUNOVERBYCAR), "nor running someone over");
 	Check(!IsForwardableDamage(WEAPONTYPE_DROWNING), "drowning happens where you drown");
@@ -1857,24 +1858,40 @@ void TestRemoteDamageToTheLocalPlayer() {
 
 	// An explosion is replayed at a fixed position everyone agrees on, so
 	// this machine answering "was I in it" is answering a question about
-	// itself with nothing stale involved.
-	Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_GRENADE), "a grenade blast may");
-	Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_MOLOTOV), "and a molotov's");
-	Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_ROCKETLAUNCHER), "and a rocket's");
-	Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_EXPLOSION), "and a generic blast");
+	// itself with nothing stale involved. Friendly fire does not appear in
+	// the answer: a blast's gate is the bExplosionProof flip around the
+	// replay, upstream of this.
+	for (bool ff : {false, true}) {
+		Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_GRENADE, ff), "a grenade blast may");
+		Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_MOLOTOV, ff), "and a molotov's");
+		Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_ROCKETLAUNCHER, ff),
+		      "and a rocket's");
+		Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_EXPLOSION, ff),
+		      "and a generic blast");
 
-	// A bullet may not. It arrives as S_Damage, decided by the shooter, or
-	// it does not arrive at all.
-	Check(!RemoteMayDamageLocalPlayer(WEAPONTYPE_COLT45), "a bullet may not");
-	Check(!RemoteMayDamageLocalPlayer(WEAPONTYPE_UNARMED), "nor a fist");
-	// And this is the one that matters for the flamethrower: the fire its
-	// CShotInfo lights names the remote ped as its source and burns for a
-	// second after the call that made it has returned.
-	Check(!RemoteMayDamageLocalPlayer(WEAPONTYPE_FLAMETHROWER),
-	      "and nor may the fire a replayed flame starts");
+		// A bullet may not, either way. It arrives as S_Damage, decided by
+		// the shooter, or it does not arrive at all.
+		Check(!RemoteMayDamageLocalPlayer(WEAPONTYPE_COLT45, ff), "a bullet may not");
+		Check(!RemoteMayDamageLocalPlayer(WEAPONTYPE_UNARMED, ff), "nor a fist");
+	}
 
-	// The flame itself is replayed now, so it is visible. The damage half is
-	// still refused in both directions until fire is synced properly.
+	// Fire, and this is the change. WEAPONTYPE_FLAMETHROWER reaching
+	// CPed::InflictDamage is not a shot - the only two producers of it in
+	// retail 1.0 are CFire::ProcessFire's own calls - so letting it through
+	// admits exactly one thing: a fire that is in this world, at a position
+	// this engine computed, burning the player standing in it. The decision
+	// is the victim's, about the victim, with nothing interpolated in it.
+	Check(RemoteMayDamageLocalPlayer(WEAPONTYPE_FLAMETHROWER, true),
+	      "a player's fire burns us when the session allows it");
+	Check(!RemoteMayDamageLocalPlayer(WEAPONTYPE_FLAMETHROWER, false),
+	      "and does not when friendly fire is off");
+	Check(IsFireDamage(WEAPONTYPE_FLAMETHROWER), "that cause means fire");
+	Check(!IsFireDamage(WEAPONTYPE_COLT45) && !IsFireDamage(WEAPONTYPE_EXPLOSION),
+	      "and nothing else does");
+
+	// The flame itself is replayed, so it is visible. Its damage still never
+	// goes on the wire in either direction: there is nobody to send it from
+	// when the fire has no source, and sixty packets a second when it does.
 	Check(IsReplayableWeapon(WEAPONTYPE_FLAMETHROWER), "the flame comes out");
 	Check(!IsForwardableDamage(WEAPONTYPE_FLAMETHROWER),
 	      "and its damage is still nobody's to forward");
@@ -1885,6 +1902,66 @@ void TestRemoteDamageToTheLocalPlayer() {
 	Check(!IsReplayableWeapon(WEAPONTYPE_UNARMED) &&
 	          !IsReplayableWeapon(WEAPONTYPE_BASEBALLBAT),
 	      "and melee, which is animation and damage and nothing else");
+}
+
+// gFireManager's table, and the walk over it.
+//
+// The class this covers is the one that has now bitten this project three
+// times: driving an engine structure past a bound the engine does not check,
+// where re3's constant is not a retail fact. re3 says NUM_FIRES is 40 and so
+// does the retail binary - this time - and the point of pinning it here is
+// that the next person to change it has to go and look again rather than
+// trust either.
+//
+// No unit test can read gFireManager, so what this pins is the arithmetic:
+// forty slots, forty-eight bytes apart, starting one dword into the manager,
+// and a walk that touches every one of them exactly once and nothing past
+// the last.
+void TestFireTable() {
+	std::printf("\nthe fire table\n");
+
+	Check(NUM_FIRES == 40, "forty fires, out of three separate loop bounds");
+	Check(SIZEOF_CFIRE == 0x30, "forty-eight bytes each, out of the same three");
+	Check(FIREMGR_TOTAL == 0 && FIREMGR_FIRES == 4,
+	      "m_nTotalFires first, then the array");
+
+	// The fields ProcessFire and Extinguish actually read, in the order the
+	// constructor writes them.
+	Check(FIRE_ONGOING == 0x00 && FIRE_SCRIPT == 0x01,
+	      "the two bytes GetNextFreeFire tests are the first two");
+	Check(FIRE_POS == 0x04 && FIRE_ENTITY == 0x10 && FIRE_SOURCE == 0x14,
+	      "position, then the entity, then who lit it");
+	Check(FIRE_POS + 12 == FIRE_ENTITY, "a CVector's three floats fit between them");
+
+	// The walk. Every address it reads is recorded, so both ends of the
+	// array can be checked rather than just the count.
+	std::vector<uintptr_t> read;
+	const uint32_t         alight = CountOngoingFires([&](uintptr_t at) {
+        read.push_back(at);
+        // Pretend every third slot is burning, so the count is a real
+        // count and not a constant.
+        return ((at - gFireManager - FIREMGR_FIRES) / SIZEOF_CFIRE) % 3 == 0;
+    });
+
+	Check(read.size() == NUM_FIRES, "the walk visits every slot once");
+	Check(alight == 14, "and counts the ones that are alight");
+	Check(!read.empty() && read.front() == gFireManager + 4,
+	      "starting at the first fire, not at the manager");
+	Check(!read.empty() &&
+	          read.back() == gFireManager + 4 + (NUM_FIRES - 1) * SIZEOF_CFIRE,
+	      "and ending on the fortieth");
+
+	// The one that matters: the last byte touched has to be inside the
+	// manager. 4 + 40*48 is 1924, and the last ongoing flag sits at 1876.
+	Check(!read.empty() && read.back() - gFireManager <
+	                           FIREMGR_FIRES + NUM_FIRES * SIZEOF_CFIRE,
+	      "and never past the end of the array");
+
+	// Forty-one would be the bug. Written out because "it is 40" is a claim
+	// and "41 would read into whatever follows gFireManager" is the reason
+	// the claim had to be measured.
+	Check(gFireManager + FIREMGR_FIRES + NUM_FIRES * SIZEOF_CFIRE == 0x008F3954,
+	      "the manager ends at 0x008F3954, and slot 40 would start there");
 }
 
 void TestDeathAnimChoice() {
@@ -2506,6 +2583,7 @@ int main() {
 	TestNonLoopingWeapons();
 	TestWeaponAnimLoop();
 	TestRemoteDamageToTheLocalPlayer();
+	TestFireTable();
 	TestDeathAnimChoice();
 	TestDamageOnlyLandsOnUs();
 	TestDeathKillsTheirPed();

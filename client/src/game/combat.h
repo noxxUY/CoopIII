@@ -100,10 +100,11 @@ inline bool IsProjectileExplosion(uint8_t type) {
 // holding an engine flag across frames. CShotInfo::Update itself only lights
 // fires, and it skips bFireProof peds, which every remote player already is.
 //
-// So the flame comes out and nobody on this machine decides who burns.
-// Syncing the fires themselves, so that burning actually hurts and everyone
-// sees the same fires whatever lit them, is a separate piece of work:
-// docs/roadmap.md §5.7.
+// So the flame comes out, and since phase two it burns the person standing
+// in it as well - but still without this machine deciding anything about
+// anybody else. The burning is decided by the victim, about the victim, from
+// a fire that is physically in the victim's world: RemoteMayDamageLocalPlayer
+// below, and docs/roadmap.md §5.7.
 //
 // HELICANNON (13) and anything above it aren't inventory weapons at all and
 // get refused by the bound check.
@@ -127,33 +128,84 @@ inline bool IsReplayableWeapon(uint8_t weapon) {
 // May something coming off a remote player's ped reduce the local player's
 // health on this machine?
 //
-// Almost never, and the exception is the interesting part. Everything a
+// Almost never, and the exceptions are the interesting part. Everything a
 // remote player legitimately does to us arrives as S_Damage, decided on
 // their machine from their own bullet trace (§1.10.1). Anything else that
 // names their ped as the culprit is this machine guessing, off a ped that is
-// interpolated 100 ms into the past.
+// interpolated 100 ms into the past. That is the hole this rule closed and
+// nothing below reopens it.
 //
-// The exception is the blast, and it is not a hole. §1.9.2: an explosion is
-// replayed at a fixed world position that its owner chose, so "was I
-// standing in it" is a question about us, answered here, with nothing stale
-// in it. The three projectile causes and the generic EXPLOSION are that
-// question.
+// Two causes are let through, and they are the same argument twice.
 //
-// This one predicate is what let the flamethrower come off the refused list.
-// The fire a replayed flame starts names the remote ped as its source
-// (CFire::ProcessFire passes m_pSource straight into InflictDamage), so the
-// flame is visible and the burning is refused, for the whole life of the
-// CShotInfo, with no timer to get wrong.
-inline bool RemoteMayDamageLocalPlayer(uint8_t weapon) {
+// **The blast** (§1.9.2). An explosion is replayed at a fixed world position
+// that its owner chose, so "was I standing in it" is a question about us,
+// answered here, with nothing stale in it. Friendly fire does not appear in
+// this predicate for the blast because its gate is upstream: combat.cpp flips
+// the local player bExplosionProof around the replay, so a friendly's blast
+// never reaches InflictDamage at all when the session has it off.
+//
+// **The fire** (§1.10.6, docs/roadmap.md §5.7), and this is the one that
+// changed. WEAPONTYPE_FLAMETHROWER arriving here does not mean "a remote
+// player shot us with a flamethrower". In retail 1.0 it means one thing and
+// there is no second thing it can mean: *a CFire is burning us, and it
+// remembers who lit it*. Proved from the binary rather than assumed - of the
+// 21 `call CPed::InflictDamage` sites in the image, exactly two push 9, and
+// both of them are inside CFire::ProcessFire:
+//
+//   0x0047998D   the FindPlayerPed() arm    1.2f * timestep, PEDPIECE_TORSO
+//   0x004799B0   the other-ped arm          the same, plus bRenderScorched
+//
+// So the culprit on this call is a *souvenir*, not an input. The decision was
+// "is the local player's position inside a fire that exists in this world",
+// taken by this machine about its own player, from its own position, this
+// frame. Nothing interpolated goes into it. The remote ped is carried purely
+// so the engine's blood, its threat entity and CDarkel's kill register point
+// at the player who lit it instead of at nobody - the same reason
+// ApplyRemoteDamage names an attacker.
+//
+// That is why fire is never forwarded as damage and never will be
+// (IsForwardableDamage still refuses it): there is nobody to forward it from.
+// Most fires have no source at all - a car burning out, a script fire, the
+// puddle a molotov leaves - and a rule that only works when somebody owns the
+// fire is not a rule about fire.
+//
+// Friendly fire *is* in the predicate for the fire case, because m_pSource is
+// exactly the thing that distinguishes an attack from terrain and it arrives
+// here as `damagedBy`:
+//
+//   source is nil          nobody's fire. Terrain. It burns whoever walks
+//                          into it, friendly fire or not - roadmap §5.7 and
+//                          M4 both already say so. This predicate never even
+//                          sees it, since the caller only asks about a
+//                          culprit that resolved to a remote player.
+//   source is their ped    their fire, lit deliberately, at us. Same standing
+//                          as their bullets and their blast, so the same
+//                          switch decides it. The server cannot: fire damage
+//                          never passes through it (§1.10.3's exception,
+//                          which now covers two things rather than one).
+inline bool RemoteMayDamageLocalPlayer(uint8_t weapon, bool friendlyFire) {
 	switch (weapon) {
 	case WEAPONTYPE_ROCKETLAUNCHER:
 	case WEAPONTYPE_MOLOTOV:
 	case WEAPONTYPE_GRENADE:
 	case WEAPONTYPE_EXPLOSION:
 		return true;
+	case WEAPONTYPE_FLAMETHROWER:
+		return friendlyFire;
 	default:
 		return false;
 	}
+}
+
+// Is this damage cause one only a CFire can produce?
+//
+// One cause, and the list is short because the binary says it is short: the
+// only two producers of WEAPONTYPE_FLAMETHROWER in retail 1.0 are
+// CFire::ProcessFire's two InflictDamage calls (addresses above). Used to
+// tell "fire burned me" apart from "somebody shot me" in the log, which is
+// the distinction the last round had no way to make.
+inline bool IsFireDamage(uint8_t weapon) {
+	return weapon == WEAPONTYPE_FLAMETHROWER;
 }
 
 // ---- damage decisions -----------------------------------------------------
@@ -185,10 +237,13 @@ constexpr float MAX_REMOTE_DAMAGE = 1000.0f;
 //                    on, so "was I in it" is a question about the victim,
 //                    answered on the victim's machine with nothing stale in
 //                    it (§1.9.2). Forwarding it as well would apply it twice.
-//   FLAMETHROWER     CShotInfo keeps damaging for as long as the shot lives,
-//                    so one trigger pull becomes a stream of packets, and
-//                    the victim would burn with no flame on screen because
-//                    the flamethrower isn't replayed either.
+//   FLAMETHROWER     this cause is never a shot, it's a CFire burning
+//                    somebody, and the fire is already in the victim's world
+//                    at a position their own engine computed. Deciding it
+//                    here would be deciding it twice and worse: CFire hits
+//                    once per frame for as long as it burns, so one trigger
+//                    pull becomes sixty packets a second. The victim decides
+//                    their own burning - RemoteMayDamageLocalPlayer above.
 //   RAMMEDBYCAR /    a remote ped is teleported 25 times a second, which is
 //   RUNOVERBYCAR     not a motion any collision test was written for, and
 //                    CPed::KillPedWithCar's hit is a flat 1000. Driving past

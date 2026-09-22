@@ -2398,6 +2398,180 @@ constexpr uint8_t PEDPIECE_COUNT    = 7;
 // socket.
 constexpr uint8_t PED_DAMAGE_DIRECTIONS = 4;
 
+// ---- fire -----------------------------------------------------------------
+//
+// Verified 2026-09-21, against the binary and not against re3's NUM_FIRES.
+// docs/roadmap.md §5.7 asked two questions before any of this could be
+// designed, and this block is the answer to both.
+//
+// **Is the fire table a fixed size in retail, and what size?** Yes, and 40.
+// Three separate functions carry the bound and all three agree, which is what
+// makes it a fact rather than a reading:
+//
+//   0x00479336  cmp ebp,28h / jl      CFireManager::Update
+//   0x00479304  cmp eax,28h / jl      CFireManager::GetNextFreeFire
+//   0x004794C4  cmp ebx,28h / jl      FindFurthestFire_NeverMindFireMen
+//
+// and all three walk it with `add <reg>,30h`, with GetNextFreeFire and
+// FindFurthestFire also doing `imul <reg>,<reg>,30h` to turn an index back
+// into a pointer. So NUM_FIRES is 40 and sizeof(CFire) is 0x30.
+//
+// re3 also says 40 (src/core/config.h:107). That is a coincidence worth
+// naming rather than leaning on: the last three bugs in this project were all
+// an re3 constant that did not match retail (the four-entry anim group, the
+// twelve-entry node array, the ANIM_STD_NUM off-by-one), so this one was
+// measured the same way and happens to have come back equal.
+//
+// **Can a CFire point at an entity rather than just a position?** Yes, and
+// the answer has more in it than a yes. CFire::ProcessFire opens on
+// `mov eax,[ebx+10h] / test eax,eax` and, when m_pEntity is set, *rewrites
+// m_vecPos from that entity's matrix every single frame* before doing
+// anything else:
+//
+//   0x004798D8  mov eax,[ebx+10h]             m_pEntity
+//   0x004798E3  add eax,34h                   ->GetPosition()
+//   0x004798E6  fld [eax] / fstp [ebx+4]      m_vecPos.x
+//                     ... y, z                m_vecPos = entity position
+//   0x004798FA  mov al,[esi+50h] / and al,7   entity type
+//   0x00479904  cmp eax,3                     ENTITY_TYPE_PED
+//   0x0047990D  cmp [esi+4B4h],ebx            ped->m_pFire != this -> Extinguish
+//   0x004795DD  cmp [ecx+1E4h],0              veh->m_pCarFire (StartFire's arm)
+//
+// So the two kinds of fire are genuinely different sync problems, which is
+// what §5.7 suspected. A fire on the pavement has a position that *is* its
+// state. A fire on an entity has a position that is *derived* from the
+// entity, a life tied to that entity, and a two-way link the engine asserts
+// every frame - and it cannot exist at all on a machine where that entity
+// does not. That is also why CReplay's two memcpys are not the precedent they
+// look like: replay is one process, so m_pEntity and m_pSource still point at
+// something. Across the wire they are per-process pool pointers (§1.5).
+//
+// CFire, 0x30 bytes, every field pinned by CFire::CFire at 0x00479220 unless
+// noted, and cross-confirmed by StartFire and ProcessFire:
+//
+//   +0x00  bool  m_bIsOngoing              ctor 0, Update's `cmp byte,1`
+//   +0x01  bool  m_bIsScriptFire           ctor 0, GetNextFreeFire's second test
+//   +0x02  bool  m_bPropagationFlag        ctor 1, StartFire writes the arg
+//   +0x03  bool  m_bAudioSet               ctor 1
+//   +0x04  CVector m_vecPos                ctor (0,0,0); ProcessFire rewrites
+//   +0x10  CEntity *m_pEntity              ctor nil
+//   +0x14  CEntity *m_pSource              ctor nil; ProcessFire passes it
+//                                          straight to InflictDamage
+//   +0x18  uint32 m_nExtinguishTime        StartFire: GetTimeInMilliseconds()
+//                                          + 2710h (10000)
+//   +0x1C  uint32 m_nStartTime             StartFire: + 190h (400)
+//   +0x20  int32  field_20                 ctor 1
+//   +0x24  uint32 m_nNextTimeToAddFlames   StartFire 0; ProcessFire compares
+//                                          it against [0x00885B48]
+//   +0x28  uint32 m_nFiremenPuttingOut     ctor 0
+//   +0x2C  float  m_fStrength              ctor 3F4CCCCDh = 0.8f
+constexpr uintptr_t gFireManager      = 0x008F31D0;
+constexpr size_t    FIREMGR_TOTAL     = 0x00;   // uint32 m_nTotalFires
+constexpr size_t    FIREMGR_FIRES     = 0x04;   // CFire m_aFires[NUM_FIRES]
+constexpr size_t    NUM_FIRES         = 40;     // 28h, three witnesses above
+constexpr size_t    SIZEOF_CFIRE      = 0x30;
+
+constexpr size_t FIRE_ONGOING     = 0x00;
+constexpr size_t FIRE_SCRIPT      = 0x01;
+constexpr size_t FIRE_POS         = 0x04;
+constexpr size_t FIRE_ENTITY      = 0x10;
+constexpr size_t FIRE_SOURCE      = 0x14;
+constexpr size_t FIRE_EXTINGUISH  = 0x18;
+constexpr size_t FIRE_STRENGTH    = 0x2C;
+
+// gFireManager's m_nTotalFires is the dword CFire::ReportThisFire increments
+// and CFire::Extinguish decrements, which is how the global was found in the
+// first place:
+//
+//   0x004798B0  inc dword [0x008F31D0]        ReportThisFire
+//   0x00479D4F  dec dword [0x008F31D0]        Extinguish, !m_bIsScriptFire arm
+//
+// It is not a count of burning fires. Extinguish only decrements it for a
+// fire that is not a script fire, and StartScriptFire never reports one at
+// all, so anything that wants "how many fires are alive" has to walk the
+// array. combat.cpp's BurningFires() does.
+static_assert(FIREMGR_FIRES == 4, "m_aFires starts one dword into the manager");
+
+// The back-pointers the engine keeps on the burning entity itself. Both are
+// asserted by ProcessFire every frame: a fire whose entity no longer points
+// back at it extinguishes itself on the spot.
+constexpr size_t PED_FIRE     = 0x4B4;   // CFire *CPed::m_pFire
+constexpr size_t VEHICLE_FIRE = 0x1E4;   // CFire *CVehicle::m_pCarFire
+
+// __thiscall void CFireManager::Update() - the loop above, called once a
+// frame from 0x0048C936 with ecx = 0x008F31D0.
+constexpr uintptr_t CFireManager__Update = 0x00479310;
+
+// __thiscall CFire *CFireManager::GetNextFreeFire() - first slot with neither
+// m_bIsOngoing nor m_bIsScriptFire set, nil if all 40 are taken.
+constexpr uintptr_t CFireManager__GetNextFreeFire = 0x004792E0;
+
+// __thiscall void CFireManager::StartFire(CVector pos, float size,
+//                                         bool propagation)   [ret 14h]
+//
+// A fire on the pavement: m_pEntity and m_pSource are both nilled, the
+// extinguish time is fixed at ten seconds, and nothing owns it.
+//
+// **It has exactly one caller in the whole image**, at 0x0055957E inside
+// CExplosion::AddExplosion. That single fact retires half of §5.7's phase
+// two: in retail 1.0 the only thing that puts an ownerless fire on the ground
+// is an explosion, and CoopIII already replays every player's explosion at a
+// fixed world position every machine agrees on (§1.9.3). Pavement fires are
+// therefore already the same on every machine, and syncing them again would
+// double them.
+constexpr uintptr_t CFireManager__StartFirePos = 0x00479500;
+
+// __thiscall CFire *CFireManager::StartFire(CEntity *entityOnFire,
+//                                           CEntity *fleeFrom, float strength,
+//                                           bool propagation)   [ret 10h]
+//
+// A fire on a ped or a car. Returns nil rather than starting one when the
+// target already has a fire (`cmp [ebx+4B4h],0`), when a ped is not
+// IsPedInControl (call 0x004CE6C0), or when a car's engine is already past
+// 225. Six callers: ProcessFire's own spread rule, CWorld::SetCarsOnFire and
+// its ped equivalent, CExplosion, and CShotInfo::Update - which is the
+// flamethrower.
+constexpr uintptr_t CFireManager__StartFireEntity = 0x00479590;
+
+// __thiscall int32 CFireManager::StartScriptFire(const CVector &pos,
+//                                                CEntity *target,
+//                                                float strength,
+//                                                bool propagation)
+//
+// The script's own fire, and the one kind that is not tied to an explosion.
+// Only the host runs CTheScripts::Process (docs/campaign.md), so this is
+// Area D's problem rather than this one's; it is recorded because §5.7's
+// phase three has to account for it.
+constexpr uintptr_t CFireManager__StartScriptFire = 0x00479E60;
+
+// __thiscall void CFire::ProcessFire() - the whole of the burning rule, and
+// the only producer of WEAPONTYPE_FLAMETHROWER damage in the image. See the
+// two call sites named in combat.h.
+constexpr uintptr_t CFire__ProcessFire = 0x004798D0;
+
+// __thiscall void CFire::Extinguish() - clears m_bIsOngoing, nils the
+// entity's back-pointer and, for a ped, calls CPed::RestorePreviousState
+// (0x004C5E30). Safe on a fire that is not burning: the whole body is inside
+// `cmp byte [ebx],0 / je end`.
+constexpr uintptr_t CFire__Extinguish = 0x00479D40;
+
+// How many of the 40 slots are actually alight. Pure arithmetic over the
+// table geometry above so tools/clienttest can check the walk without the
+// game; the caller supplies the reader.
+//
+// Bounded by NUM_FIRES and by nothing else - there is no count to trust. This
+// is the shape the last three crashes said to use: the engine's own bound,
+// read out of the engine's own loop, applied by us.
+template <typename ReadByte>
+inline uint32_t CountOngoingFires(ReadByte readByte) {
+	uint32_t n = 0;
+	for (size_t i = 0; i < NUM_FIRES; ++i) {
+		if (readByte(gFireManager + FIREMGR_FIRES + i * SIZEOF_CFIRE + FIRE_ONGOING))
+			++n;
+	}
+	return n;
+}
+
 // ---- the moving entity list -----------------------------------------------
 //
 // CWorld::ms_listMovingEntityPtrs (0x008F433C) is a CPtrList of every physical

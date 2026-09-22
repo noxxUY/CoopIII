@@ -259,3 +259,25 @@ afternoon to them.
 | `Where to physically put CoopIII.asi, and the ordering it buys you` | `` | constant | medium | - |
 | `What NOT to pattern-scan for, concretely` | `` | constant | medium | - |
 
+
+## fire (found 2026-09-21, alongside §5.7 phase two)
+
+The fire work proved `gFireManager`, the table geometry, the `CFire` layout,
+`Update`, `GetNextFreeFire`, both `StartFire` overloads, `StartScriptFire`,
+`ProcessFire`, `Extinguish`, `ReportThisFire`, `CPed::m_pFire` and
+`CVehicle::m_pCarFire`; all of those are in `addresses.h` now with the
+disassembly that carries each one.
+
+These came out of the same pass and are **not** proved. Every one of them was
+identified from a single call site or from re3's statement order alone, which
+is the way the three refuted addresses in this document were arrived at.
+
+| Claim | Address | Kind | Confidence | How far it got |
+|---|---|---|---|---|
+| `CFireManager::FindNearestFire(CVector, float*)` | `0x00479340` | function | medium | Only the argument shape: called from `0x004C3D29` with `push edx / push [eax+8] / push [eax+4] / push [eax]`, which is a `CVector` by value plus an out pointer, and re3 declares exactly one such member. The body was never read. |
+| `CFireManager::FindFurthestFire_NeverMindFireMen` | `0x00479430` | function | high | The body *was* read and it is the right shape - 40 slots, stride `0x30`, skips script fires, 2D distance, keeps the furthest, returns `&m_aFires[i]`. Its loop bound is one of the three witnesses `addresses.h` cites for `NUM_FIRES`, and that part stands on the bound rather than on the name. The name itself is re3's and unconfirmed. |
+| `CPed::RestorePreviousState` | `0x004C5E30` | function | medium | The call `CFire::Extinguish` makes on a burning ped immediately before nilling `m_pFire`, which is re3 `Fire.cpp` `Extinguish`'s only ped statement. Nothing else checked. |
+| `CPed::IsPedInControl` | `0x004CE6C0` | function | medium | The call `StartFire(entity, ...)` makes on a ped before deciding whether to light it, re3 `Fire.cpp` `StartFire`'s second ped guard. Returns a bool in `al`. Nothing else checked. |
+| `CWorld::SetCarsOnFire` / its ped equivalent | `0x004B3D20`-ish, `0x004B3F00`-ish | function | low | Two of the six callers of `StartFire(entity, ...)` sit in these, at `0x004B3E3C` and `0x004B3F9C`. The function *starts* were never located, so the addresses above are the containing region and not entry points. Do not call either. |
+| `CShotInfo::Update` | contains `0x0055C232` | function | low | The flamethrower's own caller of `StartFire(entity, ...)`. Same problem: a call site inside it, not its start. |
+| `CPed::DoStuffToGoOnFire` | - | function | none | Named by re3 as what `ProcessFire` calls before spreading fire to the player. Never looked for. |
