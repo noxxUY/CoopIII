@@ -16,7 +16,7 @@ in the city; there's more detail at the bottom.
 ## Demostration
 
 <p align="center">
-  <video src="docs/assets/vid.mp4" width="800" controls></video>
+  <img src="docs/assets/demo.gif" alt="CoopIII demo" width="800">
 </p>
 
 ## Disclaimer
