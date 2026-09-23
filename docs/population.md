@@ -71,6 +71,20 @@ The engine then stops generating when the street in front of you is full,
 whoever filled it. Nobody's city is empty, nobody's city is doubled, and the
 density is the one the game was tuned for.
 
+### 1.3.0 Traffic does hand off now, as of 2026-09-23
+
+The "no handoff, deliberately" below is still the rule for a car nobody is in,
+and it is still right: an ambient car belongs to the machine whose `CCarCtrl`
+made it, and a player leaving takes their traffic with them.
+
+What changed is the one case it could not describe. A player taking the **wheel**
+of somebody else's traffic car needs a seat, and this roster has an owner and no
+seats — so every observer went on drawing that player's ped in the road beside a
+car its original host was still steering. That car stops being traffic and
+becomes a session car, under the same netId, with nothing created or destroyed on
+any machine. `protocol.md` §1.21 is the design and `roadmap.md` §5.8.2 is why it
+is the session's own claim rather than a second mechanism here.
+
 ### 1.3.1 Measured 2026-09-22: for pedestrians, the engine was already doing it
 
 The counter rewriting above turned out to be unnecessary on the ped side, and
@@ -435,9 +449,118 @@ else walks around is not something a joiner should walk through.
 - **Who killed him is not carried.** `C_Death` has a `killerNetId` because a
   session keeps score for players. Nothing keeps score for pedestrians, and
   the byte would buy nothing but a line in a log.
-- **A replica that dies on its own is still not reported anywhere.** The
-  local engine's `m_fHealth <= 1.0f` auto-`SetDie` or a stray explosion can
-  still put one there, and `ApplyAmbientPedState` has refused to drive a walk
-  into it since step 6. That is an observer disagreeing with its host about
-  one pedestrian and it is not new; what is new is that the common cause of
-  it - the host having killed him - no longer produces it.
+- ~~**A replica that dies on its own is still not reported anywhere.**~~
+  **Closed, and deliberately without a packet - see §5.7.**
+
+---
+
+## 5.7 A replica that dies on its own
+
+The case §5.6 left open, and the answer to it is that nothing goes on the
+wire. That is the finding, not a shortcut: the opcode block reserved for this
+was handed back unused.
+
+### 5.7.1 Report is the wrong shape
+
+Everything else in §5 carries a fact from the machine entitled to know it to
+the machines that are not. This is the opposite. When an observer's copy of
+somebody else's pedestrian dies, **the host's pedestrian is alive and
+walking**. The observer has not discovered anything; it has made a decision it
+is not entitled to make. A packet announcing it would ask the server to
+arbitrate between a machine that is right and a machine that is wrong about
+the same person, and there is nothing there to arbitrate.
+
+So the fix is local on both halves, and there are two of them because the
+engine reaches a dead pedestrian through two doors.
+
+### 5.7.2 The door almost everything uses: `CPed::SetDie`
+
+`CPed::SetDie` (0x004D37D0) has eleven call sites in the retail image. Three
+are script command handlers and a fourth (0x004EB470) is only reached from
+two of those, so nothing a replica can meet. Two are inside
+`CPed::InflictDamage`, which has refused to touch a replica at all since the
+pedestrian-damage path landed. That leaves five:
+
+| site | function | what has to be true |
+|---|---|---|
+| 0x004C8E28 | `CPed::ProcessControl` | `m_fHealth <= 1.0f` (the constant at 0x005F8440 **is** 1.0f - the claim in §5.6 checked out) and `m_nPedState <= 0x22` |
+| 0x004D0F95 | `CPed::SetGetUp` | crushed under a car: `m_fHealth < 1.0f`, and it writes `m_fHealth = 0` at 0x004D0F7A *before* it calls |
+| 0x004E0D88 | `CPed::EnterCar` | the car it was walking to is gone or wrecked, or its health is already `<= 0` |
+| 0x0053BDFE, 0x0053BE60 | `CAutomobile::BlowUpCar` | an occupant whose `m_nPedState != PED_DRIVING` |
+
+All five are refused for a replica, unless CoopIII's own `KillAmbientReplica`
+is the caller - it kills through the engine's address, so through the same
+detour, and it says so with a `HostDeathScope`.
+
+**The refusal is on the object and not on the damage cause**, and that is the
+load-bearing part. `SpawnAmbientReplica` sets four `CEntity` proof flags plus
+`bExplosionProof`, and they are a backstop rather than a mechanism:
+`CPed::InflictDamage` dispatches through the jump table at 0x005F9EB8 and
+**six of its causes read no flag at all** - 12, 13, 14, 15 (`ARMOUR`), 19
+(`UZI_DRIVEBY`) and 20 (`DROWNING`), plus everything from 22 up. That is the
+same thing protocol 23 found for `CVehicle::InflictDamage`, where five causes
+leak, and it is why a guard that enumerates causes is a guard that will be
+wrong again. `client/src/game/population.h`'s `PedProofForDamageCause` has the
+whole table with the address of every arm, and `clienttest` walks all 256
+values of it.
+
+The refusal also puts the health back to 100.0f, which is what `CPed::CPed`
+gives a new pedestrian (0x004C4225). Two of those callers zero the health
+*before* they call, and a replica left walking around on zero health is one
+`CPed::ProcessControl` would bring straight back to `SetDie` on every frame
+for the rest of the session.
+
+### 5.7.3 The door that never touches `SetDie`, and the backstop for it
+
+`CAutomobile::BlowUpCar` (0x0053BC60) kills its driver at 0x0053BDA7 and each
+passenger at 0x0053BE07, reading no proof flag on either, and it picks its arm
+on `m_nPedState == PED_DRIVING` (0x0053BDC4, 0x0053BE26). A **seated** replica
+- which is every traffic-driver replica - takes the other arm: `CPed::SetDead`
+(0x004D3970, `m_fHealth = 0` at 0x004D397B), then vtable +0x40,
+`FlagToDestroyWhenNextProcessed`. That is a different address, and no guard on
+`CPed::SetDie` can ever see it. `CBoat::BlowUpCar` does the same at
+0x00541D68.
+
+So `AmbientReplicaIsAlive` grows a third condition, beside the two it already
+has: a replica that resolves, is still ours, and reads `PED_DIE` or `PED_DEAD`
+while `RemoteAmbientPed::dead` is false, is **not alive**. The body is taken
+away through the ordinary despawn - a corpse left behind would lie there for
+good, since it is a `MISSION_CHAR` and `CanBeDeleted` refuses it - and the
+spawn is re-armed. `Client::UpdateRemoteAmbientPeds` runs the liveness check
+before the spawn pass, the death pass and the seat pass, so the rebuild, the
+`deathApplied` reset and the re-seating all land on the same frame.
+
+Two things about that test are the point:
+
+- it is on the **state**, not on the route, so it is complete by
+  construction - including for routes nobody has found yet;
+- `ped.dead` is what stops it being a resurrection machine. Without it every
+  corpse the host legitimately reported would be rebuilt on the frame after
+  `KillAmbientReplica` laid it down, and killed again on the one after that,
+  for as long as the body lay there.
+
+### 5.7.4 What this does not do, and the car-shaped twin of it
+
+The same question for a **traffic car replica** is open and is worse, because
+nothing guards it at all. `SpawnAmbientCarReplica` sets no proof flag;
+`CorrectAmbientCarReplica` sets `bCollisionProof` and only while the local
+player is not driving; `game/vehicle.cpp`'s `CVehicle::InflictDamage` detour
+refuses only cars the session records a live *driver* for, and so does its
+`BlowUpCar` detour. So bullets, fire and blasts take health off an ambient car
+replica locally, and at zero health this machine wrecks a car whose owner
+never touched it - §1.11.1's bug, in the one place that change did not reach.
+It is also the only remaining way to kill a pedestrian replica, since it is
+what calls `BlowUpCar` in the first place; the backstop above rebuilds the
+driver, but the car stays a wreck on one screen and intact on the other.
+
+That is a finding rather than a change here: it belongs to whoever owns the
+car seam, and doing it properly means refusing the damage *and* the blow-up
+together, exactly as protocol 23 had to do both halves for a player's car.
+
+**Closed, see `protocol.md` §1.23.** The finding held. One correction to
+§5.7.3: `0x0053BDA7` and `0x0053BE07` are where `BlowUpCar` loads
+the driver and each passenger; the `CPed::SetDead` calls themselves are at
+`0x0053BDCD` and `0x0053BE2F`. A replica now refuses both damage and
+`BlowUpCar`, holds the health its host streams, and hits the local player lands
+on it go to the host as `C_CarHit`. The rebuild in §5.7.3 stays as the
+backstop for routes nobody has found.

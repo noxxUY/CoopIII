@@ -11,7 +11,11 @@
 
 #include "session.h"
 
+#include "coopiii/net.h"
+
 #include <cstdio>
+#include <cstring>
+#include <limits>
 #include <string>
 
 using namespace coopiii;
@@ -312,6 +316,31 @@ void TestADeadPlayerIsInNoSeat() {
 	      "but the car is still there - somebody parked it, it did not vanish");
 }
 
+// Busted. The client sends the police station as a C_Respawn with no C_Death
+// in front of it, because nobody died - the ped was arrested and moved. The
+// server has to take that as it is: still alive, somewhere else, out of the
+// car the cop caught them in.
+void TestAnArrestIsARespawnWithoutADeath() {
+	std::printf("\nleaving the police station, as a joiner sees it\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Vehicle *car  = Claim(s, *alice, 91);
+	s.NotePlayerState(*alice, State(100.0f, 80.0f, 50.0f));
+
+	s.NotePlayerRespawned(*alice, Vec3{1200.0f, -300.0f, 10.0f}, 1.5f);
+	Check(alice->alive, "never dead, still alive");
+
+	Player *bob = Join(s, 2, "bob");
+	const Backfill      fill = s.BuildBackfill(bob->id, 1);
+	const S_PlayerJoin *j    = FindJoin(fill, alice->id);
+	Check(j != nullptr && (j->flags & PJF_DEAD) == 0, "bob is not told she is dead");
+	Check(j != nullptr && j->pos.x == 1200.0f, "he is told she is at the police station");
+	Check(j != nullptr && j->health == 100.0f && j->armour == 0.0f,
+	      "on what the station hands back");
+	Check(fill.seats.empty() && car->driverPlayerId == INVALID_PLAYER,
+	      "and not in the car she was arrested in");
+}
+
 void TestABackfilledCarCarriesItsCondition() {
 	std::printf("\nwhat a joiner is told about a car\n");
 	Session s;
@@ -422,9 +451,22 @@ void TestOnlyTheDriverMayReportTheCar() {
 	// do was move a car. Now the same packet carries VEH_WRECKED, so a
 	// permissive gate is a way for any player in the session to delete any
 	// car from every future backfill.
+	//
+	// Getting out no longer ends her right to report it *immediately*, and
+	// that is the custody change rather than a hole: she is the one machine
+	// asked to finish whatever the car was doing, because she was driving it
+	// a frame ago and is standing next to it. What has not changed is that
+	// nobody else may, and that the right ends the moment she says the car
+	// has settled.
 	s.NoteExitVehicle(*alice, car->netId);
+	Check(s.MayReportVehicle(alice->id, car->netId),
+	      "once she is out she is the one settling it, so she still may");
+	Check(!s.MayReportVehicle(bob->id, car->netId),
+	      "and the passenger still may not");
+	Check(s.EndCustody(car->netId, alice->id),
+	      "she can hand it back when it has come to rest");
 	Check(!s.MayReportVehicle(alice->id, car->netId),
-	      "and not once she has got out of it");
+	      "and then she may not either - nobody simulates it now");
 }
 
 void TestAPassengerGetsOutOfAWreck() {
@@ -468,6 +510,98 @@ void TestSteppingStraightFromOneCarIntoAnother() {
 	Check(back.seats.size() == 1 && back.seats[0].body.netId == second->netId,
 	      "a joiner is told about one seat, in the car she is actually in");
 	Check(back.vehicles.size() == 2, "and about both cars");
+}
+
+// ---- the carjack -----------------------------------------------------------
+//
+// The one decision in this whole area that only the server can make.
+//
+// A carjack happens in exactly one process: the jacker's engine plays the
+// animation, drags the victim's replica out of the seat and puts its own player
+// behind the wheel. The victim's engine is never told anything and still has
+// *its* player behind the wheel. Both clients then answer "we drive that car"
+// to CVehicle::m_pDriver, which is the only question either of them can ask,
+// and neither is wrong from where it is standing. Nothing a client can look at
+// breaks that tie.
+//
+// The session's record does. Before this, it broke it badly: the name in
+// driverPlayerId was simply overwritten, the player the car had been taken from
+// was never told, and the record kept them in seat 0 of a car it now said
+// somebody else was driving. Their machine went on believing it owned the car
+// for the rest of the session - refusing every snapshot the new owner sent, so
+// the car stood still on that screen while it was driven away on the other -
+// and its own snapshots were dropped by MayReportVehicle, so nothing it did
+// with the car reached anybody either.
+void TestAJackTakesTheCarOffThePlayerWhoHadIt() {
+	std::printf("\none car, two players who both think they are driving it\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+
+	Vehicle       *car   = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+	Check(car->driverPlayerId == alice->id, "alice is at the wheel");
+	Check(s.MayReportVehicle(alice->id, netId), "so the session believes her snapshots");
+
+	const uint8_t displaced = s.NoteEnterVehicle(*bob, *car, /*seat=*/0);
+	Check(displaced == alice->id,
+	      "bob taking the wheel says who he took it from - which is the only "
+	      "way she can ever be told");
+	Check(car->driverPlayerId == bob->id, "the car is his now");
+	Check(alice->vehicleNetId == INVALID_NETID,
+	      "and she is recorded out of it, so no joiner is told two people are "
+	      "in one seat");
+	Check(!s.MayReportVehicle(alice->id, netId), "her snapshots stop being believed");
+	Check(s.MayReportVehicle(bob->id, netId), "and his start");
+
+	// A joiner arriving now is told about one seat, bob's.
+	Player       *carol = Join(s, 3, "carol");
+	const Backfill back = s.BuildBackfill(carol->id, 1);
+	Check(back.seats.size() == 1 && back.seats[0].playerId == bob->id,
+	      "and a joiner is told about one driver, not two");
+}
+
+void TestTakingAnEmptySeatIsNotAJack() {
+	std::printf("\nwhat is not a jack\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+
+	Vehicle *parked = s.AddVehicle(91, 1, 2, Vec3{1.0f, 1.0f, 1.0f},
+	                              Quat{0.0f, 0.0f, 0.0f, 1.0f});
+	Check(s.NoteEnterVehicle(*bob, *parked, /*seat=*/0) == INVALID_PLAYER,
+	      "a parked car had nobody to take it from");
+	Check(s.NoteEnterVehicle(*bob, *parked, /*seat=*/0) == INVALID_PLAYER,
+	      "and a repeat of the same claim does not displace the claimer");
+
+	// A passenger climbing in does not take the car off its driver. That is the
+	// whole reason the test is on seat 0 rather than on "somebody got in".
+	Vehicle *hers = Claim(s, *alice, 105);
+	Check(s.NoteEnterVehicle(*bob, *hers, /*seat=*/2) == INVALID_PLAYER,
+	      "and riding in the back is not a jack");
+	Check(hers->driverPlayerId == alice->id, "alice keeps the wheel");
+	Check(s.MayReportVehicle(alice->id, hers->netId), "and keeps reporting it");
+}
+
+void TestAJackedCarKeepsItsPassengers() {
+	std::printf("\njacking a car with somebody in the back\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Player *carol = Join(s, 3, "carol");
+
+	Vehicle *car = Claim(s, *alice, 91);
+	s.NoteEnterVehicle(*bob, *car, /*seat=*/1);
+
+	// Carol jacks alice. Bob is in the back and stays there, exactly as the
+	// engine's own jack leaves him: only the driver's seat carries ownership
+	// and only the driver's seat changes hands.
+	Check(s.NoteEnterVehicle(*carol, *car, /*seat=*/0) == alice->id,
+	      "carol took it off alice");
+	Check(bob->vehicleNetId == car->netId && bob->seat == 1,
+	      "and bob is still sitting in the back of it");
+	Check(!s.MayReportVehicle(bob->id, car->netId),
+	      "a passenger still speaks for nothing");
 }
 
 void TestTheJoinerIsNotInTheirOwnBackfill() {
@@ -628,6 +762,73 @@ void TestAJoinerIsHandedTheCorpses() {
 	Check(back.pedDeaths[0].body.animId == 20,
 	      "lying the way he fell rather than in the default knockdown");
 	Check(walking->netId != deadNetId, "and the live one is untouched");
+}
+
+void TestOnlySomebodyElseMayShootYourPed() {
+	std::printf("\nwho gets to say an ambient ped was shot\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+
+	AmbientPed *ped = s.AddPed(alice->id, PedBody(7, 4, 5.0f));
+	const uint16_t netId = ped->netId;
+
+	// Every other ambient claim - a despawn, a limb, a death - is refused to
+	// anybody but the owner. This one is the only packet that goes the other
+	// way, so the rule is inverted, and the inversion is the point: a hit is
+	// resolved on the shooter's machine from a ray only the shooter has.
+	Player *to = s.PedDamageRecipient(netId, bob->id);
+	Check(to == alice, "bob's hit on alice's pedestrian is routed to alice");
+	Check(s.PedDamageRecipient(netId, alice->id) == nullptr,
+	      "and alice cannot report a hit on her own - her engine already applied it");
+
+	// Point to point. Nobody else has anything to do with it: what the rest of
+	// the session needs to see reaches them from alice afterwards.
+	Player *carol = Join(s, 3, "carol");
+	Check(s.PedDamageRecipient(netId, carol->id) == alice,
+	      "carol's hit on the same pedestrian goes to alice too, and only to her");
+
+	// A pedestrian the session has never had. Not an error - a despawn is
+	// reliable and a hit races it - and not invented into existence either.
+	Check(s.PedDamageRecipient(9999, bob->id) == nullptr,
+	      "a pedestrian the session never named is refused");
+
+	// Already on the floor. The owner's own CPed::InflictDamage refuses a ped
+	// that is dying or dead at 0x004EA485, so this only saves the trip - but a
+	// burst that was in flight when he dropped is the ordinary case, not a rare
+	// one.
+	PedDeathBody death{};
+	death.netId  = netId;
+	death.animId = 17;
+	Check(s.NotePedDeath(death, alice->id), "he dies");
+	Check(s.PedDamageRecipient(netId, bob->id) == nullptr,
+	      "and the rest of the burst is not relayed onto the corpse");
+}
+
+void TestFriendlyFireHasNoSayOverPedestrians() {
+	std::printf("\nfriendly fire is about players, not pedestrians\n");
+
+	// The default session, which is the one the bug was reported on. Friendly
+	// fire off stops one player hurting another (docs/roadmap.md §5.2) and must
+	// not stop anybody shooting NPCs - a session where the whole city is
+	// bulletproof is the bug, not the fix.
+	Session off;
+	Check(!off.FriendlyFire(), "off is the default");
+	Player *a = Join(off, 1, "alice");
+	Player *b = Join(off, 2, "bob");
+	AmbientPed *ped = off.AddPed(a->id, PedBody(7, 4, 5.0f));
+	Check(off.PedDamageRecipient(ped->netId, b->id) == a,
+	      "and bob can still shoot alice's pedestrian");
+
+	// And it makes no difference the other way either, which is what says the
+	// flag is not consulted rather than merely happening to allow it.
+	Session on;
+	on.SetFriendlyFire(true);
+	Player *c = Join(on, 1, "alice");
+	Player *d = Join(on, 2, "bob");
+	AmbientPed *p2 = on.AddPed(c->id, PedBody(7, 4, 5.0f));
+	Check(on.PedDamageRecipient(p2->netId, d->id) == c,
+	      "with it on, the same hit is routed the same way");
 }
 
 // ---- ambient traffic (docs/population.md §3 step 4) ----------------------
@@ -1142,11 +1343,12 @@ void TestAParkedSessionCarCanBeReportedByAnybody() {
 	      "bob may not write off the car alice is driving");
 	Check(!s.FindVehicle(car->netId)->destroyed, "and it is not written off");
 
-	// She gets out. Now nobody owns it, and there is nobody left who could
-	// ever report it - which is the whole of roadmap.md 5.8.
+	// She gets out, and settles it. Now nobody owns it, and there is nobody
+	// left who could ever report it - which is the whole of roadmap.md 5.8.
 	s.NoteExitVehicle(*alice, car->netId);
+	s.EndCustody(car->netId, alice->id);
 	Check(s.NoteUnownedBlowUp(k, bob->id, 0),
-	      "once she is out, whoever was standing next to it may");
+	      "once she is out and it has settled, whoever was standing next to it may");
 	Check(s.FindVehicle(car->netId)->destroyed, "and the session agrees");
 
 	// It lands in Vehicle::destroyed rather than in a second table, because
@@ -1216,6 +1418,384 @@ void TestAWreckTakesNoMoreDamageReports() {
 	// a car less broken than the one everybody is looking at.
 	Check(!s.NoteVehicleDamage(Dent(car->netId, 3, 3), out),
 	      "and nothing after the blast does");
+}
+
+// ---- shooting somebody else's car (protocol.h, VehicleHitBody) -------------
+//
+// Every other packet about a claimed car is a statement about the sender's own
+// world, and MayReportVehicle is the one rule that checks all of them. This one
+// runs the other way, so its rule is the inverse - and the inverse is what
+// these tests are about, because getting it the right way round is the whole
+// difference between a working feature and a machine being talked into
+// damaging a car it is only watching.
+void TestAHitOnACarIsRoutedToItsDriver() {
+	std::printf("\na hit on a car is routed to whoever is driving it\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+
+	Check(s.VehicleHitRecipient(car->netId, bob->id) == alice,
+	      "bob's hit on alice's car goes to alice");
+	Check(s.VehicleHitRecipient(car->netId, alice->id) == nullptr,
+	      "and alice cannot report a hit on the car she is driving - her own "
+	      "engine already applied it");
+
+	// Point to point. Nobody else has anything to do with it: what the rest of
+	// the session needs to see reaches them from alice afterwards, on the
+	// snapshot, on C_VehicleDamage and on C_VehicleBlowUp.
+	Player *carol = Join(s, 3, "carol");
+	Check(s.VehicleHitRecipient(car->netId, carol->id) == alice,
+	      "carol's hit on the same car goes to alice too, and only to her");
+
+	// A car the session has never had. Not an error - a despawn is reliable and
+	// a hit races it - and not invented into existence either.
+	Check(s.VehicleHitRecipient(9999, bob->id) == nullptr,
+	      "a car the session never named is refused");
+}
+
+void TestNobodyMayShootACarNobodyIsDriving() {
+	std::printf("\na car with nobody in it has nobody to tell\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+
+	// She parks it and walks away, and once it has settled nobody holds it.
+	// VehicleHitRecipient has nobody to route a hit to - a bystander would be
+	// taking health off a car it does not own either. The shooter gets it
+	// instead, through CustodyForHit, which Server::OnVehicleHit asks first.
+	s.NoteExitVehicle(*alice, car->netId);
+	Check(s.EndCustody(car->netId, alice->id), "she settles it");
+	Check(s.VehicleHitRecipient(car->netId, bob->id) == nullptr,
+	      "an abandoned car has no recipient of its own");
+	Check(s.VehicleHitRecipient(car->netId, alice->id) == nullptr,
+	      "not even from the player who parked it");
+
+	// And it starts taking them again the moment somebody is at the wheel,
+	// which is what says the test is about the driver rather than about the
+	// car having once had one.
+	s.NoteEnterVehicle(*alice, *car, /*seat=*/0);
+	Check(s.VehicleHitRecipient(car->netId, bob->id) == alice,
+	      "and again as soon as she gets back in");
+}
+
+void TestAWreckedCarTakesNoMoreHits() {
+	std::printf("\na burst still in the air when the car went up\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+
+	Check(s.VehicleHitRecipient(car->netId, bob->id) == alice, "it is hittable");
+	s.DestroyVehicle(car->netId);
+
+	// The owner's own CVehicle::InflictDamage would refuse it anyway - health
+	// <= 0 leaves at 0x00551A10 before the arithmetic - so this only saves the
+	// trip. A burst that was in flight when the car exploded is the ordinary
+	// case, not a rare one.
+	Check(s.VehicleHitRecipient(car->netId, bob->id) == nullptr,
+	      "and the rest of the burst is not relayed onto the wreck");
+}
+
+void TestAPassengerMayNotShootTheCarHeIsSittingIn() {
+	std::printf("\na passenger is not the driver, in either direction\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	s.NoteEnterVehicle(*bob, *car, /*seat=*/1);
+
+	// Bob is in the car and is still not its owner - the same rule
+	// MayReportVehicle applies to his snapshots. So a hit he lands goes to
+	// alice like anybody else's, rather than being refused as "his own car" or
+	// routed to himself.
+	Check(s.VehicleHitRecipient(car->netId, bob->id) == alice,
+	      "a passenger's hit is still routed to the driver");
+}
+
+void TestFriendlyFireHasNoSayOverCars() {
+	std::printf("\nfriendly fire is about players, not cars\n");
+
+	// The default session. Friendly fire off stops one player hurting another
+	// (docs/roadmap.md 5.2) and must not stop anybody shooting a car - a
+	// session where every car is bulletproof is the bug, not the fix. It is
+	// also not the lever anybody would want: with it off you can still ram the
+	// same car off a bridge.
+	Session off;
+	Check(!off.FriendlyFire(), "off is the default");
+	Player *a = Join(off, 1, "alice");
+	Player *b = Join(off, 2, "bob");
+	Vehicle *car = Claim(off, *a, 91);
+	Check(off.VehicleHitRecipient(car->netId, b->id) == a,
+	      "and bob can still shoot alice's car");
+
+	// And it makes no difference the other way either, which is what says the
+	// flag is not consulted rather than merely happening to allow it.
+	Session on;
+	on.SetFriendlyFire(true);
+	Player *c = Join(on, 1, "alice");
+	Player *d = Join(on, 2, "bob");
+	Vehicle *car2 = Claim(on, *c, 91);
+	Check(on.VehicleHitRecipient(car2->netId, d->id) == c,
+	      "with it on, the same hit is routed the same way");
+}
+
+void TestAHitIsTheInverseOfEveryOtherCarPacket() {
+	std::printf("\nthe one car packet whose ownership rule runs backwards\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+
+	// Stated as the pair rather than as two separate facts, because the pair is
+	// the invariant: for a given car and a given player, exactly one of "may I
+	// describe it" and "should I be told about a hit on it" can be true, and
+	// which one it is never depends on anything but the driver.
+	Check(s.MayReportVehicle(alice->id, car->netId) &&
+	          s.VehicleHitRecipient(car->netId, alice->id) == nullptr,
+	      "the driver describes the car and is never told about hits on it");
+	Check(!s.MayReportVehicle(bob->id, car->netId) &&
+	          s.VehicleHitRecipient(car->netId, bob->id) == alice,
+	      "everybody else lands hits on it and never describes it");
+
+	// Nothing is recorded. A hit is not a state a joiner has to be handed - the
+	// health it produced lives on the owner's machine and reaches the session
+	// on the snapshot that has always carried it - so asking twice gives the
+	// same answer rather than a smaller one.
+	Check(s.VehicleHitRecipient(car->netId, bob->id) == alice &&
+	          s.VehicleHitRecipient(car->netId, bob->id) == alice,
+	      "and the session keeps no record of one, so it does not run out");
+}
+
+// A car somebody is settling (S_VehicleCustody). The custodian's engine is the
+// one simulating it and streaming its health, so a hit goes to them the way it
+// goes to a driver - MayReportVehicle's precedence, turned round.
+void TestAHitOnACarInCustodyGoesToTheCustodian() {
+	std::printf("\na hit on a car somebody is settling goes to them\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	s.NoteExitVehicle(*alice, car->netId);
+	Check(s.CustodianOf(car->netId) == alice->id, "alice is settling it");
+
+	Check(s.VehicleHitRecipient(car->netId, bob->id) == alice,
+	      "bob's hit goes to alice, whose engine is the one simulating it");
+	Check(s.VehicleHitRecipient(car->netId, alice->id) == nullptr,
+	      "and alice's own is hers already - her engine applied it");
+	Check(s.MayReportVehicle(alice->id, car->netId) &&
+	          !s.MayReportVehicle(bob->id, car->netId),
+	      "the same one machine that may describe it");
+
+	// It settles. A hit fired during the settle that lands now has nobody to
+	// go to - the car is nobody's, like any parked car.
+	s.EndCustody(car->netId, alice->id);
+	Check(s.VehicleHitRecipient(car->netId, bob->id) == nullptr,
+	      "after the settle, a late hit is dropped");
+}
+
+void TestACustodyEndingMovesTheHitsOn() {
+	std::printf("\nthe three other ways a custody ends, with a hit in flight\n");
+
+	// Somebody gets in. The hit goes to the new driver.
+	{
+		Session s;
+		Player *alice = Join(s, 1, "alice");
+		Player *bob   = Join(s, 2, "bob");
+		Player *carol = Join(s, 3, "carol");
+		Vehicle *car  = Claim(s, *alice, 91);
+		s.NoteExitVehicle(*alice, car->netId);
+		s.NoteEnterVehicle(*bob, *car, /*seat=*/0);
+		Check(s.VehicleHitRecipient(car->netId, carol->id) == bob,
+		      "bob got in: carol's hit is his");
+		Check(s.VehicleHitRecipient(car->netId, alice->id) == bob,
+		      "and alice's too, now she isn't settling it");
+	}
+
+	// The custodian quits. Handed to nobody, so nobody takes it.
+	{
+		Session s;
+		Player *alice = Join(s, 1, "alice");
+		Player *bob   = Join(s, 2, "bob");
+		Vehicle *car  = Claim(s, *alice, 91);
+		const uint16_t netId = car->netId;
+		s.NoteExitVehicle(*alice, netId);
+		s.RemovePeer(1);
+		Check(s.CustodianOf(netId) == INVALID_PLAYER, "her custody went with her");
+		Check(s.VehicleHitRecipient(netId, bob->id) == nullptr,
+		      "and bob's hit has nobody to go to");
+	}
+
+	// It blows up during the settle.
+	{
+		Session s;
+		Player *alice = Join(s, 1, "alice");
+		Player *bob   = Join(s, 2, "bob");
+		Vehicle *car  = Claim(s, *alice, 91);
+		s.NoteExitVehicle(*alice, car->netId);
+		s.DestroyVehicle(car->netId);
+		Check(s.VehicleHitRecipient(car->netId, bob->id) == nullptr,
+		      "the rest of the burst is not relayed onto the wreck");
+	}
+}
+
+void TestOnlyTheCustodianWritesOffACarInCustody() {
+	std::printf("\na car blown up while somebody is settling it\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	s.NoteExitVehicle(*alice, car->netId);
+
+	UnownedVehicleKey k{};
+	k.kind = UNOWNED_SESSION;
+	k.id   = car->netId;
+
+	// Every client but the custodian refuses to blow it up, so a report from
+	// one of them is a copy that went its own way.
+	Check(!s.NoteUnownedBlowUp(k, bob->id, 0),
+	      "bob may not write off the car alice is settling");
+	Check(!s.FindVehicle(car->netId)->destroyed, "and it is not written off");
+
+	Check(s.NoteUnownedBlowUp(k, alice->id, 10), "alice may");
+	Check(s.FindVehicle(car->netId)->destroyed, "and the session agrees");
+	Check(s.CustodianOf(car->netId) == INVALID_PLAYER,
+	      "which ends her custody: a wreck has nothing left to settle");
+	Check(!s.NoteUnownedBlowUp(k, bob->id, 20) && !s.NoteUnownedBlowUp(k, alice->id, 30),
+	      "and it is written off once");
+}
+
+// A hit on a session car nobody holds. Every machine pins such a car's health
+// at the last report, so a hit taken locally lasted a frame and a parked car
+// could not be shot into a fire. The shooter becomes its custodian instead,
+// and its engine keeps the health and the fire timer for everybody.
+void TestAHitOnACarNobodyHoldsMakesTheShooterItsCustodian() {
+	std::printf("\na hit on a session car nobody holds\n");
+	using HC = Session::HitCustody;
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Player *carol = Join(s, 3, "carol");
+	Vehicle *car  = Claim(s, *alice, 91);
+	s.NoteExitVehicle(*alice, car->netId);
+	s.EndCustody(car->netId, alice->id);
+	Check(s.CustodianOf(car->netId) == INVALID_PLAYER, "parked, nobody holds it");
+
+	Check(s.CustodyForHit(car->netId, bob->id) == HC::Granted,
+	      "bob shoots it and it is his to settle");
+	Check(s.CustodianOf(car->netId) == bob->id && s.MayReportVehicle(bob->id, car->netId),
+	      "so his snapshot is the one that carries its health");
+	Check(s.CustodyForHit(car->netId, bob->id) == HC::AlreadyTheirs,
+	      "his next round, fired before he heard, goes back to him");
+	Check(s.CustodyForHit(car->netId, carol->id) == HC::NotTheirs &&
+	          s.VehicleHitRecipient(car->netId, carol->id) == bob,
+	      "carol's goes to him too, the way any custody's does");
+
+	UnownedVehicleKey k{};
+	k.kind = UNOWNED_SESSION;
+	k.id   = car->netId;
+	Check(!s.NoteUnownedBlowUp(k, carol->id, 0),
+	      "only he may say it burned out - his is the one fire timer running");
+	Check(s.NoteUnownedBlowUp(k, bob->id, 10), "and he may");
+	Check(s.CustodyForHit(car->netId, carol->id) == HC::NotTheirs,
+	      "a wreck is nobody's to take");
+
+	// With a driver it is the driver's, whoever shoots it.
+	Vehicle *car2 = Claim(s, *alice, 92);
+	Check(s.CustodyForHit(car2->netId, bob->id) == HC::NotTheirs &&
+	          s.CustodianOf(car2->netId) == INVALID_PLAYER,
+	      "a driven car gives nobody custody");
+	Check(s.CustodyForHit(9999, bob->id) == HC::NotTheirs, "nor a car there isn't");
+	s.NoteExitVehicle(*alice, car2->netId);
+	s.EndCustody(car2->netId, alice->id);
+	Check(s.CustodyForHit(car2->netId, 7) == HC::NotTheirs &&
+	          s.CustodianOf(car2->netId) == INVALID_PLAYER,
+	      "nor a player there isn't");
+}
+
+// ---- shooting somebody else's traffic (docs/protocol.md §1.23) -------------
+//
+// The same inversion with the host in the driver's place. The rule it inverts
+// is NoteCarState's: only the host streams a traffic car, so only somebody who
+// isn't the host gets to report a hit on it, and the host is who hears it.
+void TestAHitOnTrafficIsRoutedToItsHost() {
+	std::printf("\na hit on a traffic car goes to the machine hosting it\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Player *carol = Join(s, 3, "carol");
+	AmbientCar *car = s.AddCar(alice->id, CarBody(91, 5.0f));
+	const uint16_t netId = car->netId;
+
+	Check(s.CarHitRecipient(netId, bob->id) == alice,
+	      "bob's hit on alice's traffic goes to alice");
+	Check(s.CarHitRecipient(netId, carol->id) == alice,
+	      "carol's too, and only to her");
+	Check(s.CarHitRecipient(netId, alice->id) == nullptr,
+	      "alice can't report one on her own traffic - her engine already applied it");
+	Check(s.CarHitRecipient(9999, bob->id) == nullptr,
+	      "a car the session never named is refused");
+
+	// The pair, stated together because the pair is the invariant.
+	AmbientCarState moved{};
+	moved.netId = netId;
+	moved.rot   = {0.0f, 0.0f, 0.0f, 1.0f};
+	Check(s.NoteCarState(moved, alice->id) &&
+	          s.CarHitRecipient(netId, alice->id) == nullptr,
+	      "the host streams the car and is never told about hits on it");
+	Check(!s.NoteCarState(moved, bob->id) && s.CarHitRecipient(netId, bob->id) == alice,
+	      "everybody else lands hits on it and never streams it");
+
+	// Nothing is recorded, so asking twice gives the same answer.
+	Check(s.CarHitRecipient(netId, bob->id) == alice &&
+	          s.CarHitRecipient(netId, bob->id) == alice,
+	      "and the session keeps no record of a hit");
+}
+
+void TestTrafficThatIsGoneTakesNoHits() {
+	std::printf("a traffic car that is a wreck, promoted, or hostless takes no hits\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+
+	// Burned out, as its host reported. A burst in flight when it went up is
+	// the ordinary case.
+	const uint16_t burnt = s.AddCar(alice->id, CarBody(91, 1.0f))->netId;
+	Check(s.NoteUnownedBlowUp(AmbientKey(burnt), alice->id, 0), "alice writes it off");
+	Check(s.CarHitRecipient(burnt, bob->id) == nullptr, "and hits on the shell stop");
+
+	// Promoted: somebody took the wheel and it's a session car now. A hit
+	// that was in flight across that is dropped, not rerouted - the driven
+	// car's own exchange takes over from the next shot.
+	const uint16_t taken = s.AddCar(alice->id, CarBody(92, 2.0f))->netId;
+	uint8_t        wasOwner = INVALID_PLAYER;
+	AmbientCarBody body{};
+	Check(s.PromoteCar(taken, bob->id, wasOwner, body) != nullptr, "bob takes one");
+	Check(s.CarHitRecipient(taken, bob->id) == nullptr &&
+	          s.CarHitRecipient(taken, alice->id) == nullptr,
+	      "and it's no longer traffic, so this exchange has nobody to tell");
+
+	// The host left. The server drops their cars too (Server::DropCarsOf),
+	// but the lookup mustn't depend on that having run first.
+	const uint16_t orphan = s.AddCar(alice->id, CarBody(93, 3.0f))->netId;
+	s.RemovePeer(1);
+	Check(s.CarHitRecipient(orphan, bob->id) == nullptr,
+	      "a host who has gone can't be told anything");
+}
+
+void TestTrafficAndDrivenHitsDoNotCross() {
+	std::printf("the two hit exchanges each answer only for their own kind of car\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	const uint16_t traffic = s.AddCar(alice->id, CarBody(91, 1.0f))->netId;
+	Vehicle *driven = Claim(s, *alice, 90);
+
+	Check(s.VehicleHitRecipient(traffic, bob->id) == nullptr,
+	      "C_VehicleHit naming a traffic car goes nowhere");
+	Check(s.CarHitRecipient(driven->netId, bob->id) == nullptr,
+	      "and C_CarHit naming a driven car goes nowhere");
 }
 
 // The collision between the damage work and the garage work: the first left
@@ -1412,6 +1992,77 @@ void TestLosingAWeaponIsNewsAndThenForgotten() {
 	      "and the joiner is not sent an absence");
 }
 
+// ---------------------------------------------------------------------------
+// The two street-object relays
+// ---------------------------------------------------------------------------
+//
+// The server's whole job for a broken or a knocked-over street object is to
+// stamp the sender and pass it on: no row, no table, no backfill. That is a
+// decision rather than an omission, and docs/objects.md 1 is the argument -
+// CPopulation::ManagePopulation converts the object back to a pristine dummy
+// 80 m out and throws the state away, so anything remembered here would
+// outlive the fact it recorded.
+//
+// What there *is* to test without a socket is the one thing that would
+// actually break: the agreement between the opcode a client sends and the
+// size the server's dispatch is willing to read. Message::as<T> is exactly
+// that check and nothing else, so driving it here drives the real gate.
+template <class T>
+Message Packet(const T &pkt) {
+	Message m;
+	m.opcode  = T::OPCODE;
+	m.channel = CH_EVENT;
+	m.data.resize(sizeof(T));
+	std::memcpy(m.data.data(), &pkt, sizeof(T));
+	return m;
+}
+
+void TestAStreetObjectRelayIsStampedAndPassedOn() {
+	std::printf("\nstreet objects: what the server is willing to read\n");
+
+	C_ObjectSettled in;
+	in.hdr.opcode           = C_ObjectSettled::OPCODE;
+	in.body.ident.pos       = {1234.5f, -678.0f, 12.0f};
+	in.body.ident.modelIndex = 1393;
+	in.body.right           = {1.0f, 0.0f, 0.0f};
+	in.body.forward         = {0.0f, 0.0f, -1.0f};
+	in.body.up              = {0.0f, 1.0f, 0.0f};
+	in.body.pos             = {1235.8f, -678.3f, 10.4f};
+
+	const Message m = Packet(in);
+	Check(m.as<C_ObjectSettled>() != nullptr,
+	      "a resting place of the right size and opcode is read");
+	Check(m.as<C_ObjectBroken>() == nullptr,
+	      "and is never mistaken for a break - the two are different opcodes "
+	      "and different sizes");
+
+	// A truncated one is refused rather than read short, which is the whole
+	// reason the server's dispatch goes through as<T> instead of casting.
+	Message cut = m;
+	cut.data.pop_back();
+	Check(cut.as<C_ObjectSettled>() == nullptr, "a byte short is not a packet");
+
+	// The relay is the client packet with one byte in front of the body, and
+	// that byte is the only thing the server adds. Pinning the arithmetic
+	// here is what stops a field being quietly added to one half.
+	Check(sizeof(S_ObjectSettled) == sizeof(C_ObjectSettled) + 1,
+	      "the relay is the report plus the reporter's id and nothing else");
+	Check(sizeof(S_ObjectBroken) == sizeof(C_ObjectBroken) + 1,
+	      "same as the break, which is the shape this copies");
+
+	// And the reason there is no backfill to test: a joiner is handed
+	// vehicles, their damage and the roster, and nothing about the map.
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	(void)alice;
+	Player *bob = Join(s, 2, "bob");
+	const Backfill back = s.BuildBackfill(bob->id, 1);
+	Check(back.vehicles.empty() && back.vehicleDamage.empty(),
+	      "a joiner in an empty session is handed nothing, and a lamp post "
+	      "somebody flattened is not on that list either - the engine will "
+	      "have stood it back up by the time he is in");
+}
+
 void TestNothingIsBackfilledWithTheSwitchOff() {
 	std::printf("with ammo sync off the backfill says nothing about ammunition\n");
 	Session s;
@@ -1428,7 +2079,1293 @@ void TestNothingIsBackfilledWithTheSwitchOff() {
 	      "and it is there the moment the option goes on");
 }
 
+// ---- who simulates a car nobody is driving (protocol.h, S_VehicleCustody) --
+
+void TestGettingOutHandsTheCarToTheDriverWhoLeftIt() {
+	std::printf("\nwho settles a car nobody is driving\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+
+	Check(s.CustodianOf(car->netId) == INVALID_PLAYER,
+	      "a car with a driver has no custodian - the driver is simulating it");
+
+	s.NoteExitVehicle(*alice, car->netId);
+	Check(s.CustodianOf(car->netId) == alice->id,
+	      "and the moment she gets out it is hers to settle");
+	Check(car->driverPlayerId == INVALID_PLAYER,
+	      "which is not the same thing as still driving it");
+
+	// The whole of the stability argument in one line: the session host has
+	// nothing to do with this. bob is the lowest-numbered player and would be
+	// the host in any election, and a car alice parked is not his to simulate
+	// - his engine may not even have the street it is standing in.
+	Check(s.CustodianOf(car->netId) != bob->id,
+	      "and not the host's, whoever the host happens to be");
+}
+
+void TestOnlyTheCustodianCanHandACarBack() {
+	std::printf("\nending a custody\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	s.NoteExitVehicle(*alice, car->netId);
+
+	Check(!s.EndCustody(car->netId, bob->id),
+	      "bob cannot declare somebody else's car settled");
+	Check(s.CustodianOf(car->netId) == alice->id, "so it is still alice's");
+	Check(!s.EndCustody(999, alice->id), "nor can anybody for a car that is not there");
+	Check(s.EndCustody(car->netId, alice->id), "the custodian can");
+	Check(s.CustodianOf(car->netId) == INVALID_PLAYER,
+	      "and then nobody is simulating it, which is a car everyone pins");
+	Check(!s.EndCustody(car->netId, alice->id),
+	      "and she cannot end it twice");
+}
+
+void TestADriverEndsACustody() {
+	std::printf("\nsomebody gets into a car that was settling\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	s.NoteExitVehicle(*alice, car->netId);
+	Check(s.CustodianOf(car->netId) == alice->id, "alice is settling it");
+
+	s.NoteEnterVehicle(*bob, *car, /*seat=*/0);
+	Check(car->driverPlayerId == bob->id, "bob is driving it now");
+	Check(s.CustodianOf(car->netId) == INVALID_PLAYER,
+	      "so nobody is settling it - a driver ends a custody with no packet "
+	      "spent saying so");
+	Check(s.MayReportVehicle(bob->id, car->netId), "and bob reports it");
+	Check(!s.MayReportVehicle(alice->id, car->netId),
+	      "and alice does not, although she held it a moment ago");
+}
+
+void TestAPassengerDoesNotEndACustody() {
+	std::printf("\nsomebody gets into the back of a car that was settling\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	s.NoteExitVehicle(*alice, car->netId);
+
+	s.NoteEnterVehicle(*bob, *car, /*seat=*/2);
+	Check(s.CustodianOf(car->netId) == alice->id,
+	      "a passenger changes nothing about who is simulating it");
+	Check(!s.MayReportVehicle(bob->id, car->netId), "and he still may not report it");
+}
+
+void TestACustodianLeavingGivesTheCarBackToNobody() {
+	std::printf("\nthe machine settling a car disconnects\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+	s.NoteExitVehicle(*alice, netId);
+	Check(s.CustodianOf(netId) == alice->id, "alice is settling it");
+
+	s.RemovePeer(1);
+	// Handed to nobody rather than to the next player along. The only machine
+	// worth giving a driverless car to is one that has it streamed in, and
+	// after a disconnect the session does not know that about anybody - so it
+	// falls back to the behaviour that was there before custody existed:
+	// everybody pins it where it stands.
+	Check(s.CustodianOf(netId) == INVALID_PLAYER,
+	      "and nobody inherits it when she drops out");
+	Check(s.FindVehicle(netId) != nullptr, "the car itself is still there");
+}
+
+void TestAWreckIsNotHandedToAnybodyToSettle() {
+	std::printf("\na car that blew up has nothing left to settle\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Vehicle *car  = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+
+	s.DestroyVehicle(netId);
+	Check(s.CustodianOf(netId) == INVALID_PLAYER,
+	      "blowing up takes the driver out and hands the shell to nobody");
+	Check(!s.MayReportVehicle(alice->id, netId),
+	      "so nothing more is reported about it");
+
+	// And the other order: a car that was already being settled and then went
+	// up underneath its custodian.
+	Session t;
+	Player *bea = Join(t, 1, "bea");
+	Vehicle *c2 = Claim(t, *bea, 91);
+	t.NoteExitVehicle(*bea, c2->netId);
+	Check(t.CustodianOf(c2->netId) == bea->id, "bea is settling it");
+	t.DestroyVehicle(c2->netId);
+	Check(t.CustodianOf(c2->netId) == INVALID_PLAYER,
+	      "and the blast ends that too");
+}
+
+// ---- the dents a settling car takes ----------------------------------------
+//
+// Server::OnVehicleDamage is these two calls and a relay, in this order. The
+// relay goes to everyone but the reporter, so "reaches everyone" is the gate
+// saying yes and the merge calling it news.
+bool ReportDent(Session &s, uint8_t playerId, const VehicleDamageBody &in,
+                VehicleDamageBody &out) {
+	return s.MayReportVehicle(playerId, in.netId) && s.NoteVehicleDamage(in, out);
+}
+
+void TestTheCustodianReportsTheDentsOfASettle() {
+	std::printf("\na dent a car takes while somebody settles it\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+	s.NoteExitVehicle(*alice, netId);
+	Check(s.CustodianOf(netId) == alice->id, "alice is settling it");
+
+	VehicleDamageBody out{};
+	Check(ReportDent(s, alice->id, Dent(netId, 1, 2, 0, 2), out),
+	      "her dent is taken, with nobody at the wheel");
+	Check(GetPanelLevel(out.panels, 1) == 2 && GetDoorLevel(out.doors, 0) == 2,
+	      "and relayed as what the session now holds");
+	Check(!ReportDent(s, bob->id, Dent(netId, 3, 3), out),
+	      "bob's copy is pinned and collision-proof; his is refused");
+
+	Player *carol = Join(s, 3, "carol");
+	const Backfill back = s.BuildBackfill(carol->id, 1);
+	Check(back.vehicleDamage.size() == 1 &&
+	          GetPanelLevel(back.vehicleDamage[0].body.panels, 1) == 2,
+	      "and a joiner gets the car as the settle left it");
+}
+
+void TestADentAfterACustodyEndsIsRefused() {
+	std::printf("\nthe ways a custody ends, and a dent after each\n");
+
+	// It settled.
+	{
+		Session s;
+		Player *alice = Join(s, 1, "alice");
+		const uint16_t netId = Claim(s, *alice, 91)->netId;
+		s.NoteExitVehicle(*alice, netId);
+		VehicleDamageBody out{};
+		Check(ReportDent(s, alice->id, Dent(netId, 0, 1), out),
+		      "the last dent before C_VehicleSettled lands");
+		s.EndCustody(netId, alice->id);
+		Check(!ReportDent(s, alice->id, Dent(netId, 0, 3), out),
+		      "settled: one after it doesn't");
+	}
+
+	// Somebody got in.
+	{
+		Session s;
+		Player *alice = Join(s, 1, "alice");
+		Player *bob   = Join(s, 2, "bob");
+		Vehicle *car  = Claim(s, *alice, 91);
+		const uint16_t netId = car->netId;
+		s.NoteExitVehicle(*alice, netId);
+		s.NoteEnterVehicle(*bob, *car, /*seat=*/0);
+		VehicleDamageBody out{};
+		Check(!ReportDent(s, alice->id, Dent(netId, 0, 3), out),
+		      "a new driver: the old custodian is refused");
+		Check(ReportDent(s, bob->id, Dent(netId, 0, 3), out), "and he is taken");
+	}
+
+	// The custodian quit.
+	{
+		Session s;
+		Player *alice = Join(s, 1, "alice");
+		Player *bob   = Join(s, 2, "bob");
+		const uint16_t netId = Claim(s, *alice, 91)->netId;
+		s.NoteExitVehicle(*alice, netId);
+		s.RemovePeer(1);
+		VehicleDamageBody out{};
+		Check(!ReportDent(s, bob->id, Dent(netId, 0, 3), out),
+		      "custodian gone: nobody inherits the right to dent it");
+	}
+}
+
+void TestALaterDriversLighterDentIsStillNews() {
+	std::printf("\na lighter dent after a settle that recorded a heavy one\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+	s.NoteExitVehicle(*alice, netId);
+
+	VehicleDamageBody out{};
+	ReportDent(s, alice->id, Dent(netId, 0, 3), out);
+	s.EndCustody(netId, alice->id);
+
+	s.NoteEnterVehicle(*bob, *car, /*seat=*/0);
+	Check(ReportDent(s, bob->id, Dent(netId, 4, 1), out),
+	      "bob's scrape on another panel is news");
+	Check(!ReportDent(s, bob->id, Dent(netId, 0, 1), out),
+	      "on the wing the settle already took off, it isn't - the car is worse");
+
+	VehicleDamageBody repair{};
+	repair.netId  = netId;
+	repair.panels = VEH_DAMAGE_RESET;
+	Check(ReportDent(s, bob->id, repair, out), "he takes it through a spray shop");
+	Check(ReportDent(s, bob->id, Dent(netId, 0, 1), out),
+	      "and now the same lighter scrape is news again");
+	Check(GetPanelLevel(out.panels, 0) == 1 && GetPanelLevel(out.panels, 4) == 0,
+	      "the record is the car after the spray, not the settle's dents");
+}
+
+// ---- a traffic car that has stopped being traffic (S_CarPromoted) ----------
+
+void TestGettingIntoSomebodyElsesTrafficMovesOwnership() {
+	std::printf("\na player takes the wheel of somebody else's traffic\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+
+	AmbientCar *car = s.AddCar(alice->id, CarBody(91, 5.0f));
+	const uint16_t netId = car->netId;
+
+	uint8_t        wasOwner = INVALID_PLAYER;
+	AmbientCarBody body{};
+	Vehicle *promoted = s.PromoteCar(netId, bob->id, wasOwner, body);
+	Check(promoted != nullptr, "the session promotes it");
+	// The netId is the whole point. Every machine already has this CVehicle
+	// filed under this number, and keeping it is what lets them move the
+	// bookkeeping instead of destroying and rebuilding the car.
+	Check(promoted != nullptr && promoted->netId == netId,
+	      "under the same netId, so nothing anywhere has to be rebuilt");
+	Check(wasOwner == alice->id, "and it says whose traffic it was");
+	Check(promoted != nullptr && promoted->modelId == 91,
+	      "carrying the identity the ambient row was holding");
+
+	Check(s.FindCar(netId) == nullptr,
+	      "the traffic row is gone, so its old host is not asked about it again");
+	AmbientCarState stale{};
+	stale.netId = netId;
+	stale.pos   = {9.0f, 9.0f, 9.0f};
+	stale.rot   = {0.0f, 0.0f, 0.0f, 1.0f};
+	Check(!s.NoteCarState(stale, alice->id),
+	      "and a state from that host lands nowhere");
+
+	s.NoteEnterVehicle(*bob, *promoted, /*seat=*/0);
+	Check(s.MayReportVehicle(bob->id, netId), "the new driver reports it");
+	Check(!s.MayReportVehicle(alice->id, netId), "and its old host does not");
+}
+
+void TestAPromotionNeedsATrafficCarThatIsActuallyThere() {
+	std::printf("\nwhat cannot be promoted\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+
+	uint8_t        wasOwner = INVALID_PLAYER;
+	AmbientCarBody body{};
+	Check(s.PromoteCar(999, bob->id, wasOwner, body) == nullptr,
+	      "a number the session has never heard of promotes nothing");
+	Check(wasOwner == INVALID_PLAYER, "and names nobody");
+
+	// A session car is already a session car. The netId space is one space
+	// (AllocNetId), so this cannot happen - the check is the statement that
+	// it cannot, not a case anybody reaches.
+	Vehicle *mine = Claim(s, *alice, 91);
+	Check(s.PromoteCar(mine->netId, bob->id, wasOwner, body) == nullptr,
+	      "and a car that is already a session car is not promoted twice");
+
+	// A burnt shell is not a car anybody is driving away.
+	AmbientCar *car = s.AddCar(alice->id, CarBody(91, 5.0f));
+	const uint16_t netId = car->netId;
+	s.NoteUnownedBlowUp(AmbientKey(netId), alice->id, 0);
+	Check(s.PromoteCar(netId, bob->id, wasOwner, body) == nullptr,
+	      "and neither is a traffic car its host has already written off");
+}
+
+// ---------------------------------------------------------------------------
+// Rampages - docs/roadmap.md 5.10
+// ---------------------------------------------------------------------------
+//
+// What the server holds is small and every one of these is about a race the
+// live game would hand over once, at speed, with no way to watch it.
+
+RampageStartBody Start(int32_t limitMs, uint16_t target) {
+	RampageStartBody b{};
+	b.limitMs = limitMs;
+	b.target  = target;
+	return b;
+}
+
+RampageKillBody Kill(uint16_t frenzyId, uint16_t model) {
+	RampageKillBody b{};
+	b.frenzyId = frenzyId;
+	b.model    = model;
+	b.weapon   = 6;   // M16, the weapon rampage 01 is started with
+	b.flags    = 0;
+	return b;
+}
+
+RampageEndBody End(uint16_t frenzyId, uint8_t outcome) {
+	RampageEndBody b{};
+	b.frenzyId = frenzyId;
+	b.outcome  = outcome;
+	return b;
+}
+
+void TestOneFrenzyAtATimeAndEverybodyIsPutInIt() {
+	std::printf("\none rampage, and every machine's own script joins it\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+
+	// Both machines' rampage.sc start the same frenzy off their own
+	// aPickUpsCollected, a round trip apart.
+	RampageOpenBody first{}, second{};
+	Check(s.NoteRampageStart(alice->id, Start(120000, 20), 1000, first),
+	      "alice's script opens the session's frenzy");
+	Check(first.frenzyId != 0, "and it is named");
+	Check(first.killsNeeded == 20, "playing for the number the script asked for");
+	Check(first.elapsedMs == 0, "and it has just started");
+
+	Check(s.NoteRampageStart(bob->id, Start(120000, 20), 1080, second),
+	      "bob's script is answered too");
+	Check(second.frenzyId == first.frenzyId,
+	      "with the frenzy that is already open, not a second one");
+	Check(second.elapsedMs == 80, "and how far into it he is");
+	Check(s.CurrentRampage().openedBy == alice->id,
+	      "the session remembers whose report was first");
+}
+
+void TestAJoinerIsPutIntoTheRampageAlreadyRunning() {
+	std::printf("\njoining a rampage that is already half over\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+
+	RampageOpenBody open{};
+	s.NoteRampageStart(alice->id, Start(120000, 20), 0, open);
+	for (int i = 0; i < 12; ++i)
+		Check(s.NoteRampageKill(Kill(open.frenzyId, 108)), "a kill lands");
+
+	// He is backfilled with the KILLFRENZY collection like any other pickup,
+	// so his own script starts a fresh 120-second, 20-kill frenzy and says
+	// so. Without an answer he would sit in his script's wait loop forever.
+	Player         *carl = Join(s, 2, "carl");
+	RampageOpenBody late{};
+	Check(s.NoteRampageStart(carl->id, Start(120000, 20), 65000, late),
+	      "the joiner's own start is answered");
+	Check(late.frenzyId == open.frenzyId, "with the session's frenzy");
+	Check(late.killsNeeded == 8, "and the eight kills that are actually left");
+	Check(late.elapsedMs == 65000, "and the 65 seconds already gone");
+}
+
+void TestAKillForAnOldFrenzyIsNotCountedAgainstTheNewOne() {
+	std::printf("\na kill that arrives after its own rampage ended\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+
+	RampageOpenBody one{};
+	s.NoteRampageStart(alice->id, Start(120000, 20), 0, one);
+	RampageEndBody verdict{};
+	Check(s.NoteRampageEnd(End(one.frenzyId, RAMPAGE_FAILED), verdict),
+	      "it fails");
+
+	// rampage.sc destroys the pickup and creates a new one at the second
+	// position within a frame or two, so the next frenzy really can be
+	// seconds away.
+	RampageOpenBody two{};
+	s.NoteRampageStart(alice->id, Start(120000, 20), 4000, two);
+	Check(two.frenzyId != one.frenzyId, "the next one gets its own name");
+
+	Check(!s.NoteRampageKill(Kill(one.frenzyId, 108)),
+	      "a straggler for the old frenzy is dropped");
+	Check(s.CurrentRampage().kills == 0, "and does not count against the new one");
+	Check(s.NoteRampageKill(Kill(two.frenzyId, 108)), "the new one's kills do");
+}
+
+void TestTheFirstEndingWins() {
+	std::printf("\ntwo machines disagreeing about how a rampage ended\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+
+	RampageOpenBody open{};
+	s.NoteRampageStart(alice->id, Start(120000, 20), 0, open);
+
+	// The race this exists for: bob's clock runs out while alice's winning
+	// kill is still on the wire. Whichever report the server sees first is
+	// the session's, and the other is dropped - so nobody is told the
+	// rampage failed after being told it passed.
+	RampageEndBody first{}, second{};
+	Check(s.NoteRampageEnd(End(open.frenzyId, RAMPAGE_FAILED), first),
+	      "bob's timeout gets there first");
+	Check(first.outcome == RAMPAGE_FAILED, "and that is the verdict");
+	Check(!s.NoteRampageEnd(End(open.frenzyId, RAMPAGE_PASSED), second),
+	      "alice's pass is dropped");
+	(void)bob;
+}
+
+void TestTheServerEndsARampageNobodyIsLeftToEnd() {
+	std::printf("\na rampage whose owner disconnected\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+
+	RampageOpenBody open{};
+	s.NoteRampageStart(alice->id, Start(120000, 20), 5000, open);
+
+	RampageEndBody ended{};
+	Check(!s.ExpireRampage(5000 + 120000, ended),
+	      "the deadline itself is not enough - the grace has to pass too");
+	Check(s.ExpireRampage(5000 + 120000 + Session::RAMPAGE_GRACE_MS, ended),
+	      "a second later the session calls it");
+	Check(ended.outcome == RAMPAGE_FAILED && ended.frenzyId == open.frenzyId,
+	      "as a failure, for the frenzy that was open");
+	Check(!s.ExpireRampage(5000 + 300000, ended), "and only once");
+}
+
+void TestARampageWithNoTimeLimitNeverTimesOut() {
+	std::printf("\na rampage the script gave no time limit\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+
+	RampageOpenBody open{};
+	s.NoteRampageStart(alice->id, Start(-1, 20), 0, open);
+
+	// CDarkel::Update takes the ongoing arm whenever TimeLimit is negative
+	// (`cmp dword [00885BACh],0 / jl` at 0x00420696), so a server that
+	// timed this one out would end a rampage the engine never would.
+	RampageEndBody ended{};
+	Check(!s.ExpireRampage(10u * 60u * 1000u, ended), "ten minutes in, still open");
+	Check(s.CurrentRampage().open, "because the engine would not end it either");
+}
+
+void TestTheTargetIsScaledByThePlayerCount() {
+	std::printf("\nthe scaled rule\n");
+	// The arithmetic on its own first, because it is shared with the client
+	// and has the awkward cases.
+	Check(ScaledRampageTarget(20, RAMPAGE_RULE_SHARED, 4) == 20,
+	      "the default rule leaves the script's number alone");
+	Check(ScaledRampageTarget(20, RAMPAGE_RULE_SCALED, 1) == 20,
+	      "one player has nobody to share with");
+	Check(ScaledRampageTarget(20, RAMPAGE_RULE_SCALED, 0) == 20,
+	      "and neither does an empty session");
+	Check(ScaledRampageTarget(20, RAMPAGE_RULE_SCALED, 4) == 80, "four players, 80");
+	Check(ScaledRampageTarget(500, RAMPAGE_RULE_SCALED, 8) == RAMPAGE_MAX_KILLS,
+	      "and it is clamped rather than left to overflow a uint16");
+
+	Session s;
+	s.SetRampageRule(RAMPAGE_RULE_SCALED);
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+
+	RampageOpenBody open{};
+	s.NoteRampageStart(alice->id, Start(120000, 20), 0, open);
+	Check(open.killsNeeded == 40, "two players murder 40 Diablos, not 20");
+	Check(s.CurrentRampage().target == 40, "and the session plays for that");
+	(void)bob;
+}
+
+void TestWithRampagesOffThereIsNoSessionFrenzy() {
+	std::printf("\nrampages off\n");
+	Session s;
+	s.SetRampageRule(RAMPAGE_RULE_OFF);
+	Player *alice = Join(s, 1, "alice");
+
+	RampageOpenBody open{};
+	Check(!s.NoteRampageStart(alice->id, Start(120000, 20), 0, open),
+	      "no frenzy is opened");
+	Check(!s.CurrentRampage().open, "and nothing is held");
+	// Which is exactly the behaviour this build had before the feature
+	// existed: every machine's own CDarkel, counting its own player.
+	Check(!s.NoteRampageKill(Kill(1, 108)), "so a kill has nothing to land on");
+	RampageCarBody car{};
+	car.frenzyId = 1;
+	car.model    = 90;
+	car.key.kind = RAMPAGE_CAR_UNKEYED;
+	Check(!s.NoteRampageCar(car), "and neither has a car");
+}
+
+// ---- vehicle rampages ------------------------------------------------------
+
+RampageCarBody Car(uint16_t frenzyId, uint16_t model, uint8_t kind, uint16_t id) {
+	RampageCarBody b{};
+	b.frenzyId = frenzyId;
+	b.model    = model;
+	b.key.kind = kind;
+	b.key.pad  = 0;
+	b.key.id   = id;
+	return b;
+}
+
+void TestANamedCarCountsOnceHoweverManyMachinesSawIt() {
+	std::printf("\nrampage 02: a parked car two machines blew up\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Join(s, 2, "bob");
+
+	RampageOpenBody open{};
+	s.NoteRampageStart(alice->id, Start(120000, 13), 0, open);
+
+	// Each machine's copy of a parked car went up in its own copy of the same
+	// rocket, and each engine reported it.
+	Check(s.NoteRampageCar(Car(open.frenzyId, 95, UNOWNED_PARKED, 41)),
+	      "the first report of a parked car is counted and relayed");
+	Check(!s.NoteRampageCar(Car(open.frenzyId, 95, UNOWNED_PARKED, 41)),
+	      "the second machine's report of the same car is dropped");
+	Check(s.CurrentRampage().kills == 1, "one car");
+
+	Check(s.NoteRampageCar(Car(open.frenzyId, 116, UNOWNED_SESSION, 41)),
+	      "the same id under another kind is another car");
+	Check(!s.NoteRampageCar(Car(open.frenzyId, 116, UNOWNED_SESSION, 41)),
+	      "and it counts once too");
+
+	// Traffic, somebody's own car, a car only one machine has. One machine
+	// can decide each of those, so two reports are two cars.
+	Check(s.NoteRampageCar(Car(open.frenzyId, 90, RAMPAGE_CAR_UNKEYED, 0)),
+	      "an unkeyed car is counted");
+	Check(s.NoteRampageCar(Car(open.frenzyId, 90, RAMPAGE_CAR_UNKEYED, 0)),
+	      "and so is the next one, same model and all");
+	Check(s.NoteRampageCar(Car(open.frenzyId, 90, UNOWNED_AMBIENT, 12)),
+	      "traffic isn't deduplicated: only its host reports it");
+	Check(s.NoteRampageCar(Car(open.frenzyId, 90, UNOWNED_AMBIENT, 12)),
+	      "so a second report would be a second car, which is the host's call");
+	Check(s.CurrentRampage().kills == 6, "six cars in all");
+
+	// A joiner is told what's left, cars and kills in the same number.
+	RampageOpenBody late{};
+	Player         *carl = Join(s, 3, "carl");
+	s.NoteRampageStart(carl->id, Start(120000, 13), 30000, late);
+	Check(late.killsNeeded == 7, "a joiner is told seven cars are left");
+}
+
+void TestACarForAnOldFrenzyIsDropped() {
+	std::printf("\na car that arrives after its own rampage ended\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+
+	RampageOpenBody one{};
+	s.NoteRampageStart(alice->id, Start(120000, 13), 0, one);
+	Check(s.NoteRampageCar(Car(one.frenzyId, 95, UNOWNED_PARKED, 41)), "counted");
+	RampageEndBody verdict{};
+	s.NoteRampageEnd(End(one.frenzyId, RAMPAGE_FAILED), verdict);
+
+	RampageOpenBody two{};
+	s.NoteRampageStart(alice->id, Start(120000, 13), 4000, two);
+	Check(!s.NoteRampageCar(Car(one.frenzyId, 95, UNOWNED_PARKED, 42)),
+	      "a straggler for the old frenzy is dropped");
+	Check(s.CurrentRampage().kills == 0, "and doesn't count against the new one");
+	Check(s.NoteRampageCar(Car(two.frenzyId, 95, UNOWNED_PARKED, 41)),
+	      "a name counted in the last frenzy counts again in this one");
+}
+
+void TestTheOldestCarNameGoesFirst() {
+	std::printf("\nmore named cars than the frenzy remembers\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	RampageOpenBody open{};
+	s.NoteRampageStart(alice->id, Start(-1, 1000), 0, open);
+
+	for (uint16_t i = 0; i <= Session::RAMPAGE_CAR_KEYS; ++i)
+		s.NoteRampageCar(Car(open.frenzyId, 95, UNOWNED_PARKED, i));
+	Check(s.CurrentRampage().kills == Session::RAMPAGE_CAR_KEYS + 1,
+	      "every one of them counted");
+	Check(!s.NoteRampageCar(Car(open.frenzyId, 95, UNOWNED_PARKED,
+	                            Session::RAMPAGE_CAR_KEYS)),
+	      "the newest name is still remembered");
+	Check(s.NoteRampageCar(Car(open.frenzyId, 95, UNOWNED_PARKED, 0)),
+	      "the oldest one was let go to make room");
+}
+
+// ---- police helicopters ------------------------------------------------------
+
+HeliStateBody Heli(uint16_t serial, uint8_t slot = 0,
+                   uint8_t status = HELI_STATUS_CHASE) {
+	HeliStateBody b{};
+	b.serial = serial;
+	b.slot   = slot;
+	b.status = status;
+	b.rot    = {0.0f, 0.0f, 0.0f, 1.0f};
+	return b;
+}
+
+HeliGoneBody Gone(uint16_t serial, uint8_t slot = 0,
+                  uint8_t reason = HELI_GONE_SHOT_DOWN) {
+	HeliGoneBody b{};
+	b.serial         = serial;
+	b.slot           = slot;
+	b.reason         = reason;
+	b.creditPlayerId = INVALID_PLAYER;
+	return b;
+}
+
+HeliHitBody HeliHit(uint8_t owner, uint16_t serial, uint8_t slot = 0) {
+	HeliHitBody b{};
+	b.ownerPlayerId = owner;
+	b.slot          = slot;
+	b.serial        = serial;
+	b.kind          = HELI_HIT_BULLET;
+	b.damage        = 4;
+	return b;
+}
+
+void TestAHelicopterStateIsRelayedUntilItIsGone() {
+	std::printf("\na helicopter's state\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Check(s.NoteHeliState(alice->id, Heli(1)), "a police slot is relayed");
+	Check(s.HeliLive(alice->id, 0, 1), "and the session knows it is live");
+	Check(!s.NoteHeliState(alice->id, Heli(2, 2)),
+	      "the script helicopter's slot is not");
+	Check(!s.NoteHeliState(alice->id, Heli(3, 0, 9)), "nor a status the engine lacks");
+	Check(s.NoteHeliGone(alice->id, Gone(1)), "its end is relayed");
+	Check(!s.HeliLive(alice->id, 0, 1), "and it is no longer live");
+	Check(!s.NoteHeliState(alice->id, Heli(1)),
+	      "a state that overtook its own end is not relayed");
+	Check(s.NoteHeliState(alice->id, Heli(2)), "the next helicopter in the slot is");
+}
+
+void TestAHelicopterIsGoneOnce() {
+	std::printf("\na helicopter ends once\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	s.NoteHeliState(alice->id, Heli(4, 1));
+	Check(s.NoteHeliGone(alice->id, Gone(4, 1)), "the first report goes out");
+	Check(!s.NoteHeliGone(alice->id, Gone(4, 1)), "a second does not");
+	Check(!s.NoteHeliGone(alice->id, Gone(5, 3)), "nor one for a slot that isn't police");
+	HeliGoneBody odd = Gone(6);
+	odd.reason = 9;
+	Check(!s.NoteHeliGone(alice->id, odd), "nor one with no reason we know");
+
+	// More ends than the ring holds, and the oldest is let go.
+	for (uint16_t i = 100; i < 100 + 9; ++i)
+		s.NoteHeliGone(alice->id, Gone(i));
+	Check(s.NoteHeliState(alice->id, Heli(100)),
+	      "the oldest remembered end is forgotten once the ring wraps");
+	Check(!s.NoteHeliState(alice->id, Heli(108)), "the newest is still remembered");
+}
+
+void TestAHitGoesToTheOwnerOfALiveHelicopter() {
+	std::printf("\na hit on a helicopter\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	s.NoteHeliState(alice->id, Heli(1));
+
+	Check(s.HeliHitRecipient(HeliHit(alice->id, 1), bob->id) == alice,
+	      "bob's hit goes to alice");
+	Check(s.HeliHitRecipient(HeliHit(alice->id, 1), alice->id) == nullptr,
+	      "not to alice from alice; her engine took it already");
+	Check(s.HeliHitRecipient(HeliHit(alice->id, 2), bob->id) == nullptr,
+	      "not for a serial that isn't live");
+	Check(s.HeliHitRecipient(HeliHit(alice->id, 1, 1), bob->id) == nullptr,
+	      "not for the wrong slot");
+	HeliHitBody huge = HeliHit(alice->id, 1);
+	huge.damage = 800;
+	Check(s.HeliHitRecipient(huge, bob->id) == nullptr,
+	      "not one that would bring it down in a packet");
+	s.NoteHeliGone(alice->id, Gone(1));
+	Check(s.HeliHitRecipient(HeliHit(alice->id, 1), bob->id) == nullptr,
+	      "not after it is gone");
+}
+
+HeliShotBody HeliShot(uint16_t serial, uint8_t slot = 0) {
+	HeliShotBody b{};
+	b.serial = serial;
+	b.slot   = slot;
+	b.source = {100.0f, 200.0f, 60.0f};
+	b.target = {110.0f, 205.0f, 12.0f};
+	return b;
+}
+
+void TestAHelicopterRoundIsRelayedOnlyFromALiveOne() {
+	std::printf("\na round a helicopter fired\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+
+	Check(!s.MayRelayHeliShot(alice->id, HeliShot(1)),
+	      "not before the helicopter's first state; nobody has a replica yet");
+	s.NoteHeliState(alice->id, Heli(1));
+	Check(s.MayRelayHeliShot(alice->id, HeliShot(1)), "relayed while it is live");
+	Check(!s.MayRelayHeliShot(bob->id, HeliShot(1)),
+	      "not from somebody who isn't its owner");
+	Check(!s.MayRelayHeliShot(alice->id, HeliShot(2)), "not for a serial that isn't live");
+	Check(!s.MayRelayHeliShot(alice->id, HeliShot(1, 1)), "not for the wrong slot");
+
+	HeliShotBody script = HeliShot(1, 2);
+	Check(!s.MayRelayHeliShot(alice->id, script), "not from the script's slot");
+
+	HeliShotBody nan = HeliShot(1);
+	nan.target.z = std::numeric_limits<float>::quiet_NaN();
+	Check(!s.MayRelayHeliShot(alice->id, nan), "not with a NaN in it");
+
+	HeliShotBody far = HeliShot(1);
+	far.target.x = far.source.x + HELI_SHOT_MAX_LENGTH + 1.0f;
+	Check(!s.MayRelayHeliShot(alice->id, far), "not a line longer than the gun reaches");
+	HeliShotBody reach = HeliShot(1);
+	reach.target = {reach.source.x + HELI_SHOT_MAX_LENGTH - 1.0f, reach.source.y,
+	                reach.source.z};
+	Check(s.MayRelayHeliShot(alice->id, reach), "and one just inside it is");
+
+	s.NoteHeliGone(alice->id, Gone(1));
+	Check(!s.MayRelayHeliShot(alice->id, HeliShot(1)),
+	      "not once it is gone; a round that overtook the end has nowhere to go");
+}
+
+void TestOnlySomebodyElseInTheSessionIsCredited() {
+	std::printf("\nwho can be credited with a helicopter\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Check(s.MayCreditHeli(alice->id, bob->id), "bob, for alice's helicopter");
+	Check(!s.MayCreditHeli(alice->id, alice->id), "not alice for her own");
+	Check(!s.MayCreditHeli(alice->id, 6), "not a slot nobody is in");
+	s.RemovePeer(2);
+	Check(!s.MayCreditHeli(alice->id, 1), "not bob once he has left");
+}
+
+void TestALeavingOwnerTakesHisHelicoptersWithHim() {
+	std::printf("\nan owner who leaves\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	const uint8_t aliceId = alice->id;
+	s.NoteHeliState(aliceId, Heli(1));
+	s.NoteHeliGone(aliceId, Gone(2, 1));
+	s.RemovePeer(1);
+	Check(!s.HeliLive(aliceId, 0, 1), "his helicopter is not live");
+	Check(s.HeliHitRecipient(HeliHit(aliceId, 1), bob->id) == nullptr,
+	      "and a hit on it goes nowhere");
+	Player *carol = Join(s, 3, "carol");
+	Check(carol->id == aliceId, "the slot is handed on");
+	Check(s.NoteHeliState(carol->id, Heli(2, 1)),
+	      "and her serial 2 is not mistaken for his finished one");
+}
+
 } // namespace
+
+// ---- cheats (docs/cheats.md) -----------------------------------------------
+
+CheatBody Cheat(uint8_t id, uint8_t state) {
+	CheatBody b{};
+	b.cheat = id;
+	b.state = state;
+	return b;
+}
+
+// Every cheat through the server's decision, under every rule, from the host
+// and from somebody else. What comes out has to be exactly the route the
+// client planned for, or a cheat goes somewhere its typist's machine did not
+// expect - a sky to everybody, a riot to nobody.
+void TestEveryCheatIsRelayedWhereItsRouteSays() {
+	std::printf("\nthe cheat relay, every cheat, every rule\n");
+	int wrong = 0;
+	for (uint8_t rule = 0; rule <= CHEAT_RULE_OFF; ++rule) {
+		for (uint8_t id = 0; id < CHEAT_COUNT; ++id) {
+			for (int fromHost = 0; fromHost < 2; ++fromHost) {
+				// A state the cheat can actually carry, where it has one.
+				uint8_t state = 0;
+				if (id == CHEAT_MAYHEM || id == CHEAT_WEAPONS_FOR_ALL ||
+				    id == CHEAT_FAST_WEATHER)
+					state = 1;
+				if (id == CHEAT_FAST_TIME || id == CHEAT_SLOW_TIME)
+					state = 3;
+				const uint8_t got =
+				    CheatRelayFor(rule, id, state, fromHost != 0, true);
+
+				uint8_t want = CHEAT_RELAY_DROP;
+				if (CheatAllowed(rule, id)) {
+					if (CheatRouteOf(id) == CHEAT_ROUTE_EVERYONE)
+						want = CHEAT_RELAY_OTHERS;
+					else if (CheatRouteOf(id) == CHEAT_ROUTE_HOST && !fromHost)
+						want = CHEAT_RELAY_HOST;
+				}
+				if (got != want) {
+					++wrong;
+					std::printf("    rule %u cheat %u fromHost %d: got %u want %u\n",
+					            rule, id, fromHost, got, want);
+				}
+			}
+		}
+	}
+	Check(wrong == 0, "138 combinations, each where its route says");
+
+	Check(CheatRelayFor(CHEAT_RULE_SHARED, CHEAT_FOGGY, 0, false, false) ==
+	          CHEAT_RELAY_DROP,
+	      "a sky with no host to take it goes nowhere");
+	Check(CheatRelayFor(CHEAT_RULE_SHARED, CHEAT_MAYHEM, 0, false, true) ==
+	          CHEAT_RELAY_DROP,
+	      "a riot that claims to be undone is dropped - there is no undo");
+	Check(CheatRelayFor(CHEAT_RULE_SHARED, CHEAT_FAST_TIME, 5, false, true) ==
+	          CHEAT_RELAY_DROP,
+	      "a time scale past 4.0 is dropped");
+	Check(CheatRelayFor(CHEAT_RULE_SHARED, CHEAT_WEAPONS, 0, false, true) ==
+	          CHEAT_RELAY_DROP,
+	      "a personal cheat that turns up anyway is dropped");
+	Check(CheatRelayFor(CHEAT_RULE_SHARED, CHEAT_COUNT, 1, false, true) ==
+	          CHEAT_RELAY_DROP,
+	      "and so is a cheat that does not exist");
+}
+
+void TestTheSessionRemembersWhatEverybodyRuns() {
+	std::printf("\nthe cheats a joiner has to be brought to\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");   // the host
+	Player *bob   = Join(s, 2, "bob");
+
+	Check(s.NoteCheat(bob->id, Cheat(CHEAT_FOGGY, 0)) == CHEAT_RELAY_HOST,
+	      "bob's fog goes to alice");
+	Check(s.NoteCheat(alice->id, Cheat(CHEAT_FOGGY, 0)) == CHEAT_RELAY_DROP,
+	      "alice's own fog goes nowhere - her world packet carries it");
+	Check(s.NoteCheat(bob->id, Cheat(CHEAT_MAYHEM, 1)) == CHEAT_RELAY_OTHERS,
+	      "bob's riot goes to everybody else");
+	Check(s.NoteCheat(bob->id, Cheat(CHEAT_WEAPONS_FOR_ALL, 1)) == CHEAT_RELAY_OTHERS,
+	      "and so does arming the crowd");
+	s.NoteCheat(alice->id, Cheat(CHEAT_WEAPONS_FOR_ALL, 0));   // and alice undoes it
+	s.NoteCheat(alice->id, Cheat(CHEAT_FAST_TIME, 3));
+	s.NoteCheat(bob->id, Cheat(CHEAT_SLOW_TIME, 1));
+
+	Player *carl = Join(s, 3, "carl");
+	const Backfill back = s.BuildBackfill(carl->id, 99);
+
+	bool mayhem = false, weapons = false, time = false, sky = false;
+	int  timeRows = 0;
+	for (const S_Cheat &c : back.cheats) {
+		if (c.playerId != INVALID_PLAYER)
+			Check(false, "a replay names nobody");
+		if (c.body.cheat == CHEAT_MAYHEM)
+			mayhem = c.body.state == 1;
+		if (c.body.cheat == CHEAT_WEAPONS_FOR_ALL)
+			weapons = c.body.state == 0;
+		if (c.body.cheat == CHEAT_FAST_TIME || c.body.cheat == CHEAT_SLOW_TIME) {
+			++timeRows;
+			time = c.body.cheat == CHEAT_SLOW_TIME && c.body.state == 1;
+		}
+		if (c.body.cheat == CHEAT_FOGGY)
+			sky = true;
+	}
+	Check(mayhem, "carl is handed the riot");
+	Check(weapons, "and the crowd as alice left it, unarmed");
+	Check(timeRows == 1 && time,
+	      "and one time scale, the last one typed (BOOOOORING's 0.5)");
+	Check(!sky, "but no sky - the host's world packet is what carries that");
+	Check(back.cheats.size() == 3, "three rows and nothing else");
+
+	// A rule changed to personal since: the riot is no longer the session's.
+	s.SetCheatRule(CHEAT_RULE_PERSONAL);
+	Check(s.BuildBackfill(carl->id, 100).cheats.empty(),
+	      "under personal nobody is brought into a riot");
+	Check(s.NoteCheat(bob->id, Cheat(CHEAT_MAYHEM, 1)) == CHEAT_RELAY_DROP,
+	      "and a new one is not passed on");
+	s.SetCheatRule(CHEAT_RULE_SHARED);
+
+	// Everybody leaves; the next session starts from single player.
+	s.RemovePeer(1);
+	s.RemovePeer(2);
+	s.RemovePeer(3);
+	Player *dave = Join(s, 4, "dave");
+	Check(s.BuildBackfill(dave->id, 101).cheats.empty(),
+	      "an emptied session forgets what its cheats did");
+}
+
+void TestTheCheatRuleIsClamped() {
+	std::printf("\nthe cheat rule\n");
+	Session s;
+	Check(s.CheatRuleValue() == CHEAT_RULE_SHARED, "shared by default (5.14)");
+	s.SetCheatRule(CHEAT_RULE_OFF);
+	Check(s.CheatRuleValue() == CHEAT_RULE_OFF, "off sticks");
+	s.SetCheatRule(3);
+	Check(s.CheatRuleValue() == CHEAT_RULE_SHARED, "3 is not a rule and means shared");
+}
+
+// ---- when a session car stops being one ------------------------------------
+//
+// VEHICLE_KEEP_RADIUS_M and VEHICLE_RELEASE_MS in session.h. Before these the
+// session never let go of a car: every claim took a row for good, the 65th
+// claim of a session was refused, and every machine kept a mission car for
+// every car anybody had ever taken.
+
+// Somewhere to stand, `metres` east of where Claim parks a car (10, 10).
+PlayerStateBody StandAt(float metres) {
+	PlayerStateBody b = State(10.0f + metres, 100.0f);
+	b.pos.y           = 10.0f;
+	return b;
+}
+
+void TestACarsWholeLife() {
+	std::printf("\na session car from its claim to its row being reused\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	s.NotePlayerState(*alice, StandAt(0.0f));
+
+	// Claimed and driven somewhere.
+	Vehicle *car = Claim(s, *alice, 91);
+	const uint16_t first = car->netId;
+	s.NoteVehicleState(VehState(first, 300.0f, 1000.0f));
+	s.NotePlayerState(*alice, StandAt(290.0f));
+	Check(s.ReleaseIdleVehicles(1000).empty(), "a car being driven is kept");
+
+	// Parked, and the two seconds of settling over.
+	s.NoteExitVehicle(*alice, first);
+	Check(s.ReleaseIdleVehicles(2000).empty(), "a car being settled is kept");
+	s.EndCustody(first, alice->id);
+	Check(s.ReleaseIdleVehicles(3000).empty(), "a parked car with its driver beside it is kept");
+
+	// Abandoned: she goes a long way off. The minute runs from the last sweep
+	// that found her near it, 3000.
+	s.NotePlayerState(*alice, StandAt(1500.0f));
+	Check(s.ReleaseIdleVehicles(4000).empty(), "and for a minute after she has gone");
+	Check(s.ReleaseIdleVehicles(3000 + VEHICLE_RELEASE_MS - 1).empty(),
+	      "right up to the minute");
+	const std::vector<uint16_t> gone = s.ReleaseIdleVehicles(3000 + VEHICLE_RELEASE_MS);
+	Check(gone.size() == 1 && gone[0] == first, "then it is released, by its netId");
+	Check(s.FindVehicle(first) == nullptr, "the row is gone");
+	Check(s.LiveVehicleCount() == 0, "and nothing is left alive");
+	Check(!s.MayReportVehicle(alice->id, first),
+	      "a late snapshot for it is refused like any unknown car");
+	Player *bob = Join(s, 2, "bob");
+	Check(s.BuildBackfill(bob->id, 1).vehicles.empty(), "a joiner isn't told about it");
+
+	// Her next car takes the same row under a new number.
+	const size_t rows = s.Vehicles().size();
+	Vehicle *next = Claim(s, *alice, 92);
+	Check(next != nullptr && s.Vehicles().size() == rows, "the next claim reuses the row");
+	Check(next != nullptr && next->netId != first, "under a netId of its own");
+	Check(next != nullptr && next->modelId == 92 && next->driverPlayerId == alice->id &&
+	          !next->destroyed && next->damagePanels == 0,
+	      "and nothing of the old car is left in it");
+}
+
+void TestWalkingBackToAParkedCarKeepsIt() {
+	std::printf("\nparked, walked 50 m off and back\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Vehicle *car  = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+	s.NoteExitVehicle(*alice, netId);
+	s.EndCustody(netId, alice->id);
+
+	// Ten minutes of sweeps, once a second, with her 50 m off.
+	s.NotePlayerState(*alice, StandAt(50.0f));
+	bool kept = true;
+	for (uint32_t t = 0; t <= 10 * VEHICLE_RELEASE_MS; t += 1000)
+		if (!s.ReleaseIdleVehicles(t).empty())
+			kept = false;
+	Check(kept && s.FindVehicle(netId) != nullptr,
+	      "50 m away, the car is still there after ten minutes");
+
+	// Just inside the radius and just outside it.
+	s.NotePlayerState(*alice, StandAt(VEHICLE_KEEP_RADIUS_M - 1.0f));
+	Check(s.VehicleNeeded(*car), "inside the keep radius the car is needed");
+	s.NotePlayerState(*alice, StandAt(VEHICLE_KEEP_RADIUS_M + 1.0f));
+	Check(!s.VehicleNeeded(*car), "outside it, it isn't");
+
+	// Away for most of a minute, back once, away again: the clock restarts.
+	uint32_t t = 20 * VEHICLE_RELEASE_MS;
+	s.NotePlayerState(*alice, StandAt(10.0f));
+	s.ReleaseIdleVehicles(t);
+	s.NotePlayerState(*alice, StandAt(900.0f));
+	s.ReleaseIdleVehicles(t += VEHICLE_RELEASE_MS - 5000);
+	s.NotePlayerState(*alice, StandAt(10.0f));
+	s.ReleaseIdleVehicles(t += 1000);
+	s.NotePlayerState(*alice, StandAt(900.0f));
+	Check(s.ReleaseIdleVehicles(t += VEHICLE_RELEASE_MS - 5000).empty(),
+	      "walking back once is enough to start the minute again");
+	Check(s.ReleaseIdleVehicles(t += 5000).size() == 1,
+	      "and a full minute away after that releases it");
+}
+
+void TestNobodyInItOrSettlingItIsReleased() {
+	std::printf("\nwhat keeps a car that nobody is near\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	s.NotePlayerState(*alice, StandAt(5000.0f));
+	s.NotePlayerState(*bob, StandAt(5000.0f));
+
+	// A passenger, with the driver gone. Everybody's reported position is far
+	// off, which is the case of a stale position the seat has to outvote.
+	Vehicle *car = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+	s.NoteEnterVehicle(*bob, *car, 1);
+	s.NoteExitVehicle(*alice, netId);
+	s.EndCustody(netId, alice->id);
+	s.ReleaseIdleVehicles(0);
+	Check(s.ReleaseIdleVehicles(5 * VEHICLE_RELEASE_MS).empty(),
+	      "a passenger keeps it, wherever the session thinks he is");
+
+	// A custodian alone.
+	s.NoteEnterVehicle(*bob, *car, 0);
+	s.NoteExitVehicle(*bob, netId);
+	Check(s.CustodianOf(netId) == bob->id, "bob is settling it");
+	Check(s.ReleaseIdleVehicles(10 * VEHICLE_RELEASE_MS).empty(), "a custody keeps it");
+	s.EndCustody(netId, bob->id);
+	Check(s.ReleaseIdleVehicles(11 * VEHICLE_RELEASE_MS).size() == 1,
+	      "and once that ends, a car nobody is near goes");
+
+	// A player the session has no position for yet is near nothing.
+	Session u;
+	Player *carol = Join(u, 1, "carol");
+	Vehicle *c2   = Claim(u, *carol, 91);
+	u.NoteExitVehicle(*carol, c2->netId);
+	u.EndCustody(c2->netId, carol->id);
+	Check(!u.VehicleNeeded(*c2), "no position, no claim on the car");
+
+	// A wreck goes the same way.
+	Session w;
+	Player *dave = Join(w, 1, "dave");
+	Vehicle *c3  = Claim(w, *dave, 91);
+	w.DestroyVehicle(c3->netId);
+	w.NotePlayerState(*dave, StandAt(1000.0f));
+	w.ReleaseIdleVehicles(0);
+	Check(w.ReleaseIdleVehicles(VEHICLE_RELEASE_MS).size() == 1, "a wreck is released too");
+
+	// And a session nobody is in lets go of everything.
+	Session e;
+	Player *ed = Join(e, 1, "ed");
+	Claim(e, *ed, 91);
+	e.RemovePeer(1);
+	e.ReleaseIdleVehicles(0);
+	Check(e.ReleaseIdleVehicles(VEHICLE_RELEASE_MS).size() == 1,
+	      "an empty session keeps nothing for a minute");
+}
+
+void TestTheCapIsOnCarsAliveNotCarsEver() {
+	std::printf("\n64 cars at once, not 64 cars a session\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	s.NotePlayerState(*alice, StandAt(0.0f));
+
+	std::vector<uint16_t> ids;
+	for (size_t i = 0; i < MAX_SESSION_VEHICLES; ++i) {
+		Vehicle *v = Claim(s, *alice, 91);
+		if (!v)
+			break;
+		ids.push_back(v->netId);
+		s.NoteExitVehicle(*alice, v->netId);
+		s.EndCustody(v->netId, alice->id);
+	}
+	Check(ids.size() == MAX_SESSION_VEHICLES, "64 claims are granted");
+	Check(Claim(s, *alice, 91) == nullptr, "the 65th, with all 64 alive, is not");
+
+	// She leaves them all behind. A minute later the rows are free.
+	s.NotePlayerState(*alice, StandAt(3000.0f));
+	s.ReleaseIdleVehicles(0);
+	Check(s.ReleaseIdleVehicles(VEHICLE_RELEASE_MS).size() == MAX_SESSION_VEHICLES,
+	      "all 64 are released");
+
+	// Three hundred more cars over the rest of the session, a few alive at a
+	// time, the way somebody who keeps changing cars actually plays.
+	uint32_t t     = 2 * VEHICLE_RELEASE_MS;
+	int      taken = 0;
+	for (int i = 0; i < 300; ++i) {
+		s.NotePlayerState(*alice, StandAt(0.0f));
+		Vehicle *v = Claim(s, *alice, 91);
+		if (!v)
+			break;
+		++taken;
+		for (uint16_t old : ids)
+			if (old == v->netId)
+				taken = -1000;
+		s.NoteExitVehicle(*alice, v->netId);
+		s.EndCustody(v->netId, alice->id);
+		s.NotePlayerState(*alice, StandAt(3000.0f));
+		s.ReleaseIdleVehicles(t);
+		t += VEHICLE_RELEASE_MS / 4;
+	}
+	Check(taken == 300, "300 more claims are all granted, none under an old netId");
+	Check(s.Vehicles().size() <= MAX_SESSION_VEHICLES, "and the table never grew past 64");
+}
+
+void TestAPromotedCarIsReleasedLikeAnyOther() {
+	std::printf("\ntraffic that became a session car goes the same way\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	AmbientCar *traffic = s.AddCar(alice->id, CarBody(91, 5.0f));
+	const uint16_t netId = traffic->netId;
+	uint8_t        was   = INVALID_PLAYER;
+	AmbientCarBody body{};
+	Vehicle *v = s.PromoteCar(netId, bob->id, was, body);
+	Check(v != nullptr, "bob takes its wheel");
+	s.NoteEnterVehicle(*bob, *v, 0);
+	s.NoteExitVehicle(*bob, netId);
+	s.EndCustody(netId, bob->id);
+	s.NotePlayerState(*alice, StandAt(4000.0f));
+	s.NotePlayerState(*bob, StandAt(4000.0f));
+	s.ReleaseIdleVehicles(0);
+	const std::vector<uint16_t> gone = s.ReleaseIdleVehicles(VEHICLE_RELEASE_MS);
+	Check(gone.size() == 1 && gone[0] == netId, "released under the number it kept");
+	Check(s.FindCar(netId) == nullptr && s.FindVehicle(netId) == nullptr,
+	      "and neither roster has it");
+}
+
+void TestTheClaimerLeavingDoesntTakeACarSomebodyIsNear() {
+	std::printf("\nthe claimer leaves while somebody else is beside the car\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+	s.NotePlayerState(*bob, StandAt(20.0f));
+
+	// She drops out at the wheel.
+	s.RemovePeer(1);
+	Check(car->driverPlayerId == INVALID_PLAYER, "her seat is empty");
+	s.ReleaseIdleVehicles(0);
+	Check(s.ReleaseIdleVehicles(5 * VEHICLE_RELEASE_MS).empty(),
+	      "bob beside it keeps it, for as long as he stays");
+
+	// He walks off.
+	s.NotePlayerState(*bob, StandAt(2000.0f));
+	Check(s.ReleaseIdleVehicles(6 * VEHICLE_RELEASE_MS - 1).empty(),
+	      "not the moment he goes");
+	Check(s.ReleaseIdleVehicles(6 * VEHICLE_RELEASE_MS).size() == 1 &&
+	          s.FindVehicle(netId) == nullptr,
+	      "but a minute after, the car goes too");
+}
+
+// ---- money ------------------------------------------------------------------------
+
+MoneyChangeBody Change(uint32_t seq, int32_t delta, int32_t have) {
+	MoneyChangeBody b{};
+	b.seq   = seq;
+	b.delta = delta;
+	b.have  = have;
+	return b;
+}
+
+MoneyAwardBody Award(uint8_t to, int32_t unit, uint8_t keyKind = MONEY_AWARD_UNKEYED,
+                     uint16_t keyId = 0) {
+	MoneyAwardBody b{};
+	b.toPlayerId = to;
+	b.kind       = MONEY_AWARD_FIRE;
+	b.model      = 90;
+	b.unit       = unit;
+	b.key.kind   = keyKind;
+	b.key.id     = keyId;
+	return b;
+}
+
+void TestTheMoneyRuleIsOffAndClamped() {
+	std::printf("\nthe money rule\n");
+	Session s;
+	Check(s.MoneyRuleValue() == MONEY_RULE_OFF, "off by default");
+	s.SetMoneyRule(MONEY_RULE_SHARED);
+	Check(s.MoneyRuleValue() == MONEY_RULE_SHARED, "shared sticks");
+	s.SetMoneyRule(7);
+	Check(s.MoneyRuleValue() == MONEY_RULE_OFF, "7 is not a rule and means off");
+	Check(SaneMoneyRule(MONEY_RULE_OWN) == MONEY_RULE_OWN && SaneMoneyRule(3) == MONEY_RULE_OFF,
+	      "and the wire says the same");
+}
+
+void TestNothingIsPooledUnlessTheRuleSaysShared() {
+	std::printf("\nmoney off or own: no pool\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Check(!s.NoteMoneyChange(alice->id, Change(1, 100, 1100)), "off takes no change");
+	s.SetMoneyRule(MONEY_RULE_OWN);
+	Check(!s.NoteMoneyChange(alice->id, Change(1, 100, 1100)), "neither does own");
+	Check(!s.MoneyPoolSeeded(), "and the pool stays empty");
+	const S_Money m = s.MoneyFor(alice->id, INVALID_PLAYER, 0, 5);
+	Check(m.rule == MONEY_RULE_OWN && m.flags == 0 && m.total == 0,
+	      "what the welcome follow-up says under own: the rule, no pool");
+}
+
+void TestTheFirstPlayerInSeedsThePool() {
+	std::printf("\na shared wallet\n");
+	Session s;
+	s.SetMoneyRule(MONEY_RULE_SHARED);
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+
+	const S_Money empty = s.MoneyFor(alice->id, INVALID_PLAYER, 0, 5);
+	Check(empty.rule == MONEY_RULE_SHARED && (empty.flags & MONEY_POOL_SEEDED) == 0,
+	      "an empty pool says so");
+
+	Check(s.NoteMoneyChange(alice->id, Change(1, 0, 5000)) && s.MoneyPoolSeeded() &&
+	          s.MoneyPool() == 5000,
+	      "alice's $5000 seeds it");
+	Check(s.NoteMoneyChange(bob->id, Change(1, 0, 90000)) && s.MoneyPool() == 5000,
+	      "bob's seed a moment later is nothing, but still answered so he adopts");
+
+	Check(s.NoteMoneyChange(bob->id, Change(2, 250, 5250)) && s.MoneyPool() == 5250,
+	      "bob earns $250 and the pool has it");
+	Check(s.NoteMoneyChange(alice->id, Change(2, -1500, 3750)) && s.MoneyPool() == 3750,
+	      "alice is busted at six stars, $1500");
+	Check(!s.NoteMoneyChange(alice->id, Change(2, -1500, 3750)) && s.MoneyPool() == 3750,
+	      "the same change twice is counted once");
+	Check(!s.NoteMoneyChange(alice->id, Change(0, 100, 0)), "sequence 0 is nobody's");
+
+	const S_Money toAlice = s.MoneyFor(alice->id, bob->id, 250, 6);
+	const S_Money toBob   = s.MoneyFor(bob->id, bob->id, 250, 6);
+	Check((toAlice.flags & MONEY_POOL_SEEDED) && toAlice.total == 3750,
+	      "everybody is told the same total");
+	Check(toAlice.ackSeq == 2 && toBob.ackSeq == 2 && toAlice.fromPlayerId == bob->id,
+	      "each with their own last change it holds");
+
+	Check(s.NoteMoneyChange(bob->id, Change(3, -10000, 0)) && s.MoneyPool() == 0,
+	      "the pool stops at zero, as the engine's fines do");
+	s.NoteMoneyChange(bob->id, Change(4, INT32_MAX, 0));
+	s.NoteMoneyChange(bob->id, Change(5, 10, 0));
+	Check(s.MoneyPool() == INT32_MAX, "and at the top of an int32");
+}
+
+void TestTheWalletEmptiesWithTheSession() {
+	std::printf("\nthe wallet and the session\n");
+	Session s;
+	s.SetMoneyRule(MONEY_RULE_SHARED);
+	Player *alice = Join(s, 1, "alice");
+	Join(s, 2, "bob");
+	s.NoteMoneyChange(alice->id, Change(1, 0, 700));
+	s.RemovePeer(1);
+	Check(s.MoneyPoolSeeded() && s.MoneyPool() == 700, "one player leaving takes nothing");
+	s.RemovePeer(2);
+	Check(!s.MoneyPoolSeeded(), "the last one out empties it");
+
+	Player *carl = Join(s, 3, "carl");
+	Check(carl->moneySeq == 0, "a new player in an old slot starts his count again");
+	s.NoteMoneyChange(carl->id, Change(1, 0, 42));
+	Check(s.MoneyPool() == 42, "and the next one in seeds it afresh");
+
+	s.SetMoneyRule(MONEY_RULE_SHARED);
+	Check(s.MoneyPool() == 42, "setting the same rule again keeps it");
+	s.SetMoneyRule(MONEY_RULE_OWN);
+	s.SetMoneyRule(MONEY_RULE_SHARED);
+	Check(!s.MoneyPoolSeeded(), "changing the rule empties it");
+}
+
+void TestAnAwardIsDeliveredOncePerCar() {
+	std::printf("\nmoney awards\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Check(!s.TakeMoneyAward(alice->id, Award(bob->id, 50), 1000),
+	      "nothing is delivered with money off");
+
+	s.SetMoneyRule(MONEY_RULE_OWN);
+	Check(s.TakeMoneyAward(alice->id, Award(bob->id, 50), 1000),
+	      "own: alice's game pays bob for a car only it decided");
+	Check(s.TakeMoneyAward(alice->id, Award(bob->id, 50), 1001),
+	      "and a second car like it, a moment later, is paid as well");
+	Check(!s.TakeMoneyAward(alice->id, Award(9, 50), 1000), "nobody in slot 9");
+	Check(!s.TakeMoneyAward(alice->id, Award(bob->id, 0), 1000), "nothing for a car worth $0");
+	Check(!s.TakeMoneyAward(alice->id, Award(bob->id, MONEY_AWARD_MAX_UNIT + 1), 1000),
+	      "nor for more than any car is worth");
+	MoneyAwardBody odd = Award(bob->id, 50);
+	odd.kind = 7;
+	Check(!s.TakeMoneyAward(alice->id, odd, 1000), "nor from a caller the engine hasn't got");
+
+	Check(s.TakeMoneyAward(alice->id, Award(bob->id, 50, UNOWNED_PARKED, 17), 2000),
+	      "a parked car: alice's game is first");
+	Check(!s.TakeMoneyAward(bob->id, Award(bob->id, 50, UNOWNED_PARKED, 17), 2040),
+	      "bob's own game decided it too and is not paid again");
+	Check(s.TakeMoneyAward(bob->id, Award(bob->id, 50, UNOWNED_PARKED, 18), 2040),
+	      "the car next to it is another car");
+	Check(s.TakeMoneyAward(bob->id, Award(alice->id, 50, UNOWNED_SESSION, 17), 2040),
+	      "and a session car with the same number is another kind of name");
+	Check(s.TakeMoneyAward(alice->id,
+	                       Award(bob->id, 50, UNOWNED_PARKED, 17),
+	                       2000 + MONEY_AWARD_KEY_MS),
+	      "the generator's next car, ten seconds on, is paid for");
+	Check(s.TakeMoneyAward(alice->id, Award(alice->id, 50, UNOWNED_AMBIENT, 17), 2000),
+	      "traffic has one host and is never keyed, so it is not deduped");
+}
 
 int main() {
 	TestHostIsTheFirstPlayerIn();
@@ -1443,6 +3380,7 @@ int main() {
 	TestAJoinerIsToldWhichDoorsAreOpen();
 	TestAJoinerIsToldWhoIsDead();
 	TestADeadPlayerIsInNoSeat();
+	TestAnArrestIsARespawnWithoutADeath();
 	TestABackfilledCarCarriesItsCondition();
 	TestAWreckIsNotBackfilled();
 	TestADriverLeavingReleasesTheirCar();
@@ -1450,6 +3388,9 @@ int main() {
 	TestOnlyTheDriverMayReportTheCar();
 	TestAPassengerGetsOutOfAWreck();
 	TestSteppingStraightFromOneCarIntoAnother();
+	TestAJackTakesTheCarOffThePlayerWhoHadIt();
+	TestTakingAnEmptySeatIsNotAJack();
+	TestAJackedCarKeepsItsPassengers();
 	TestTheJoinerIsNotInTheirOwnBackfill();
 
 	TestOnlyTheOwnerMayTakeAPedAway();
@@ -1457,6 +3398,8 @@ int main() {
 	TestAPlayerTakesTheirPedsWithThem();
 	TestABackfilledPedIsNeverMistakenForYourOwn();
 	TestOnlyTheOwnerMayKillTheirPed();
+	TestOnlySomebodyElseMayShootYourPed();
+	TestFriendlyFireHasNoSayOverPedestrians();
 	TestAJoinerIsHandedTheCorpses();
 	TestOnlyTheOwnerMayTakeACarAway();
 	TestEveryCarGetsItsOwnName();
@@ -1484,7 +3427,32 @@ int main() {
 	TestAParkedSessionCarCanBeReportedByAnybody();
 	TestTheSessionRemembersTheWorstAnybodySaw();
 	TestAWreckTakesNoMoreDamageReports();
+	TestAHitOnACarIsRoutedToItsDriver();
+	TestNobodyMayShootACarNobodyIsDriving();
+	TestAHitOnACarInCustodyGoesToTheCustodian();
+	TestACustodyEndingMovesTheHitsOn();
+	TestOnlyTheCustodianWritesOffACarInCustody();
+	TestAHitOnACarNobodyHoldsMakesTheShooterItsCustodian();
+	TestAWreckedCarTakesNoMoreHits();
+	TestAPassengerMayNotShootTheCarHeIsSittingIn();
+	TestFriendlyFireHasNoSayOverCars();
+	TestAHitIsTheInverseOfEveryOtherCarPacket();
+	TestAHitOnTrafficIsRoutedToItsHost();
+	TestTrafficThatIsGoneTakesNoHits();
+	TestTrafficAndDrivenHitsDoNotCross();
 	TestARespraysClearTravelsAsADamageReport();
+
+	TestGettingOutHandsTheCarToTheDriverWhoLeftIt();
+	TestOnlyTheCustodianCanHandACarBack();
+	TestADriverEndsACustody();
+	TestAPassengerDoesNotEndACustody();
+	TestACustodianLeavingGivesTheCarBackToNobody();
+	TestAWreckIsNotHandedToAnybodyToSettle();
+	TestTheCustodianReportsTheDentsOfASettle();
+	TestADentAfterACustodyEndsIsRefused();
+	TestALaterDriversLighterDentIsStillNews();
+	TestGettingIntoSomebodyElsesTrafficMovesOwnership();
+	TestAPromotionNeedsATrafficCarThatIsActuallyThere();
 	TestAJoinerIsToldWhatShapeTheCarsAreIn();
 	TestAJoinerIsToldWhichParkedCarsAreWrecks();
 	TestAnUnownedWreckStopsBeingBackfilledAfterAMinute();
@@ -1494,6 +3462,43 @@ int main() {
 	TestAJoinerIsToldWhatEveryoneIsCarrying();
 	TestLosingAWeaponIsNewsAndThenForgotten();
 	TestNothingIsBackfilledWithTheSwitchOff();
+
+	TestOneFrenzyAtATimeAndEverybodyIsPutInIt();
+	TestAJoinerIsPutIntoTheRampageAlreadyRunning();
+	TestAKillForAnOldFrenzyIsNotCountedAgainstTheNewOne();
+	TestTheFirstEndingWins();
+	TestTheServerEndsARampageNobodyIsLeftToEnd();
+	TestARampageWithNoTimeLimitNeverTimesOut();
+	TestTheTargetIsScaledByThePlayerCount();
+	TestWithRampagesOffThereIsNoSessionFrenzy();
+	TestANamedCarCountsOnceHoweverManyMachinesSawIt();
+	TestACarForAnOldFrenzyIsDropped();
+	TestTheOldestCarNameGoesFirst();
+
+	TestAStreetObjectRelayIsStampedAndPassedOn();
+
+	TestAHelicopterStateIsRelayedUntilItIsGone();
+	TestAHelicopterIsGoneOnce();
+	TestAHitGoesToTheOwnerOfALiveHelicopter();
+	TestAHelicopterRoundIsRelayedOnlyFromALiveOne();
+	TestOnlySomebodyElseInTheSessionIsCredited();
+	TestALeavingOwnerTakesHisHelicoptersWithHim();
+
+	TestEveryCheatIsRelayedWhereItsRouteSays();
+	TestTheSessionRemembersWhatEverybodyRuns();
+	TestTheCheatRuleIsClamped();
+
+	TestACarsWholeLife();
+	TestWalkingBackToAParkedCarKeepsIt();
+	TestNobodyInItOrSettlingItIsReleased();
+	TestTheCapIsOnCarsAliveNotCarsEver();
+	TestAPromotedCarIsReleasedLikeAnyOther();
+	TestTheClaimerLeavingDoesntTakeACarSomebodyIsNear();
+	TestTheMoneyRuleIsOffAndClamped();
+	TestNothingIsPooledUnlessTheRuleSaysShared();
+	TestTheFirstPlayerInSeedsThePool();
+	TestTheWalletEmptiesWithTheSession();
+	TestAnAwardIsDeliveredOncePerCar();
 
 	std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL",
 	            g_failures, g_failures == 1 ? "" : "s");

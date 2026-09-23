@@ -25,6 +25,11 @@ namespace coopiii::game {
 //
 // See addresses.h, CPed__WarpPedIntoCar, for why the objective has to be set
 // first and what happens if it is not.
+//
+// That reads-it-back story is now only the fallback's. The animated entry has
+// to name a door, and a door is a seat, so it picks the slot before the walk
+// and finds out afterwards whether it kept it. SeatLocalPlayerIn below says
+// what that costs.
 
 // Which key asks for a seat. A virtual-key code; 'G' by default, settable
 // from CoopIII.ini before the feature is installed.
@@ -42,7 +47,15 @@ bool LocalWantsSeatToggle();
 //
 // Never seats anyone in the driver's seat. Taking the wheel is the enter key
 // and the engine's business; this is only ever the seat beside it.
-int32_t SeatLocalPlayerIn(int32_t vehicleHandle);
+//
+// `seatAsked` is written on the SEAT_LOCAL_WALKING answer, and only then: it
+// is the slot the engine was asked for before the walk started, which is what
+// the session is told straight away so every other machine animates the same
+// entry at the same time. It is a request and not a fact - another ped can
+// take that slot while we are walking - so PollLocalSeatEntry still reports
+// the seat the engine actually gave, and the caller corrects the session if
+// the two differ. May be null.
+int32_t SeatLocalPlayerIn(int32_t vehicleHandle, uint8_t *seatAsked);
 
 // Get out of the car we are riding in. The same key does both, because the
 // game's own exit could not be shown to work on a warped-in passenger and a

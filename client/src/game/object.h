@@ -43,13 +43,32 @@
 // What this file does NOT do
 // ---------------------------------------------------------------------------
 //
-// - **It does not replicate a knocked-over lamp post's resting place.**
-//   Uprooting is a different mechanism from breaking: CPhysical clears
-//   bIsStatic when the impulse beats m_fUprootLimit and hands the object to
-//   the moving list, and where it ends up after that is local physics, which
-//   roadmap.md 2.4 says is not reproducible. A bent post standing on one
-//   screen and lying on the other is a real remaining difference and it is
-//   named as open work in docs/objects.md 8, not quietly ignored.
+// 5. **Uprooting is one bit and one list, and it is not breaking.** An
+//    object falls over when bIsStatic (CEntity byte A bit 2) is cleared and
+//    CPhysical::AddToMovingList is handed the object; from there ordinary
+//    physics takes it. ObjectDamage never clears that bit - its smash arm
+//    *sets* it - so a post can be bent without coming loose and can come
+//    loose without being bent. Three places decide it and all three read
+//    m_fUprootLimit: a collision (impulse > limit), a blast (power > limit),
+//    and a bullet, a pellet or a bat (limit <= 0). addresses.h has the
+//    instructions.
+//
+//    Two of those three already agree on every machine and the third does
+//    not, which is the same shape as points 3 and 4. A blast's power is a
+//    pure function of two positions and a radius. A bullet's uproot is
+//    replayed with the shot itself (protocol.md 1.9.2 fires the remote ped's
+//    own CWeapon through the engine, out of the wire's muzzle and along the
+//    wire's direction, so every observer's own DoBulletImpact runs the same
+//    object arm) - and in any case object.dat gives every lamp post an
+//    uproot limit of 400, every traffic light 500 and every meter, bin,
+//    postbox and hydrant 100, so a bullet cannot knock any of them over at
+//    all. **What no other machine ran is somebody else's collision.**
+//
+//    So what travels is the resting place, once, when the engine's own sleep
+//    test decides the object has stopped - not an impulse and not a stream,
+//    because roadmap.md 2.4 says two machines handed the same impulse do not
+//    put the post down in the same place, and a machine that never uprooted
+//    it has nothing to integrate.
 //
 // - **It does not suppress a local break.** An observer whose own engine
 //   breaks the object - because a replica of somebody else's car really did
@@ -123,6 +142,30 @@ constexpr uint8_t BreakStateFromFlags(uint8_t flagsA, uint8_t flagsB) {
 	return state;
 }
 
+// Has this one come loose?
+//
+// The whole of "uprooted", and it is a CEntity flag rather than anything on
+// CObject: bIsStatic is byte A bit 2, the engine clears it when the impulse
+// beats m_fUprootLimit, and CWorld::Process then simulates the object every
+// frame until CPhysical::ProcessControl's own sleep test sets it back.
+//
+// Deliberately NOT folded into BreakStateFromFlags. That function answers
+// "how broken is it", which is a latch the receiver replays; this answers
+// "is it still standing", which is a transform the receiver is told. Mixing
+// them would make a smash - which sets bIsStatic - look like an un-uprooting.
+constexpr bool ObjectIsLoose(uint8_t flagsA) {
+	return (flagsA & 0x04) == 0;   // offs::ENTITY_IS_STATIC
+}
+
+// The whole state byte as it goes on the wire: how broken, plus whether it is
+// standing.
+constexpr uint8_t BreakStateWithUproot(uint8_t flagsA, uint8_t flagsB) {
+	uint8_t state = BreakStateFromFlags(flagsA, flagsB);
+	if (ObjectIsLoose(flagsA))
+		state |= OBJ_BREAK_UPROOTED;
+	return state;
+}
+
 // How many more times the engine's own ObjectDamage has to run here before
 // this object looks like the one on the wire.
 //
@@ -136,7 +179,13 @@ constexpr uint8_t BreakStateFromFlags(uint8_t flagsA, uint8_t flagsB) {
 // left exactly as it is. There is no way to un-break an object in this engine
 // and it would be the wrong thing to do anyway - the break already happened
 // here, and the reporter's packet is just late.
+//
+// The uproot bit is masked off at the top rather than handled: ObjectDamage
+// cannot uproot anything, so replaying it more times would never produce the
+// bit, and a loose local copy is not a reason to hit a standing one again.
 constexpr int BreakReplaysNeeded(uint8_t local, uint8_t wanted) {
+	local  &= static_cast<uint8_t>(~OBJ_BREAK_UPROOTED);
+	wanted &= static_cast<uint8_t>(~OBJ_BREAK_UPROOTED);
 	if (local & OBJ_BREAK_SMASHED)
 		return 0;   // already at the end state, whatever the wire says
 	if (wanted & OBJ_BREAK_SMASHED)
@@ -145,6 +194,26 @@ constexpr int BreakReplaysNeeded(uint8_t local, uint8_t wanted) {
 		return 1;
 	return 0;
 }
+
+// ---------------------------------------------------------------------------
+// A resting place off the wire
+// ---------------------------------------------------------------------------
+
+// Is this something we are willing to write into an entity's matrix?
+//
+// Nine floats off a socket go into the matrix the collision code reads, and
+// pedanim.h's rule applies unchanged: NaN propagates, reaches collision, and
+// faults somewhere with no obvious connection to netcode. The test is the
+// cheapest thing that is still a real test - each row has to be finite and
+// close to unit length - and it also rejects the all-zero body a truncated,
+// zero-filled or hand-forged packet carries, which would otherwise collapse
+// the object's collision volume to a point.
+//
+// Deliberately loose rather than exact. The rows were orthonormal when the
+// reporter's engine produced them and they travel as the same 32-bit
+// patterns, so this is a guard against a wrong packet, not a tolerance for a
+// drifting one.
+bool SaneRotation(const ObjectRestBody &body);
 
 // ---------------------------------------------------------------------------
 // Finding our copy, over a pool we are handed rather than the live one
@@ -246,6 +315,45 @@ constexpr bool MayReportBreak(uint8_t createdBy, bool isPickupObject,
 	return false;
 }
 
+// Who is entitled to say where an object that just came loose ended up?
+//
+// The same three answers, reached one step earlier. An uproot happens a frame
+// *before* the break it usually comes with - CPhysical's collision code
+// clears bIsStatic while it is resolving the contact, and CObject::
+// ProcessControl only passes m_fDamageImpulse to ObjectDamage on the next
+// frame - so the cause has to be read at the moment the object is handed to
+// the moving list, not at the moment it breaks.
+//
+// `hadImpulse` is `m_fDamageImpulse > 0` on the object right now, and that is
+// a reliable question rather than a hopeful one: CPhysical::ProcessControl
+// zeroes both m_fDamageImpulse and m_pDamageEntity at its top
+// (0x00495F78/0x00495F82), so a non-zero impulse was written this frame by
+// the collision that is unwinding around us, and the entity beside it is that
+// collision's.
+//
+// No impulse means nothing collided with it, and there is exactly one other
+// thing in the image that can clear bIsStatic on a breakable map object: the
+// object arm shared by CWeapon::DoBulletImpact, CWeapon::FireShotgun and
+// CWeapon::FireMelee. That arm only ever runs inside somebody's
+// CWeapon::Fire - ours, or the one combat.cpp is replaying for a remote
+// player right now. So **the shooter knows a break was theirs because the
+// engine is still inside their own trigger pull when it happens**, which is
+// a fact rather than an inference from a stale pointer.
+//
+// The alternative - leave it with the host and make the host's report travel
+// - is worse, and docs/objects.md 5 already contains the proof without
+// applying it here: CPopulation::ManagePopulation turns any map object more
+// than 80 m from the local player back into a dummy, so the host is the one
+// participant in the session who is not guaranteed to have the object at
+// all. Handing an ownerless event to the host hands it to the machine most
+// likely to be somewhere else.
+constexpr BreakCause UprootCause(bool hadImpulse, BreakCause collisionCause,
+                                 bool insideReplayedShot) {
+	if (hadImpulse)
+		return collisionCause;
+	return insideReplayedShot ? BreakCause::REPLICA : BreakCause::OURS;
+}
+
 // ---------------------------------------------------------------------------
 // What the client half has to provide
 // ---------------------------------------------------------------------------
@@ -257,6 +365,16 @@ struct ObjectCallbacks {
 	// out - being wired is not being connected, which is a distinction this
 	// project has already paid for once in pickup.h.
 	bool (*Broken)(const ObjectBreakBody &body) = nullptr;
+
+	// Tell the session where an object we knocked loose came to rest. Same
+	// contract as Broken: false means it did not go out.
+	bool (*Settled)(const ObjectRestBody &body) = nullptr;
+
+	// Is combat.cpp replaying somebody else's shot through the engine right
+	// now? Null means "no", which makes every bullet uproot read as ours -
+	// the single-player answer, and the one a client with nothing wired
+	// should give.
+	bool (*InReplayedShot)() = nullptr;
 
 	// Is this ped / vehicle one CoopIII built as somebody else's? Takes the
 	// engine's own pool reference rather than a pointer, for the same reason
@@ -277,7 +395,7 @@ void SetObjectCallbacks(const ObjectCallbacks &callbacks);
 // Installation
 // ---------------------------------------------------------------------------
 
-// Two detours.
+// Three detours.
 //
 // CObject::ObjectDamage (0x004BB240) is the one door: a whole-image scan for
 // rel32 targets equal to it finds five call sites and all five are inside the
@@ -291,11 +409,44 @@ void SetObjectCallbacks(const ObjectCallbacks &callbacks);
 // duplicates of something the receiving engine had already worked out for
 // itself.
 //
+// CPhysical::AddToMovingList (0x004958F0) is the one door for the other half.
+// Every uproot in the image goes through it - the CPhysical collision arm,
+// both explosion arms and the three weapon arms - and it is the only moment
+// at which "who knocked this loose" is still a live fact. The detour is a
+// read-only bracket: it calls the original and then looks at the object. It
+// never manipulates the list, which is the thing client/src/game/movinglist.h
+// exists to clean up after.
+//
 // Must not be called from DllMain - docs/compat.md 2.2, same rule as every
 // other hook here.
 bool InstallObjectHooks();
 void RemoveObjectHooks();
 bool ObjectHooksInstalled();
+
+// ---------------------------------------------------------------------------
+// The frame pump
+// ---------------------------------------------------------------------------
+
+// How many objects this machine can be carrying a resting place for at once.
+//
+// A car ploughing a row of lamp posts is the worst realistic case and it is
+// nowhere near this; a rocket is bigger and is deliberately excluded, since
+// an explosion uproots the same objects on every machine for the same reason
+// it breaks them. Overflow drops the newest and counts it, because the
+// alternative is growing a table on the game thread.
+constexpr int kMaxUprootedWatched = 24;
+
+// Called from PostFrame, after CGame::Process, which is exactly where the
+// engine has just finished deciding whether each loose object is asleep.
+//
+// Walks the handful of objects this machine is the reporter for and sends one
+// ObjectRestBody for each that has gone back to bIsStatic - the engine's own
+// answer (CPhysical::ProcessControl counts m_nStaticFrames past 10 and then
+// calls SetIsStatic(true)), not a threshold of ours. An entry whose object
+// has left the pool, been converted back to a dummy or stopped being the one
+// we named is dropped silently: the 80 m horizon does that constantly and it
+// is not an error.
+void TickUprootedObjects();
 
 // ---------------------------------------------------------------------------
 // Inbound
@@ -312,6 +463,23 @@ bool ObjectHooksInstalled();
 // to break. When we walk over there the engine will build a pristine one,
 // which is exactly what it does in single player after you drive away.
 void OnObjectBrokenElsewhere(const ObjectBreakBody &body);
+
+// Somebody else's machine watched this one fall over and stop. Finds our copy
+// by ident - which still works, because the ident is where the *map* put it
+// and that number has not moved on either machine - writes the matrix through
+// the engine's own CMatrix::UpdateRW and CEntity::UpdateRwFrame, re-files it
+// with CPhysical::RemoveAndAdd, and puts it back to sleep.
+//
+// RemoveAndAdd is not optional. An entity whose position is written from
+// outside stays filed in the sector it was added in, and CRenderer::ScanWorld
+// only walks the sectors around the camera - so a post that fell into the
+// next sector would simply stop being drawn (addresses.h, "moving an entity
+// the engine already owns").
+//
+// Setting bIsStatic is all the moving list needs: CWorld::Process's own loop
+// unlinks any moving entity that has become static, at 0x004B1BA8 and
+// 0x004B1BF3. Nothing here writes into that list.
+void OnObjectSettledElsewhere(const ObjectRestBody &body);
 
 void AddObjectsToBridge(WorldBridge &bridge);
 
@@ -333,6 +501,21 @@ struct ObjectStats {
 	uint32_t replaysRun        = 0;   // ObjectDamage calls made on receipt
 	uint32_t applyFailed       = 0;   // replayed and the state did not move
 	uint32_t identCollisions   = 0;   // two live objects inside the tolerance
+
+	// ---- uprooting --------------------------------------------------------
+	uint32_t uprootsSeen       = 0;   // a map object was handed to the moving list
+	uint32_t uprootsWatched    = 0;   // ...and it was ours to follow
+	uint32_t uprootsNotOurs    = 0;   // somebody else's car did it
+	uint32_t uprootsBlast      = 0;   // an explosion, agreed everywhere already
+	uint32_t uprootsDropped    = 0;   // the watch table was full
+	uint32_t uprootsLost       = 0;   // it left the pool before it stopped
+	uint32_t restsSent         = 0;
+	uint32_t restsUnsent       = 0;   // worth sending, no session to tell
+	uint32_t restsReceived     = 0;
+	uint32_t restsUnmatched    = 0;   // no live copy here, usually distance
+	uint32_t restsApplied      = 0;
+	uint32_t restsRefused      = 0;   // the matrix on the wire was not one
+	uint32_t looseFromWire     = 0;   // dropped a standing post on a break
 };
 
 const ObjectStats &GetObjectStats();

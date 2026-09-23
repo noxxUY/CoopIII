@@ -40,13 +40,19 @@ int RunConsole(const Startup &startup) {
 		std::printf("[coopiii] settings from %s\n", startup.configPath.c_str());
 	else
 		std::printf("[coopiii] no %s, using the defaults\n", startup.configPath.c_str());
-	std::printf("[coopiii] wanted level %s, mission fails on death %s\n",
+	std::printf("[coopiii] wanted level %s, mission fails on death %s, rampages %s, "
+	            "cheats %s, money %s\n",
 	            Name(startup.config.wantedLevel),
-	            startup.config.missionFailOnDeath ? "on" : "off");
+	            startup.config.missionFailOnDeath ? "on" : "off",
+	            Name(startup.config.rampage), Name(startup.config.cheats),
+	            Name(startup.config.money));
 
 	Server server;
 	if (!server.Start(startup.config.port, startup.config.friendlyFire,
-	                  startup.config.ammoSync, WireValue(startup.config.wantedLevel)))
+	                  startup.config.ammoSync, WireValue(startup.config.wantedLevel),
+	                  WireValue(startup.config.rampage),
+	                  WireValue(startup.config.cheats),
+	                  WireValue(startup.config.money)))
 		return 1;
 
 	while (g_running)

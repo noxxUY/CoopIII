@@ -64,7 +64,10 @@ public:
 	// ammoSync and wantedRule are defaulted rather than required so the two
 	// front ends that already call this keep compiling; both pass both.
 	bool Start(uint16_t port, bool friendlyFire, bool ammoSync = false,
-	           uint8_t wantedRule = WANTED_RULE_PERPLAYER) {
+	           uint8_t wantedRule  = WANTED_RULE_PERPLAYER,
+	           uint8_t rampageRule = RAMPAGE_RULE_SHARED,
+	           uint8_t cheatRule   = CHEAT_RULE_SHARED,
+	           uint8_t moneyRule   = MONEY_RULE_OFF) {
 		if (!NetInit()) {
 			Log(LogKind::Warn, "enet init failed");
 			return false;
@@ -77,15 +80,21 @@ public:
 		m_session.SetFriendlyFire(friendlyFire);
 		m_session.SetAmmoSync(ammoSync);
 		m_session.SetWantedRule(wantedRule);
+		m_session.SetRampageRule(rampageRule);
+		m_session.SetCheatRule(cheatRule);
+		m_session.SetMoneyRule(moneyRule);
 		m_port      = port;
 		m_listening = true;
 		m_startedMs = NowMs();
 		Log(LogKind::Info, "listening on %u, %u slots, friendly fire %s, "
-		            "ammo sync %s, wanted level %s", port, MAX_PLAYERS,
+		            "ammo sync %s, wanted level %s, money %s", port, MAX_PLAYERS,
 		            friendlyFire ? "on" : "off", ammoSync ? "on" : "off",
 		            m_session.WantedRule() == WANTED_RULE_SHARED ? "shared"
 		                : m_session.WantedRule() == WANTED_RULE_OFF ? "off"
-		                                                            : "per player");
+		                                                            : "per player",
+		            m_session.MoneyRuleValue() == MONEY_RULE_SHARED ? "shared"
+		                : m_session.MoneyRuleValue() == MONEY_RULE_OWN ? "own"
+		                                                               : "off");
 		return true;
 	}
 
@@ -111,6 +120,23 @@ public:
 		// engine has had time to clear the shell and let the generator park a
 		// new car there. docs/roadmap.md 5.8 and WreckedUnownedCar.
 		m_session.ExpireUnownedWrecks(now);
+		// And let go of session cars nobody has been in or near for a minute,
+		// on every machine. VEHICLE_RELEASE_MS in session.h has the rule.
+		ReleaseIdleVehicles(now);
+		// And end a rampage nobody is left to end. Normally a client's own
+		// CDarkel::Update times it out first and this never fires; it is what
+		// answers the player who started a rampage and then disconnected, and
+		// the session where everyone is sitting in the pause menu with CTimer
+		// stopped. docs/roadmap.md 5.10 and Session::ExpireRampage.
+		{
+			RampageEndBody ended{};
+			if (m_session.ExpireRampage(now, ended)) {
+				Log(LogKind::Info,
+				    "rampage %u failed on the session's own clock - nobody was "
+				    "left running one to say so", ended.frenzyId);
+				BroadcastRampageEnd(ended);
+			}
+		}
 
 		m_events.clear();
 		m_net.Service(m_events, waitMs);
@@ -139,6 +165,25 @@ private:
 		case ServerEvent::MESSAGE:
 			OnMessage(ev.peer, ev.msg);
 			break;
+		}
+	}
+
+	// Everybody, the claimer included. On the machine whose engine made the
+	// car the client only forgets the row and leaves the car to its engine
+	// (RemoteVehicle::ours); everywhere else the copy is destroyed. This is
+	// the only sender of S_VehicleDespawn.
+	void ReleaseIdleVehicles(uint32_t now) {
+		for (uint16_t netId : m_session.ReleaseIdleVehicles(now)) {
+			S_VehicleDespawn out;
+			InitHeader(out, now);
+			out.netId = netId;
+			m_net.Broadcast(out, CH_EVENT);
+			Log(LogKind::Detail,
+			    "vehicle %u released - nobody has been in it or within %.0f m "
+			    "of it for %u s (%u session cars left)",
+			    netId, static_cast<double>(VEHICLE_KEEP_RADIUS_M),
+			    static_cast<unsigned>(VEHICLE_RELEASE_MS / 1000),
+			    static_cast<unsigned>(m_session.LiveVehicleCount()));
 		}
 	}
 
@@ -202,6 +247,10 @@ private:
 			if (const auto *pkt = msg.as<C_EnterVehicle>())
 				OnEnterVehicle(peer, *pkt);
 			break;
+		case OP_C_ENTERING_VEHICLE:
+			if (const auto *pkt = msg.as<C_EnteringVehicle>())
+				OnEnteringVehicle(peer, *pkt);
+			break;
 		case OP_C_SHOT:
 			if (const auto *pkt = msg.as<C_Shot>())
 				OnShot(peer, *pkt);
@@ -226,6 +275,10 @@ private:
 			if (const auto *pkt = msg.as<C_ExitVehicle>())
 				OnExitVehicle(peer, *pkt);
 			break;
+		case OP_C_VEHICLE_SETTLED:
+			if (const auto *pkt = msg.as<C_VehicleSettled>())
+				OnVehicleSettled(peer, *pkt);
+			break;
 		case OP_C_VEHICLE_BLOWUP:
 			if (const auto *pkt = msg.as<C_VehicleBlowUp>())
 				OnVehicleBlowUp(peer, *pkt);
@@ -237,6 +290,14 @@ private:
 		case OP_C_VEHICLE_DAMAGE:
 			if (const auto *pkt = msg.as<C_VehicleDamage>())
 				OnVehicleDamage(peer, *pkt);
+			break;
+		case OP_C_VEHICLE_HIT:
+			if (const auto *pkt = msg.as<C_VehicleHit>())
+				OnVehicleHit(peer, *pkt);
+			break;
+		case OP_C_CAR_HIT:
+			if (const auto *pkt = msg.as<C_CarHit>())
+				OnCarHit(peer, *pkt);
 			break;
 		case OP_C_WORLD_STATE:
 			if (const auto *pkt = msg.as<C_WorldState>())
@@ -265,6 +326,10 @@ private:
 		case OP_C_PED_DEATH:
 			if (const auto *pkt = msg.as<C_PedDeath>())
 				OnPedDeath(peer, *pkt);
+			break;
+		case OP_C_PED_DAMAGE:
+			if (const auto *pkt = msg.as<C_PedDamage>())
+				OnPedDamage(peer, *pkt);
 			break;
 		case OP_C_CAR_SPAWN:
 			if (const auto *pkt = msg.as<C_CarSpawn>())
@@ -309,6 +374,54 @@ private:
 		case OP_C_OBJECT_BROKEN:
 			if (const auto *pkt = msg.as<C_ObjectBroken>())
 				OnObjectBroken(peer, *pkt);
+			break;
+		case OP_C_RAMPAGE_START:
+			if (const auto *pkt = msg.as<C_RampageStart>())
+				OnRampageStart(peer, *pkt);
+			break;
+		case OP_C_RAMPAGE_KILL:
+			if (const auto *pkt = msg.as<C_RampageKill>())
+				OnRampageKill(peer, *pkt);
+			break;
+		case OP_C_RAMPAGE_CAR:
+			if (const auto *pkt = msg.as<C_RampageCar>())
+				OnRampageCar(peer, *pkt);
+			break;
+		case OP_C_RAMPAGE_END:
+			if (const auto *pkt = msg.as<C_RampageEnd>())
+				OnRampageEnd(peer, *pkt);
+			break;
+		case OP_C_OBJECT_SETTLED:
+			if (const auto *pkt = msg.as<C_ObjectSettled>())
+				OnObjectSettled(peer, *pkt);
+			break;
+		case OP_C_HELI_STATE:
+			if (const auto *pkt = msg.as<C_HeliState>())
+				OnHeliState(peer, *pkt);
+			break;
+		case OP_C_HELI_GONE:
+			if (const auto *pkt = msg.as<C_HeliGone>())
+				OnHeliGone(peer, *pkt);
+			break;
+		case OP_C_HELI_HIT:
+			if (const auto *pkt = msg.as<C_HeliHit>())
+				OnHeliHit(peer, *pkt);
+			break;
+		case OP_C_HELI_SHOT:
+			if (const auto *pkt = msg.as<C_HeliShot>())
+				OnHeliShot(peer, *pkt);
+			break;
+		case OP_C_CHEAT:
+			if (const auto *pkt = msg.as<C_Cheat>())
+				OnCheat(peer, *pkt);
+			break;
+		case OP_C_MONEY_CHANGE:
+			if (const auto *pkt = msg.as<C_MoneyChange>())
+				OnMoneyChange(peer, *pkt);
+			break;
+		case OP_C_MONEY_AWARD:
+			if (const auto *pkt = msg.as<C_MoneyAward>())
+				OnMoneyAward(peer, *pkt);
 			break;
 		default:
 			// Unknown or not implemented, ignore it. Length is never trusted
@@ -430,6 +543,51 @@ private:
 		InitHeader(out, in.hdr.sendTimeMs);
 		out.body = in.body;
 		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// A hit one player's machine landed on a pedestrian another player hosts.
+	//
+	// The mirror image of the three handlers above and the only ambient packet
+	// that travels *towards* an owner. Every decision in it is
+	// Session::PedDamageRecipient's, which is where the inverted ownership rule,
+	// the corpse test and the reason friendly fire has no say are written down.
+	//
+	// Point to point, like OnDamage and for the same reason: only the owner has
+	// anything to do with it. What the other machines need to see - the flinch,
+	// the limb, the corpse - reaches them from the owner afterwards, on its own
+	// ped stream and on C_PedBodyPart and C_PedDeath.
+	void OnPedDamage(PeerId peer, const C_PedDamage &in) {
+		const Player *attacker = m_session.FindByPeer(peer);
+		if (!attacker)
+			return;
+
+		// Every refusal is Session::PedDamageRecipient's - a pedestrian nobody
+		// has, a sender claiming a hit on its own, one already reported dead, an
+		// owner who has gone - and the relay does not second-guess any of them,
+		// the same division OnPedDeath has with NotePedDeath.
+		const Player *owner = m_session.PedDamageRecipient(in.body.netId, attacker->id);
+		if (!owner)
+			return;
+
+		// The weapon, the piece and the direction are NOT bounded here, and that
+		// is the same position OnDamage takes about the identical three fields.
+		// It is deliberate rather than an oversight: what counts as a cause a
+		// shooter may decide, which pieces exist and how many hit directions
+		// there are are facts about the engine, they live in
+		// client/src/game/combat.h beside the disassembly that proves each one,
+		// and the receiving client checks all three before it calls the engine.
+		// A second copy of that list in here would be a second thing to keep in
+		// step with a binary this process has never loaded.
+		//
+		// The contrast is OnPedBodyPart, which does bound its node - because
+		// IsRemovableBodyPart is a *wire* fact and lives in protocol.h, where
+		// both ends read the same one.
+
+		S_PedDamage out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.attackerId = attacker->id;
+		out.body       = in.body;
+		m_net.SendTo(owner->peer, out, CH_EVENT);
 	}
 
 	// The ped stream, relayed exactly the way the traffic one is: rows the
@@ -559,6 +717,16 @@ private:
 			// what a latecomer's backfill is built from.
 			if (!m_session.NoteCarState(in.cars[i], p->id))
 				continue;
+			// The horn bit follows its row to wherever the row lands. Not
+			// kept in the session: a honk is over long before a latecomer
+			// could be told about it.
+			if (CarStateHornSet(in.hornMask, i))
+				out.hornMask |= CarStateHornBit(out.count);
+			// The siren too, for the same reason. It is a state rather than a
+			// honk, but the host restates it on every row, so a latecomer
+			// has it from the first batch he gets.
+			if (CarStateSirenSet(in.sirenMask, i))
+				out.sirenMask |= CarStateSirenBit(out.count);
 			out.cars[out.count++] = in.cars[i];
 		}
 
@@ -622,7 +790,22 @@ private:
 		if (m_session.AmmoSync())
 			welcome.flags |= SESSION_AMMO_SYNC;
 		welcome.flags        = FlagsWithWantedRule(welcome.flags, m_session.WantedRule());
+		// docs/roadmap.md 5.10. Same shape as the wanted rule above and for
+		// the same reason: it governs something inside each client's own
+		// CDarkel that never passes through here.
+		welcome.flags        =
+		    FlagsWithRampageRule(welcome.flags, m_session.RampageRuleValue());
+		// And the cheat rule, which the server can only half enforce: a
+		// personal cheat never leaves the machine it was typed on, so `off`
+		// for one of those is that machine's to carry out. docs/cheats.md.
+		welcome.flags        =
+		    FlagsWithCheatRule(welcome.flags, m_session.CheatRuleValue());
 		m_net.SendTo(peer, welcome, CH_EVENT);
+		// The money rule has no bit left in those flags, so it follows the
+		// welcome on its own - and with money off, not at all.
+		if (m_session.MoneyRuleValue() != MONEY_RULE_OFF)
+			m_net.SendTo(peer, m_session.MoneyFor(p->id, INVALID_PLAYER, 0, NowMs()),
+			             CH_EVENT);
 
 		// Everything the session was already doing before this peer turned up.
 		//
@@ -675,6 +858,12 @@ private:
 		// closed.
 		for (const S_GarageState &garage : back.garages)
 			m_net.SendTo(peer, garage, CH_EVENT);
+		// And the cheats every machine is running, at the state the last one
+		// left them. Without it a joiner walks into a riot as the one screen
+		// where nobody is rioting, and at normal speed while everybody else
+		// is in slow motion. docs/cheats.md.
+		for (const S_Cheat &cheat : back.cheats)
+			m_net.SendTo(peer, cheat, CH_EVENT);
 
 		// ...and tell everyone else about the newcomer. Same packet shape,
 		// built the same way, so "what a player looks like on the wire" has
@@ -824,7 +1013,17 @@ private:
 		// reaches whoever was connected when it happened, so without this the
 		// next player in is the one machine in the session that thinks the
 		// body in the road is standing up.
+		// Read before the record is cleared: NotePlayerDied takes them out of
+		// whatever they were in, which is what hands the car's settle to
+		// their machine, and afterwards there is nothing left to name.
+		const uint16_t wasIn = p->vehicleNetId;
 		m_session.NotePlayerDied(*p, in.animId);
+		// A player who dies at the wheel is the case this matters most in.
+		// They cannot get out of a rolling car by hand - CVehicle::CanPedExitCar
+		// refuses anything above 0.005 - so dying in one is a common way for a
+		// car to lose its driver mid-motion, which is exactly the state the
+		// old code froze for the rest of the session.
+		AnnounceCustody(wasIn, in.hdr.sendTimeMs);
 
 		const Player *killer = m_session.FindByNetId(in.killerNetId);
 		Log(LogKind::Detail, "%s died%s%s", p->nick.c_str(),
@@ -850,7 +1049,9 @@ private:
 		// in - a dead player was taken out of theirs on every other machine
 		// before their ped was killed, so the session has to agree or the
 		// next joiner gets told to put them back in it.
+		const uint16_t wasIn = p->vehicleNetId;
 		m_session.NotePlayerRespawned(*p, in.body.pos, in.body.heading);
+		AnnounceCustody(wasIn, in.hdr.sendTimeMs);
 
 		S_Respawn out;
 		InitHeader(out, in.hdr.sendTimeMs);
@@ -882,10 +1083,12 @@ private:
 	// The same entitlement gate as the snapshot above, and for the same
 	// reason: a car's owner is its driver, and the server has no GTA III
 	// running so the one useful thing it can check is whether the reporter is
-	// the player it believes is behind the wheel. roadmap.md §5.8's other
-	// three kinds of car - a parked one, a traffic car, one somebody walked
-	// away from - are named work and are not accepted here yet; phase one is
-	// the car with a driver.
+	// the player it believes is behind the wheel - or, with nobody behind it,
+	// the player settling it (S_VehicleCustody), whose engine is the one
+	// denting it until C_VehicleSettled. roadmap.md §5.8's other three kinds
+	// of car - a parked one, a traffic car, one somebody walked away from and
+	// that has finished settling - are named work and are not accepted here
+	// yet.
 	//
 	// Relayed only when it added something, which is what keeps an absolute,
 	// near-static state from becoming a stream.
@@ -916,6 +1119,153 @@ private:
 		// Everyone but the reporter: their own engine did it, which is how
 		// they came to be the one telling us.
 		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// A hit one player's machine landed on a car another player is driving,
+	// or settling after getting out of it.
+	//
+	// The mirror image of the three vehicle handlers around it, and the only
+	// packet about a claimed car that travels *towards* its owner. Every
+	// decision in it is Session::CustodyForHit's or VehicleHitRecipient's - a
+	// car nobody has, a sender claiming a hit on the car they drive, a car
+	// nobody holds (which becomes the sender's), one already destroyed, an
+	// owner who has gone - and the relay does not second-guess any of them,
+	// the same division OnPedDamage has with PedDamageRecipient.
+	//
+	// Point to point, like OnDamage and OnPedDamage: only the owner has
+	// anything to do with it. What the rest of the session needs to see - the
+	// smoke, the dents, the wreck - reaches them from the driver afterwards, on
+	// the snapshot and on C_VehicleDamage and C_VehicleBlowUp.
+	void OnVehicleHit(PeerId peer, const C_VehicleHit &in) {
+		const Player *attacker = m_session.FindByPeer(peer);
+		if (!attacker)
+			return;
+
+		// A session car nobody is driving or settling becomes the shooter's
+		// to settle, and the hit goes back to them - after the custody, on the
+		// same ordered channel, so it lands in a car they already know is
+		// theirs. Session::CustodyForHit says why.
+		const Player *owner = nullptr;
+		switch (m_session.CustodyForHit(in.body.netId, attacker->id)) {
+		case Session::HitCustody::Granted:
+			AnnounceCustody(in.body.netId, in.hdr.sendTimeMs);
+			Log(LogKind::Detail,
+			    "vehicle %u had nobody holding it; %s shot it and is settling it "
+			    "now", in.body.netId, attacker->nick.c_str());
+			owner = attacker;
+			break;
+		case Session::HitCustody::AlreadyTheirs:
+			owner = attacker;
+			break;
+		case Session::HitCustody::NotTheirs:
+			owner = m_session.VehicleHitRecipient(in.body.netId, attacker->id);
+			break;
+		}
+		if (!owner)
+			return;
+
+		// The weapon is NOT bounded here, and that is the same position
+		// OnPedDamage and OnDamage take about the identical field. It is
+		// deliberate rather than an oversight: what counts as a cause a shooter
+		// may decide is a fact about the engine, it lives in
+		// client/src/game/combat.h beside the disassembly that proves it, and
+		// the receiving client checks it before it calls CVehicle::
+		// InflictDamage. A second copy of that list in here would be a second
+		// thing to keep in step with a binary this process has never loaded.
+		//
+		// The amount is not bounded here either, for the same reason plus one:
+		// the ceiling that matters is a memory-safety one (a NaN reaching
+		// m_fHealth and from there the car's matrix), and it belongs on the
+		// machine that is about to do the writing.
+
+		S_VehicleHit out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.attackerId = attacker->id;
+		out.body       = in.body;
+		m_net.SendTo(owner->peer, out, CH_EVENT);
+	}
+
+	// A hit on a replica of somebody's traffic, sent on to the machine hosting
+	// the car. Same shape as OnVehicleHit and the same position on bounds: the
+	// weapon and the amount are checked by the client that is about to call
+	// the engine. Who gets it is Session::CarHitRecipient's decision.
+	void OnCarHit(PeerId peer, const C_CarHit &in) {
+		const Player *attacker = m_session.FindByPeer(peer);
+		if (!attacker)
+			return;
+
+		const Player *owner = m_session.CarHitRecipient(in.body.netId, attacker->id);
+		if (!owner)
+			return;
+
+		S_CarHit out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.attackerId = attacker->id;
+		out.body       = in.body;
+		m_net.SendTo(owner->peer, out, CH_EVENT);
+	}
+
+	// ---- police helicopters ------------------------------------------------
+	//
+	// protocol.h, entry 32. The sender of a state or a gone is the
+	// owner by definition - it is his own engine's helicopter - so the only
+	// checks are the ones Session makes: a real police slot, and not a
+	// serial he has already said is finished.
+	void OnHeliState(PeerId peer, const C_HeliState &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.NoteHeliState(p->id, in.body))
+			return;
+		S_HeliState out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.ownerPlayerId = p->id;
+		out.body          = in.body;
+		m_net.Broadcast(out, CH_SNAPSHOT, peer);
+	}
+
+	void OnHeliGone(PeerId peer, const C_HeliGone &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.NoteHeliGone(p->id, in.body))
+			return;
+		S_HeliGone out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.ownerPlayerId = p->id;
+		out.body          = in.body;
+		// A credit that names the owner, or somebody who has gone, names
+		// nobody. The shooter's machine is the only one that acts on it.
+		if (out.body.creditPlayerId != INVALID_PLAYER &&
+		    !m_session.MayCreditHeli(p->id, out.body.creditPlayerId))
+			out.body.creditPlayerId = INVALID_PLAYER;
+		if (out.body.reason == HELI_GONE_SHOT_DOWN)
+			Log(LogKind::Info, "%s's police helicopter was shot down%s", p->nick.c_str(),
+			    out.body.creditPlayerId != INVALID_PLAYER ? " by another player" : "");
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	void OnHeliHit(PeerId peer, const C_HeliHit &in) {
+		const Player *attacker = m_session.FindByPeer(peer);
+		if (!attacker)
+			return;
+		const Player *owner = m_session.HeliHitRecipient(in.body, attacker->id);
+		if (!owner)
+			return;
+		S_HeliHit out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.attackerId = attacker->id;
+		out.body       = in.body;
+		m_net.SendTo(owner->peer, out, CH_EVENT);
+	}
+
+	// A round the owner's helicopter fired, for everybody else to see and
+	// hear. The damage already happened on the owner's machine.
+	void OnHeliShot(PeerId peer, const C_HeliShot &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.MayRelayHeliShot(p->id, in.body))
+			return;
+		S_HeliShot out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.ownerPlayerId = p->id;
+		out.body          = in.body;
+		m_net.Broadcast(out, CH_SNAPSHOT, peer);
 	}
 
 	void OnVehicleState(PeerId peer, const C_VehicleState &in) {
@@ -1011,6 +1361,44 @@ private:
 
 		Vehicle *v = m_session.FindVehicle(in.body.netId);
 		if (!v) {
+			// A number the session knows as traffic rather than as a session
+			// car. Somebody has taken the wheel of a car another machine's
+			// engine made, and that is an ownership change the ambient roster
+			// cannot describe - it has an owner and no seats, so the driver
+			// would be invisible to it and every observer would go on drawing
+			// their ped in the road. protocol.h, S_CarPromoted.
+			//
+			// Answered before the "never heard of" refusal below on purpose:
+			// netIds are one space, so a number that names an AmbientCar is
+			// not a stale or invented one, it is a car the session has and
+			// files under the other kind.
+			if (in.body.netId != INVALID_NETID && in.body.seat == 0) {
+				uint8_t        wasOwner = INVALID_PLAYER;
+				AmbientCarBody body{};
+				v = m_session.PromoteCar(in.body.netId, p->id, wasOwner, body);
+				if (v) {
+					// Everyone, the claimer included, and BEFORE the
+					// S_EnterVehicle below. Same ordering rule as the jack:
+					// the two ride one reliable ordered channel, so this is
+					// what stops a machine being told about a seat in a car
+					// it still has filed as traffic.
+					S_CarPromoted promoted;
+					InitHeader(promoted, in.hdr.sendTimeMs);
+					promoted.netId            = v->netId;
+					promoted.driverPlayerId   = p->id;
+					promoted.wasOwnerPlayerId = wasOwner;
+					promoted.body             = body;
+					m_net.Broadcast(promoted, CH_EVENT);
+					Log(LogKind::Detail,
+					    "traffic car %u is a session car now - %s took the "
+					    "wheel of it and it was player %u's",
+					    v->netId, p->nick.c_str(),
+					    static_cast<unsigned>(wasOwner));
+				}
+			}
+		}
+
+		if (!v) {
 			if (in.body.netId != INVALID_NETID) {
 				RefuseVehicleClaim(peer, *p, in.hdr.sendTimeMs,
 				                   "it names a car the session has never heard "
@@ -1065,8 +1453,40 @@ private:
 		// carrier on the wire and that is this packet, so a session that does
 		// not write it down is a session that cannot tell the next joiner
 		// about it - see Player::seat.
-		m_session.NoteEnterVehicle(*p, *v, in.body.seat);
+		const uint8_t displaced = m_session.NoteEnterVehicle(*p, *v, in.body.seat);
 		p->warnedVehicleAuthority = false;
+
+		// A car that has changed hands. Session::NoteEnterVehicle has already
+		// taken the previous driver out of it and says who that was; this is
+		// the half only the fan-out can do, which is telling them.
+		//
+		// Sent before the enter, and to everybody including the loser. Before,
+		// because the two packets ride the same reliable ordered channel, so
+		// this ordering is the one thing that guarantees no client ever holds
+		// two owners for one car - not even for one packet. To the loser,
+		// because their own process never saw the jack: the animation, the
+		// door and the drag-out all happened in the claimer's game, and the
+		// only thing that can reach the victim is a packet. Until this
+		// existed, the victim's client kept m_localVehicleNetId pointing at a
+		// car it no longer owned, which made it refuse every snapshot the new
+		// owner sent - the car sat in the street on that screen while it was
+		// driven away on the other.
+		//
+		// An ordinary S_ExitVehicle, not a new event. "You are no longer in
+		// that car" is exactly what it says, it is what the client already
+		// handles on both arms, and a jack-specific packet would need the
+		// client to do something different with it - which it does not.
+		if (displaced != INVALID_PLAYER) {
+			S_ExitVehicle lost;
+			InitHeader(lost, in.hdr.sendTimeMs);
+			lost.playerId = displaced;
+			lost.netId    = v->netId;
+			m_net.Broadcast(lost, CH_EVENT);
+			Log(LogKind::Detail,
+			    "vehicle %u changed hands: %s took it from player %u, who has "
+			    "been told they are out of it",
+			    v->netId, p->nick.c_str(), static_cast<unsigned>(displaced));
+		}
 
 		// Broadcast includes the claimer this time. It's the only way they
 		// find out what netId the server gave their car.
@@ -1110,6 +1530,37 @@ private:
 		InitHeader(out, in.hdr.sendTimeMs);
 		out.playerId = p->id;
 		out.body     = in.body;
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// "I am getting into that car." Relayed, and written down nowhere.
+	//
+	// This is the one packet in the vehicle seam that changes no session
+	// state at all, and that is the whole of its design rather than a gap in
+	// it. An entry can be abandoned - the player is shot halfway in, the car
+	// drives off, he changes his mind - and nothing ever retracts this: the
+	// only thing that confirms an entry is the C_EnterVehicle at the end of
+	// it, which is where the seat, the driver and the car's ownership are
+	// still decided. A server that recorded a seat from here would hand a car
+	// to a player who never got in, and §2.8.3 would be reading a record that
+	// no packet ever corrects.
+	//
+	// So the two tests are only about whether the packet is worth forwarding:
+	// the sender exists, and the car is one the session has. There is
+	// deliberately no "is he near it", no "is the seat free" and no
+	// arbitration - it decides nothing, so there is nothing to arbitrate.
+	void OnEnteringVehicle(PeerId peer, const C_EnteringVehicle &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		if (!m_session.FindVehicle(in.body.netId))
+			return;   // a car we have never heard of; nobody could animate it
+
+		S_EnteringVehicle out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.body     = in.body;
+		// Everybody but the sender: his own engine is the one playing it.
 		m_net.Broadcast(out, CH_EVENT, peer);
 	}
 
@@ -1222,6 +1673,30 @@ private:
 		m_net.Broadcast(out, CH_EVENT, peer);
 	}
 
+	// Who simulates a car nobody is driving, told to everybody.
+	// protocol.h, S_VehicleCustody.
+	//
+	// Always sent AFTER the S_ExitVehicle that created the vacancy, on the
+	// same reliable ordered channel, which is the whole of the ordering
+	// guarantee: no client ever holds a driver and a custodian for one car at
+	// the same instant. The mirror of the jack's rule, where the loser's exit
+	// goes out before the winner's enter, and for the same reason.
+	//
+	// Sent even when the custodian is INVALID_PLAYER - "nobody is simulating
+	// this" is a real instruction and not an absence. A client that was told
+	// it had custody and never told it had lost it would go on streaming a car
+	// whose reports the server has already started dropping.
+	void AnnounceCustody(uint16_t netId, uint32_t sendTimeMs) {
+		if (netId == INVALID_NETID)
+			return;
+		S_VehicleCustody out;
+		InitHeader(out, sendTimeMs);
+		out.netId    = netId;
+		out.playerId = m_session.CustodianOf(netId);
+		out.pad      = 0;
+		m_net.Broadcast(out, CH_EVENT);
+	}
+
 	void OnExitVehicle(PeerId peer, const C_ExitVehicle &in) {
 		Player *p = m_session.FindByPeer(peer);
 		if (!p)
@@ -1235,6 +1710,36 @@ private:
 		out.playerId = p->id;
 		out.netId    = in.netId;
 		m_net.Broadcast(out, CH_EVENT);
+
+		// And who finishes what the car was doing, if it was doing anything.
+		// This is the packet that frees a car left reared up against a wall:
+		// without it every machine, including the one that just got out,
+		// writes the pose back onto the car after physics, every frame, for
+		// ever. Session::NoteExitVehicle has already decided who; this only
+		// says it out loud.
+		AnnounceCustody(in.netId, in.hdr.sendTimeMs);
+	}
+
+	// The custodian reporting that it is finished. protocol.h, C_VehicleSettled.
+	//
+	// Nothing is taken from the packet but the number. Where the car ended up
+	// arrived on the ordinary C_VehicleState stream while the settle was
+	// running, which is the same channel and the same record a driver's car
+	// uses, and a transform carried here as well would be a second copy of a
+	// fact with no way to say which of the two is newer.
+	void OnVehicleSettled(PeerId peer, const C_VehicleSettled &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		// Refuses anybody but the custodian. A client may end its own
+		// ownership and never somebody else's.
+		if (!m_session.EndCustody(in.netId, p->id))
+			return;
+		AnnounceCustody(in.netId, in.hdr.sendTimeMs);
+		Log(LogKind::Detail,
+		    "vehicle %u has settled - %s is finished with it and every machine "
+		    "holds it where it stands now",
+		    in.netId, p->nick.c_str());
 	}
 
 	void OnChat(PeerId peer, const C_Chat &in) {
@@ -1312,6 +1817,98 @@ private:
 		m_net.Broadcast(out, CH_EVENT, peer);
 	}
 
+	// ---- rampages - docs/roadmap.md 5.10 -----------------------------------
+	//
+	// Three handlers, and between them the server's whole part in a rampage:
+	// it names the frenzy, it says what the session is playing for, it relays
+	// kills, and it picks one ending. It never decides that a rampage was
+	// passed - the clients' own CDarkel does that, off a counter they are now
+	// all driving with the same events.
+
+	void OnRampageStart(PeerId peer, const C_RampageStart &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+
+		RampageOpenBody body{};
+		if (!m_session.NoteRampageStart(p->id, in.body, NowMs(), body))
+			return;   // rule off: there is no session-wide rampage to be in
+
+		const Session::Rampage &r = m_session.CurrentRampage();
+		if (r.openedBy == p->id && body.elapsedMs == 0)
+			Log(LogKind::Info,
+			    "rampage %u open: %u kills in %d ms, started by %s%s", r.id,
+			    r.target, r.limitMs, p->nick.c_str(),
+			    r.target != in.body.target ? " (target scaled to the session)" : "");
+
+		// To this one client and not broadcast. Every machine's own script
+		// starts the frenzy by itself, so every machine sends its own start
+		// and gets its own answer; broadcasting would hand the other seven a
+		// kill count and an elapsed time they had not asked about, one per
+		// player, for one rampage.
+		S_RampageOpen out;
+		InitHeader(out, NowMs());
+		out.body = body;
+		m_net.SendTo(peer, out, CH_EVENT);
+	}
+
+	void OnRampageKill(PeerId peer, const C_RampageKill &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		if (!m_session.NoteRampageKill(in.body))
+			return;
+
+		// Everyone except them: their own engine counted it before this
+		// packet was built, which is what produced it.
+		S_RampageKill out;
+		InitHeader(out, NowMs());
+		out.byPlayer = p->id;
+		out.body     = in.body;
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// A car wreck, from the machine that decided it. Relayed the way a kill
+	// is, except that a named car reported by a second machine is dropped
+	// here: both copies of it blew up, but it's one car.
+	void OnRampageCar(PeerId peer, const C_RampageCar &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		if (!m_session.NoteRampageCar(in.body))
+			return;
+
+		S_RampageCar out;
+		InitHeader(out, NowMs());
+		out.byPlayer = p->id;
+		out.body     = in.body;
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	void OnRampageEnd(PeerId peer, const C_RampageEnd &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+
+		RampageEndBody body{};
+		if (!m_session.NoteRampageEnd(in.body, body))
+			return;   // somebody already ended it, or it names an old frenzy
+
+		Log(LogKind::Info, "rampage %u %s (%s got there first)", body.frenzyId,
+		    body.outcome == RAMPAGE_PASSED ? "passed" : "failed", p->nick.c_str());
+		BroadcastRampageEnd(body);
+	}
+
+	// To everybody including the reporter: a machine whose own CDarkel has
+	// already ended still needs the verdict, because its rampage.sc is being
+	// held on ONGOING until one arrives.
+	void BroadcastRampageEnd(const RampageEndBody &body) {
+		S_RampageEnd out;
+		InitHeader(out, NowMs());
+		out.body = body;
+		m_net.Broadcast(out, CH_EVENT);
+	}
+
 	// A pedestrian somebody hosts has died and left something behind.
 	// docs/pickups.md 10.
 	//
@@ -1376,6 +1973,119 @@ private:
 		m_net.Broadcast(out, CH_EVENT, peer);
 	}
 
+	// ---- cheats - docs/cheats.md -------------------------------------------
+	//
+	// A cheat that changes something its typist's machine does not own. The
+	// decision is Session::NoteCheat's, which is CheatRelayFor over the rule
+	// and the host: a sky to the host alone, the rest to everybody but the
+	// typist, whose own engine already ran it. Everything else is dropped -
+	// a personal cheat never comes here at all, and one the rule refuses is
+	// refused a second time here for a client too old to have refused it.
+	void OnCheat(PeerId peer, const C_Cheat &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+
+		S_Cheat out;
+		InitHeader(out, NowMs());
+		out.playerId = p->id;
+		out.body     = in.body;
+
+		switch (m_session.NoteCheat(p->id, in.body)) {
+		case CHEAT_RELAY_HOST: {
+			const Player *host = m_session.FindById(m_session.HostId());
+			if (!host)
+				return;
+			m_net.SendTo(host->peer, out, CH_EVENT);
+			Log(LogKind::Detail, "%s used cheat %u; sent to the host, %s",
+			    p->nick.c_str(), static_cast<unsigned>(in.body.cheat),
+			    host->nick.c_str());
+			return;
+		}
+		case CHEAT_RELAY_OTHERS:
+			m_net.Broadcast(out, CH_EVENT, peer);
+			Log(LogKind::Detail, "%s used cheat %u; everybody runs it (state %u)",
+			    p->nick.c_str(), static_cast<unsigned>(in.body.cheat),
+			    static_cast<unsigned>(in.body.state));
+			return;
+		default:
+			Log(LogKind::Warn, "%s used cheat %u, which this session does not "
+			    "pass on (cheats = %s)", p->nick.c_str(),
+			    static_cast<unsigned>(in.body.cheat),
+			    m_session.CheatRuleValue() == CHEAT_RULE_OFF        ? "off"
+			    : m_session.CheatRuleValue() == CHEAT_RULE_PERSONAL ? "personal"
+			                                                        : "shared");
+			return;
+		}
+	}
+
+	// ---- money - protocol.h, MoneyRule ---------------------------------------
+	//
+	// Under `shared` a player's cash moved. The server adds it up and tells
+	// everybody the total, each with their own ack, so a machine with changes
+	// still in flight doesn't write them away.
+	void OnMoneyChange(PeerId peer, const C_MoneyChange &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const bool seeds = !m_session.MoneyPoolSeeded();
+		if (!m_session.NoteMoneyChange(p->id, in.body))
+			return;
+
+		if (seeds)
+			Log(LogKind::Detail, "%s brought $%d, which is now everybody's",
+			    p->nick.c_str(), m_session.MoneyPool());
+		else if (in.body.delta != 0)
+			Log(LogKind::Detail, "%s: $%+d, the session has $%d", p->nick.c_str(),
+			    in.body.delta, m_session.MoneyPool());
+
+		for (const Player &q : m_session.Players())
+			if (q.active)
+				m_net.SendTo(q.peer,
+				             m_session.MoneyFor(q.id, p->id, in.body.delta, NowMs()),
+				             CH_EVENT);
+	}
+
+	// A wreck the sender decided and somebody else earned - or the sender
+	// earned, on a car other machines decide too. To the recipient alone.
+	void OnMoneyAward(PeerId peer, const C_MoneyAward &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		if (!m_session.TakeMoneyAward(p->id, in.body, NowMs()))
+			return;
+		const Player *to = m_session.FindById(in.body.toPlayerId);
+		if (!to)
+			return;
+
+		S_MoneyAward out;
+		InitHeader(out, NowMs());
+		out.fromPlayerId = p->id;
+		out.body         = in.body;
+		m_net.SendTo(to->peer, out, CH_EVENT);
+		Log(LogKind::Detail, "%s's game sends %s $%d for a wrecked car",
+		    p->nick.c_str(), to->nick.c_str(), in.body.unit);
+	}
+
+	// Where a knocked-over one came to rest. Same job, same reasons, and
+	// deliberately the same amount of server: stamp the sender and pass it
+	// on. The server has no opinion about whether a lamp post fell over,
+	// holds no table of the ones that did, and tells no joiner - the engine
+	// converts the object back to a pristine dummy 80 m out and throws the
+	// whole transform away, so anything remembered here would be a fact with
+	// a shorter life than the packet that carried it.
+	void OnObjectSettled(PeerId peer, const C_ObjectSettled &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+
+		S_ObjectSettled out;
+		InitHeader(out, NowMs());
+		out.playerId = p->id;
+		out.body     = in.body;
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
 	void OnPickupRelease(PeerId peer, const C_PickupRelease &in) {
 		if (!m_session.FindByPeer(peer))
 			return;
@@ -1405,6 +2115,9 @@ private:
 			return;
 
 		S_WorldState out;
+		// Our own clock, never the host's C_WorldState header. Clients run
+		// the trains and planes off this timestamp (client/src/sessiontime.h),
+		// so it has to be the same clock for every one of them.
 		InitHeader(out, NowMs());
 		out.body.hour       = m_session.Clock().Hour();
 		out.body.minute     = m_session.Clock().Minute();

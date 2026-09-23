@@ -60,9 +60,8 @@
 // **4. The wanted seam.**
 //
 // CWanted::Reset (0x004AD790) is in addresses.h and is deliberately never
-// called from here. The wanted level is not on the wire at all yet
-// (roadmap.md §5.1, designed and unbuilt, and owned by another agent right
-// now), and the respray already clears the stars of the player who paid,
+// called from here. The wanted level has its own sync (wanted.h), and the
+// respray already clears the stars of the player who paid,
 // through the engine's own code, on their own machine - that needs nothing
 // from CoopIII. The only thing CoopIII does about it is *not* clear an
 // observer's stars, which falls out of (3) for free.

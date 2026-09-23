@@ -270,7 +270,9 @@ target("clienttest")
     set_default(false)
     add_files("tools/clienttest/*.cpp",
               "client/src/client.cpp", "client/src/netthread.cpp",
-              "client/src/interp.cpp", "client/src/log.cpp")
+              "client/src/interp.cpp", "client/src/log.cpp",
+              "client/src/game/sessionclock.cpp",
+              "client/src/helisync.cpp", "client/src/moneysync.cpp")
     add_includedirs("client/src")
     add_deps("sdk")
 

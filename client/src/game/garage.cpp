@@ -320,8 +320,8 @@ uint8_t DrainLocalRespraysImpl(LocalRespray *out, uint8_t max) {
 void ApplyRemoteResprayImpl(RemoteVehicle *vehicle, const ResprayBody &body) {
 	// SEAM (wanted level). Nothing here clears anybody's stars, on purpose.
 	//
-	// The wanted level is not on the wire at all yet (docs/roadmap.md §5.1 is
-	// designed and unbuilt) and this packet has no field for it. The respray
+	// The wanted level travels on its own, in PlayerFlags since version 18
+	// (docs/wanted.md), and this packet has no field for it. The respray
 	// already clears the stars of the player who paid for it, on their own
 	// machine, through the engine's own CWanted::Reset inside the arm that
 	// produced this packet - CoopIII does nothing to make that happen and
@@ -330,9 +330,10 @@ void ApplyRemoteResprayImpl(RemoteVehicle *vehicle, const ResprayBody &body) {
 	// does not, because HookedGarageUpdate never lets the arm that would run
 	// here.
 	//
-	// If §5.1 ever lands a *shared* wanted level, this is the one place that
-	// changes, and the change is a call into whatever seam that work
-	// exposes - never a second CWanted::Reset of CoopIII's own.
+	// The `shared` wanted rule did land, and this place did not have to
+	// change: the payer's own engine clears the payer's level, and
+	// game/wanted.h (PlanWanted) decides what that does to the session's
+	// floor. Never a second CWanted::Reset of CoopIII's own here.
 
 	if (!vehicle || vehicle->poolHandle < 0)
 		return;

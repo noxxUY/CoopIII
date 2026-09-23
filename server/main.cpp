@@ -31,12 +31,17 @@ namespace {
 bool OpenConsole() { return ui::OpenConsole(L"CoopIII Server"); }
 
 void Usage() {
-	std::printf("usage: server [port] [-friendlyfire] [-ammosync] [--nogui]\n"
+	std::printf("usage: server [port] [-friendlyfire] [-ammosync] [-money off|own|shared]\n"
+	            "              [--nogui]\n"
 	            "\n"
 	            "  port           listen on this UDP port instead of the one in the ini\n"
 	            "  -friendlyfire  players can hurt each other (also -ff)\n"
 	            "  -ammosync      a player's real ammunition is reported to everyone\n"
 	            "                 else instead of a fixed thousand rounds (also -ammo)\n"
+	            "  -money RULE    off: each game pays its own player, as always\n"
+	            "                 own: rewards go to whoever earned them\n"
+	            "                 shared: one wallet for the whole session\n"
+	            "                 (also -money=RULE)\n"
 	            "  --nogui        no window: log to this console, Ctrl-C to stop\n");
 }
 
@@ -67,6 +72,23 @@ int main(int argc, char **argv) {
 		if (Matches(argv[i], "-ammosync", "-ammo")) {
 			startup.config.ammoSync = true;
 			continue;
+		}
+		// The one option with a value. Either `-money shared` or
+		// `-money=shared`; a missing or unknown value is refused below like
+		// any other bad argument rather than quietly left at off.
+		if (Matches(argv[i], "-money") || std::strncmp(argv[i], "-money=", 7) == 0) {
+			const char *value = argv[i][6] == '=' ? argv[i] + 7
+			                    : i + 1 < argc    ? argv[++i]
+			                                      : "";
+			MoneyMode rule = startup.config.money;
+			if (ParseMoney(value, &rule)) {
+				startup.config.money = rule;
+				continue;
+			}
+			OpenConsole();
+			std::printf("server: -money takes off, own or shared, not \"%s\"\n\n", value);
+			Usage();
+			return 2;
 		}
 		// Both spellings: the options this already had use one dash, and
 		// turning somebody away over a dash they did not type is not worth

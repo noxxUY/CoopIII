@@ -1,9 +1,18 @@
 #include "vehicle.h"
 
 #include "addresses.h"
+#include "boat.h"
 #include "cardamage.h"
+#include "carlife.h"
+#include "carstatus.h"
+#include "combat.h"
+#include "horn.h"
+#include "observed.h"
+#include "ped.h"
 #include "pedanim.h"
 #include "population.h"
+#include "siren.h"
+#include "wreckqueue.h"
 #include "../hook/hook.h"
 #include "../log.h"
 #include "../quat.h"
@@ -15,6 +24,12 @@ namespace {
 void *PlayerPed() {
 	return Func<void *(__cdecl *)()>(FindPlayerPed)();
 }
+
+// How far to the side of the car to put the local player when the session
+// takes a car off him. A GTA III car is about two metres across, so this
+// clears the body and no more - the same step game/seat.cpp puts a passenger
+// down with, and for the same reason.
+constexpr float PED_STEP_OUT_M = 2.0f;
 
 // The vehicle the local player is in, or null. Reads CPed::m_pMyVehicle, but
 // only after CPed::bInVehicle confirms the pointer means anything -
@@ -107,6 +122,31 @@ bool IsWrecked(void *vehicle) {
 	return VehicleStatus(vehicle) == ENTITY_STATUS_WRECKED;
 }
 
+// CVehicle::m_vehType, which the constructor stamps and never changes. Every
+// CAutomobile-only write in this file asks this first (game/boat.h).
+int32_t VehicleTypeOf(void *vehicle) {
+	return Field<int32_t>(vehicle, offs::VEH_TYPE);
+}
+
+// Holds the five-second fire timer at zero, on whichever member this vehicle
+// keeps it in. A car's is at +0x530 and a boat's at +0x2CC, and the car's
+// offset is past the end of a boat (addresses.h, "boats").
+void HoldFireTimer(void *vehicle) {
+	const size_t at = FireBlowUpTimerOffset(VehicleTypeOf(vehicle));
+	if (at)
+		Field<float>(vehicle, at) = 0.0f;
+}
+
+// CREATE_CAR's class choice for a model id off the wire. Reads the model info
+// itself rather than calling CModelInfo::IsBoatModel, which has no null check.
+VehicleBuild VehicleBuildForModel(uint32_t model) {
+	void *const info = VehicleModelInfo(model);
+	if (!info)
+		return VehicleBuild::None;
+	return VehicleBuildFor(true, Field<uint8_t>(info, offs::MODELINFO_TYPE),
+	                       Field<int32_t>(info, offs::MODELINFO_VEHICLE_TYPE));
+}
+
 // ---- which cars this machine is only watching ------------------------------
 //
 // The BlowUpCar detour gets a bare CVehicle* and has to answer two questions
@@ -123,36 +163,27 @@ bool IsWrecked(void *vehicle) {
 // taxi blow up for the rest of the session. CPool::GetAt compares the whole
 // flags byte including the slot's free bit, so a dead handle resolves to null
 // and can never match anything.
+//
+// Every row in the session's vehicle roster that has a CVehicle here has a row
+// in this table too, whoever built the car: SpawnRemoteVehicle for a replica,
+// AdoptPromotedCar for traffic that became a session car, and
+// AdoptClaimedVehicle for a car the local player claimed out of his own
+// street. The last one is the car that goes on being ours after somebody else
+// takes it, and without a row it was a car another player drives that this
+// engine still dented and blew up by itself. game/observed.h has the table.
 constexpr size_t MAX_OBSERVED = 64;   // Client::MAX_REMOTE_VEHICLES
 
-struct Observed {
-	int32_t  handle        = -1;
-	uint16_t netId          = 0;
-	uint8_t  driverPlayerId = 0xFF;
-};
+using Observed = ObservedRow;
 
-Observed g_observed[MAX_OBSERVED];
+ObservedTable<MAX_OBSERVED> g_observed;
 
 Observed *FindObserved(const void *vehicle) {
-	if (!vehicle)
-		return nullptr;
-	for (Observed &o : g_observed) {
-		if (o.handle < 0)
-			continue;
-		if (VehicleFromRef(o.handle) == vehicle)
-			return &o;
-	}
-	return nullptr;
+	return g_observed.Find(vehicle, &VehicleFromRef);
 }
 
 void RememberObserved(int32_t handle, uint16_t netId) {
-	if (handle < 0)
+	if (g_observed.Remember(handle, netId, &VehicleFromRef))
 		return;
-	for (Observed &o : g_observed)
-		if (o.handle < 0) {
-			o = Observed{handle, netId, 0xFF};
-			return;
-		}
 	// Full means the roster is already full, so this cannot happen without a
 	// bug upstream. Say so once rather than silently watching a car nobody
 	// can refuse to destroy.
@@ -165,20 +196,77 @@ void RememberObserved(int32_t handle, uint16_t netId) {
 	}
 }
 
-void ForgetObserved(uint16_t netId) {
-	for (Observed &o : g_observed)
-		if (o.handle >= 0 && o.netId == netId)
-			o = Observed{};
+void ForgetObserved(uint16_t netId) { g_observed.Forget(netId); }
+
+// A session car with nobody at the wheel and nobody settling it, us included.
+// The caller has already ruled out the local player driving it.
+bool Unheld(const Observed *o) {
+	return o != nullptr && o->driverPlayerId == 0xFF &&
+	       o->custodianPlayerId == 0xFF && !o->weSettle;
 }
 
-// Who the session says is driving a given observed car. Called every frame
-// from CorrectRemoteVehicle rather than only from ApplyRemoteVehicle, because
-// the detour's refusal rule turns on it and ApplyRemoteVehicle is skipped for
-// a wreck and for a car with no snapshot yet. A car whose row still said
-// "nobody" would be one this machine's own engine felt free to destroy.
-void NoteObservedDriver(const void *vehicle, uint8_t driverPlayerId) {
-	if (Observed *o = FindObserved(vehicle))
-		o->driverPlayerId = driverPlayerId;
+// Who else holds a car is written by NoteVehicleHolders, below, and nothing
+// else. It used to be written from CorrectRemoteVehicle, ApplyRemoteVehicle
+// and RestRemoteVehicle, which never run for a car this machine drives or
+// settles - so the row kept naming whoever held the car before us, and the
+// detours refused our own custody car on their word.
+
+// ---- which cars are replicas of somebody else's traffic --------------------
+//
+// The same idea as the Observed table, for the ambient roster. The detours
+// get a bare CVehicle*, and to forward a hit they need the netId as well as
+// the fact that it's a replica. So SpawnAmbientCarReplica writes a row and
+// the despawn, the promotion and a reaped handle clear it.
+//
+// Handles, not pointers, for the reason the Observed table gives. A row whose
+// handle has stopped resolving can never match, and RememberReplica reuses it.
+constexpr size_t MAX_REPLICAS = 128;   // Client::MAX_REMOTE_CARS
+
+struct ReplicaRow {
+	int32_t  handle = -1;
+	uint16_t netId  = 0;
+	// Its host's ped rows put somebody in the driver's seat, and its siren is
+	// on. Rewritten every frame by CorrectAmbientCarReplica; only the siren
+	// detour reads it.
+	bool     driverSaid = false;
+};
+
+ReplicaRow g_replicas[MAX_REPLICAS];
+
+const ReplicaRow *FindReplica(const void *vehicle) {
+	if (!vehicle)
+		return nullptr;
+	for (const ReplicaRow &r : g_replicas) {
+		if (r.handle < 0)
+			continue;
+		if (VehicleFromRef(r.handle) == vehicle)
+			return &r;
+	}
+	return nullptr;
+}
+
+void ForgetReplica(uint16_t netId) {
+	for (ReplicaRow &r : g_replicas)
+		if (r.handle >= 0 && r.netId == netId)
+			r = ReplicaRow{};
+}
+
+void RememberReplica(int32_t handle, uint16_t netId) {
+	if (handle < 0)
+		return;
+	ForgetReplica(netId);
+	for (ReplicaRow &r : g_replicas)
+		if (r.handle < 0 || VehicleFromRef(r.handle) == nullptr) {
+			r = ReplicaRow{handle, netId};
+			return;
+		}
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("bridge: the traffic replica table is full at %u; replica %u will "
+		    "take damage here like a car nobody owns",
+		    static_cast<unsigned>(MAX_REPLICAS), netId);
+	}
 }
 
 // Set while CoopIII is driving BlowUpCar rather than the engine. Same shape
@@ -191,15 +279,37 @@ struct BlastGuard {
 	~BlastGuard() { g_replayingBlast = false; }
 };
 
+// The same thing for the hit this machine is applying to its OWN car off
+// somebody else's report. Separate from the blast flag rather than shared:
+// the two guard different functions, and a single flag would mean one of them
+// could open the other's door.
+bool g_replayingHit = false;
+
+struct HitGuard {
+	HitGuard() { g_replayingHit = true; }
+	~HitGuard() { g_replayingHit = false; }
+};
+
 // One line each, first time only. A car that quietly fails to explode is
 // indistinguishable from a feature nobody built - that lesson cost this
 // project a session in M4 - so each link of the chain says itself once.
 bool g_saidBlastSent    = false;
 bool g_saidBlastApplied = false;
 bool g_saidBlastRefused = false;
+bool g_saidSettleBlastRefused = false;
 bool g_saidWreckReaped  = false;
 bool g_saidTookOver     = false;
 bool g_saidBurning      = false;
+bool g_saidReplicaBlastRefused = false;
+bool g_saidCarHitSent          = false;
+bool g_saidCarHitApplied       = false;
+bool g_saidCarHitGone          = false;
+bool g_saidHornSent            = false;
+bool g_saidHornReplayed        = false;
+
+// How many more snapshots the horn bit rides after the horn stopped. One
+// local car at a time, so one of these (game/horn.h, HornOnWire).
+HornTail g_hornTail;
 
 // The local player's car blowing up, waiting to be picked up by Client.
 //
@@ -309,29 +419,67 @@ void *CarFromGenerator(uint32_t index) {
 // Unowned cars this machine's engine destroyed, waiting for Client to put
 // them on the wire.
 //
-// Eight rather than the driver queue's four: a single rocket into a row of
-// parked cars is one frame and several wrecks, and dropping one of them is a
-// car that stays intact on every other screen.
-constexpr uint8_t MAX_PENDING_UNOWNED = 8;
-UnownedVehicleKey g_unowned[MAX_PENDING_UNOWNED];
-uint8_t           g_unownedHead  = 0;
-uint8_t           g_unownedCount = 0;
+// It used to hold eight, sized for a rocket into a row of parked cars.
+// BANGBANGBANG wrecks the whole pool in one frame and the ninth car onwards
+// fell off the front, intact on every other screen. So it holds the pool:
+// nothing can wreck more cars in a frame than there are (game/wreckqueue.h).
+//
+// The transform is zeroed rather than left unread. A parked car is where the
+// map put it on every machine and the receiver never looks at these bytes,
+// but a packet with uninitialised bytes on it is a packet nobody can read a
+// capture of.
+WreckQueue<VEHICLE_POOL_SIZE> g_unowned;
+static_assert(WreckQueue<VEHICLE_POOL_SIZE>::kCapacity >= size_t(VEHICLE_POOL_SIZE),
+              "one frame can wreck every car in the pool");
 
 void PushUnownedBlast(const UnownedVehicleKey &key) {
-	// Already queued: two calls for one car in one drain window. Cheap to
-	// check and it keeps the queue for distinct cars.
-	for (uint8_t i = 0; i < g_unownedCount; ++i) {
-		const UnownedVehicleKey &k =
-		    g_unowned[(g_unownedHead + i) % MAX_PENDING_UNOWNED];
-		if (k.kind == key.kind && k.id == key.id)
-			return;
+	// Already queued: two calls for one car in one drain window. The queue
+	// refuses the second, which keeps it for distinct cars.
+	UnownedBlast blast{};
+	blast.key = key;
+	g_unowned.Push(blast);
+}
+
+// Hits the local player landed on cars other people are driving, waiting for
+// Client to name them and put them on the wire.
+//
+// Sixteen, and it is the widest queue in this file on purpose. A blast is one
+// event per car per life; a burst from an Uzi is one of these per round, and
+// several of them land inside one frame at 60 FPS. Oldest drops rather than
+// newest, the same as the combat queue: if this ever overflows, the rounds
+// worth keeping are the ones still in the air.
+constexpr uint8_t MAX_PENDING_HITS = 16;
+VehicleHitBody    g_hits[MAX_PENDING_HITS];
+uint8_t           g_hitHead  = 0;
+uint8_t           g_hitCount = 0;
+
+// Not deduplicated, and that is a decision rather than an omission. Two rounds
+// into the same car are two hits and the engine would apply both in single
+// player; collapsing them here would make a shotgun cost what a pistol costs.
+// Contrast PushUnownedBlast above, which does dedupe, because a car can only
+// be destroyed once.
+void PushVehicleHit(const VehicleHitBody &hit) {
+	if (g_hitCount == MAX_PENDING_HITS) {
+		g_hitHead = static_cast<uint8_t>((g_hitHead + 1) % MAX_PENDING_HITS);
+		--g_hitCount;
 	}
-	if (g_unownedCount == MAX_PENDING_UNOWNED) {
-		g_unownedHead = static_cast<uint8_t>((g_unownedHead + 1) % MAX_PENDING_UNOWNED);
-		--g_unownedCount;
+	g_hits[(g_hitHead + g_hitCount) % MAX_PENDING_HITS] = hit;
+	++g_hitCount;
+}
+
+// The same queue for hits on traffic replicas. Separate because the two go out
+// as different packets to owners the server finds by different rules.
+VehicleHitBody g_carHits[MAX_PENDING_HITS];
+uint8_t        g_carHitHead  = 0;
+uint8_t        g_carHitCount = 0;
+
+void PushCarHit(const VehicleHitBody &hit) {
+	if (g_carHitCount == MAX_PENDING_HITS) {
+		g_carHitHead = static_cast<uint8_t>((g_carHitHead + 1) % MAX_PENDING_HITS);
+		--g_carHitCount;
 	}
-	g_unowned[(g_unownedHead + g_unownedCount) % MAX_PENDING_UNOWNED] = key;
-	++g_unownedCount;
+	g_carHits[(g_carHitHead + g_carHitCount) % MAX_PENDING_HITS] = hit;
+	++g_carHitCount;
 }
 
 // One detour per function. CAutomobile::BlowUpCar and CBoat::BlowUpCar are
@@ -339,6 +487,11 @@ void PushUnownedBlast(const UnownedVehicleKey &key) {
 // that one, so both are hooked and both land in the same handler below.
 Detour g_blowUpCar;
 Detour g_blowUpBoat;
+Detour g_inflictDamage;
+Detour g_sirenAudio;   // cAudioManager::ProcessVehicleSirenOrAlarm, game/siren.h
+Detour g_carAiUpdate;  // CCarAI::UpdateCarAI, game/carstatus.h
+Detour g_carAiSteer;   // CCarCtrl::SteerAICarWithPhysics, game/carstatus.h
+Detour g_boatAiSteer;  // CCarCtrl::SteerAIBoatWithPhysics, game/carstatus.h
 
 // __thiscall void CAutomobile::BlowUpCar(CEntity *culprit).
 //
@@ -394,17 +547,53 @@ void BlowUpCarCommon(Detour &detour, void *self, void *culprit) {
 	// ourselves - that one goes out as C_VehicleBlowUp.
 	uint16_t sessionNetId = INVALID_NETID;
 
-	if (const Observed *o = weDrive ? nullptr : FindObserved(self)) {
-		if (o->driverPlayerId != 0xFF) {
-			Field<float>(self, offs::AUTO_FIRE_BLOWUP_TIMER) = 0.0f;
-			if (!g_saidBlastRefused) {
-				g_saidBlastRefused = true;
-				Log("bridge: refused to blow up vehicle %u - player %u is driving "
-				    "it, so it is theirs to destroy",
-				    o->netId, o->driverPlayerId);
-			}
-			return;
+	// A replica of somebody else's traffic is refused the same way, and for
+	// the same reason: its host decides when it's finished, and that decision
+	// arrives as C_UnownedBlowUp and comes back in through
+	// BlowUpCarAsOwnerSaid. Letting this one through wrecked the car on this
+	// screen only and killed its driver replica on the way, through
+	// CPed::SetDead at 0x0053BDCD, which no SetDie guard can see.
+	//
+	// A car another player is settling is refused too. Their engine is the
+	// only one simulating it until they hand it back, and their wreck reaches
+	// us as C_UnownedBlowUp through WreckSessionVehicle, under the replay
+	// guard - so it's a wreck here once and isn't counted toward a rampage
+	// twice.
+	const Observed *const o        = weDrive ? nullptr : FindObserved(self);
+	const bool            driven   = o != nullptr && o->driverPlayerId != 0xFF;
+	const bool            settling = o != nullptr && !driven &&
+	                                 o->custodianPlayerId != 0xFF;
+	const ReplicaRow     *replica  =
+	    (weDrive || driven || settling) ? nullptr : FindReplica(self);
+
+	if (!MayBlowUpCar(ClassifyCar(false, weDrive, driven, settling,
+	                              replica != nullptr, Unheld(o)))) {
+		// Through HoldFireTimer, because this detour is also the boat's and a
+		// boat's timer is not at the car's offset - it reads the object's own
+		// m_vehType, so it is right whichever detour brought us here.
+		HoldFireTimer(self);
+		if (driven && !g_saidBlastRefused) {
+			g_saidBlastRefused = true;
+			Log("bridge: refused to blow up vehicle %u - player %u is driving "
+			    "it, so it is theirs to destroy",
+			    o->netId, o->driverPlayerId);
 		}
+		if (settling && !g_saidSettleBlastRefused) {
+			g_saidSettleBlastRefused = true;
+			Log("bridge: refused to blow up vehicle %u - player %u is settling "
+			    "it, so until they hand it back it is theirs to destroy",
+			    o->netId, o->custodianPlayerId);
+		}
+		if (replica && !g_saidReplicaBlastRefused) {
+			g_saidReplicaBlastRefused = true;
+			Log("bridge: refused to blow up traffic replica %u - the machine "
+			    "hosting it decides that, and says so with C_UnownedBlowUp",
+			    replica->netId);
+		}
+		return;
+	}
+
+	if (o) {
 		// A synced car with nobody in it is nobody's, so this machine keeps
 		// its ordinary behaviour and lets the engine destroy it - and then
 		// says so, below, because until now nobody did. That is
@@ -506,6 +695,221 @@ void __fastcall HookedBlowUpCar(void *self, void * /*edx*/, void *culprit) {
 
 void __fastcall HookedBlowUpBoat(void *self, void * /*edx*/, void *culprit) {
 	BlowUpCarCommon(g_blowUpBoat, self, culprit);
+}
+
+// ---- a hit on a car somebody else is driving, or hosting -------------------
+//
+// __thiscall void CVehicle::InflictDamage(CEntity *culprit, eWeaponType,
+//                                         float damage). ret 0Ch.
+//
+// Written __fastcall for the same reason every other detour in this codebase
+// is: it is how a free function receives `this` in ecx with the three stack
+// arguments left exactly where __thiscall put them, and both conventions have
+// the callee clean them. The signature, the convention and the argument count
+// were re-read out of the retail image for this change rather than inherited -
+// addresses.h carries the transcription, including the twelve bytes of
+// alignment padding that prove 0x00551950 is a function start and the `ret 0Ch`
+// at every one of the seven exits that proves there are three arguments.
+//
+// This detour is to a car what combat.cpp's CPed::InflictDamage detour is to a
+// pedestrian, and it exists for a reason that is sharper here than there.
+//
+// **The proof flags were never going to be the mechanism.** CoopIII sets
+// exactly one on an observed car - bCollisionProof, in SetVehicleObserved
+// below - and it cannot set the rest: bExplosionProof would stop a replayed
+// blast reaching a car it is supposed to reach identically on every machine.
+// Even all five would not close it, because the flags sit inside a switch on
+// the damage cause and four of that switch's arms check nothing at all
+// (0x00551A10, reached for causes 12, 14, 15, 17 and everything from 20 up).
+// So the rule is stated here, once, positively: nothing on this machine may
+// take health off a car this machine does not drive, and anything the local
+// player did on purpose becomes a packet instead.
+//
+// **A blast is not routed through here and must not be.** An explosion is
+// replayed on every machine at a position everybody agreed on, and
+// CWorld::TriggerExplosionSectorList's damage multiplier is a function of the
+// blast position and the car's position and nothing else - so the owner's own
+// engine puts its own car in its own blast and decides what it costs, and if
+// that kills it the wreck travels on C_VehicleBlowUp with the transform its
+// physics chose. Forwarding it as damage as well would apply it twice, which
+// is the argument IsForwardableDamage already makes for a player and for a
+// pedestrian. What is new for a car is the other half: the observer must also
+// *refuse* it locally, because unlike a replica ped a replica car is not
+// explosion-proof and unlike a player its copy cannot then blow up - the
+// BlowUpCar detour above refuses that - so it would sit at zero health, on
+// fire, forever. That is §1.11.1's bug exactly.
+//
+// A traffic replica gets the same treatment with its host in the driver's
+// place (docs/protocol.md §1.23). Both detours refuse it together, for the
+// reason just given, and CorrectAmbientCarReplica holds the host's health on
+// it every frame as a backstop for the writers that never call this function:
+// the upside-down drain at 0x0052F472, the burning-occupant write of 75.0f at
+// 0x00479959 and the engine-status drain at 0x005347E0.
+using InflictDamageThisFn = void(__thiscall *)(void *, void *, uint32_t, float);
+using InflictDamageHookFn = void(__fastcall *)(void *, void *, void *, uint32_t,
+                                               float);
+
+bool g_saidHitSent         = false;
+bool g_saidUnheldHitSent   = false;
+bool g_saidHitNotForwarded = false;
+bool g_saidHitApplied      = false;
+bool g_saidHitNoMove       = false;
+bool g_saidHitGone         = false;
+bool g_saidReplayHitRefused = false;
+
+void __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *culprit,
+                                    uint32_t weapon, float damage) {
+	// Our own ApplyRemoteVehicleHit, putting somebody else's report into our
+	// own car. It goes straight through: the car is ours, the decision was
+	// ours to make, and the guard below would not catch it anyway - but a
+	// replay that ran through the reporting arm would be this machine
+	// forwarding a hit back at the machine that sent it.
+	if (!self || g_replayingHit) {
+		g_inflictDamage.Original<InflictDamageHookFn>()(self, nullptr, culprit,
+		                                                weapon, damage);
+		return;
+	}
+
+	// Whose car is it? Three kinds belong to another machine: a session car
+	// the session says somebody else is driving (protocol 23), one somebody
+	// else is settling after getting out of it (S_VehicleCustody), and a
+	// replica of traffic somebody else hosts (§1.23). Everything else -
+	// traffic we host, a parked car - is this engine's to damage, a replayed
+	// blast damages every copy of those the same way, and roadmap.md §5.8's
+	// wreck report carries what is left over.
+	//
+	// The custodian is in that list because its engine is the one simulating
+	// the car and streaming its health, exactly like a driver's. Left out, a
+	// shot here took health off our copy, the custodian's next snapshot put it
+	// back, and a car that died here during the settle blew up on this screen
+	// and went out as UNOWNED_SESSION while the custodian's copy was fine.
+	//
+	// A session car nobody is in or settling is Nobody, and it used to be
+	// treated as ours. Its health is the session's last word and every machine
+	// writes it back each frame, so a shot here lasted one frame and a parked
+	// car could be emptied into without ever catching fire. Now our own hit
+	// goes out and the server makes us the custodian, whose engine then keeps
+	// the health and the fire timer for everybody. A blast still lands here.
+	//
+	// The local player at the wheel wins over all of them, the same as in
+	// BlowUpCarCommon: a car the session hasn't caught up on yet is still
+	// ours to this engine, and refusing damage under its actual driver would
+	// be the worse bug.
+	void *const           localPed = PlayerPed();
+	const bool            weDrive =
+	    localPed != nullptr && Field<void *>(self, offs::VEH_DRIVER) == localPed;
+	const Observed *const o        = weDrive ? nullptr : FindObserved(self);
+	const bool            driven   = o != nullptr && o->driverPlayerId != 0xFF;
+	const bool            settling = o != nullptr && !driven &&
+	                                 o->custodianPlayerId != 0xFF;
+	const ReplicaRow     *replica  =
+	    (weDrive || driven || settling) ? nullptr : FindReplica(self);
+	const CarOwner owner =
+	    ClassifyCar(false, weDrive, driven, settling, replica != nullptr, Unheld(o));
+
+	// Our own car, hit by somebody else's replayed round. If they would have
+	// forwarded a hit on it - the car we drive, the one we settle, our named
+	// traffic - that packet is the hit, and this would be the same round a
+	// second time (combat.h, ReplayedShotMayDamage). The sparks and the sound
+	// are DoBulletImpact's own and were drawn before this call.
+	if (owner == CarOwner::Local && ReplayingRemoteShot()) {
+		bool       named  = false;
+		const bool hosted = !weDrive && HostedCarFor(self, named);
+		const ReplayTarget target =
+		    ClassifyReplayCar(owner, weDrive, o != nullptr && o->weSettle, hosted, named);
+		if (!ReplayedShotMayDamage(target, static_cast<uint8_t>(weapon))) {
+			if (!g_saidReplayHitRefused) {
+				g_saidReplayHitRefused = true;
+				Log("vehicle: a replayed shot reached %s (cause %u, %.0f) and we did "
+				    "not take the health. The shooter's %s for it is the hit that "
+				    "counts",
+				    target == ReplayTarget::CarWeDrive    ? "the car we are driving"
+				    : target == ReplayTarget::CarWeSettle ? "the car we are settling"
+				                                          : "one of our traffic cars",
+				    weapon, damage,
+				    target == ReplayTarget::NamedHostedCar ? "C_CarHit" : "C_VehicleHit");
+			}
+			return;
+		}
+	}
+
+	// Only what the local player did deliberately is reported, the same test
+	// as the pedestrian branch in combat.cpp: a city NPC shooting a replica
+	// happened in one simulation only, and forwarding it would have this
+	// machine's traffic shooting up another machine's cars. Not into a wreck
+	// either: the owner's InflictDamage leaves at 0x00551A10 for health <= 0.
+	const bool ours = localPed != nullptr && culprit == localPed;
+	const CarDamageVerdict verdict =
+	    DecideCarDamage(owner, ours, IsWrecked(self), static_cast<uint8_t>(weapon));
+
+	if (verdict == CarDamageVerdict::Apply) {
+		g_inflictDamage.Original<InflictDamageHookFn>()(self, nullptr, culprit,
+		                                                weapon, damage);
+		return;
+	}
+
+	// Refused from here on. A traffic replica's hit goes to its host.
+	if (owner == CarOwner::RemoteHost) {
+		if (verdict == CarDamageVerdict::Forward) {
+			VehicleHitBody hit{};
+			hit.netId  = replica->netId;
+			hit.weapon = static_cast<uint8_t>(weapon);
+			hit.amount = damage;
+			PushCarHit(hit);
+			if (!g_saidCarHitSent) {
+				g_saidCarHitSent = true;
+				Log("vehicle: our first hit on traffic replica %u, %.0f with "
+				    "cause %u, is refused here and goes to its host as C_CarHit",
+				    replica->netId, damage, weapon);
+			}
+		}
+		return;
+	}
+
+	// A driven car and a settling one both go out as C_VehicleHit. The server
+	// sends it to the driver, or to the custodian when there is no driver
+	// (Session::VehicleHitRecipient), so the packet doesn't have to say which.
+	// With neither it makes us the custodian and sends it back
+	// (Session::CustodyForHit).
+	if (verdict == CarDamageVerdict::Forward) {
+		VehicleHitBody hit{};
+		hit.netId  = o->netId;
+		hit.weapon = static_cast<uint8_t>(weapon);
+		hit.amount = damage;
+		PushVehicleHit(hit);
+
+		if (owner == CarOwner::Nobody) {
+			if (!g_saidUnheldHitSent) {
+				g_saidUnheldHitSent = true;
+				Log("vehicle: our first hit on car net %u, which nobody is driving "
+				    "or settling, %.0f with cause %u, is refused here and goes out "
+				    "as C_VehicleHit. The session makes us its custodian and hands "
+				    "it back, so one engine keeps its health and its fire timer",
+				    o->netId, damage, weapon);
+			}
+		} else if (!g_saidHitSent) {
+			g_saidHitSent = true;
+			Log("vehicle: our first hit on somebody else's car, net %u for %.0f "
+			    "with cause %u, is on its way as C_VehicleHit. Player %u's "
+			    "machine (%s) applies it through its own CVehicle::InflictDamage, "
+			    "and whatever comes of it - the smoke, the dents, the wreck - "
+			    "comes back on the packets that already carry those",
+			    o->netId, damage, weapon,
+			    static_cast<unsigned>(driven ? o->driverPlayerId
+			                                 : o->custodianPlayerId),
+			    driven ? "driving it" : "settling it");
+		}
+	} else if (ours && !IsWrecked(self) &&
+	           !IsFireDamage(static_cast<uint8_t>(weapon)) && !g_saidHitNotForwarded) {
+		// Cause 9 is left out: that is our own flame's fire burning our copy
+		// of the car, and its ignition already went out (ReportOurFlameOnCar).
+		g_saidHitNotForwarded = true;
+		Log("vehicle: our hit on car net %u is refused here and not forwarded, "
+		    "because cause %u is not one the shooter gets to decide "
+		    "(combat.h, IsForwardableDamage). A blast gets there on its own, "
+		    "because every machine replays it at the same place",
+		    o->netId, weapon);
+	}
 }
 
 // ---- extras ---------------------------------------------------------------
@@ -660,14 +1064,18 @@ bool SampleLocalVehicleIdentity(VehicleIdentity &out) {
 
 bool SampleLocalVehicle(VehicleStateBody &out) {
 	void *const vehicle = PlayerVehicle();
-	if (!vehicle)
+	if (!vehicle) {
+		g_hornTail = HornTail{};
 		return false;
+	}
 
 	// Only the driver is authoritative here. A passenger sees the same car
 	// the driver does, and if it also sent state the two would fight it out
 	// at 25 Hz.
-	if (Field<void *>(vehicle, offs::VEH_DRIVER) != PlayerPed())
+	if (Field<void *>(vehicle, offs::VEH_DRIVER) != PlayerPed()) {
+		g_hornTail = HornTail{};
 		return false;
+	}
 
 	out = VehicleStateBody{};
 	out.netId = 0;   // filled in by the caller: netIds are the server's
@@ -694,7 +1102,243 @@ bool SampleLocalVehicle(VehicleStateBody &out) {
 	if (GetBit(vehicle, offs::VEH_FLAGS_A, offs::VEH_LIGHTS_ON))
 		out.flags |= VEH_LIGHTS;
 
+	// The horn as the engine has already decided it this frame, not the key:
+	// this runs after CGame::Process, where ProcessControl wrote 1 or 0 for a
+	// car in status PLAYER. On a siren car a tap of the key writes 0 and
+	// toggles the siren, and on Mr Whoopee the key works the jingle and the
+	// timer is not written at all - the key is not the horn. game/horn.h.
+	const bool honking = Field<uint8_t>(vehicle, offs::VEH_HORN_TIMER) != 0;
+	if (HornOnWire(honking, g_hornTail)) {
+		out.flags |= VEH_HORN;
+		if (!g_saidHornSent) {
+			g_saidHornSent = true;
+			Log("bridge: our first honk is on its way out");
+		}
+	}
+
 	return true;
+}
+
+// ---- a car nobody is sitting in (protocol.h, S_VehicleCustody) -------------
+//
+// Reads the same fields SampleLocalVehicle does, off a car named by its roster
+// row rather than by the local player's seat. Split rather than generalised
+// because the two refusals are opposites and both are load-bearing:
+// SampleLocalVehicle refuses everything the local player is not at the wheel
+// of, and this one is only ever called for a car nobody is in at all.
+bool SampleObservedVehicle(RemoteVehicle &vehicle, VehicleStateBody &out) {
+	void *const v = ResolveRemoteVehicle(vehicle);
+	if (!v)
+		return false;
+
+	// A wreck is finished, and reporting it would relight it - the same
+	// refusal ApplyRemoteVehicle and RestRemoteVehicle make and for the same
+	// reason. A car that blew up while it was settling is a car whose settle
+	// is over.
+	if (IsWrecked(v)) {
+		vehicle.destroyed = true;
+		return false;
+	}
+
+	out       = VehicleStateBody{};
+	out.netId = 0;   // filled in by the caller: netIds are the server's
+
+	out.pos = ReadVec3(v, offs::POSITION);
+	out.rot = QuatFromAxes(ReadVec3(v, offs::MATRIX_RIGHT),
+	                       ReadVec3(v, offs::MATRIX_FWD),
+	                       ReadVec3(v, offs::MATRIX_UP));
+
+	out.moveSpeed = ReadVec3(v, offs::MOVE_SPEED);
+	out.turnSpeed = ReadVec3(v, offs::TURN_SPEED);
+
+	out.steer  = Field<float>(v, offs::VEH_STEER_ANGLE);
+	out.gas    = Field<float>(v, offs::VEH_GAS_PEDAL);
+	out.brake  = Field<float>(v, offs::VEH_BRAKE_PEDAL);
+	out.gear   = Field<uint8_t>(v, offs::VEH_CURRENT_GEAR);
+	out.health = Field<float>(v, offs::VEH_HEALTH);
+
+	out.flags = 0;
+	if (GetBit(v, offs::VEH_FLAGS_A, offs::VEH_ENGINE_ON))
+		out.flags |= VEH_ENGINE_ON;
+	if (Field<bool>(v, offs::VEH_SIREN_OR_ALARM))
+		out.flags |= VEH_SIREN;
+	if (GetBit(v, offs::VEH_FLAGS_A, offs::VEH_LIGHTS_ON))
+		out.flags |= VEH_LIGHTS;
+
+	return true;
+}
+
+// Has it stopped? The speed numbers below answer it, and they are
+// CanPedExitCar's - the tightest gates in the engine - because the whole
+// point of letting a car settle is that a player can then get into it and out
+// of it again.
+//
+// `bIsStatic` is tested first but never answers for a car. The quiet-frame
+// counter in CPhysical::ProcessControl that sets it is behind a type test at
+// 0x00495F9A - an object, or a ped without bPedPhysics - and a vehicle jumps
+// past it to 0x00496179. CAutomobile::ProcessControl keeps its own count
+// (0x00531EDD) and only skips its physics and zeroes both speeds, and no
+// vehicle code in the image sets the bit. A car at rest is never static; the
+// test stays as a guard in case something else ever sets it.
+//
+// A car the engine has taken out of the pool answers true: there is nothing
+// left to settle, and the caller's alternative is to keep the custody open
+// against an object that no longer exists. ResolveRemoteVehicle has already
+// re-armed the spawn by then.
+bool VehicleAtRest(RemoteVehicle &vehicle) {
+	void *const v = ResolveRemoteVehicle(vehicle);
+	if (!v)
+		return true;
+
+	if (GetBit(v, offs::ENTITY_FLAGS_A, offs::ENTITY_IS_STATIC))
+		return true;
+
+	const Vec3 move = ReadVec3(v, offs::MOVE_SPEED);
+	const Vec3 turn = ReadVec3(v, offs::TURN_SPEED);
+	const float moveSq = move.x * move.x + move.y * move.y + move.z * move.z;
+	return VehicleAtRestNumbers(moveSq, turn.x, turn.y, turn.z);
+}
+
+// The custodian's half of who owns a fire. Its engine is the only one running
+// the timer (ApplyRemoteVehicle holds everybody else's), so while this says
+// yes the car is not handed back - a car given back mid-burn has every
+// machine's timer running at once and as many BlowUpCars as players.
+bool VehicleBurning(RemoteVehicle &vehicle) {
+	void *const v = ResolveRemoteVehicle(vehicle);
+	if (!v)
+		return false;
+	return VehicleOnFire(VehicleTypeOf(v), Field<float>(v, offs::VEH_HEALTH),
+	                     IsWrecked(v), Field<void *>(v, VEHICLE_FIRE) != nullptr);
+}
+
+// A traffic car the session has just made a session car (protocol.h,
+// S_CarPromoted). The roster has already moved the pool handle across; this is
+// everything that has to happen to the CVehicle itself.
+//
+// One job, and the interesting part is what is deliberately not done here.
+//
+// The car stops being ours to dent. It has a driver now and that driver is not
+// this machine, which is the same pairing CorrectRemoteVehicle keeps between
+// the transform and bCollisionProof - an observer that goes on denting a car
+// it does not own accumulates damage nobody else has, and damage only ever
+// climbs. If the local player IS the new driver, CorrectRemoteVehicle clears
+// it again on its very next pass by the same test that decides the transform,
+// which is one frame of a flag nothing reads until the collision solver runs
+// and far better than two functions disagreeing about who owns the question.
+//
+// **The pedestrian its own CCarCtrl put at the wheel is not taken out here**,
+// and that is not an omission. A traffic car usually has an AI driver, and the
+// session is about to seat a real player in seat 0 of it - but that seating is
+// the existing one: S_EnterVehicle records the driver, Client::UpdateRemoteSeats
+// carries it out on the first frame both halves exist, and game/ped.cpp's
+// SeatPedInCar opens by calling EvictSeatOccupant for exactly this case. Doing
+// it a second time from here would be a second machine for the same job, and
+// the one in ped.cpp is the one that also knows not to throw the local player
+// out of a seat.
+//
+// `weHostedIt` therefore changes nothing on the engine side. It is taken as an
+// argument because the roster's use of it - never running the deleting
+// destructor on a car this engine made - is the half of the promotion that is
+// genuinely dangerous, and a seam that is handed the fact is a seam the next
+// reader can see was thought about.
+void AdoptPromotedCar(RemoteVehicle &vehicle, bool weHostedIt) {
+	void *const v = ResolveRemoteVehicle(vehicle);
+	if (!v)
+		return;
+
+	SetVehicleObserved(v, true);
+
+	// It stops being a traffic replica and starts being a driven car, and the
+	// two detours have to agree. SpawnRemoteVehicle never ran for it, so
+	// nothing else would put it in the Observed table - and without a row a
+	// driven car on an observer is one this engine damages and blows up on
+	// its own, and one whose hits never reach the driver (protocol 23).
+	// Remembered on the old host too: somebody else drives its car now.
+	// NoteVehicleHolders fills in the driver before the next frame.
+	ForgetReplica(vehicle.netId);
+	if (!FindObserved(v))
+		RememberObserved(vehicle.poolHandle, vehicle.netId);
+
+	// A replica we built is a copy now, so it becomes the same kind of car
+	// SpawnRemoteVehicle builds: MISSION_VEHICLE and on the copy list, which
+	// keeps it out of the traffic budget, the save and a hideout garage like
+	// every other copy (game/carlife.h). Our own engine's car is left as it
+	// is; it was never CoopIII's.
+	if (!weHostedIt) {
+		MakeCopyAMissionCar(v);
+		NoteSessionCopy(vehicle.poolHandle);
+	}
+
+	Log("bridge: traffic car %u is a session car now (%s)", vehicle.netId,
+	    weHostedIt ? "our own engine's, so never ours to destroy"
+	               : "a replica we already had");
+}
+
+// The car the local player is sitting in has just been given a netId by the
+// session (Client::AdoptOurClaimedVehicle). The same registration
+// AdoptPromotedCar makes, for the same reason: SpawnRemoteVehicle never ran
+// for this car, so nothing else puts it in the Observed table.
+//
+// It changes nothing while we drive. Both detours ask m_pDriver first and
+// never look at the table for a car the local player is at the wheel of, so
+// our own car still dents and blows up under us exactly as it did. What the
+// row is for is afterwards: get out, somebody else takes it (a plain entry or
+// a jack), and NoteVehicleHolders writes their id into the row - after which
+// a shot from us is refused here and goes to them as C_VehicleHit, and our
+// engine no longer gets to blow up a car they are driving. And while nobody
+// drives it, the row is what names the wreck UNOWNED_SESSION if it goes up
+// here; without it the blast was nobody's and stayed on this screen.
+//
+// Deliberately not SetVehicleObserved. The collision-proof bit follows the
+// driver's seat and CorrectRemoteVehicle / SurrenderVehicleSeat already move
+// it; setting it here would make the car we are driving collision-proof.
+void AdoptClaimedVehicle(RemoteVehicle &vehicle) {
+	if (vehicle.poolHandle < 0)
+		return;
+	void *const v = VehicleFromRef(vehicle.poolHandle);
+	if (!v)
+		return;
+	// Already there - a replica we built, a promoted car, or our own car
+	// claimed again. The session has just named us, so nobody else is at the
+	// wheel or settling it. NoteVehicleHolders would say the same before the
+	// next frame's physics; this is the frame in between.
+	if (Observed *const o = FindObserved(v)) {
+		o->driverPlayerId    = 0xFF;
+		o->custodianPlayerId = 0xFF;
+		o->weSettle          = false;
+		return;
+	}
+	RememberObserved(vehicle.poolHandle, vehicle.netId);
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("bridge: vehicle %u is the car we claimed; it has an observed row "
+		    "now, for when somebody else is driving it", vehicle.netId);
+	}
+}
+
+// The session has let go of a car our own engine made (RemoteVehicle::ours),
+// so the roster drops the row without destroying the car. The engine half:
+// the Observed row goes, and the collision-proof bit comes off if somebody
+// else had it last. Left behind, the row would go on refusing damage to one of
+// the player's own cars on the word of a session that is over, and the bit
+// would leave it undentable for good.
+//
+// Not through ResolveRemoteVehicle. That re-arms a spawn when the handle is
+// dead, and this row is about to be wiped anyway.
+void ReleaseOwnVehicle(RemoteVehicle &vehicle) {
+	ForgetObserved(vehicle.netId);
+	if (void *const v = VehicleFromRef(vehicle.poolHandle))
+		SetVehicleObserved(v, false);
+}
+
+// The one writer of who else holds a car, for both detours. Client calls it
+// for every row with a CVehicle, before every frame's physics, and has
+// already turned the roster's names into "somebody other than us" - so this
+// only stores.
+void NoteVehicleHolders(uint16_t netId, uint8_t driverPlayerId,
+                        uint8_t custodianPlayerId, bool weSettle) {
+	g_observed.NoteHolders(netId, driverPlayerId, custodianPlayerId, weSettle);
 }
 
 bool SpawnRemoteVehicle(RemoteVehicle &vehicle) {
@@ -713,7 +1357,24 @@ bool SpawnRemoteVehicle(RemoteVehicle &vehicle) {
 	if (!model || !HasModelLoaded(model))
 		return false;
 
-	void *const mem = Func<NewFn>(CVehicle__operator_new)(offs::SIZEOF_AUTOMOBILE);
+	// Which class, decided the way CREATE_CAR decides it: by the model info's
+	// vehicle type, not by a list of model ids. Before this a boat was built
+	// as a CAutomobile wearing a boat's model - car suspension and four
+	// wheels that aren't there, on water. game/boat.h.
+	const VehicleBuild build = VehicleBuildForModel(model);
+	if (build == VehicleBuild::None) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			Log("bridge: vehicle %u has model %u, which is not a car or a boat "
+			    "model here; not building it (and this will not be said again)",
+			    vehicle.netId, model);
+		}
+		return false;
+	}
+	const bool boat = build == VehicleBuild::Boat;
+
+	void *const mem = Func<NewFn>(CVehicle__operator_new)(VehicleBuildSize(build));
 	if (!mem)
 		return false;   // the vehicle pool is full
 
@@ -722,7 +1383,8 @@ bool SpawnRemoteVehicle(RemoteVehicle &vehicle) {
 	// The extras are RwAtomics cloned into the clump by
 	// CVehicleModelInfo::CreateInstance, which runs INSIDE the constructor
 	// below (CAutomobile ctor -> CVehicle::SetModelIndex ->
-	// CEntity::SetModelIndex -> CreateRwObject). So the override goes in
+	// CEntity::SetModelIndex -> CreateRwObject; CBoat's reaches the same
+	// place through vtable slot 3 at 0x0053E481). So the override goes in
 	// first and comes back out afterwards, which is exactly what the engine's
 	// own garage code does (CStoredCar::RestoreCar).
 	//
@@ -751,7 +1413,7 @@ bool SpawnRemoteVehicle(RemoteVehicle &vehicle) {
 	// constructor's second argument. The other half is bIsLocked, below.
 	{
 		ComponentOverride override(extra1, extra2);
-		Func<CtorFn>(CAutomobile__ctor)(
+		Func<CtorFn>(VehicleBuildCtor(build))(
 		    mem, model, static_cast<uint8_t>(VEHICLE_CREATED_BY_MISSION));
 	}
 
@@ -759,9 +1421,18 @@ bool SpawnRemoteVehicle(RemoteVehicle &vehicle) {
 	// bailed, the object isn't a vehicle and everything after this writes
 	// into garbage.
 	if (Field<void *>(mem, 0) == nullptr) {
-		Log("bridge: the CAutomobile constructor did not complete for model %u", model);
+		Log("bridge: the %s constructor did not complete for model %u",
+		    boat ? "CBoat" : "CAutomobile", model);
 		return false;
 	}
+
+	// And it is the class we asked for. Every guard downstream reads
+	// m_vehType off the object rather than remembering the build, so this is
+	// the one place the two could be seen to disagree.
+	if (VehicleTypeOf(mem) != VehicleBuildType(build))
+		Log("bridge: vehicle %u was built as a %s and reads m_vehType %d",
+		    vehicle.netId, boat ? "CBoat" : "CAutomobile",
+		    static_cast<int>(VehicleTypeOf(mem)));
 
 	// Said once, and it is the line that answers "did the extras arrive".
 	// Reads them back off the car rather than repeating what was asked for,
@@ -809,23 +1480,29 @@ bool SpawnRemoteVehicle(RemoteVehicle &vehicle) {
         (ENTITY_STATUS_ABANDONED << ENTITY_STATUS_SHIFT));
 	SetBit(mem, offs::VEH_FLAGS_A, offs::VEH_IS_LOCKED, true);
 
-	Func<JoinFn>(CCarCtrl__JoinCarWithRoadSystem)(mem);
+	// Not for a boat. CREATE_CAR's boat branch never calls it, and the
+	// nearest node it would find is a road one (addresses.h, "boats").
+	if (JoinsRoadSystemOnSpawn(build))
+		Func<JoinFn>(CCarCtrl__JoinCarWithRoadSystem)(mem);
 
 	// AutoPilot, so the engine's traffic AI has nothing to say about a car a
-	// remote player is driving.
+	// remote player is driving. The fields are CVehicle's, so they are safe
+	// on either class; only the cruise speed differs, 9 against a boat's 20,
+	// each straight out of its branch of CREATE_CAR.
 	//
 	// The AUTOPILOT_* offsets are absolute from the vehicle, not relative to
 	// the CAutoPilot sub-object - the static_asserts in addresses.h check
 	// them against VEH_AUTOPILOT rather than defining them from it. Pass the
 	// sub-object as the base here instead and it writes 0x12C bytes past
 	// every field.
+	const float cruise = SpawnCruiseSpeed(build);
 	Field<uint8_t>(mem, offs::AUTOPILOT_CAR_MISSION)     = 0;   // MISSION_NONE
 	Field<uint8_t>(mem, offs::AUTOPILOT_TEMP_ACTION)     = 0;   // TEMPACT_NONE
 	Field<uint8_t>(mem, offs::AUTOPILOT_DRIVING_STYLE)   = 0;   // STOP_FOR_CARS
 	Field<int8_t>(mem, offs::AUTOPILOT_CURRENT_LANE)     = 0;
 	Field<int8_t>(mem, offs::AUTOPILOT_NEXT_LANE)        = 0;
-	Field<uint8_t>(mem, offs::AUTOPILOT_CRUISE_SPEED)    = 9;
-	Field<float>(mem, offs::AUTOPILOT_MAX_TRAFFIC_SPEED) = 9.0f;
+	Field<uint8_t>(mem, offs::AUTOPILOT_CRUISE_SPEED)    = static_cast<uint8_t>(cruise);
+	Field<float>(mem, offs::AUTOPILOT_MAX_TRAFFIC_SPEED) = cruise;
 
 	SetBit(mem, offs::VEH_FLAGS_A, offs::VEH_ENGINE_ON, false);
 
@@ -866,8 +1543,12 @@ bool SpawnRemoteVehicle(RemoteVehicle &vehicle) {
 	// than by pointer so it cannot outlive the car.
 	RememberObserved(vehicle.poolHandle, vehicle.netId);
 
-	Log("bridge: spawned vehicle %u as a mission car (ref %d, model %u)",
-	    vehicle.netId, vehicle.poolHandle, model);
+	// And on the copy list, which is what the traffic allowance counts and
+	// what the save detour hides. game/carlife.h.
+	NoteSessionCopy(vehicle.poolHandle);
+
+	Log("bridge: spawned vehicle %u as a mission %s (ref %d, model %u)",
+	    vehicle.netId, boat ? "boat" : "car", vehicle.poolHandle, model);
 	return true;
 }
 
@@ -882,12 +1563,35 @@ void DespawnRemoteVehicle(RemoteVehicle &vehicle) {
 	}
 	ForgetObserved(vehicle.netId);
 
+	// Not with the local player in it, on his way in or on his way out.
+	// m_pMyVehicle is set for all three (see LocalDrivesVehicle). The session
+	// never releases a car anybody is in, so this is the dropped connection
+	// with the player driving somebody else's car, or a release that raced
+	// him getting in. Deleting it would leave him with bInVehicle set and a
+	// nulled m_pMyVehicle. game/carlife.h, CopyEnd::HandToEngine.
+	void *const ped = PlayerPed();
+	const bool aboard = ped != nullptr && Field<void *>(ped, offs::PED_MY_VEHICLE) == v;
+	if (HowToEndCopy(vehicle.ours, aboard) == CopyEnd::HandToEngine) {
+		HandCopyToEngine(v);
+		Log("bridge: vehicle %u was let go of with us in it; it's this engine's "
+		    "car now instead of being destroyed", vehicle.netId);
+		vehicle.poolHandle   = -1;
+		vehicle.appliedFlags = 0xFF;
+		return;
+	}
+	ForgetSessionCopy(vehicle.poolHandle);
+
 	// By hand, before CWorld::Remove, because CWorld::Remove will not do it
-	// for a vehicle that has gone static and a parked one always has
-	// (addresses.h, WorldRemoveUnlinksFromMovingList). Leave the node behind
-	// and the next CWorld::Process reads m_rwObject off a freed pool slot.
-	// RemoveFromMovingList checks m_movingListNode itself, so this is free
-	// when the car was never in the list.
+	// for an entity that has gone static (addresses.h,
+	// WorldRemoveUnlinksFromMovingList). Leave the node behind and the next
+	// CWorld::Process reads m_rwObject off a freed pool slot.
+	//
+	// A parked car does not go static, though this used to say it always
+	// did: the engine never sets bIsStatic on a vehicle (see VehicleAtRest).
+	// So this is a guard rather than the fix for a known case, and the log
+	// line says so if something ever sets the bit. RemoveFromMovingList
+	// checks m_movingListNode itself, so this is free when the car was never
+	// in the list.
 	if (NeedsMovingListUnlink(Field<uint8_t>(v, offs::ENTITY_FLAGS_A),
 	                          Field<void *>(v, offs::MOVING_LIST_NODE) != nullptr))
 		Log("bridge: vehicle %u went static while still in the moving list; "
@@ -932,6 +1636,18 @@ void DespawnRemoteVehicle(RemoteVehicle &vehicle) {
 // ENTER_CAR_AS_DRIVER, so the next frame walks the ped back to the same door.
 // There is no timeout in it: the player walks at the car forever.
 //
+// **And the same replay is what makes a car impossible to get OUT of, on a
+// threshold eight times tighter.** CVehicle::CanPedExitCar (0x005523C0, in
+// addresses.h beside CPed__SetExitCar) refuses any car whose m_vecMoveSpeed
+// magnitude-squared is over 0.005 or whose m_vecTurnSpeed has any component
+// past 0.01 - against sq(0.2) = 0.04 on the way in - and CPed::SetExitCar's
+// answer to a refusal is to return having done nothing. There is one call site
+// of SetExitCar in the whole image and the player's exit key goes through it,
+// so a car this machine is writing a stale velocity onto is a car the player
+// cannot leave, with no message and nothing that retries. That is why every
+// writer in this file is guarded on who is in the driver's seat, and why the
+// guard has to be right rather than nearly right: the failure is silent.
+//
 // Zeroed every frame rather than once on the transition, and that is
 // deliberate. CorrectRemoteVehicle pins the transform after physics every
 // frame, so a car held a hair off the ground never lands - and the engine
@@ -941,8 +1657,6 @@ void RestRemoteVehicle(RemoteVehicle &vehicle) {
 	void *const v = ResolveRemoteVehicle(vehicle);
 	if (!v)
 		return;
-
-	NoteObservedDriver(v, 0xFF);
 
 	// A wreck is finished; the same refusal ApplyRemoteVehicle makes, and for
 	// the same reason. Nothing below belongs on one.
@@ -962,23 +1676,139 @@ void RestRemoteVehicle(RemoteVehicle &vehicle) {
 	// They belong to the session whether or not anybody is driving - a joiner
 	// has to be shown the shot-up car somebody parked - and ApplyRemoteVehicle
 	// has already written them this frame. The engine's idle note and the
-	// headlights are left alone for the same reason plus one more: those go
-	// through appliedFlags, which is a change-detector, and two functions
-	// writing it on alternate frames would restart the siren sixty times a
-	// second.
+	// siren are left alone for the same reason plus one more: those go
+	// through appliedFlags, a change detector, which only works with one
+	// function writing it. The headlights are left alone too;
+	// ApplyRemoteVehicle writes them every frame, from the last driver's
+	// snapshot.
+}
+
+// ---- the losing end of a carjack ------------------------------------------
+//
+// A car changes hands in one process. The jacker's engine plays CPed::SetCarJack,
+// drags whoever was in the seat out of it and puts its own player behind the
+// wheel; the victim's engine is told nothing and still has *its* player behind
+// the wheel. Both machines then answer "we drive this" to
+// CVehicle::m_pDriver - the question every guard in this file asks - and from
+// there the car is two different cars: each end refuses to apply the other's
+// state, and the server's arbitration means only one of them is being believed
+// by anybody else.
+//
+// The victim's engine cannot be shown the jack. SetCarJack needs a jacker ped,
+// every replica CoopIII builds is a CCivilianPed, and its MISSION_VEHICLE bail
+// at 0x004E032B does apply to a CCivilianPed (it is only the *player* that the
+// `jne` at 0x004E0319 carries over it) - so the animation is unavailable on
+// exactly the cars a session has. What is left is the end of the jack without
+// its animation, which is the same sequence
+// COMMAND_WARP_CHAR_FROM_CAR_TO_COORD's handler runs and which addresses.h has
+// transcribed: take the driver off the car, put the ped on foot, stand him
+// beside it.
+//
+// Three differences from ped.cpp's UnseatPedFromCar, and each one is here
+// because this is the local player rather than a replica:
+//
+//   - CPed::RemoveInCarAnims is called. It opens with `call CPed::IsPlayer /
+//     test al,al / je ret`, so it is a no-op on a replica and the remote path
+//     skips it for that reason; on the player it is what takes the sitting and
+//     steering poses off, and without it he stands up still holding the wheel.
+//   - the weapon goes back in his hand. The engine takes the model off in
+//     PedSetInCarCB and puts it back in PedSetOutCarCB, and this exit does not
+//     run PedSetOutCarCB - so a jacked player would be empty-handed until the
+//     next time he changed weapon. CPed::SetCurrentWeapon does both halves and
+//     the model is certainly streamed in, since he was holding it a moment ago.
+//   - the ped is put down beside the car. A replica is pulled out by the next
+//     snapshot its owner sends; the local player has nothing pulling him, so
+//     he would be left standing inside the car's own collision.
+//
+// The car's velocities are deliberately NOT zeroed, which is the other
+// difference from the remote path. Its new owner is driving it: it is doing
+// forty and ApplyRemoteVehicle is about to say so. Zeroing them here would put
+// one frame of standstill into a car somebody else is accelerating.
+bool SurrenderVehicleSeat(RemoteVehicle &vehicle) {
+	void *const v = ResolveRemoteVehicle(vehicle);
+	if (!v)
+		return false;
+
+	void *const ped = PlayerPed();
+	if (!ped || Field<void *>(v, offs::VEH_DRIVER) != ped)
+		return false;   // not at its wheel after all; nothing to hand over
+
+	// The car, first. CVehicle::RemoveDriver is five instructions and does two
+	// things, both of them checked against the image rather than assumed:
+	//
+	//   005520A0  mov al,[ecx+50h] / and al,7 / or al,20h / mov [ecx+50h],al
+	//   005520AA  mov dword [ecx+1A4h],0
+	//
+	// which is SetStatus(STATUS_ABANDONED) - 4 shifted into bits 3-7 is 0x20 -
+	// and pDriver = nil. So the status write the warp-out handler appears to
+	// make around it is already made, and repeating it here would be two
+	// identical stores with a comment claiming the second one mattered.
+	Func<void(__thiscall *)(void *)>(CVehicle__RemoveDriver)(v);
+	static_assert((ENTITY_STATUS_ABANDONED << ENTITY_STATUS_SHIFT) == 0x20,
+	              "RemoveDriver's `or al,20h` is STATUS_ABANDONED, so this "
+	              "function does not have to write the status itself");
+
+	uint8_t &flagsA = Field<uint8_t>(v, offs::VEH_FLAGS_A);
+	flagsA = static_cast<uint8_t>(flagsA & ~offs::VEH_ENGINE_ON);
+	Field<uint8_t>(v, offs::AUTOPILOT_CRUISE_SPEED) = 0;
+
+	// appliedFlags is a change detector, and the engine flag has just been
+	// changed behind its back. Forget what was applied so the new owner's very
+	// next snapshot puts the engine, the lights and the siren back the way its
+	// own machine has them.
+	vehicle.appliedFlags = 0xFF;
+
+	// And then the ped, exactly as the warp-out handler leaves one.
+	Field<bool>(ped, offs::PED_IN_VEHICLE)     = false;
+	Field<void *>(ped, offs::PED_MY_VEHICLE)   = nullptr;
+	Field<uint32_t>(ped, offs::PED_STATE)      = PEDSTATE_IDLE;
+	Field<uint32_t>(ped, offs::PED_LAST_STATE) = PEDSTATE_NONE;
+	Field<uint8_t>(ped, offs::ENTITY_FLAGS_A) |= offs::ENTITY_USES_COLLISION;
+
+	Field<uint32_t>(ped, offs::PED_OBJECTIVE)      = OBJECTIVE_NONE;
+	Field<uint32_t>(ped, offs::PED_PREV_OBJECTIVE) = OBJECTIVE_NONE;
+	Field<void *>(ped, offs::PED_CAR_IN_OBJECTIVE) = nullptr;
+
+	float *const vel = &Field<float>(ped, offs::MOVE_SPEED);
+	vel[0] = vel[1] = vel[2] = 0.0f;
+
+	if (void *const anim = Field<void *>(ped, offs::PED_VEHICLE_ANIM)) {
+		Field<float>(anim, ANIM_BLEND_DELTA)       = -1000.0f;
+		Field<void *>(ped, offs::PED_VEHICLE_ANIM) = nullptr;
+	}
+
+	Func<void(__thiscall *)(void *)>(CPed__RemoveInCarAnims)(ped);
+
+	const uint8_t slot = Field<uint8_t>(ped, offs::PED_CURRENT_WEAPON);
+	if (slot < offs::NUM_WEAPON_SLOTS)
+		Func<void(__thiscall *)(void *, uint32_t)>(CPed__SetCurrentWeapon)(ped, slot);
+
+	// Beside it, on the driver's side. The right row of the car's matrix is a
+	// unit vector across the car, and the driver sits on the left, so the step
+	// is along minus that - the door he came in by. A metre up as well, so the
+	// drop settles onto the pavement rather than through it.
+	const float *const right = &Field<float>(v, offs::MATRIX_RIGHT);
+	const float *const from  = &Field<float>(v, offs::POSITION);
+	float *const       to    = &Field<float>(ped, offs::POSITION);
+	to[0] = from[0] - right[0] * PED_STEP_OUT_M;
+	to[1] = from[1] - right[1] * PED_STEP_OUT_M;
+	to[2] = from[2] - right[2] * PED_STEP_OUT_M + 1.0f;
+
+	// And it is no longer ours to dent, in the same frame it stops being ours
+	// to drive. The pair CorrectRemoteVehicle keeps, kept here too, because
+	// this is the other way round the same transition can happen.
+	SetVehicleObserved(v, true);
+
+	Log("bridge: handed the driver's seat of vehicle %u over - the session says "
+	    "player %u has it now, and this machine had us in it",
+	    vehicle.netId, static_cast<unsigned>(vehicle.driverPlayerId));
+	return true;
 }
 
 void CorrectRemoteVehicle(RemoteVehicle &vehicle, const VehicleTransform &at) {
 	void *const v = ResolveRemoteVehicle(vehicle);
 	if (!v)
 		return;
-
-	// Who the session says is driving, for the BlowUpCar detour's refusal
-	// rule. Refreshed here because this is the one place that runs every
-	// frame for every observed car with both the roster entry and the live
-	// object in hand - ApplyRemoteVehicle stops running for a wreck and
-	// never runs for a car with no snapshot yet.
-	NoteObservedDriver(v, vehicle.driverPlayerId);
 
 	// Whoever is in the driver's seat owns the car. If that is the local
 	// player, this machine has stopped being an observer of it and must stop
@@ -1020,17 +1850,47 @@ void CorrectRemoteVehicle(RemoteVehicle &vehicle, const VehicleTransform &at) {
 	// sparks - the engine took our transform as a starting point and then
 	// moved it on its own.
 	PlaceVehicle(v, at.pos, at.rot, /*inWorld=*/true);
+
+	// The owner's horn. Here, after CGame::Process, and every frame, because
+	// the engine takes the timer back from a copy inside every frame: a copy
+	// with its driver seated is STATUS_PHYSICS and the horn block takes one
+	// off it (ReduceHornCounter, 0x005341B5), and one without is ABANDONED,
+	// whose arm zeroes it (0x00531BAC). DMAudio.Service is the next thing the
+	// game does after this returns, so it hears what is written here. 42 and
+	// not the owner's 1, because a car that is not the local player's is
+	// played through a rhythm and column 43 of every rhythm is silence
+	// (game/horn.h).
+	//
+	// And 0 when he isn't honking, written rather than left to the engine.
+	// The countdown would otherwise carry a released horn on through the
+	// rest of its rhythm, up to 41 more frames of it.
+	//
+	// No pedestrian flees from this, here or anywhere. The flee is decided in
+	// the car's own ped scan and only for a car in status PLAYER. The evasive
+	// step and dive read the timer from the same scan, and on a driven copy
+	// that runs after the horn block has taken 42 to 41 rather than to 0, so
+	// they see a horn; what they do with it is behind their own early returns
+	// (addresses.h, "the horn") and hasn't been watched in a game.
+	// So the machine hosting the pedestrians a remote player honks at does not
+	// make them run - single player would. Getting that back means running
+	// the engine's flee branch for a copy, and the one way into it, status
+	// PLAYER, also has ProcessControl read this machine's own pad into the
+	// car. Not done; not faked.
+	if (!IsWrecked(v)) {
+		Field<uint8_t>(v, offs::VEH_HORN_TIMER) =
+		    vehicle.hornSounding ? HORN_REPLAY_TIMER : uint8_t{0};
+		if (vehicle.hornSounding && !g_saidHornReplayed) {
+			g_saidHornReplayed = true;
+			Log("bridge: vehicle %u's driver is honking, and we are sounding it",
+			    vehicle.netId);
+		}
+	}
 }
 
 void ApplyRemoteVehicle(RemoteVehicle &vehicle, const VehicleStateBody &body) {
 	void *const v = ResolveRemoteVehicle(vehicle);
 	if (!v)
 		return;
-
-	// Who is driving it, for the BlowUpCar detour. Also done from
-	// CorrectRemoteVehicle, which is the one that runs unconditionally; this
-	// one is here so the very first snapshot does not have to wait a frame.
-	NoteObservedDriver(v, vehicle.driverPlayerId);
 
 	// A wreck is finished. Nothing below belongs on one: its health is zero
 	// by definition, its engine and lights are off because BlowUpCar turned
@@ -1056,8 +1916,18 @@ void ApplyRemoteVehicle(RemoteVehicle &vehicle, const VehicleStateBody &body) {
 	// m_fHealth in the same block and are untouched, so a burning car still
 	// burns here exactly as it does on its driver's screen. What is taken
 	// away is the decision, not the picture.
-	if (vehicle.driverPlayerId != 0xFF)
-		Field<float>(v, offs::AUTO_FIRE_BLOWUP_TIMER) = 0.0f;
+	//
+	// A custodian counts as an owner here. For the length of a settle the car
+	// is being simulated and reported by one machine exactly as a driven one
+	// is, so an observer deciding five seconds later that it is finished is
+	// the same mistake with the same cause.
+	//
+	// A boat has the same timer on a different member, armed below 150 health
+	// rather than 250 and never reset by the engine at all, so it goes through
+	// the helper that knows which (addresses.h, "boats").
+	if (vehicle.driverPlayerId != 0xFF ||
+	    vehicle.custodianPlayerId != INVALID_PLAYER)
+		HoldFireTimer(v);
 
 	// Did a dying car's health actually reach us? Said once, because it is
 	// the question the next live session has to answer and neither the old
@@ -1094,21 +1964,57 @@ void ApplyRemoteVehicle(RemoteVehicle &vehicle, const VehicleStateBody &body) {
 	WriteVec3(v, offs::MOVE_SPEED, move);
 	WriteVec3(v, offs::TURN_SPEED, turn);
 
-	// Controls - so the front wheels turn and the brake lights come on.
+	// Controls - so the front wheels turn and the brake lights come on. For a
+	// copy with its driver in the seat (STATUS_PHYSICS, game/carstatus.h)
+	// these are what the physics runs on this frame, now that the car AI is
+	// kept off it; before that SteerAICarWithPhysics wrote MISSION_NONE's
+	// over them first. A car nobody is driving is ABANDONED, and that arm
+	// writes its own over them anyway.
+	//
+	// The handbrake is not on the wire, so it is off. The AI was the only
+	// thing that set it on a copy.
 	FiniteOr(body.steer, 0.0f, Field<float>(v, offs::VEH_STEER_ANGLE));
 	FiniteOr(body.gas, 0.0f, Field<float>(v, offs::VEH_GAS_PEDAL));
 	FiniteOr(body.brake, 0.0f, Field<float>(v, offs::VEH_BRAKE_PEDAL));
+	SetBit(v, offs::VEH_FLAGS_A, offs::VEH_HANDBRAKE_ON, false);
 	Field<uint8_t>(v, offs::VEH_CURRENT_GEAR) = body.gear;
 
 	FiniteOr(body.health, 1000.0f, Field<float>(v, offs::VEH_HEALTH));
 
-	// Flags on change only - the siren restarts its sound every time it's set.
-	if (body.flags != vehicle.appliedFlags) {
+	// Engine and siren on change only. Not because rewriting the siren would
+	// restart it, which is what this used to say: the audio reads the byte
+	// every frame and nothing keys on it being written. On change is simply
+	// enough, since nothing in the engine clears the siren of a live copy -
+	// UpdateCarAI, the one writer that could reach a driven one, is skipped
+	// for it (game/siren.h has the list of writers). Hearing it is a separate
+	// matter; game/siren.h again.
+	//
+	// Two bits are left out of the comparison, because the engine takes them
+	// back from a copy by itself and a change detector never notices:
+	//
+	//   - the horn, which the ABANDONED arm of ProcessControl zeroes and the
+	//     horn block counts down (0x005341B5) for every other status that
+	//     isn't PLAYER. It is written per frame from CorrectRemoteVehicle,
+	//     after physics, and left out here so that a honk is not two
+	//     "changes" that rewrite the engine and the siren for nothing.
+	//   - the headlights. CAutomobile::PreRender switches the lights of a car
+	//     in status 4 OFF once it is more than 100 m (|dx| + |dy|, 0x006005BC)
+	//     from the camera, and never back on (0x005380BE-0x00538145) - that
+	//     is the engine putting out the lights of a car somebody parked. A
+	//     copy nobody is driving is status 4, and so is a driven one whose
+	//     driver's ped isn't in the seat here yet. Written every frame, near
+	//     they stay on; far, PreRender puts them out again before it draws.
+	//     A driven copy with its driver seated is status 3, and for that one
+	//     PreRender replaces bLightsOn with its own time-of-day answer every
+	//     frame (0x005380C3), the same thing it does for the owner's own car -
+	//     so on those this write is overwritten before anything draws.
+	const uint8_t onChange = VehicleFlagsWrittenOnChange(body.flags);
+	if (onChange != vehicle.appliedFlags) {
 		SetBit(v, offs::VEH_FLAGS_A, offs::VEH_ENGINE_ON, (body.flags & VEH_ENGINE_ON) != 0);
-		SetBit(v, offs::VEH_FLAGS_A, offs::VEH_LIGHTS_ON, (body.flags & VEH_LIGHTS) != 0);
 		Field<bool>(v, offs::VEH_SIREN_OR_ALARM) = (body.flags & VEH_SIREN) != 0;
-		vehicle.appliedFlags = body.flags;
+		vehicle.appliedFlags = onChange;
 	}
+	SetBit(v, offs::VEH_FLAGS_A, offs::VEH_LIGHTS_ON, (body.flags & VEH_LIGHTS) != 0);
 }
 
 // ---- the damage model (docs/cardamage.md) ----------------------------------
@@ -1155,14 +2061,16 @@ void ReadDamage(void *vehicle, uint32_t &panels, uint16_t &doors) {
 
 bool g_saidDamageApplied = false;
 
-} // namespace
-
-bool SampleLocalVehicleDamage(VehicleDamageBody &out) {
-	void *const vehicle = PlayerVehicle();
-	if (!vehicle)
+// The two refusals every damage sample makes, whoever it is being sampled for.
+// Shared by the driver's sampler and the custodian's so the two cannot drift
+// apart on what counts as a car worth reporting.
+bool SampleDamageOf(void *vehicle, VehicleDamageBody &out) {
+	// Only a car has a CDamageManager. In a CBoat the same offset holds the
+	// boat's own floats (0.25f, 0.35f, 0.7f... out of CBoat::CBoat at
+	// 0x0053E588), so reading them as panels and doors puts whatever bytes
+	// those floats happen to be on the wire as a boat's damage.
+	if (!HasAutomobileBody(VehicleTypeOf(vehicle)))
 		return false;
-	if (Field<void *>(vehicle, offs::VEH_DRIVER) != PlayerPed())
-		return false;   // a passenger owns nothing, same test as everywhere else
 
 	// A wreck has nothing to say. CDamageManager::FuckCarCompletely gave it
 	// six missing doors and a zeroed panel word with no input of any kind, and
@@ -1176,6 +2084,29 @@ bool SampleLocalVehicleDamage(VehicleDamageBody &out) {
 	out.netId = 0;   // the caller's: netIds are the server's
 	ReadDamage(vehicle, out.panels, out.doors);
 	return true;
+}
+
+} // namespace
+
+bool SampleLocalVehicleDamage(VehicleDamageBody &out) {
+	void *const vehicle = PlayerVehicle();
+	if (!vehicle)
+		return false;
+	if (Field<void *>(vehicle, offs::VEH_DRIVER) != PlayerPed())
+		return false;   // a passenger owns nothing, same test as everywhere else
+	return SampleDamageOf(vehicle, out);
+}
+
+// The car this machine is settling for the session. Found by its roster row
+// the way SampleObservedVehicle finds it, because nobody is in the seat
+// SampleLocalVehicleDamage reads from. The custodian's engine is the one
+// denting it for those two seconds, so this is the only machine that can say
+// what it looks like afterwards.
+bool SampleObservedVehicleDamage(RemoteVehicle &vehicle, VehicleDamageBody &out) {
+	void *const v = ResolveRemoteVehicle(vehicle);
+	if (!v)
+		return false;
+	return SampleDamageOf(v, out);
 }
 
 void ApplyRemoteVehicleDamage(RemoteVehicle &vehicle,
@@ -1195,6 +2126,22 @@ void ApplyRemoteVehicleDamage(RemoteVehicle &vehicle,
 	// over it would be the same mistake as writing a pre-blast health.
 	if (IsWrecked(v))
 		return;
+
+	// Nothing below is valid on anything but a CAutomobile. DamageManager()
+	// is +0x288, which in a CBoat is the boat's own first member, and the
+	// three appliers are CAutomobile methods that reach into the car's own
+	// frame nodes. A panel word for a boat can still arrive - a build from
+	// before this change sampled one - and it is dropped here, once said.
+	if (!HasAutomobileBody(VehicleTypeOf(v))) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			Log("bridge: dropped car damage addressed to vehicle %u, which is "
+			    "not a car here (m_vehType %d)",
+			    vehicle.netId, static_cast<int>(VehicleTypeOf(v)));
+		}
+		return;
+	}
 
 	const int32_t noFlying = flying ? 0 : 1;
 
@@ -1285,13 +2232,152 @@ void SetVehicleObserved(void *vehicle, bool observed) {
 	SetBit(vehicle, offs::ENTITY_FLAGS_C, offs::ENTITY_COLLISION_PROOF, observed);
 }
 
+// ---- the siren (game/siren.h) ----------------------------------------------
+//
+// __thiscall bool cAudioManager::ProcessVehicleSirenOrAlarm(cVehicleParams *),
+// ret 4. __fastcall for the reason the other detours give: `this` in ecx, the
+// one stack argument where __thiscall left it, and the callee cleans it.
+//
+// For a copy the session says somebody else is driving and which is still
+// ABANDONED here, the status bits read PHYSICS for the length of this call and
+// ABANDONED again the moment it returns. Only the status bits are put back,
+// not the whole byte, so m_type is never touched.
+//
+// That is narrower than it was written for. A copy with its driver's ped in
+// the seat is PHYSICS already (game/carstatus.h) and the audio plays its
+// siren with no help. What is left for this is the time the session names a
+// driver whose ped isn't in the seat here: not streamed in yet, the seating
+// refused, or the entry still walking to the door. Somebody else's traffic
+// gets the same, when a ped row from its host names a driver for it.
+
+namespace {
+
+bool g_saidSirenReplayed = false;
+
+bool SirenGateOpensFor(void *vehicle) {
+	if (VehicleTypeOf(vehicle) != VEHICLE_TYPE_CAR)
+		return false;
+	const uint16_t model   = static_cast<uint16_t>(Field<int16_t>(vehicle, offs::MODEL_INDEX));
+	const uint8_t  status  = VehicleStatus(vehicle);
+	const bool     sirenOn = Field<bool>(vehicle, offs::VEH_SIREN_OR_ALARM);
+	// Asked with the driver taken for granted first, so the table walk below
+	// only happens for a status-4 siren car with its siren on. This runs for
+	// every car the audio looks at, and hardly any of them is that.
+	if (!ReplicaSirenGateOpens(model, status, sirenOn, /*remoteDriver=*/true))
+		return false;
+	if (const Observed *const row = FindObserved(vehicle))
+		return row->driverPlayerId != 0xFF;
+	// Somebody else's traffic: its host's ped rows name a driver whose
+	// replica isn't in the seat here yet.
+	const ReplicaRow *const replica = FindReplica(vehicle);
+	return replica != nullptr && replica->driverSaid;
+}
+
+bool __fastcall HookedProcessVehicleSirenOrAlarm(void *self, void * /*edx*/,
+                                                 void *params) {
+	using Fn = bool(__fastcall *)(void *, void *, void *);
+	const Fn original = g_sirenAudio.Original<Fn>();
+
+	void *const v = params ? Field<void *>(params, offs::AUDIO_PARAMS_VEHICLE) : nullptr;
+	if (!v || !SirenGateOpensFor(v))
+		return original(self, nullptr, params);
+
+	constexpr uint8_t TYPE_BITS = 0x07;
+	uint8_t      &flags = Field<uint8_t>(v, offs::ENTITY_FLAGS);
+	const uint8_t held  = flags;
+	flags = static_cast<uint8_t>((held & TYPE_BITS) |
+	                             (ENTITY_STATUS_PHYSICS << ENTITY_STATUS_SHIFT));
+	const bool result = original(self, nullptr, params);
+	flags = static_cast<uint8_t>((flags & TYPE_BITS) | (held & ~TYPE_BITS));
+
+	if (!g_saidSirenReplayed) {
+		g_saidSirenReplayed = true;
+		const Observed *const row = FindObserved(v);
+		const ReplicaRow *const replica = row ? nullptr : FindReplica(v);
+		Log("bridge: %s %u's driver has the siren on, and we are sounding it",
+		    row ? "vehicle" : "ambient car",
+		    row ? static_cast<unsigned>(row->netId)
+		        : replica ? static_cast<unsigned>(replica->netId) : 0u);
+	}
+	return result;
+}
+
+} // namespace
+
+// ---- the car AI on a copy (game/carstatus.h) -------------------------------
+//
+// A copy with somebody in the driver's seat is STATUS_PHYSICS, because the
+// engine makes it that when it seats the ped, and ProcessControl's PHYSICS
+// arm then runs this machine's car AI on it every frame. With no mission that
+// was steer 0, gas 0, brake 0.5 and the handbrake on, written over the
+// owner's controls after ApplyRemoteVehicle had put them there and before the
+// physics read them. The correction after CGame::Process still put the car
+// where its owner had it, so what that cost was everything else: the owner's
+// speed bled off inside every frame, rear wheels locked, front wheels
+// straight, brake lights on whatever he was doing, and a siren car picking up
+// a 45 on the horn at random off UpdateCarAI's last few lines.
+//
+// Both calls are skipped for a copy, so the arm's only other call,
+// PlayHornIfNecessary, is left, and it honks only when the autopilot's
+// slowed-down bits are set - which ProcessControl clears at 0x00531892 before
+// the switch and only the steering sets again.
+//
+// A boat copy gets seated the same way (the objective is written by hand,
+// SeatPedInCar) and ends up PHYSICS the same way. Its arm is one call,
+// SteerAIBoatWithPhysics, and with no mission that published gas 0 and
+// steer 0 over the owner's, so it goes too.
+
+namespace {
+
+bool g_saidCarAiSkipped = false;
+
+bool CarAiMayRunOn(void *vehicle) {
+	const uint8_t status = VehicleStatus(vehicle);
+	// Every car on rails comes through UpdateCarAI, so the table walks below
+	// only happen for a car that could be a driven copy at all.
+	if (status != ENTITY_STATUS_PHYSICS)
+		return true;
+	const bool local = Field<void *>(vehicle, offs::VEH_DRIVER) == PlayerPed();
+	const bool copy  = !local && (FindObserved(vehicle) || FindReplica(vehicle));
+	if (CarAiMayRun(status, copy, local))
+		return true;
+	if (!g_saidCarAiSkipped) {
+		g_saidCarAiSkipped = true;
+		Log("bridge: a car somebody else drives is in STATUS_PHYSICS here, and "
+		    "this machine's car AI is being kept off it");
+	}
+	return false;
+}
+
+void __cdecl HookedUpdateCarAI(void *vehicle) {
+	if (vehicle && !CarAiMayRunOn(vehicle))
+		return;
+	g_carAiUpdate.Original<void(__cdecl *)(void *)>()(vehicle);
+}
+
+void __cdecl HookedSteerAICarWithPhysics(void *vehicle) {
+	if (vehicle && !CarAiMayRunOn(vehicle))
+		return;
+	g_carAiSteer.Original<void(__cdecl *)(void *)>()(vehicle);
+}
+
+void __cdecl HookedSteerAIBoatWithPhysics(void *vehicle) {
+	if (vehicle && !CarAiMayRunOn(vehicle))
+		return;
+	g_boatAiSteer.Original<void(__cdecl *)(void *)>()(vehicle);
+}
+
+} // namespace
+
 // ---- destruction -----------------------------------------------------------
 
 bool InstallVehicleHooks() {
 	for (Observed &o : g_observed)
 		o = Observed{};
 	g_blastHead = g_blastCount = 0;
-	g_unownedHead = g_unownedCount = 0;
+	g_unowned.Clear();
+	g_hitHead = g_hitCount = 0;
+	g_carHitHead = g_carHitCount = 0;
 	g_saidDamageApplied = false;
 
 	// Taken here rather than lazily, and the timing is the point. The hooks
@@ -1322,12 +2408,13 @@ bool InstallVehicleHooks() {
 		    "when somebody else's car is finished",
 		    static_cast<unsigned>(CAutomobile__BlowUpCar));
 
-	// A separate function, so a separate detour. Only the send half depends
-	// on it today - SpawnRemoteVehicle always builds a CAutomobile - so
-	// losing it costs "the local player's boat exploding says nothing" and
-	// nothing else. Said in its own line either way rather than folded into
-	// the car's, because a half-installed pair is the sort of thing that
-	// looks like a working feature until somebody takes a boat out.
+	// A separate function, so a separate detour. SpawnRemoteVehicle builds a
+	// real CBoat for a boat model now, so both halves depend on it: without
+	// it the local player's boat exploding says nothing, and an observed boat
+	// somebody else is driving can be destroyed by this machine's own engine.
+	// Said in its own line either way rather than folded into the car's,
+	// because a half-installed pair is the sort of thing that looks like a
+	// working feature until somebody takes a boat out.
 	const bool boat = g_blowUpBoat.Install(
 	    "CBoat::BlowUpCar", reinterpret_cast<void *>(CBoat__BlowUpCar),
 	    reinterpret_cast<void *>(&HookedBlowUpBoat));
@@ -1339,7 +2426,75 @@ bool InstallVehicleHooks() {
 		    "exploding will not travel",
 		    static_cast<unsigned>(CBoat__BlowUpCar));
 
-	if (car && boat)
+	// The third detour, and the only one of the three whose absence is a
+	// correctness bug rather than a missing feature. Without the two above, a
+	// car's destruction does not travel; without this one, every machine keeps
+	// deciding what somebody else's car is worth and the two copies diverge -
+	// which is the behaviour it replaces, so it is not fatal either. Said in
+	// its own line for the reason the boat's is: a half-installed set is the
+	// sort of thing that looks like a working feature.
+	const bool hit = g_inflictDamage.Install(
+	    "CVehicle::InflictDamage",
+	    reinterpret_cast<void *>(CVehicle__InflictDamage),
+	    reinterpret_cast<void *>(&HookedInflictDamage));
+	if (hit)
+		Log("vehicle: hooked CVehicle::InflictDamage at 0x%08X",
+		    static_cast<unsigned>(CVehicle__InflictDamage));
+	else
+		Log("vehicle: FAILED to hook CVehicle::InflictDamage at 0x%08X - "
+		    "shooting somebody else's car will go on taking health off our own "
+		    "copy of it and nothing will travel, so the two will diverge",
+		    static_cast<unsigned>(CVehicle__InflictDamage));
+
+	// Kept out of the return value. The caller's failure line is about cars
+	// exploding, and all this one costs is a remote siren nobody hears, which
+	// is how it always was. Said on its own line instead.
+	g_saidSirenReplayed = false;
+	if (g_sirenAudio.Install("cAudioManager::ProcessVehicleSirenOrAlarm",
+	                         reinterpret_cast<void *>(cAudioManager__ProcessVehicleSirenOrAlarm),
+	                         reinterpret_cast<void *>(&HookedProcessVehicleSirenOrAlarm)))
+		Log("vehicle: hooked cAudioManager::ProcessVehicleSirenOrAlarm at 0x%08X",
+		    static_cast<unsigned>(cAudioManager__ProcessVehicleSirenOrAlarm));
+	else
+		Log("vehicle: FAILED to hook cAudioManager::ProcessVehicleSirenOrAlarm "
+		    "at 0x%08X - a remote player's siren will flash and stay silent",
+		    static_cast<unsigned>(cAudioManager__ProcessVehicleSirenOrAlarm));
+
+	// Out of the return value too, for the siren's reason: the caller's line
+	// is about cars exploding. InstallSaveGuard says loudly what its failure
+	// means on its own.
+	InstallSaveGuard();
+	// Also out of the return value. Without them a driven copy is steered by
+	// this machine's AI between corrections, which is how it has always been.
+	g_saidCarAiSkipped = false;
+	if (g_carAiUpdate.Install("CCarAI::UpdateCarAI",
+	                          reinterpret_cast<void *>(CCarAI__UpdateCarAI),
+	                          reinterpret_cast<void *>(&HookedUpdateCarAI)))
+		Log("vehicle: hooked CCarAI::UpdateCarAI at 0x%08X",
+		    static_cast<unsigned>(CCarAI__UpdateCarAI));
+	else
+		Log("vehicle: FAILED to hook CCarAI::UpdateCarAI at 0x%08X",
+		    static_cast<unsigned>(CCarAI__UpdateCarAI));
+	if (g_carAiSteer.Install("CCarCtrl::SteerAICarWithPhysics",
+	                         reinterpret_cast<void *>(CCarCtrl__SteerAICarWithPhysics),
+	                         reinterpret_cast<void *>(&HookedSteerAICarWithPhysics)))
+		Log("vehicle: hooked CCarCtrl::SteerAICarWithPhysics at 0x%08X",
+		    static_cast<unsigned>(CCarCtrl__SteerAICarWithPhysics));
+	else
+		Log("vehicle: FAILED to hook CCarCtrl::SteerAICarWithPhysics at 0x%08X - "
+		    "a car somebody else drives brakes against its own speed here",
+		    static_cast<unsigned>(CCarCtrl__SteerAICarWithPhysics));
+	if (g_boatAiSteer.Install("CCarCtrl::SteerAIBoatWithPhysics",
+	                          reinterpret_cast<void *>(CCarCtrl__SteerAIBoatWithPhysics),
+	                          reinterpret_cast<void *>(&HookedSteerAIBoatWithPhysics)))
+		Log("vehicle: hooked CCarCtrl::SteerAIBoatWithPhysics at 0x%08X",
+		    static_cast<unsigned>(CCarCtrl__SteerAIBoatWithPhysics));
+	else
+		Log("vehicle: FAILED to hook CCarCtrl::SteerAIBoatWithPhysics at 0x%08X - "
+		    "a boat somebody else drives has no throttle here between corrections",
+		    static_cast<unsigned>(CCarCtrl__SteerAIBoatWithPhysics));
+
+	if (car && boat && hit)
 		return true;
 	for (const auto &f : HookFailures())
 		Log("vehicle:   %s: %s", f.name.c_str(), f.reason.c_str());
@@ -1349,13 +2504,24 @@ bool InstallVehicleHooks() {
 void RemoveVehicleHooks() {
 	g_blowUpCar.Remove();
 	g_blowUpBoat.Remove();
+	g_inflictDamage.Remove();
+	g_sirenAudio.Remove();
+	// And MaxNumberOfCarsInUse goes back to what the engine set.
+	RemoveSaveGuard();
+	g_carAiUpdate.Remove();
+	g_carAiSteer.Remove();
+	g_boatAiSteer.Remove();
 	SetComponentsToUse(VEHICLE_COMPS_RANDOM, VEHICLE_COMPS_RANDOM);
 	g_blastHead = g_blastCount = 0;
-	g_unownedHead = g_unownedCount = 0;
+	g_unowned.Clear();
+	g_hitHead = g_hitCount = 0;
+	g_carHitHead = g_carHitCount = 0;
 	// Re-measured next time, because a reload rebuilds the generator array.
 	g_cargenBaseline = 0;
 	for (Observed &o : g_observed)
 		o = Observed{};
+	for (ReplicaRow &r : g_replicas)
+		r = ReplicaRow{};
 }
 
 bool VehicleHooksInstalled() { return g_blowUpCar.IsInstalled(); }
@@ -1368,6 +2534,422 @@ uint8_t DrainLocalVehicleBlasts(LocalVehicleBlast *out, uint8_t max) {
 		--g_blastCount;
 	}
 	return n;
+}
+
+uint8_t DrainLocalVehicleHits(VehicleHitBody *out, uint8_t max) {
+	uint8_t n = 0;
+	while (n < max && g_hitCount > 0) {
+		out[n++]  = g_hits[g_hitHead];
+		g_hitHead = static_cast<uint8_t>((g_hitHead + 1) % MAX_PENDING_HITS);
+		--g_hitCount;
+	}
+	return n;
+}
+
+uint8_t DrainLocalCarHits(VehicleHitBody *out, uint8_t max) {
+	uint8_t n = 0;
+	while (n < max && g_carHitCount > 0) {
+		out[n++]     = g_carHits[g_carHitHead];
+		g_carHitHead = static_cast<uint8_t>((g_carHitHead + 1) % MAX_PENDING_HITS);
+		--g_carHitCount;
+	}
+	return n;
+}
+
+// ---- a flame reaching a car (combat.h, IsOurFlame) --------------------------
+
+bool ReportOurFlameOnCar(void *vehicle, FlameReportThrottle &throttle, uint32_t nowMs) {
+	if (!vehicle || IsWrecked(vehicle))
+		return false;
+
+	// Whose car it is, asked exactly the way HookedInflictDamage asks it, so
+	// the fire and the bullet can never disagree about who owns a car.
+	void *const           localPed = PlayerPed();
+	const bool            weDrive =
+	    localPed != nullptr && Field<void *>(vehicle, offs::VEH_DRIVER) == localPed;
+	const Observed *const o        = weDrive ? nullptr : FindObserved(vehicle);
+	const bool            driven   = o != nullptr && o->driverPlayerId != 0xFF;
+	const bool            settling = o != nullptr && !driven &&
+	                                 o->custodianPlayerId != 0xFF;
+	const ReplicaRow     *replica  =
+	    (weDrive || driven || settling) ? nullptr : FindReplica(vehicle);
+	const CarOwner owner =
+	    ClassifyCar(false, weDrive, driven, settling, replica != nullptr, Unheld(o));
+
+	if (!FlameGoesToOwner(owner))
+		return false;
+
+	VehicleHitBody hit{};
+	hit.weapon = WEAPONTYPE_FLAMETHROWER;
+	hit.amount = 0.0f;
+
+	if (owner == CarOwner::RemoteHost) {
+		if (!throttle.Due(FlameTargetKind::Traffic, replica->netId, nowMs))
+			return false;
+		hit.netId = replica->netId;
+		PushCarHit(hit);
+		return true;
+	}
+
+	if (!throttle.Due(FlameTargetKind::DrivenCar, o->netId, nowMs))
+		return false;
+	hit.netId = o->netId;
+	PushVehicleHit(hit);
+	return true;
+}
+
+// ---- who decides a wreck, for the money it pays (game/money.h) -------------
+
+WreckDecider WhoDecidesWreckHere(void *vehicle, UnownedVehicleKey &key) {
+	key      = UnownedVehicleKey{};
+	key.kind = MONEY_AWARD_UNKEYED;
+	if (!vehicle)
+		return WreckDecider::Elsewhere;
+
+	// BlowUpCarCommon's questions, in its order.
+	void *const           localPed = PlayerPed();
+	const bool            weDrive =
+	    localPed != nullptr && Field<void *>(vehicle, offs::VEH_DRIVER) == localPed;
+	const Observed *const o        = weDrive ? nullptr : FindObserved(vehicle);
+	const bool            driven   = o != nullptr && o->driverPlayerId != 0xFF;
+	const bool            settling = o != nullptr && !driven &&
+	                                 o->custodianPlayerId != 0xFF;
+	const ReplicaRow     *replica  =
+	    (weDrive || driven || settling) ? nullptr : FindReplica(vehicle);
+	const CarOwner owner =
+	    ClassifyCar(false, weDrive, driven, settling, replica != nullptr);
+
+	bool       named  = false;
+	const bool hosted = MayBlowUpCar(owner) && !weDrive && !o &&
+	                    HostedCarFor(vehicle, named);
+	const WreckDecider d =
+	    WhoDecidesWreck(owner, weDrive, o != nullptr && o->weSettle, hosted);
+	if (d != WreckDecider::Everywhere)
+		return d;
+
+	// The names BlowUpCarCommon announces the same wreck under, so every
+	// machine that decides it asks the server about the same car.
+	if (o) {
+		key.kind = UNOWNED_SESSION;
+		key.id   = o->netId;
+	} else {
+		const int32_t cargen = FindCarGeneratorFor(vehicle);
+		if (cargen >= 0) {
+			key.kind = UNOWNED_PARKED;
+			key.id   = static_cast<uint16_t>(cargen);
+		}
+	}
+	return d;
+}
+
+uint8_t RemoteDriverOf(const void *vehicle) {
+	const Observed *const o = FindObserved(vehicle);
+	return o != nullptr ? o->driverPlayerId : INVALID_PLAYER;
+}
+
+namespace {
+
+bool g_saidFlameCarLit     = false;
+bool g_saidFlameCarRefused = false;
+bool g_saidFlameCarNoLight = false;
+
+// The owner's half: somebody's flame reached one of our cars on their screen.
+// Light it with the engine's own StartFire and the 0.8f SetCarsOnFire pushes
+// (0x005F7A50). The burning is then ours: the CFire hits
+// CVehicle::InflictDamage with cause 9 every frame, and the detour lets that
+// through because the car is ours.
+void LightOurCarForFlame(void *v, RemotePlayer *attacker, uint16_t netId,
+                         const char *whose) {
+	const bool fireProof = (Field<uint8_t>(v, offs::ENTITY_FLAGS_C) &
+	                        offs::ENTITY_FIRE_PROOF) != 0;
+	if (!OwnerLightsFlame(fireProof, IsWrecked(v))) {
+		if (!g_saidFlameCarNoLight) {
+			g_saidFlameCarNoLight = true;
+			Log("vehicle: a flame reached %s %u on another screen, and here it is "
+			    "%s, which SetCarsOnFire would have skipped (0x004B3EFB). Not lit",
+			    whose, netId, fireProof ? "bFireProof" : "a wreck");
+		}
+		return;
+	}
+
+	// The shooter's ped, the same culprit a bullet gets, so the fire's
+	// m_pSource and the car's eventual m_pSetOnFireEntity blame him.
+	void *const culprit = attacker ? ResolveRemotePed(*attacker) : nullptr;
+
+	using StartFireFn = void *(__thiscall *)(void *, void *, void *, float, uint32_t);
+	void *const fire  = Func<StartFireFn>(CFireManager__StartFireEntity)(
+        reinterpret_cast<void *>(gFireManager), v, culprit, FIRE_PED_STRENGTH, 1u);
+
+	if (fire) {
+		if (!g_saidFlameCarLit) {
+			g_saidFlameCarLit = true;
+			Log("vehicle: lit %s %u because %s's flame reached it on their screen. "
+			    "The fire and whatever it costs the car are ours from here",
+			    whose, netId, attacker ? attacker->nick.c_str() : "somebody");
+		}
+	} else if (!g_saidFlameCarRefused) {
+		// StartFire's own no: already burning, which is usually our replay of
+		// the same flame getting there first, or an engine past 225
+		// (0x00479606), or no free fire slot.
+		g_saidFlameCarRefused = true;
+		Log("vehicle: a flame reached %s %u on another screen and StartFire "
+		    "declined to light it (%s)", whose, netId,
+		    Field<void *>(v, VEHICLE_FIRE) ? "already burning"
+		                                   : "engine too far gone, or no free slot");
+	}
+}
+
+} // namespace
+
+// Somebody shot a replica of one of our traffic cars. The host end of §1.23,
+// and ApplyRemoteVehicleHit with the roster lookup swapped for the hosted
+// table: population.cpp holds the handle, this file holds the engine calls.
+void ApplyHostedCarHit(uint16_t netId, RemotePlayer *attacker,
+                       const VehicleHitBody &body) {
+	void *const v = ResolveHostedCar(netId);
+	if (!v) {
+		// Recycled, promoted or never ours. Dropped, the same decision
+		// ApplyRemoteVehicleHit makes: a hit is only worth anything on the car
+		// that was standing there.
+		if (!g_saidCarHitGone) {
+			g_saidCarHitGone = true;
+			Log("vehicle: a hit arrived for traffic car %u and we don't host it "
+			    "any more. Dropped", netId);
+		}
+		return;
+	}
+	if (IsWrecked(v))
+		return;
+
+	// Cause 9 is an ignition, not a hit (combat.h, IsFlameIgnition).
+	if (IsFlameIgnition(body.weapon)) {
+		LightOurCarForFlame(v, attacker, netId, "our traffic car");
+		return;
+	}
+
+	// The same bounds ApplyRemoteVehicleHit applies to the same two fields.
+	if (!IsForwardableDamage(body.weapon))
+		return;
+	float amount = 0.0f;
+	if (!FiniteOr(body.amount, 0.0f, amount) || !(amount > 0.0f))
+		return;
+	if (amount > MAX_REMOTE_DAMAGE)
+		amount = MAX_REMOTE_DAMAGE;
+
+	// The shooter's own ped as the culprit, so m_pSetOnFireEntity (0x00551BF3)
+	// and the eventual BlowUpCar blame them. It is a replica here, not
+	// FindPlayerPed(), so combat.cpp's AddExplosion detour doesn't relay the
+	// car's explosion as ours; the wreck goes out as C_UnownedBlowUp instead.
+	void *const culprit = attacker ? ResolveRemotePed(*attacker) : nullptr;
+
+	const float before = Field<float>(v, offs::VEH_HEALTH);
+	{
+		HitGuard guard;
+		Func<InflictDamageThisFn>(CVehicle__InflictDamage)(v, culprit, body.weapon,
+		                                                   amount);
+	}
+	const float after = Field<float>(v, offs::VEH_HEALTH);
+
+	if (!g_saidCarHitApplied) {
+		g_saidCarHitApplied = true;
+		Log("vehicle: somebody shot our traffic car %u off the wire - %.0f before, "
+		    "%.0f after, cause %u. The health goes back out on the car stream",
+		    netId, before, after, body.weapon);
+	}
+}
+
+bool BlowUpCarAsOwnerSaid(void *vehicle) {
+	if (!vehicle)
+		return false;
+	using BlowUpSlotFn = void(__thiscall *)(void *, void *);
+	void *const vtable = Field<void *>(vehicle, 0);
+	if (!vtable)
+		return false;
+	const uintptr_t slot = reinterpret_cast<uintptr_t *>(vtable)[VTABLE_BLOW_UP_CAR];
+	if (!slot)
+		return false;
+	BlastGuard guard;
+	// Null culprit, what the script's own BLOW_UP_CAR passes. Crediting the
+	// local player would pay them for a car somebody else's engine finished.
+	reinterpret_cast<BlowUpSlotFn>(slot)(vehicle, nullptr);
+	return true;
+}
+
+bool ReplayingVehicleBlast() { return g_replayingBlast; }
+
+VehicleBlastReplayScope::VehicleBlastReplayScope() : m_was(g_replayingBlast) {
+	g_replayingBlast = true;
+}
+
+VehicleBlastReplayScope::~VehicleBlastReplayScope() { g_replayingBlast = m_was; }
+
+// Asked from inside BlowUpCar, so the car is still in the pool, its generator
+// still holds its handle and m_pDriver hasn't been cleared. The order is
+// BlowUpCarCommon's: our own car first, then the Observed table, then the
+// generators.
+WreckForRampage DescribeWreckForRampage(void *vehicle) {
+	WreckForRampage out;
+	out.replay = g_replayingBlast;
+	if (out.replay || !vehicle)
+		return out;
+
+	// Ours. Nobody else may decide it, so it needs no name.
+	void *const localPed = PlayerPed();
+	if (localPed && Field<void *>(vehicle, offs::VEH_DRIVER) == localPed)
+		return out;
+
+	if (const Observed *o = FindObserved(vehicle)) {
+		// A car another player drives or settles never gets here: the detour
+		// refuses it. With nobody at the wheel every machine's copy can go up
+		// on its own, which is what the key is for - and our own custody car
+		// is keyed too, because the settle can end on another machine a few
+		// frames before it ends here and that machine's engine may get there
+		// as well.
+		if (o->driverPlayerId == 0xFF) {
+			out.key.kind = UNOWNED_SESSION;
+			out.key.id   = o->netId;
+		}
+		return out;
+	}
+
+	// Traffic we host, or a car only this machine has: one machine decides
+	// it and it goes unkeyed. A replica never gets here unless it's a replay.
+	const int32_t cargen = FindCarGeneratorFor(vehicle);
+	if (cargen >= 0) {
+		out.key.kind = UNOWNED_PARKED;
+		out.key.id   = static_cast<uint16_t>(cargen);
+	}
+	return out;
+}
+
+// Somebody shot our car, and their machine is telling us so.
+//
+// The one thing this machine is entitled to hurt on somebody else's word: a
+// car of its own that the session has named and records the local player as
+// driving, or as settling. Client checks the second half against its own
+// roster before it gets here; this end checks that the engine still agrees,
+// because those are two different questions and the round trip is several
+// frames long.
+void ApplyRemoteVehicleHit(RemoteVehicle &vehicle, RemotePlayer *attacker,
+                           const VehicleHitBody &body, bool settling) {
+	void *const v = ResolveRemoteVehicle(vehicle);
+	if (!v) {
+		// A car the pool no longer has. Dropped, not retried, and that is the
+		// decision rather than an omission - the same one ApplyRemotePedDamage
+		// makes: a hit only means anything at the instant it happened, and
+		// there is nothing left to land it on.
+		if (!g_saidHitGone) {
+			g_saidHitGone = true;
+			Log("vehicle: a hit arrived for car net %u and the engine no longer "
+			    "has it. Dropped, because a hit is only worth anything on the "
+			    "car that was standing there", body.netId);
+		}
+		return;
+	}
+
+	// The engine's own answer to "is this still ours", asked here rather than
+	// taken from the roster for the reason §1.11.5 and version 22 both turn
+	// on: a jack happens inside one process, so the two can disagree for as
+	// long as it takes the server to break the tie. If we are not at the
+	// wheel, we are not the machine allowed to decide this - unless we are
+	// settling it, and then nobody may be at the wheel.
+	void *const localPed = PlayerPed();
+	void *const atWheel  = Field<void *>(v, offs::VEH_DRIVER);
+	if (!MayTakeReportedHit(localPed != nullptr && atWheel == localPed,
+	                        atWheel == nullptr, settling))
+		return;
+
+	// A wreck is finished. The engine would refuse it anyway - health <= 0
+	// leaves at 0x00551A10 before any arithmetic - but calling into it with a
+	// burst that was in flight when the car exploded is a per-round trip into
+	// a function that will do nothing.
+	if (IsWrecked(v))
+		return;
+
+	// Every bound below is on something that arrived off a socket and is about
+	// to be handed to the engine, and each is the bound ApplyRemotePedDamage
+	// applies to the same field. The weapon steers a twenty-entry jump table
+	// at 0x006026CC and is written into m_nLastWeaponDamage; the amount
+	// reaches m_fHealth, and from there the fatal arm and the car's own
+	// matrix.
+	//
+	// Cause 9 is the exception: it is an ignition and carries no amount
+	// (combat.h, IsFlameIgnition).
+	if (IsFlameIgnition(body.weapon)) {
+		LightOurCarForFlame(v, attacker, body.netId,
+		                    settling ? "the car we are settling" : "our car");
+		return;
+	}
+	if (!IsForwardableDamage(body.weapon))
+		return;
+
+	float amount = 0.0f;
+	if (!FiniteOr(body.amount, 0.0f, amount) || !(amount > 0.0f))
+		return;
+	if (amount > MAX_REMOTE_DAMAGE)
+		amount = MAX_REMOTE_DAMAGE;
+
+	// Blame, and it is the same choice ApplyRemotePedDamage makes for the same
+	// reason: naming the shooter's own ped puts the engine's bookkeeping - the
+	// scorch marks, m_pSetOnFireEntity, whoever gets blamed for the explosion -
+	// on the player who did it rather than on nobody. Null is legitimate and
+	// means what the script's own damage calls mean by it.
+	//
+	// It buys one thing it cannot buy for a pedestrian, and costs one it does
+	// not cost there. What it buys: if this hit sets the car on fire,
+	// m_pSetOnFireEntity is written at 0x00551BF3 and the five-second timer
+	// later hands that same entity to BlowUpCar, so the car that burns out
+	// blames its shooter. What it costs: at 0x00551972 a car carrying
+	// bOnlyDamagedByPlayer demands a culprit that is FindPlayerPed() or
+	// FindPlayerVehicle(), and a replica of somebody else's ped is neither, so
+	// such a car takes nothing off the wire. That is a residual and it is left
+	// standing - the way round it is to name our own player as the culprit,
+	// which is a lie about who fired, and the flag exists precisely to stop
+	// anybody but the player hurting that car.
+	void *const culprit = attacker ? ResolveRemotePed(*attacker) : nullptr;
+
+	const float before = Field<float>(v, offs::VEH_HEALTH);
+
+	// Through the real function rather than the trampoline, the same as
+	// ApplyRemotePedDamage and for the same reason: the detour above passes
+	// straight through for a car this machine is driving, so this reaches the
+	// engine on a build where the hook failed to install too.
+	//
+	// The guard is taken anyway. It is not redundant with that pass-through:
+	// it is what makes the intent explicit at the one call site that is
+	// allowed, so a future change to the detour's conditions cannot quietly
+	// turn this call into a report.
+	{
+		HitGuard guard;
+		Func<InflictDamageThisFn>(CVehicle__InflictDamage)(v, culprit, body.weapon,
+		                                                   amount);
+	}
+
+	const float after = Field<float>(v, offs::VEH_HEALTH);
+
+	// Read either side of the call, because "the packet arrived" and "the car
+	// was hurt" are two different claims and the gap between them is where
+	// every previous round of this was lost.
+	if (after < before) {
+		if (!g_saidHitApplied) {
+			g_saidHitApplied = true;
+			Log("vehicle: somebody shot our car off the wire - net %u, %.2f "
+			    "health this hit, %.0f left, cause %u, %s. Whatever comes of it "
+			    "goes back out on our own snapshot and, if it kills the car, on "
+			    "our own %s",
+			    body.netId, before - after, after, body.weapon,
+			    settling ? "while we settle it" : "while we drive it",
+			    settling ? "C_UnownedBlowUp" : "C_VehicleBlowUp");
+		}
+	} else if (!g_saidHitNoMove) {
+		g_saidHitNoMove = true;
+		Log("vehicle: a hit off the wire reached CVehicle::InflictDamage on our "
+		    "car net %u and took no health off (%.0f before, %.0f after, %.2f "
+		    "asked for). The authority rule is not what stopped it - look at "
+		    "bCanBeDamaged, or at bOnlyDamagedByPlayer, which refuses any "
+		    "culprit that is not this machine's own player",
+		    body.netId, before, after, amount);
+	}
 }
 
 bool BlowUpRemoteVehicle(RemoteVehicle &vehicle, const Vec3 &pos, const Quat &rot) {
@@ -1421,19 +3003,10 @@ bool BlowUpRemoteVehicle(RemoteVehicle &vehicle, const Vec3 &pos, const Quat &ro
 }
 
 uint8_t DrainUnownedBlasts(UnownedBlast *out, uint8_t max) {
-	uint8_t n = 0;
-	while (n < max && g_unownedCount > 0) {
-		// Zeroed transform, not an unread one. A parked car is where the map
-		// put it on every machine and the receiver never looks at these
-		// twenty-eight bytes - but a packet with uninitialised bytes on it is
-		// a packet nobody can read a capture of, and this queue has always
-		// been the half of 5.8 that carries no position on purpose.
-		out[n]        = UnownedBlast{};
-		out[n++].key  = g_unowned[g_unownedHead];
-		g_unownedHead = static_cast<uint8_t>((g_unownedHead + 1) % MAX_PENDING_UNOWNED);
-		--g_unownedCount;
-	}
-	return n;
+	// The transforms come out zeroed: PushUnownedBlast never fills one in,
+	// because this queue has always been the half of 5.8 that carries no
+	// position on purpose.
+	return g_unowned.Drain(out, max);
 }
 
 UnownedWreckOutcome WreckUnownedVehicle(const UnownedVehicleKey &key) {
@@ -1496,6 +3069,20 @@ void AddVehicleBlastToBridge(WorldBridge &bridge) {
 	bridge.BlowUpRemoteVehicle     = &BlowUpRemoteVehicle;
 	bridge.DrainUnownedBlasts      = &DrainUnownedBlasts;
 	bridge.WreckUnownedVehicle     = &WreckUnownedVehicle;
+	// Both halves of the hit exchange hang off a detour rather than off the
+	// frame pump, exactly like the four above, so they install and fail with
+	// them and belong here rather than in MakeWorldBridge.
+	bridge.DrainLocalVehicleHits   = &DrainLocalVehicleHits;
+	bridge.ApplyRemoteVehicleHit   = &ApplyRemoteVehicleHit;
+	bridge.DrainLocalCarHits       = &DrainLocalCarHits;
+	bridge.ApplyHostedCarHit       = &ApplyHostedCarHit;
+	// And the two that keep the detours' table in step with a car we claimed.
+	// A row is only worth anything to the detours, so they go in with them.
+	bridge.AdoptClaimedVehicle     = &AdoptClaimedVehicle;
+	bridge.ReleaseOwnVehicle       = &ReleaseOwnVehicle;
+	bridge.NoteVehicleHolders      = &NoteVehicleHolders;
+	// Not a detour, so it doesn't depend on any of them having installed.
+	bridge.UpdateTrafficAllowance  = &UpdateTrafficAllowance;
 }
 
 // ---- ambient traffic (docs/population.md §3 step 4) ------------------------
@@ -1540,6 +3127,14 @@ bool SpawnAmbientCarReplica(RemoteAmbientCar &car) {
 
 	const uint16_t model = car.body.modelId;
 	if (!model || !HasModelLoaded(model))
+		return false;
+
+	// A CAutomobile, and only for a car model. Traffic is never anything else:
+	// the only callers of CBoat::CBoat in the image are CREATE_CAR, the save
+	// loader, the car generators and the replay (addresses.h, "boats"), none
+	// of them CCarCtrl. So a boat model here came off a socket wrong, and a
+	// CAutomobile wearing it is the bug SpawnRemoteVehicle was fixed for.
+	if (VehicleBuildForModel(model) != VehicleBuild::Automobile)
 		return false;
 
 	void *const mem = Func<NewFn>(CVehicle__operator_new)(offs::SIZEOF_AUTOMOBILE);
@@ -1594,9 +3189,10 @@ bool SpawnAmbientCarReplica(RemoteAmbientCar &car) {
 	// to make room for a copy of somebody else's.
 
 	// STATUS_ABANDONED keeps m_type in bits 0-2 and replaces m_status in bits
-	// 3-7, exactly as CREATE_CAR's `and al,7 / or al,20h` does. It is also
-	// what stops the local engine's traffic AI driving the replica: the
-	// autopilot only runs for a car whose status says it is being simulated.
+	// 3-7, exactly as CREATE_CAR's `and al,7 / or al,20h` does. The ABANDONED
+	// arm runs no car AI. It lasts until the host's driver is seated in it,
+	// which makes it PHYSICS (game/carstatus.h), and from then on it is the
+	// detours on UpdateCarAI and SteerAICarWithPhysics that keep the AI off.
 	uint8_t &status = Field<uint8_t>(mem, offs::ENTITY_FLAGS);
 	status          = static_cast<uint8_t>(
         (status & 0x07u) | (ENTITY_STATUS_ABANDONED << ENTITY_STATUS_SHIFT));
@@ -1659,6 +3255,9 @@ bool SpawnAmbientCarReplica(RemoteAmbientCar &car) {
 	Field<int8_t>(mem, offs::ZONE_LEVEL) = LEVEL_IGNORE;
 
 	car.poolHandle = VehicleRef(mem);
+	// So the two detours know this one is somebody else's to damage and to
+	// blow up. docs/protocol.md §1.23.
+	RememberReplica(car.poolHandle, car.netId);
 	return true;
 }
 
@@ -1670,14 +3269,23 @@ void DespawnAmbientCarReplica(RemoteAmbientCar &car) {
 		return;
 	void *const v  = VehicleFromRef(car.poolHandle);
 	car.poolHandle = -1;
+	ForgetReplica(car.netId);
 	if (!v)
 		return;   // the engine already took it
 
-	// Before CWorld::Remove, because CWorld::Remove will not unlink a vehicle
-	// that has gone static - and a replica is exactly the car that goes
-	// static, since it is put where the wire says and otherwise stands
-	// perfectly still. Leave the node behind and the next CWorld::Process
-	// reads m_rwObject off a freed pool slot.
+	// Before CWorld::Remove, because CWorld::Remove will not unlink an entity
+	// that has gone static (addresses.h, WorldRemoveUnlinksFromMovingList),
+	// and a node left behind has the next CWorld::Process reading m_rwObject
+	// off a freed pool slot.
+	//
+	// A replica does not go static on its own, though this used to say it
+	// did. CPhysical::ProcessControl's quiet-frame counter is behind a type
+	// test at 0x00495F9A - an object, or a ped without bPedPhysics - and a
+	// vehicle jumps past it to 0x00496179 (addresses.h, the note after the
+	// boat's exit gate). So this is a guard, not the fix for a known case:
+	// RemoveFromMovingList checks m_movingListNode itself and costs nothing
+	// when there is no node, and the log line says so if something else
+	// ever sets the bit.
 	if (NeedsMovingListUnlink(Field<uint8_t>(v, offs::ENTITY_FLAGS_A),
 	                          Field<void *>(v, offs::MOVING_LIST_NODE) != nullptr))
 		Log("population: ambient car %u went static while still in the moving "
@@ -1711,6 +3319,7 @@ void CorrectAmbientCarReplica(RemoteAmbientCar &car, const VehicleTransform &at)
 		// writing into a slot somebody else owns now - Client will build it
 		// again on the next pass, which is the same recovery
 		// ResolveRemoteVehicle does for a claimed car.
+		ForgetReplica(car.netId);
 		car.poolHandle   = -1;
 		car.spawnPending = true;
 		return;
@@ -1721,10 +3330,12 @@ void CorrectAmbientCarReplica(RemoteAmbientCar &car, const VehicleTransform &at)
 	// physics is a car you can sit in and cannot drive an inch - which is
 	// precisely the bug CorrectRemoteVehicles has a guard for.
 	//
-	// Nothing here claims the car: that is an ownership handoff and
-	// population.md §1.3.1 is explicit that this design does not promise one.
-	// What the guard buys is that the car drives while the session is still
-	// telling everybody else where its owner thinks it is.
+	// This guard is no longer the whole answer, and it used to be. The roster
+	// now asks the same question out loud through LocalDrivesAmbientCar and
+	// claims the car (protocol.h, S_CarPromoted), so what this buys is only
+	// the handful of frames the claim takes to go round - the car drives
+	// while the session is still telling everybody else where its old owner
+	// thinks it is. Left on its own it did that for ever.
 	if (Field<void *>(v, offs::VEH_DRIVER) == PlayerPed()) {
 		SetVehicleObserved(v, false);
 		static bool said = false;
@@ -1742,7 +3353,79 @@ void CorrectAmbientCarReplica(RemoteAmbientCar &car, const VehicleTransform &at)
 	// is one nobody simulated. docs/cardamage.md §2.6.
 	SetVehicleObserved(v, true);
 
+	// The host's health, every frame, and the fire timer held at zero under
+	// it. The two detours refuse InflictDamage and BlowUpCar on a replica, but
+	// three writers never call either: the upside-down drain at 0x0052F472
+	// (above VehicleDamage's bCollisionProof test), CFire::ProcessFire putting
+	// 75.0f on the car of a burning occupant at 0x00479959, and the
+	// engine-status drain at 0x005347E0. Whatever they did this frame is put
+	// back here, after physics. Below 250 the flames still draw off m_fHealth,
+	// so a car burning on the host burns here too, and only the timer is kept
+	// from deciding anything (the same split ApplyRemoteVehicle makes).
+	//
+	// Not on a wreck: the host has finished with it, and writing health back
+	// into a shell relights it.
+	if (!IsWrecked(v)) {
+		Field<float>(v, offs::VEH_HEALTH)             = car.health;
+		Field<float>(v, offs::AUTO_FIRE_BLOWUP_TIMER) = 0.0f;
+	}
+
 	PlaceVehicle(v, at.pos, at.rot, /*inWorld=*/true);
+
+	// The host's horn, counted down here (game/horn.h, TrafficHornTimer). After
+	// CGame::Process and every frame for the reason the player's horn gives in
+	// CorrectRemoteVehicle: a replica with its driver seated is STATUS_PHYSICS,
+	// whose horn block takes one off the timer every frame, and one without
+	// is ABANDONED, whose arm zeroes it; DMAudio.Service is next. When the
+	// host stops, this writes the 0 itself rather than leave a driven
+	// replica counting the rest of the rhythm down on its own.
+	if (!IsWrecked(v)) {
+		Field<uint8_t>(v, offs::VEH_HORN_TIMER) = car.hornTimer;
+		static bool said = false;
+		if (car.hornTimer != 0 && !said) {
+			said = true;
+			Log("population: ambient car %u is honking on its host, and we are "
+			    "sounding it (and will not say so again)", car.netId);
+		}
+	}
+
+	// The host's siren (game/siren.h, ReplicaTrafficSirenOn). Every frame and
+	// after physics, so whatever this machine's engine did to the byte in
+	// between is put back before PreRender draws the light bar and the audio
+	// reads it. Writing 1 over a 1 changes nothing either of them can see.
+	if (!IsWrecked(v)) {
+		Field<bool>(v, offs::VEH_SIREN_OR_ALARM) = car.sirenOn;
+		static bool said = false;
+		if (car.sirenOn && !said) {
+			said = true;
+			Log("population: ambient car %u has its siren going on its host, "
+			    "and here too (and will not say so again)", car.netId);
+		}
+	}
+	for (ReplicaRow &r : g_replicas)
+		if (r.handle == car.poolHandle && r.netId == car.netId)
+			r.driverSaid = car.sirenOn && car.driverSaid;
+}
+
+// Is the local player at the wheel of this replica? (protocol.h, S_CarPromoted.)
+//
+// The same question CorrectAmbientCarReplica has asked the engine since the
+// day it was written, given a name and a return value so the roster can act on
+// the answer instead of the correction pass quietly stepping aside from it.
+//
+// CVehicle::m_pDriver and not the roster, for the reason the session-car
+// version gives: the roster's answer is a round trip behind the engine's, and
+// the whole gap between the two is a car the player is sitting in that nobody
+// has claimed. Seat 0 only - a passenger in somebody else's traffic changes
+// nothing about who is steering it.
+bool LocalDrivesAmbientCar(const RemoteAmbientCar &car) {
+	if (car.poolHandle < 0)
+		return false;
+	void *const v = VehicleFromRef(car.poolHandle);
+	if (!v)
+		return false;
+	void *const player = PlayerPed();
+	return player != nullptr && Field<void *>(v, offs::VEH_DRIVER) == player;
 }
 
 bool SampleHostedCar(int32_t poolHandle, AmbientCarState &out) {
@@ -1750,13 +3433,27 @@ bool SampleHostedCar(int32_t poolHandle, AmbientCarState &out) {
 	if (!v)
 		return false;
 
-	out.pad[0] = out.pad[1] = 0;
+	out.health   = EncodeAmbientHealth(Field<float>(v, offs::VEH_HEALTH));
 	out.pos      = ReadVec3(v, offs::POSITION);
 	out.rot      = QuatFromAxes(ReadVec3(v, offs::MATRIX_RIGHT),
 	                            ReadVec3(v, offs::MATRIX_FWD),
 	                            ReadVec3(v, offs::MATRIX_UP));
 	out.velocity = ReadVec3(v, offs::MOVE_SPEED);
 	return true;
+}
+
+bool HostedCarHonking(int32_t poolHandle) {
+	void *const v = VehicleFromRef(poolHandle);
+	if (!v)
+		return false;
+	return TrafficHornOnWire(static_cast<uint16_t>(Field<int16_t>(v, offs::MODEL_INDEX)),
+	                         Field<bool>(v, offs::VEH_SIREN_OR_ALARM),
+	                         Field<uint8_t>(v, offs::VEH_HORN_TIMER));
+}
+
+bool HostedCarSirenOn(int32_t poolHandle) {
+	void *const v = VehicleFromRef(poolHandle);
+	return v != nullptr && Field<bool>(v, offs::VEH_SIREN_OR_ALARM);
 }
 
 void PlaceCarForBlast(void *vehicle, const BlastTransform &where) {

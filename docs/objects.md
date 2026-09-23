@@ -133,7 +133,7 @@ tolerating the duplicates. `CWorld::TriggerExplosion` (`0x004B1140`) has
 scoped guard covers every explosion there is. Without it a single rocket would
 send one reliable packet per bin in its radius.
 
-### 2.2 A bullet has never broken one
+### 2.2 A bullet has never broken one — and cannot knock a lamp post over either
 
 `CWeapon::FireInstantHit`'s `ENTITY_TYPE_OBJECT` arm adds eight spark
 particles, clears `bIsStatic` when `m_fUprootLimit <= 0`, applies
@@ -152,6 +152,48 @@ for rel32 targets equal to `0x004BB240` finds **five call sites and nothing in
 Shooting street furniture in retail III nudges it; it does not break it. The
 one exception is `CWeapon::BlowUpExplosiveThings`, which turns a barrel or a
 petrol pump into a `CExplosion` - and §2.1 has already dealt with explosions.
+
+**It does not even nudge a lamp post**, and that half was written down wrong
+the first time. The arm above is shared by three functions - `DoBulletImpact`
+(0x0055F950, arm at 0x00560481), `FireShotgun` (0x005616A2) and `FireMelee`
+(0x00558A64) - and every one of them is the same instructions:
+
+```
+mov al,[X+50h] / and al,7 / cmp al,4          ENTITY_TYPE_OBJECT
+mov al,[X+122h] / shr al,2 / and al,1         bInfiniteMass -> skip
+mov al,[X+51h]  / shr al,2 / and al,1         GetIsStatic()
+fld [X+170h] / fcomp [const] ...              m_fUprootLimit <= 0.0f
+[X+51h] &= 0FBh / call 004958F0               SetIsStatic(false), AddToMovingList
+                                              then, only if !GetIsStatic():
+                                              ApplyMoveForce(normal * -k)
+```
+
+The three constants it compares against are `0x00603060`, `0x00603060` and
+`0x00602C88`, and all three read `00000000` - so the gate really is
+`<= 0`, not a small threshold. And `data/object.dat`, which ships with the
+game, gives column G:
+
+| model | uproot limit | map instances |
+|---|---|---|
+| `doublestreetlght1`, `lamppost1/2/3` | **400.0** | 762 |
+| `trafficlight1` | **500.0** | 333 |
+| `bar_barrier10/12`, the `lhouse` barriers | **350.0** | 107+ |
+| `parkingmeter`, `bin1`, `postbox1`, `fire_hydrant` | **100.0** | |
+| `trafficcone` | **10.0** | 39 |
+| `parkbench1` | **5.0** | 70 |
+| `smashbar` | **1000.0** | |
+| `woodenbox`, `cardboardbox`/`2`/`4`, `wastebin`, `dump1`, `palette`, `parktable1`, `papermachn01`, `fishstall03/04` | **0.0** | 204+ |
+
+Every piece of street furniture worth the name is above zero, so the gate
+fails - and because the object is still static, the `!GetIsStatic()` that
+guards the move force fails too. **Shooting a lamp post in retail 1.0
+produces eight sparks and a sound and moves nothing at all.** The only
+breakable models a bullet can knock loose are the boxes and bins in the last
+row, and those it moves on every machine, because §1.9.2 replays the shot
+through the engine.
+
+`tools/objecttest` carries that table, so the claim is a regression test
+rather than a sentence.
 
 ### What is left
 
@@ -275,11 +317,58 @@ cause is nobody                      -> the HOST reports
 
 "Cause" is `CPhysical::m_pDamageEntity` (`+0x110`), the neighbour of the
 `m_fDamageImpulse` that `CObject::ProcessControl` passes straight into
-`ObjectDamage`. It is a raw pointer the engine never clears, so before it is
-trusted at all it is checked against the pool it claims to be in: inside the
-entry array, on a slot boundary, and not a free slot. A pointer that fails any
-of the three is `NOBODY`, which falls to the host - the safe direction, because
-the worst case is one extra packet rather than a wrong read.
+`ObjectDamage`. It is still checked against the pool it claims to be in before
+it is trusted at all - inside the entry array, on a slot boundary, and not a
+free slot.
+
+**It is not, however, a pointer "the engine never clears", and that was worth
+finding out.** `CPhysical::ProcessControl` (`0x00495F10`) zeroes both halves of
+the collision record at its top:
+
+```
+00495F78  mov dword [ebx+10Ch],0    m_fDamageImpulse = 0
+00495F82  mov dword [ebx+110h],0    m_pDamageEntity  = nil
+```
+
+and `CObject::ProcessControl` calls `ObjectDamage(m_fDamageImpulse)`
+immediately *before* that, at `0x004BB04F`/`0x004BB055`. So the pointer a
+break detour reads is always this frame's. §9's second open question is
+answered, in the safe direction, and the same fact is what makes the uproot
+path below able to ask "did something collide with this, just now".
+
+### 5.1 Who reports a bullet
+
+A bullet writes no collision record at all, so `m_pDamageEntity` is nil and
+the rule above reads `NOBODY` - which falls to the host. **That is the wrong
+machine, and §5 above already contains the proof without applying it**:
+`ManagePopulation` turns any map object more than 80 m from the local player
+back into a dummy, so the host is the one participant in the session who is
+not guaranteed to have the object at all. Handing an ownerless event to the
+host hands it to whoever is most likely to be somewhere else.
+
+So an uproot with no impulse behind it is attributed to the trigger pull it
+happened inside:
+
+```
+inside combat.cpp's replay of somebody else's shot  -> THEY report
+outside it                                          -> WE report
+```
+
+and that is a fact rather than a guess, for two reasons. The object arm of
+§2.2 is the only thing left in the image that can clear `bIsStatic` on a
+breakable map object without writing an impulse - a collision writes one in
+the same frame, and a blast is already guarded - and that arm only ever runs
+inside somebody's `CWeapon::Fire`. **The shooter knows the break was theirs
+because the engine is still inside their own trigger pull when it happens.**
+`combat.cpp` already holds exactly that flag for the duration of
+`ReplayRemoteShot`'s call; all that was added is a way to ask it
+(`ReplayingRemoteShot`).
+
+The alternative - keep it with the host and make the host's break travel - is
+worse for the 80 m reason above, and worse again because it needs the host to
+be *watching*: a non-host who shoots a crate loose on a street the host has
+never visited gets no report from anybody, which is exactly the symptom this
+was reported as.
 
 **Nothing is ever suppressed locally.** An observer whose own engine breaks the
 object - because a replica of somebody else's car really did push through it
@@ -337,12 +426,14 @@ no `ObjectIdent` or `ObjectBreakBody`, and leaves `Vec3` and `PacketHeader`
 byte-identical, so the sizes below hold on top of it. (The opcodes that tree
 adds and this section does not are `0x74`/`0x75`, `C_/S_PED_BODY_PART`.)
 
-Opcodes `0xC0`-`0xCF` are reserved for this; two are used.
+Opcodes `0xC0`-`0xCF` are reserved for this; four are used.
 
 | opcode | name | to | body |
 |---|---|---|---|
 | `0xC0` | `C_ObjectBroken` | server | `ObjectBreakBody` |
 | `0xC1` | `S_ObjectBroken` | everyone but the reporter | `playerId` + `ObjectBreakBody` |
+| `0xC2` | `C_ObjectSettled` | server | `ObjectRestBody` |
+| `0xC3` | `S_ObjectSettled` | everyone but the reporter | `playerId` + `ObjectRestBody` |
 
 ```
 struct ObjectIdent {      // 16 bytes
@@ -357,7 +448,30 @@ struct ObjectBreakBody {  // 24 bytes
     uint8_t     state;    // ObjectBreakFlags
     uint8_t     pad[3];
 };
+
+struct ObjectRestBody {   // 64 bytes
+    ObjectIdent ident;
+    Vec3        right;    // CMatrix, entity +0x04
+    Vec3        forward;  //          entity +0x14
+    Vec3        up;       //          entity +0x24
+    Vec3        pos;      //          entity +0x34, where it is lying
+};
 ```
+
+`ObjectBreakFlags` gained a third bit, `OBJ_BREAK_UPROOTED` (`1 << 2`), which
+costs nothing - the byte had six spare - and means "`bIsStatic` is clear on my
+copy". §8 is what it is for.
+
+`ObjectRestBody` is the one packet in this feature that is not a latch, and it
+is deliberately the full 3x3 rather than a heading: a lamp post does not lie
+down about the z axis, it falls over, and the two vectors that say so are the
+ones a heading throws away. 48 bytes once per uprooting is cheaper than
+anything that would let the receiver work it out for itself.
+
+**It is also the packet that proves why the key had to be `m_objectMatrix`.**
+By the time a resting place exists, the object is metres from where the map
+put it - and on two machines it is metres away in two different directions.
+The placement has not moved on either.
 
 Both reliable, on `CH_EVENT`. There is deliberately **no snapshot component, no
 server-side table and no backfill**, and §1's 80 m horizon is the reason: the
@@ -371,28 +485,128 @@ break is a no-op on every machine.
 
 ---
 
-## 8. What this deliberately does not do
+## 8. Uprooting — the half this used to leave out
 
-**A knocked-over lamp post does not lie down on the other screen.** Uprooting
-is a *different mechanism* from breaking: `CPhysical` clears `bIsStatic` and
-calls `AddToMovingList` when the impulse beats `m_fUprootLimit`, and where the
-post ends up after that is local physics, which `roadmap.md` §2.4 says is not
-reproducible. It is a transform, not a latch, and carrying it honestly means
-either a stream or a one-shot resting-place packet once the object goes back to
-sleep.
+**Uprooting is one bit and one list, and nothing else.** An object goes from
+standing to lying down when `bIsStatic` (CEntity byte A `+0x51`, bit 2) is
+cleared and the object is handed to `CPhysical::AddToMovingList`
+(`0x004958F0`). From that instant `CWorld::Process` calls its `ProcessControl`
+every frame and ordinary physics takes it. There is no second model, no flag
+on `CObject`, and no call anywhere in the image that means "fall over".
 
-That is named work, not an oversight, and it is worth being precise about what
-is and is not fixed by what shipped. For the 29 breakable models:
+It is therefore **orthogonal to breaking**, and `ObjectDamage` says so itself:
+none of its nine arms clears `bIsStatic`, and the smash arm *sets* it
+(`[ecx+51h] &= 0FBh / |= 4` at `0x004BB3A0`). A lamp post can be bent without
+coming loose (impulse 200 - past 150, short of 400) and can come loose without
+being bent (a bench, uproot limit 5, break threshold 150). Two decisions off
+one number, with two different thresholds, which is why one of them travelling
+never implied the other.
 
-- The ones that **vanish** - crates, pallets, cones, `smashbar`, everything
-  with effect 3, 50, 60, 70 or 80 - are fully handled. Those are the
-  satisfying ones and they are now the same on both screens.
-- The ones with effect 1 (`change_model`) - lamp posts, traffic lights, meters,
-  bins, hydrants, benches - now show the *damaged model* on both screens. A
-  post that was also uprooted is bent-and-standing here and lying down there.
-  Better than pristine-versus-gone, and not yet right.
+Three places decide it and all three read `m_fUprootLimit` (`+0x170`):
 
-Opcodes `0xC2`-`0xCF` are reserved for it.
+| | test | where |
+|---|---|---|
+| a collision | `impulse > m_fUprootLimit \|\| IsFence(model)` | `0x00497559`, `0x00497B6B`; uproot at `0x00497EB1` |
+| a blast | `fPower > m_fUprootLimit` | `0x004B1473`; uproot at `0x004B154D` and `0x004B163A` |
+| a bullet, a pellet, a bat | `m_fUprootLimit <= 0.0f` | §2.2 |
+
+### 8.1 Two of the three already agree, and the third is the report
+
+The same shape as §2.1 and §2.2, reached the same way.
+
+- **A blast** uproots identically on every machine, because its power is the
+  same pure function of two positions and a radius that its damage is. Free.
+- **A bullet** uproots identically on every machine, because `protocol.md`
+  §1.9.2 replays the shot through the engine's own `CWeapon::Fire` on the
+  remote ped, out of the wire's muzzle and along the wire's direction, so
+  every observer's own `DoBulletImpact` runs the same object arm against the
+  same map object and applies the same `normal * -4.0f`. Also free - and for
+  street furniture it is free in the strongest possible sense, because §2.2
+  says a bullet cannot knock any of it over at all.
+- **A collision** does not. Nobody else ran it. That is the case the report
+  was about, and it is the only one that needed a packet.
+
+### 8.2 What travels is the resting place, and only the resting place
+
+Not the impulse. `roadmap.md` §2.4 is unambiguous that `ms_fTimeStep` is
+frame-time-derived, so two machines handed the identical impulse put the same
+post down in two different places - and a machine that never uprooted it has
+nothing to integrate anyway. Not a stream either. **One packet per uprooting**,
+sent when the engine's own sleep test says the object has finished:
+
+```
+004960D7  inc byte [ebx+0EDh]          m_nStaticFrames++
+004960DD  cmp byte [ebx+0EDh],0Ah      more than 10 quiet frames
+004960F1  [ebx+51h] &= 0FBh / |= 4     SetIsStatic(true)
+004960FB  move/turn speed and both frictions zeroed
+00496172  m_nStaticFrames = 0          (the else arm)
+```
+
+and `CWorld::Process` then unlinks it, in its own moving-entity loop:
+
+```
+004B1B99  call [edi+20h]               ProcessControl
+004B1B9C  [ebp+51h] >> 2 & 1           GetIsStatic()
+004B1BA8  call 00495940                RemoveFromMovingList
+```
+
+(again at `0x004B1BF3` for the postponed pass.) That second listing is why
+**nothing here ever writes into the moving list to put an object back**.
+Setting `bIsStatic` is enough; the engine does the unlink on its own next
+pass. Writing into that list is what `client/src/game/movinglist.h` exists to
+clean up after, and this feature deliberately does not.
+
+The uproot is noticed by a detour on `AddToMovingList` itself, which is the
+one door all six relevant call sites go through, and it is a read-only
+bracket: it calls the original and then looks. The cause is read there rather
+than later, because that is the only moment it is still a live fact - §5's
+`m_pDamageEntity` is cleared on the next frame, and a bullet never writes one.
+
+The receiver's apply is the engine's own three steps, in the engine's own
+order: write the matrix, `CMatrix::UpdateRW` (`0x004B8EC0`),
+`CEntity::UpdateRwFrame` (`0x00474330`), then `CPhysical::RemoveAndAdd`
+(`0x00495540`). The last is not optional - an entity whose position is written
+from outside stays filed in the sector it was added in, and
+`CRenderer::ScanWorld` only walks the sectors around the camera, so a post
+that fell into the next sector would simply stop being drawn.
+
+Nine floats off a socket then go into the matrix the collision code reads, so
+they are checked first (`SaneRotation`): every row finite and within a factor
+of two of unit length. That rejects a NaN before it propagates - `pedanim.h`'s
+rule, unchanged - and rejects the all-zero body a truncated or forged packet
+carries, which would otherwise collapse the object's collision volume to a
+point.
+
+### 8.3 The uproot bit is what stops the post teleporting
+
+`OBJ_BREAK_UPROOTED` rides the break packet and costs nothing: the state byte
+had six spare bits. It is not the fix by itself - it is what lets an observer
+drop its own post *at the moment the break arrives* instead of watching it
+stand for a second and then snap flat. The receiver clears `bIsStatic` and
+links the object exactly once, guarded on `bIsStatic` being set, because the
+engine's invariant is that the moving list holds exactly the non-static
+entities and a second node for one of them is the bug `movinglist.h` exists
+for.
+
+### 8.4 What is still different
+
+**An explosion stays quiet about resting places too**, for the reason it stays
+quiet about breaks: one rocket into a row of bins would be one reliable packet
+per bin, and every machine already uprooted all of them from the same number.
+They end up lying in slightly different places. That is the one difference
+this deliberately leaves standing, and it is a far smaller one than
+standing-versus-lying.
+
+**A drive-by does not uproot anything on anybody else's screen.**
+`ReplayRemoteShot` refuses a seated ped, because drive-bys go through
+`CWeapon::FireFromCar` and that is not synced - so §8.1's free bullet answer
+does not cover `FireInstantHitFromCar`. A crate a passenger shoots from a car
+stays put on the other screens. Nothing breaks; it is simply not carried.
+
+**The watch table is 24 deep and the newest entry is dropped past that.** A
+car ploughing a row of lamp posts is nowhere near it and a rocket is excluded
+by the paragraph above, but the number is in the heartbeat line so it stops
+being a guess.
 
 **Glass is untouched.** `CGlass` is its own system with its own arrays
 (`WindowRespondsToCollision`, `WindowRespondsToExplosion`) and it never goes
@@ -401,30 +615,39 @@ through `ObjectDamage`. Separate job.
 **Script objects are untouched.** `MISSION_OBJECT` exists on the machine
 running the script, which is Area D's problem and `campaign.md`'s.
 
+Opcodes `0xC4`-`0xCF` stay reserved.
+
 ---
 
 ## 9. What has not been in front of GTA III
 
 Everything above is proved against the binary or is design. **None of it has
-run in the game.** `tools/objecttest` is 55 checks and green, and covers the
+run in the game.** `tools/objecttest` is 86 checks and green, and covers the
 wire layout, the tolerance, the break-state arithmetic, the replay count, the
-reporting truth table, and the identity matcher over a pool built by hand out
-of the same offsets and the same `0x19C` stride the engine uses.
+reporting truth table, the uproot-cause truth table, the `object.dat` uproot
+limits, the sanity test on a matrix off the wire, and the identity matcher
+over a pool built by hand out of the same offsets and the same `0x19C` stride
+the engine uses. `tools/clienttest` covers the routing either side of
+`Client`, and `tools/sessiontest` covers the size-and-opcode gate the server's
+dispatch goes through.
 
 What that leaves untested, exactly:
 
-1. **The two detours.** `CObject::ObjectDamage` is `__thiscall(float)`, hooked
-   as `__fastcall` with a dummy `edx` - the standard trick here, but it has not
-   been run. `CObject::ProcessControl` calls `ObjectDamage` for every object
-   with a damage effect *every frame*, with `m_fDamageImpulse` usually zero, so
-   the detour is on a hot path and the cost of the two byte reads either side
-   of it is a guess until somebody watches a frame time.
-2. **`m_pDamageEntity` being the right entity at the moment `ObjectDamage`
-   runs.** It is set by `CPhysical`'s own collision bookkeeping next to
-   `m_fDamageImpulse`, and the `ProcessControl` path is a frame later than the
-   collision that set it. The failure mode is a stale pointer, which the pool
-   check turns into `NOBODY`, which the host reports - one extra packet, not a
-   wrong break. Worth confirming rather than assuming.
+1. **The three detours.** `CObject::ObjectDamage` is `__thiscall(float)`,
+   hooked as `__fastcall` with a dummy `edx` - the standard trick here, but it
+   has not been run. `CObject::ProcessControl` calls `ObjectDamage` for every
+   object with a damage effect *every frame*, with `m_fDamageImpulse` usually
+   zero, so the detour is on a hot path and the cost of the two byte reads
+   either side of it is a guess until somebody watches a frame time.
+   `CPhysical::AddToMovingList` is the third, and `CWorld::Add` routes every
+   non-static entity through it, so the one byte read and compare that gets a
+   ped or a car straight back out of it is the thing to watch there.
+2. ~~**`m_pDamageEntity` being the right entity at the moment `ObjectDamage`
+   runs.**~~ **Answered, §5.** `CPhysical::ProcessControl` zeroes both
+   `m_fDamageImpulse` and `m_pDamageEntity` at its top, one call after
+   `CObject::ProcessControl` reads them, so the pointer is never stale by more
+   than the frame it was written in. What is still unmeasured is only whether
+   the pool check ever fires at all.
 3. **Whether a replica's collision produces a local break at all.** A remote
    car is simulated locally and corrected from the wire every frame
    (`protocol.md` §2.8), and whether that generates the same collision events
@@ -434,7 +657,22 @@ What that leaves untested, exactly:
 4. **Whether the receiver's replayed `ObjectDamage` looks right.** The amounts,
    the particles and the sound are the engine's, but nobody has watched a crate
    burst on a second screen.
+5. **Whether a post dropped off the wire falls before its resting place
+   arrives.** §8.3 clears `bIsStatic` on a standing copy the moment the break
+   says the reporter's came loose, and what that looks like for the second or
+   so before the rest packet lands has not been seen. A post standing perfectly
+   upright with no angular velocity may barely move, in which case the bit is
+   buying less than it looks like it should and the snap is doing all the work.
+6. **Whether `CPhysical::RemoveAndAdd` is enough on its own** to put a
+   written-in transform back in front of the renderer, or whether the object
+   also needs its bounding rect recomputed. The call is the engine's own answer
+   to "this entity moved" and it is called every frame by the physics for
+   exactly that, so it should be - but it has never been called from outside
+   the physics before.
 
-The one thing to watch in the log is the heartbeat line: `broken here` moving
-while `reported` and `from the wire` stay at zero is the shape of "nothing is
-reaching anybody".
+Two things to watch in the log. `broken here` moving while `reported` and
+`from the wire` stay at zero is the shape of "nothing is reaching anybody".
+And on the uproot line, `came loose` moving while `rest sent` stays at zero
+means objects are being knocked over here and never coming to rest - which
+would be the watch table leaking, or the 80 m conversion taking them away
+before the engine's sleep test gets to them.

@@ -109,7 +109,7 @@ int main(int argc, char **argv) {
 	const char *host = argc > 1 ? argv[1] : "127.0.0.1";
 	// Optional, and only because a second session on this machine may already
 	// be holding DEFAULT_PORT with a server built from a different tree -
-	// AGENTS.md says use another port rather than kill it, and until now
+	// use another port rather than kill it, and until now
 	// there was no way to.
 	const uint16_t port =
 	    argc > 2 ? static_cast<uint16_t>(std::atoi(argv[2])) : DEFAULT_PORT;

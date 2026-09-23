@@ -165,7 +165,10 @@ void StartServer() {
 	g_state.startError.clear();
 	if (!g_state.server.Start(g_state.config.port, g_state.config.friendlyFire,
 	                          g_state.config.ammoSync,
-	                          WireValue(g_state.config.wantedLevel))) {
+	                          WireValue(g_state.config.wantedLevel),
+	                          WireValue(g_state.config.rampage),
+	                          WireValue(g_state.config.cheats),
+	                          WireValue(g_state.config.money))) {
 		g_state.startError = "Could not listen on that port. Something else may be using it.";
 		return;
 	}
@@ -653,6 +656,11 @@ int RunWindow(const Startup &startup) {
 				g_state.server.SessionRef().SetFriendlyFire(g_state.config.friendlyFire);
 				g_state.server.SessionRef().SetAmmoSync(g_state.config.ammoSync);
 				g_state.server.SessionRef().SetWantedRule(WireValue(g_state.config.wantedLevel));
+				g_state.server.SessionRef().SetRampageRule(WireValue(g_state.config.rampage));
+				// Not in the dialog, the same as the rampage rule: the ini is where
+				// it is set, and this keeps a save from quietly putting it back.
+				g_state.server.SessionRef().SetCheatRule(WireValue(g_state.config.cheats));
+				g_state.server.SessionRef().SetMoneyRule(WireValue(g_state.config.money));
 				g_state.savedAt = app.Seconds();
 				Say(LogKind::Info, "options saved");
 				if (wlChanged) {

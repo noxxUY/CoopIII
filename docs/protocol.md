@@ -1017,7 +1017,9 @@ one.
 
 Nothing about fire goes on the wire, in either direction, and that is the
 decision rather than an omission. Fire damage is decided on the victim's
-machine, by the victim's own engine, about the victim.
+machine, by the victim's own engine, about the victim. (Between players, that
+is. A flame reaching somebody else's pedestrian or car sends the ignition to
+its owner, and the owner's own fire still decides the damage - §1.24.)
 
 This is the opposite of §1.10.1's rule for a bullet and it is the same
 principle, applied to a different question. A bullet's authority is a **ray**,
@@ -1130,6 +1132,57 @@ into. On an observer that would be this machine deciding the health of
 somebody else's car, so a remote player who gets into a car stops burning
 here. Their own machine wrecks their own car and the result arrives on the
 vehicle's stream like everything else about it.
+
+#### 1.10.8 Busted rides the death's respawn and the ped state, and adds no packet
+
+What an arrest is, from the retail image (`addresses.h`, "busted"): a cop's
+`CCopPed::SetArrestPlayer` (`0x004C2B00`) writes `PED_ARRESTED` (56) into the
+player's ped, clears `m_bCanBeDamaged`, and for a player in a car sets the car
+to `STATUS_PLAYER_DISABLED` with the handbrake on. It blends no animation on
+the player - the only animation in the whole arrest is `ANIM_STD_ARREST` on
+the cop. `CGameLogic::Update` (`0x00421400`) sees 56 and calls
+`CPlayerInfo::ArrestPlayer`, which starts the four second `WBSTATE_BUSTED`
+clock. At 0x800 ms the screen fades to black; at 0x1000 ms the engine takes a
+fine and the weapons, empties the car seat, and runs the same
+`RestorePlayerStuffDuringResurrection` a death uses, pointed at the nearest
+police station. Health is never touched.
+
+So everything an observer needs was already on the wire except the end:
+
+- **The arrest itself** is in the snapshot. `pedState` says 56, the ped stays
+  where the cop caught it, and it stays on the pose stream (it is not a
+  corpse, so nothing stops the stream). In a car the ped stays seated, which
+  is also right.
+- **Being dragged out of a car** - the usual start of an arrest in a car - is
+  `PED_DRAG_FROM_CAR` (51) on the snapshot from the first frame, and the
+  owner's `JACKEDCAR` animation and positions are on the pose stream. What
+  stopped anyone seeing it was the seat: the replica stayed in it until the
+  `S_ExitVehicle` at the end of the drag. `UpdateRemoteSeats` now stands the
+  seat down on the snapshot and holds it down through the `PED_ARRESTED` that
+  follows (`DragLatchFor`), the same way §1.14.4 starts a get-out on the
+  snapshot. For an arrested player the engine does not fade the drag
+  animation (`0x004CF022`), so they stay on the ground where they landed.
+- **The police station** was not. Health goes nowhere, so the death machine
+  never fired, and the respawn reached everyone else as a snapshot across the
+  map from the last one - and for a player arrested in a car, as an
+  `S_ExitVehicle` that put them on foot at the car for an interpolation delay
+  before the jump. The owner now reads `pedState` beside health
+  (`LocalLifeEventFor`) and sends leaving 56 as `C_Respawn`. The engine ends
+  an arrest with the same `RestorePlayerStuffDuringResurrection` it ends a
+  death with, so §1.10.5's rebuild fits it unchanged.
+  The server already took a respawn from a player who never died, and
+  `NotePlayerRespawned` already takes them out of their car.
+
+Nothing is sent at the moment of the arrest, and a late joiner is not handed
+one. Death is held by the session because a corpse cannot be rebuilt from
+snapshots - `SetDie` has no undo and health zero does not reproduce it. An
+arrested player is alive, and every snapshot describes them correctly. No new
+opcode and no version change.
+
+What is left belongs elsewhere: the fine is `CPlayerInfo::m_nMoney`, and
+`ArrestPlayer` calls `CDarkel::ResetOnPlayerDeath` exactly like `KillPlayer`
+does; the 12 hours `PassTime(720)` adds is the session clock's problem, the
+same as a death's.
 
 ### 1.11 A destroyed car: health is a number, destruction is an event
 
@@ -1790,6 +1843,15 @@ One attempt per enter event, marked spent before it is made rather than after
 it succeeds, so that a refusal and a timeout both count. Otherwise a ped that
 cannot get in is asked to again, forever, at sixty frames a second.
 
+The pre-check on how fast the car may be moving was a guess, and it was looser
+than the engine's. It is now `sq(0.2f)`, which the engine uses twice: once in
+`CVehicle::CanPedEnterCar` (`0x005522F0`) before the walk, and again inside
+the door-opening callback at `0x004DE758` - and the second one does not refuse
+the entry, it calls `QuitEnteringCar` and `SetFall(1000, ...)`. A car creeping
+at 0.3 m/s passed the old `sq(0.5f)`, the ped walked up to it, and the engine
+knocked him into the road a second later. A pre-check looser than the engine's
+own buys nothing except a worse-looking failure.
+
 #### 1.14.3 Giving up costs a call, and skipping it breaks the car
 
 `CPed::QuitEnteringCar` is not tidiness. An entry dropped without it leaves
@@ -1815,15 +1877,16 @@ engine starts the exit, which is a second earlier and exactly on time. So the
 snapshot decides *how* they leave and the event still decides *that* they
 left. Nothing on the wire changed.
 
-The entry has no equivalent and cannot have one: the claim is sent at the end
-of the owner's get-in animation too, so an observer learns which car a player
-is getting into only once they are in it. The entry therefore plays about an
-animation late, and the guards in `BeginPedEnterCar` exist to refuse it when
-that lateness would show - a car already driving away, or a ped too far from
-the door to reach it without being dragged across the street. Sending the
-claim at the *start* of the local entry would fix this and is the obvious
-next step, but it moves the server's record of who is driving a car to a
-player who is not in it yet, which §2.8.3 makes load-bearing.
+The entry now has an equivalent, and this paragraph used to say it could not
+have one. What it actually said, correctly, is that the *claim* cannot move:
+the claim names the car, introduces it to the session and hands over
+ownership, and sending it at the start would give a car to a player who is
+still standing in the road, which §2.8.3 makes load-bearing. That is true and
+unchanged.
+
+What was wrong was treating the claim and the entry as one thing. They are
+separable, and §1.14.7 separates them: the claim stays at the end, and a
+statement of intent that decides nothing goes out at the start.
 
 #### 1.14.5 The pose stream asks the ped, not the session
 
@@ -1878,6 +1941,156 @@ there, and two peds cannot both be the driver. Their own machine sends their
 exit a moment later and the two agree from then on. The visible difference
 from real jacking is that the jacker plays the ordinary get-in animation
 rather than hauling somebody through the door.
+
+**Re-examined after the handover landed, and the decision stands** - but only
+one of the two reasons still carries it, and it is the one that used to be
+called the weaker.
+
+Protocol 22 changed the second reason. "It would decide something that is not
+ours to decide" was written when a jack had no handover at all: the jacker's
+machine dragged the replica out, the victim's machine was never told, and both
+ended up believing they drove the car. That is no longer the situation. The
+server arbitrates the seat, the loser is sent `S_ExitVehicle` *before* the
+winner's `S_EnterVehicle` on the same reliable ordered channel, and
+`game::SurrenderVehicleSeat` puts the victim on the pavement beside the door.
+An observer playing the drag-out would no longer be deciding anything: it
+would be showing a decision the session had already made and told it about, in
+the right order. On its own, that reason would now fall.
+
+The first reason does not fall, and it is absolute. `CPed::SetCarJack`
+(`0x004E0220`) bails on a `MISSION_VEHICLE`, and the gate is at `0x004E032B`.
+The bail sits behind the `CPed::IsPlayer` call at `0x004E0310` with a `jne` at
+`0x004E0319` jumping the whole guard block - so it does not touch the local
+player - and the two objectives that *also* jump it, at `0x004E031B`, are
+`m_objective == 8` and `== 7`, which are `KILL_CHAR_ANY_MEANS` and
+`KILL_CHAR_ON_FOOT`. Neither is `ENTER_CAR_AS_DRIVER` (15) or
+`ENTER_CAR_AS_PASSENGER` (14). Every ped CoopIII builds is a `CCivilianPed`,
+every car it builds is a `MISSION_VEHICLE` because that is what stops the
+engine reaping it, and a replica jacking one therefore falls straight through
+to the `ret` at `0x004E033D`. The animation is not available on exactly the
+cars a session has. Calling it would do nothing at all, silently, and leave
+the seating loop waiting out its deadline before warping - which is strictly
+worse than the ordinary get-in it plays today.
+
+So: no change, and the reason is now mechanical rather than architectural. It
+would become worth revisiting only if a session's cars stopped being
+`MISSION_VEHICLE`, and roadmap.md §5.8 is where that would have to be argued
+first, because that flag is holding up the whole vehicle lifecycle.
+
+#### 1.14.7 An entry is announced at the start, and it says which door
+
+Two packets now describe getting into a car, and separating them is the whole
+of this section.
+
+| | `C_EnterVehicle` (0x30) | `C_EnteringVehicle` (0x60) |
+|---|---|---|
+| sent | when the entry **ends** | when the entry **starts** |
+| says | "I am in that car, in that seat" | "I have started getting into it" |
+| carries | the car's identity, for a car the session may never have heard of | a netId, a seat and a door |
+| decides | the seat, the driver, ownership | nothing |
+| retracted by | `C_ExitVehicle` | nothing - it expires |
+
+The first does not move, for the reason §1.14.4 gives and §2.8.3 depends on.
+The second is what version 21 gave a passenger seat and what a driver's entry
+did not have.
+
+**Why it is needed at all.** A car's door is swung frame by frame by the
+entering ped's own animation, on whichever machine is running that ped
+(`CPed::EnterCar`, `0x004E0D30`). Nothing about an open door travels and
+nothing needs to - but it does mean the only thing that ever opens that door
+on an observer's screen is a replica entry of its own, and an observer told
+about an entry after it has finished has nothing left to play.
+
+**Why the door has to be on the wire, and the walk does not.** The walk is
+already on the wire, as position, at 25 Hz, and `ApplyRemotePose` stops
+writing that position the moment the replica's own entry starts (§1.14.5). So
+the ped walks up on the pose stream and the door opens on this packet, and
+neither machine re-derives anything.
+
+The door is different, because **the seat does not name it**. A driver's entry
+does not walk round the car to the driver's door - that was the assumption and
+the retail image refutes it. `CPed::SeekCar` (`0x004D3F90`) sends anything
+holding `OBJECTIVE_ENTER_CAR_AS_DRIVER` through `CPed::GetNearestDoor`
+(`0x004E1CF0`), which compares the four door positions by squared distance and
+writes the winner into `m_vehDoor`. Press the enter key standing on the
+passenger side and the engine opens the *near* door, puts you in through it,
+and `CPed::PedAnimDoorCloseCB` then blends the shuffle and slides you across
+the front seats to the wheel.
+
+That is the bug the player reported in those words: *"si me subo a un auto con
+la F desde el lado del pasajero... luego de cambiar hacia el otro asiento como
+que se lo ve tpearse a la puerta del conductor y abrirla"*. Told only "seat
+0", the observer opened the driver's door, and `CPed::EnterCar`'s line-up
+dragged the replica round the car to it.
+
+Could the observer work the door out for itself, from the ped's position and
+the car's matrix? It has both. It should not, and this is the one place in
+this feature where re-deriving loses to sending a byte: the observer's copy of
+that position is a hundred milliseconds old and interpolated, `GetNearestDoor`
+is a comparison of four distances, and a ped walking past the corner of a car
+crosses the boundary between two of them. Getting it wrong is not a small
+error - it is the teleport again, in the cases where the two answers differ,
+which are exactly the cases this exists for. One byte, sent once per entry,
+cannot disagree with itself.
+
+**Why it decides nothing.** An entry can be abandoned - shot halfway in, the
+car drives off, the player changes his mind - and nothing on the wire
+describes an entry that did not happen. There is no packet to send, because
+the only packet about an entry is the claim at the end and there is no claim.
+So the intent expires on its own (`ENTER_INTENT_TTL_MS`, four seconds) and
+everything it caused goes with it, including a replica that got all the way
+into the seat on an entry its owner never finished. Three rules follow, and
+`UpdateRemoteSeats` is written so that they are the same three comparisons it
+already made:
+
+- an intent is a *provisional* want. It drives the animation and nothing else.
+- **it never reaches the warp.** The warp is the answer to "the session says
+  this player is in that car and the animation did not work". An intent says
+  no such thing. Warping on one would put a player in a seat they never
+  reached and leave them there until a packet that is not coming says
+  otherwise.
+- when the claim arrives it supersedes the intent, and when it does not the
+  intent lapses and the player goes back on foot through the ordinary
+  `UnseatPlayer`.
+
+The server relays it and writes nothing down, for the same reason: a seat
+recorded from an intent would be a seat no packet ever corrects, and §2.8.3
+would be reading it.
+
+**The gap, stated.** An intent can only name a car the session already has.
+A car nobody has claimed exists on one machine and nowhere else - the claim at
+the end of the entry is what introduces it - so there is nothing on any other
+screen to open a door on. That is the right gap to have: the entry an observer
+most needs to see is somebody getting into a car it can already see.
+
+#### 1.14.8 An abandoned entry used to leave the door open forever
+
+`CPed::QuitEnteringCar` makes no call on the car at all - there is no
+`call [reg+5Ch]` anywhere in `0x004E0E00..0x004E0F96`. It hands back the
+door's bit in `m_nGettingInFlags`, which is what §1.14.3 is about, and leaves
+the door itself wherever the animation had swung it to. With nobody in the
+seat nothing ever swings it back: only somebody else's get-in or get-out
+touches that door again, so a car sat in the street with a door open and no
+driver for the rest of the session.
+
+`AbandonPedEnterCar` now shuts it, with the engine's own call:
+`ProcessOpenDoor(m_vehDoor, ANIM_STD_CAR_CLOSE_DOOR_LHS, 1.0f)` through
+vehicle vtable slot `0x5C`. The animation id is `0x5C` and it was read out of
+the retail image rather than guessed - `client/src/game/addresses.h` carries
+the whole chain, but the short version is two independent readings that agree:
+
+- `CPed::PedAnimDoorCloseCB` pushes `5Ch` and `1.0f` at `0x004DF251` to close
+  a door at the end of every real get-in, whichever door it is. The side comes
+  from the component, not from the id.
+- `CAutomobile::ProcessOpenDoor` (`0x0052E910`) routes exactly four ids -
+  `0x5C`, `0x5D`, `0x6B`, `0x6C` - to the closing arm at `0x0052EB6D`, which
+  past `0.63f` calls `OpenDoor(component, door, 0.0f)`. Four, which is the set
+  re3 groups as the LHS/RHS and normal/low closing animations.
+
+Done before the ped loses the entry, and only for a ped that actually had one:
+`m_vehDoor` is not cleared when an entry ends, so a ped holding a stale door
+would otherwise reach into a car it has nothing to do with and slam a door
+somebody else was halfway through opening.
 
 ---
 
@@ -2243,6 +2456,828 @@ also have told every client its wanted rule was `shared`. The rule moved to
 bits 2-3 at the merge; see `SessionFlags` in `protocol.h`. `PlayerFlags` bits
 4-7 were free and stayed free, and **this feature allocates no opcode at all**.
 
+### 1.19 Shooting somebody else's pedestrian: the direction the crowd never had
+
+Reported twice, and the second time on a build where everything it looked like
+was already working: *"el remote sigue sin poder hacerle daño a los NPC del
+host"*. A player shoots a pedestrian the other machine hosts and nothing
+happens — no reaction, no blood, no death, on either screen.
+
+**It was a missing direction, not a broken one.** Version 17 carries a limb and
+18 carries a death, and both travel *from* the machine that hosts a pedestrian
+*out* to the observers. There was nothing at all going the other way. Every
+replica is `bBulletProof`, `bFireProof`, `bMeleeProof`, `bCollisionProof` and
+`bExplosionProof` on purpose (`game/population.cpp`, `SpawnAmbientReplica`), so
+the shooter's own `CPed::InflictDamage` threw the hit away inside the engine and
+there was nothing left either to apply or to forward. The log said so too, in
+the most misleading way available: `combat: our first hit on a remote player`
+was in the file, because the *player* direction has worked since M4, and there
+was no line anywhere for a pedestrian, because there was no code. A direction
+that does not exist reads exactly like a direction that is broken.
+
+#### 1.19.1 It is §1.10 pointed at a pedestrian
+
+The fix is not "let the shooter kill the replica and announce it". That is the
+one thing §1.10 and [roadmap.md](roadmap.md) §5 forbid: an observer never
+decides damage, and never decides where a remote entity ends up. So the split of
+authority is the one the player exchange already uses, for the same two reasons:
+
+- **The shooter reports the hit.** It fired a ray from a position, at an instant,
+  along an aim nobody else has. A host asked to work out whether it was hit is
+  doing it from a replica's transform 100 ms in the past, which is how you get
+  shot around corners.
+- **The owner applies it, through the engine's own `CPed::InflictDamage`.** It
+  is the only machine with that pedestrian's real health, its `bUsesCollision`,
+  its state and its seat. So the ped flinches, bleeds, staggers, loses a limb,
+  drops what it was holding and dies exactly where single player puts all of
+  that — and then 17's `C_PedBodyPart` and 18's `C_PedDeath` carry the visible
+  half of that outcome back out to everybody, *including the shooter*.
+
+Nothing new was needed on the way back. The existing `npcdeath` path already
+turns the owner's `CPed::SetDie` into a packet every observer replays; this just
+gives it something to witness.
+
+#### 1.19.2 Exactly the five arguments, and no more
+
+`CPed::InflictDamage` is `0x004EA420`, `__thiscall`, `ret 14h` — `this` in `ecx`
+and five stack arguments, confirmed against the retail image rather than taken
+from `re3`:
+
+```
+004EA420  fld  [005F9AB8h]              dieDelta = 4.0f
+004EA42D  mov  esi, [esp+34h]           arg1  CEntity *damagedBy
+004EA43F  mov  ebx, 0Dh                 dieAnim = ANIM_STD_KO_FRONT
+004EA444  mov  edi, [esp+40h]           arg4  ePedPieceTypes pedPiece
+004EA44D  mov  ebp, ecx                 this
+004EAD80  cmp  dword [esp+38h], 14h     arg2  eWeaponType method
+004EACC6  fsub dword [esp+3Ch]          arg3  float damage
+004EA9B4  movzx eax, byte [esp+44h]     arg5  uint8 direction
+004EADCB  ret  14h
+```
+
+`PedDamageBody` is four of those five plus a name for the ped, and it is the same
+nine bytes `DamageBody` is:
+
+| field | engine argument | why it has to travel |
+|---|---|---|
+| `netId` | — | which pedestrian. The shooter knows it because it holds a replica under that name; the owner resolves it back to a live `CPed` through its own hosted roster. |
+| `weapon` | `method` | steers the proof-flag switch, the reaction, the limb roll and `m_lastWepDam` (`+0x51E`). Bounded to `IsForwardableDamage`: a ray or a melee reach, i.e. the causes only the shooter can have resolved. |
+| `amount` | `damage` | raw. No multiplier, no armour, no clamp — all three are the owner's, and only the owner has the health. |
+| `piece` | `pedPiece` | decides which limb comes off. The limb then travels back out on the owner's own `C_PedBodyPart`. |
+| `direction` | `direction` | 0 front, 1 left, 2 back, 3 right. Two four-entry jump tables at `0x005F9E3C` and `0x005F9E5C` index straight off it and pick `ebx` = `17h`..`1Ch`, the knockdown animation. Without it every pedestrian in the city falls the same way. |
+
+`damagedBy` cannot travel — a pointer means nothing on another machine — so
+`S_PedDamage` carries `attackerId` and the owner resolves it to the replica it
+already holds of that player's ped. A null culprit is a supported input and not
+a degraded one: `test esi,esi / je 004EADE6` at `0x004EAAC4` skips only the
+car-ramming speed block and the damage still lands.
+
+**No position and no shot vector.** The shooter's engine already resolved the
+ray; what crosses the wire is its conclusion. A position would invite the owner
+to resolve it again, which is the observer-decides rule with the arguments the
+other way round.
+
+#### 1.19.3 What the wire now trusts a client to assert
+
+This is new trust and it is worth naming rather than burying. Until now every
+packet about an ambient pedestrian was a *statement about the sender's own
+world*: I made this one, I lost this one, mine lost a limb, mine died. The
+server could check all of them with one rule — is the sender its owner — and
+refuse anything else.
+
+`C_PedDamage` is the first packet where a client tells **another machine to
+change something it owns**. What it is now trusted to assert is: *that its player
+really did land a hit, on that pedestrian, with that weapon, for that much, on
+that body part, from that side.* The owner checks that the name resolves to one
+of its own named pedestrians and that the five values are in range, and then it
+does what it is told. It cannot check the claim itself, because the claim is
+about a ray that was traced on another machine.
+
+Concretely, a hostile client can put any pedestrian in the session on the floor
+at will, from anywhere on the map, without line of sight, at whatever rate it
+likes. `MAX_REMOTE_DAMAGE` (1000.0f, the biggest deliberate single hit in the
+game) and the piece and direction bounds exist so a corrupt or hostile float
+cannot become a NaN in `m_fHealth` and from there in the ped's matrix — they are
+memory safety, not anti-cheat. §2.1 already says plainly that a malicious client
+can cheat and that this is a deliberate trade for a co-op mod; this widens the
+surface of that trade from "their own player and their own city" to "anybody's
+pedestrians", and nothing else. No player's health and no player's position is
+reachable through it.
+
+#### 1.19.4 Every failure mode, and the choice made for each
+
+| case | choice |
+|---|---|
+| **The ped already died on the owner's machine** before the report landed | Let the engine refuse it. `CPed::InflictDamage` tests `DyingOrDead` at `0x004EA485` and returns false without touching anything, so the rule that refuses a hit on a corpse in single player is the rule that refuses this one. The server drops it earlier for free (`Session::PedDamageRecipient` checks `alive`), and the shooter does not send it at all if the replica is already a corpse on its own screen — so the ordinary in-flight burst costs nothing. |
+| **Two observers report the same hit** | No dedup, deliberately. They are not the same hit: two players shooting one pedestrian is two real hits and single player applies both. What keeps it honest is that a hit is only reported by the machine whose *own player* landed it (`damagedBy == localPed`), so one trigger pull produces exactly one report from exactly one machine. The *death* is still deduped, on the owner: the `CPed::SetDie` transition test plus the per-netId check in `NoteHostedPedDeath` plus `Session::NotePedDeath`'s once-per-life rule mean two simultaneous fatal hits still produce one `C_PedDeath`. |
+| **A report names a netId the owner no longer has** | Drop it. Two layers: the server refuses a netId it has no row for, and `ResolveHostedPed` returns null for one whose ped the engine reaped inside the round trip. Not retried, and that is the decision rather than an omission — a hit is only worth anything on the ped that was standing there, and there is nothing left to land it on. `CPopulation` reaps pedestrians constantly, so this is the ordinary race and not an error. The owner says so once in the log and then stays quiet. |
+| **The ped is inside a vehicle** | Send it and apply it, unchanged, and do not pretend it can kill. `CPed::InflictDamage` tests `bInVehicle` at `0x004EACF3` and sends everything that is not `WEAPONTYPE_DROWNING` to **`0x004EADD0`**, which is `mov dword [ebp+2C0h],3F800000h / xor al,al` — health clamped to exactly 1.0f, "did not die". So a driver shot in his seat survives on one health on the machine that owns him, no `C_PedDeath` is produced, and every screen agrees, because that is what retail 1.0 does. `combat.h`'s `CanKillPedInVehicle` carries the transcription and `clienttest` walks it against `IsForwardableDamage` over all 256 causes: the intersection is empty, so **no cause this wire can carry is able to kill a ped in a seat.** (The address was recorded as `0x004EADCD` in `combat.h`'s death-cause block; that is three bytes early — `0x004EADCB` is the drowning arm's own `ret 14h` and `0x004EADCE` is an alignment `mov eax,eax`. The fact was right, the address was not, and it is corrected at the declaration.) |
+| **A blast** | Never routed through this packet. An explosion is replayed on every machine at a position everybody agreed on, so the owner puts its own pedestrian in its own blast and its own engine kills it — and that death already travels. Forwarding it as damage as well would apply it twice, the same argument `IsForwardableDamage` makes for a player. |
+| **Fire, drowning, a fall, being run over** | Refused for a pedestrian for exactly the reasons §1.10.1 refuses them for a player. (The flamethrower now reaches a pedestrian as an ignition rather than as damage, §1.24.) The one worth restating is drowning: a replica standing in water on an observer's machine used to drown *locally* — `WEAPONTYPE_DROWNING` has its own arm in that switch and checks no proof flag at all — and then stayed a corpse on that screen forever, because `ApplyAmbientPedState` refuses to drive anything into a dead replica and nothing off the wire resets `m_nPedState`. The new refusal closes that hole as a side effect, which is the same hole M4 found on the player side and the same reason the proof flags were never enough. |
+| **Friendly fire** | Has no say, on either end. It is a rule about players hurting *each other*; a pedestrian is not a player, and a session with it off — which is the default, and the one the bug was reported on — still lets everybody shoot NPCs. Consulting it here would make the default session one where the whole city is bulletproof. |
+| **Kill credit** | A known residual, stated rather than hidden. At `0x004EAD1A` the engine credits `CDarkel` only when `damagedBy` is `FindPlayerPed()` or `FindPlayerVehicle()`. On the owner's machine the culprit is a replica of somebody else's ped, so the kill registers as "not by player"; the shooter cannot register it either, because its own `InflictDamage` returned before reaching that arm. So a co-op kill on an NPC counts for nobody's stats. Not worth widening this change for. |
+
+#### 1.19.5 The packets
+
+Two opcodes, and a new block for them. `0x70`..`0x7D` is full (the ped and car
+handshakes plus their two streams) and `0xD8`..`0xDF` was reserved for "a hosted
+ped reaching a state only its host can witness", which is the *opposite* of this
+— a hit is witnessed by the shooter and by nobody else. So `0x60`..`0x6F` is the
+block for the direction that runs towards an owner; two of sixteen are used and
+the rest stay free for the same direction, which is where a limb or a wreck an
+observer causes and cannot apply would go.
+
+| opcode | packet | channel | to |
+|---|---|---|---|
+| `0x68` | `C_PedDamage` — 14 bytes, `PedDamageBody` | `CH_EVENT` | server |
+| `0x69` | `S_PedDamage` — 15 bytes, `attackerId` + body | `CH_EVENT` | **the ped's owner alone** |
+
+Point to point like `S_Damage`, and for the same reason: nobody else has
+anything to do with it. What the rest of the session needs to see — the flinch,
+the limb, the corpse — reaches them from the owner afterwards, on its own ped
+stream and on `C_PedBodyPart` and `C_PedDeath`.
+
+Nothing is recorded on the server. Unlike a death, a hit is not a state a joiner
+has to be handed: the health it produced lives on the owner's machine, and no
+packet has ever carried an ambient pedestrian's health (`AmbientPedState`, and
+that omission is deliberate).
+
+Every ownership test in `Session::PedDamageRecipient` is the **inverse** of the
+three beside it. A despawn, a limb and a death are refused to anybody but the
+owner; this is refused *to* the owner, because a machine reporting a hit on its
+own pedestrian is reporting one its own engine already applied, and relaying it
+back would apply it twice.
+
+`PROTOCOL_VERSION` is deliberately left at 19. Nothing existing moved and no
+layout changed, so the number is the lead's to assign at the merge — the same
+way version 18 collected ten branches that each left theirs blank.
+
+#### 1.19.6 The same gap exists for vehicles, and it is worse-shaped
+
+Checked while this was written, reported rather than fixed.
+
+**Vehicles: the gap is real.** *(Closed for a car somebody is driving — §1.20.
+Closed for ambient traffic too, with the host as the owner - §1.23.)* Nothing
+samples damage on a replica. The only
+reporter of a car's condition is its *driver* (`WorldBridge::
+SampleLocalVehicleDamage` is explicitly "the car the local player is driving.
+False on foot, as a passenger"), and `game/vehicle.cpp` says in as many words
+that "a replica is never announced at all". So a player shooting a replica of
+somebody else's traffic car takes health off the local copy and nothing
+travels — and unlike a pedestrian, a car is not proof against anything, so the
+symptom is not "nothing happens" but **divergence**: the replica can burn out
+here and stay whole there. §1.15 already records that `AmbientCarState` carries
+no condition, so the two copies have independent healths from the frame the
+replica is created; roadmap.md §5.8's wreck report is the backstop and it only
+runs host → observer. Fixing it properly is the same shape as this change:
+`CVehicle::InflictDamage` is `0x00551950` and already verified, and a
+`C_CarDamage` in the free half of the `0x6x` block would do it.
+
+**Breakable objects: not this gap, and a smaller one.** `C_ObjectBroken` is sent
+by whichever machine's engine broke the object, and `game/object.cpp` already
+refuses to report a break a *replica* caused (`BreakCause::REPLICA`), deferring
+to the owner — so for objects the observer → host direction is deliberately
+absent and correctly so: a map object exists identically on every machine, so
+each one breaks its own copy when its own player drives into it. What is not
+covered is a break with no owner at all: `m_pDamageEntity` is a collision
+record, so a lamp post *shot* rather than driven into reads as
+`BreakCause::NOBODY`, which `MayReportBreak` gives to the host. A non-host player
+who shoots a lamp post therefore knocks it over on their own screen only. That is
+a different bug in a different file and it is left alone here.
+
+### 1.20 Shooting a car somebody else is driving: the gap §1.19.6 reported
+
+§1.19 gave a pedestrian the direction the crowd never had. This is the same
+direction for a car, and the hole is shaped differently enough that repeating
+the pedestrian argument with the nouns changed would get it wrong.
+
+#### 1.20.1 The symptom is divergence, not silence
+
+A replica pedestrian is bullet-, fire-, melee- and explosion-proof on purpose,
+so a shot at one was refused by the shooter's own engine and **nothing
+happened** — no flinch, no blood, no death, on either screen.
+
+A replica car is not. CoopIII sets exactly one proof flag on one
+(`bCollisionProof`, `game/vehicle.cpp`'s `SetVehicleObserved`) and **cannot set
+the rest**: `bExplosionProof` would stop a replayed blast reaching a car it is
+supposed to reach identically on every machine, which is the one thing about an
+unowned car that already worked for free. So a shot at a replica car was
+*accepted* — by the one machine with no right to decide it. The health came off
+a copy nobody else could see, the shooter watched a car smoke and burn on a
+number its owner never had, and the owner drove on in a car that was never
+touched.
+
+Both screens looked correct, which is what made it worse than the pedestrian
+bug. §1.15 already records that no packet carries a car's condition in that
+direction, and `SampleLocalVehicleDamage` is driver-only, so the two copies had
+independent healths from the frame the replica was created.
+
+#### 1.20.2 Flags were never going to be the mechanism, and the binary says so
+
+`CVehicle::InflictDamage` switches on the damage cause before it consults any
+flag, exactly as `CPed::InflictDamage` does (§1.10.2), and its switch leaks in
+the same way. At `0x0055199F` it does `cmp eax,13h / ja 0x00551A10` and then
+`jmp [eax*4 + 0x006026CC]`. Resolved out of the retail image, that twenty-entry
+table is:
+
+| cause | arm | flag |
+|---|---|---|
+| 0, 1 (`UNARMED`, `BASEBALLBAT`) | `0x005519AB` | `bMeleeProof` |
+| 2–7, 13, 19 (the guns, `HELICANNON`, `UZI_DRIVEBY`) | `0x005519BE` | `bBulletProof` |
+| 8, 10, 11, 18 (`ROCKETLAUNCHER`, `MOLOTOV`, `GRENADE`, `EXPLOSION`) | `0x005519E6` | `bExplosionProof` |
+| 9 (`FLAMETHROWER`) | `0x005519D4` | `bFireProof` |
+| 16 (`RAMMEDBYCAR`) | `0x005519FC` | `bCollisionProof` |
+| **12, 14, 15, 17, and everything from 20 up** | `0x00551A10` | **none — no flag is read** |
+
+So `DETONATOR`, `TOTALWEAPONS`, `ARMOUR`, `RUNOVERBYCAR`, `DROWNING`, `FALL`
+and `UNIDENTIFIED` reach `m_fHealth` with nothing consulted. Even setting all
+five bits would not have closed this. The rule is therefore stated positively,
+in a detour, the same way M4 stated the player rule and §1.19 stated the
+pedestrian one: **nothing on this machine may take health off a car this
+machine does not drive**, and anything the local player did on purpose becomes
+a packet instead. The one flag stays, because a detour that failed to install
+has to fail closed.
+
+#### 1.20.3 Exactly the three arguments, and no more
+
+`CVehicle::InflictDamage` is `0x00551950`. That address was already in the
+tree; it was re-verified from the file for this change rather than inherited,
+because one address in this project was found three bytes off in the same week.
+
+- **It is a function start.** `0x00551944`–`0x0055194F` is twelve bytes of
+  `0x00` alignment fill after the previous function's `jmp` at `0x00551942`;
+  the entry is `push ebx / push esi / mov esi,ecx / push ebp / sub esp,10h`.
+- **It is `__thiscall`** — `mov esi,ecx` is what makes every `[esi+…]` in it a
+  member of `this`.
+- **It takes three arguments.** Every one of its seven exits is
+  `add esp,10h / pop ebp / pop esi / pop ebx / ret 0Ch`, the last at
+  `0x00551C83`. Twelve bytes is three dwords, and the callee reads them at
+  `[esp+20h]` (culprit), `[esp+24h]` (weapon) and `[esp+28h]` (damage).
+- **The call site agrees**, which is the independent witness:
+  `0x004B18BE push eax / mov ecx,ebp / fstp dword [esp]` (the float) then
+  `push 12h` (the weapon) then `push [esp+0DCh]` (the culprit).
+  (`addresses.h`'s existing transcription of that site shows the `fld`/`fmul`
+  and the two pushes but not the `push eax / fstp` pair between them, which is
+  where the float actually lands. The conclusion was right; the listing was two
+  instructions short, and it is corrected there.)
+- **It returns nothing.** The last exit leaves `eax` holding a model index from
+  `movsx eax,word [esi+5Ch]`. Anything reading a bool out of it is reading a
+  leftover.
+
+So the wire carries `netId`, `weapon` and `amount`, and that is the whole
+packet — seven bytes. `PedDamageBody` is nine; the two it has that this does
+not are `pedPiece` and `direction`, and a car has neither because there is no
+limb to take off and no knockdown animation to choose.
+
+**No health.** This is the field whose absence is load-bearing and §1.11.1 is
+the whole argument: `InflictDamage` writes `mov dword [esi+200h],0` at
+`0x00551C10` and then, sixty-nine bytes later, calls `BlowUpCar` through the
+vtable at `0x00551C5A`. The zero and the destruction are two acts and only the
+second destroys anything, so a health copied off a socket produces a car with
+no health that is not wrecked — and one below 250 arms the five-second fire
+timer (§1.11.3), which is an observer deciding, five seconds later, that
+somebody else's car is finished. Health travels the way it always has: as a
+field on the driver's own 25 Hz snapshot, out of the machine that owns it.
+
+**No position and no shot vector.** The shooter's engine already resolved the
+ray; what crosses the wire is its conclusion, not its inputs. A position would
+invite the owner to re-resolve it against a car it holds somewhere else — the
+observer deciding damage with the arguments the wrong way round — and would put
+a second, competing source of truth next to the transform stream.
+
+**No panels and no doors.** Those already travel, as absolute state from the
+driver on `C_VehicleDamage` (§1.15), and the owner's own `InflictDamage` →
+`CAutomobile::VehicleDamage` is what produces them in the first place. Sending a
+dent here would double-count against a record whose whole arbitration is that
+it is a monotone maximum.
+
+**Nothing carries the result back, and that is the point.** The health rides the
+driver's snapshot, the dents ride `C_VehicleDamage`, and the wreck rides
+`C_VehicleBlowUp` at the transform the owner's own physics chose. The observer
+writes that health into its copy and the fire timer is already held at zero
+under it (`ApplyRemoteVehicle`), so the flames and the smoke appear on every
+screen at the same moment and only one machine ever decides.
+
+#### 1.20.4 Only a car somebody is driving, and why the other three are not this
+
+A car in a CoopIII session is one of four things, and only one of them has a
+machine entitled to decide its condition:
+
+| kind | owner | what carries its condition |
+|---|---|---|
+| a session car with a **live driver** | that driver's machine | **this change**, plus the snapshot, `C_VehicleDamage` and `C_VehicleBlowUp` |
+| a session car somebody **parked and walked away from** | nobody | `C_UnownedBlowUp` with `UNOWNED_SESSION` |
+| a **map-parked** car out of a car generator | nobody | `C_UnownedBlowUp` with `UNOWNED_PARKED` |
+| an **ambient traffic** car | its host (since §1.23, for its condition as well as its transform) | `C_CarHit`, the car stream's `health`, and `C_UnownedBlowUp` with `UNOWNED_AMBIENT` |
+
+The bottom three are refused outright, by the detour (it only fires for a car
+with a recorded remote driver) and again by `Session::VehicleHitRecipient`.
+
+For the two ownerless kinds there is no recipient to send to — that is what
+"unowned" means here. Each engine damages its own copy; a replayed blast damages
+every copy *identically*, because `CWorld::TriggerExplosionSectorList`'s
+multiplier is a function of the blast position and the car's position and
+nothing else; and what does not converge — accumulated gunfire, a shove — is
+exactly what roadmap.md §5.8's wreck report was built to carry, after the fact.
+Routing their hits through here would invent a fourth ownership model for a
+problem that is already closed, and would require the server to keep a health
+for every car in Liberty City.
+
+Ambient traffic is the interesting one, because it *does* have a host. It is
+still left out, on three counts: its netIds are a different table (the same
+reason `C_PedDamage` is a separate packet from `C_Damage` rather than a flag on
+it), its session row carries no condition at all and deliberately so
+(`AmbientCarState`, population.md §2.1's bandwidth argument), and its
+divergence is already bounded by `UNOWNED_AMBIENT` — the host decides the wreck
+and every observer replays it at the host's transform, so the intermediate
+health disagreement is never visible. A driven car has no such bound, because
+`C_VehicleBlowUp` is only accepted from its driver and its driver never heard
+about the hits.
+
+*(Superseded by §1.23. The third count didn't hold: the replica wasn't bounded
+by `UNOWNED_AMBIENT`, because nothing stopped it blowing up on its own first,
+and that was visible. Traffic now gets its own pair, `0x6C`/`0x6D`, with the
+host as the owner.)*
+
+#### 1.20.5 What the wire now trusts a client to assert
+
+§1.19.3 named the trust `C_PedDamage` added: a client may tell another machine
+to hurt a pedestrian it owns, and the owner cannot check the claim because the
+claim is about a ray traced somewhere else. This goes one step further **in
+kind**, not just in scope.
+
+A pedestrian is a thing in the world. A car somebody is driving is a thing that
+player is *using*, and the consequence of a hit is not a flinch — it is
+potentially the destruction of that player's vehicle, at a moment and a position
+the owner's engine picks, in the middle of whatever they were doing with it.
+What a client is now trusted to assert is: *that its player really did land a
+hit, on that car, with that weapon, for that much.*
+
+The bounds are: the cause must be in `IsForwardableDamage` (a ray or a melee
+reach the shooter's own engine resolved — the same set a player and a pedestrian
+allow), the amount must be finite, positive and under `MAX_REMOTE_DAMAGE`, the
+target must be a car the server records **another** player as driving, and the
+car must not already be a wreck. Nothing checks that the shooter was anywhere
+near the car, had line of sight, was holding that weapon, or fired at all. A
+hostile client can drive any other player's car to zero health at the packet
+rate, from anywhere on the map. `MAX_REMOTE_DAMAGE` exists so a corrupt float
+cannot become a NaN in `m_fHealth` and from there in the car's matrix — memory
+safety, not anti-cheat. §2.1 already says a malicious client can cheat and that
+this is a deliberate trade for a co-op mod; this widens that trade from
+"anybody's pedestrians" to "anybody's car", and nothing else. No player's health
+and no player's position is reachable through it.
+
+#### 1.20.6 Every failure mode, and the choice made for each
+
+| case | choice |
+|---|---|
+| **The car is already a wreck on the owner's machine** | Refused three times over, and the innermost one is the engine's own: `CVehicle::InflictDamage` compares `m_fHealth` against the `0.0f` at `0x00602534` at `0x00551A10` and leaves for the exit before any arithmetic. The server drops it earlier (`VehicleHitRecipient` checks `destroyed`), the owner's client drops it earlier still (`RemoteVehicle::destroyed`), and the shooter does not send it at all if the car reads `STATUS_WRECKED` on its own screen. A burst that was in the air when the car went up is the ordinary case, not a rare one, so all three are worth having. |
+| **Two observers report hits on the same car** | No dedup, deliberately, and this is the opposite decision from `C_VehicleDamage` on the same object. That packet is *absolute* state merged as a maximum, so a duplicate must change nothing; this is a *delta*, so two players shooting one car is two real hits and single player applies both. What keeps it honest is that a hit is only reported by the machine whose own player landed it (`culprit == PlayerPed()`), so one trigger pull produces exactly one report from exactly one machine. The transport is reliable-ordered ENet, which does not duplicate, so no sequence number is added — the same reasoning §1.19 gives. The *destruction* is still single: only the owner ever calls `BlowUpCar`, once, and `C_VehicleBlowUp` is one event. |
+| **A report names a netId the owner no longer has** | Drop it, three layers deep: the server refuses a netId with no row, the owner's client refuses one with no active roster entry or that it is not driving, and `ResolveRemoteVehicle` returns null for a car the pool has reaped. Not retried, and that is the decision rather than an omission — a hit is only worth anything on the car that was standing there. Said once in the log and then quiet. |
+| **A car that is unowned traffic, parked, or abandoned** | Not this packet. §1.20.4 is the argument; the short version is that those have no machine entitled to decide their condition, blasts already converge on them for free, and `C_UnownedBlowUp` carries what does not. Traffic has its own packet now, `C_CarHit` (§1.23). |
+| **A blast** | Never routed through this packet, and — new for a car — **also refused locally**. Not forwarding it is the argument `IsForwardableDamage` already makes for a player and a pedestrian: an explosion is replayed on every machine at an agreed position, so the owner puts its own car in its own blast and its own engine decides, and forwarding would apply it twice. Refusing it locally is the half a pedestrian did not need: a replica ped is `bExplosionProof` and a replica car is not, and unlike a player the observer's copy cannot then blow up (the `BlowUpCar` detour refuses a car a remote player is driving), so without the refusal it would sit at zero health, on fire, forever. That is §1.11.1's bug exactly. |
+| **Fire, ramming, running over, drowning, a fall** | Refused for the same reasons §1.10.1 refuses them for a player. Ramming is worth restating for a car: `WEAPONTYPE_RAMMEDBYCAR` is the one cause `bCollisionProof` already blocks completely (`0x005519FC`), and it must stay blocked, because a remote car's transform is corrected 25 times a second rather than simulated and a "collision" with one is not a collision anybody ran. |
+| **A car with `bOnlyDamagedByPlayer`** | A known residual, stated rather than worked around. At `0x00551972` the engine demands a culprit that is `FindPlayerPed()` or `FindPlayerVehicle()` and returns otherwise. On the owner's machine the culprit is a replica of the *shooter's* ped, which is neither, so such a car takes nothing off the wire. The only way round it is to name the local player as the culprit, which is a lie about who fired, and the flag exists precisely to stop anybody but the player hurting that car. The owner's log says so, with `bOnlyDamagedByPlayer` named, when a hit lands and takes no health. |
+| **The local player gets into the car between firing and sending** | Dropped at the send (`VehicleHitIsWorthSending`). Our own engine is the one deciding now, so sending would be asking the server to route a hit back to us. |
+| **A jack, so two machines each think they drive it** | The server decides, exactly as version 22 says. Both ends ask their own question anyway — the client asks its roster before sending to the seam, and the seam asks `CVehicle::m_pDriver` before calling the engine — and those are two different questions on purpose: the engine's answer moves first and the session's catches up. |
+| **A city NPC shoots a replica** | Not forwarded. Only what the local player did deliberately, the same test and reason as the pedestrian branch: a shot fired by traffic happened in one simulation and not in the others, and forwarding it would have this machine's NPCs shooting up another machine's cars. |
+| **Kill credit and `AwardMoneyForExplosion`** | Untouched, and untouched on purpose. If this hit is the one that sets the car alight, `m_pSetOnFireEntity` is written at `0x00551BF3` with the shooter's replica, so the car that burns out blames the player who shot it. The money is the owner's engine's business and stays there. |
+
+#### 1.20.7 The packets
+
+| opcode | packet | channel | to |
+|---|---|---|---|
+| `0x6A` | `C_VehicleHit` — 12 bytes, `VehicleHitBody` | `CH_EVENT` | server |
+| `0x6B` | `S_VehicleHit` — 13 bytes, `attackerId` + body | `CH_EVENT` | **the car's driver alone** |
+
+Named "hit" and not "damage" because `C_VehicleDamage` (`0x3A`) already exists
+and is a different thing entirely: absolute cosmetic state, sent **by** the
+driver, merged as a maximum. This is a delta, sent **to** the driver, never
+merged. Two packets called damage on the same object travelling in opposite
+directions with opposite arbitration is a name nobody could keep straight.
+
+`Session::VehicleHitRecipient` is the exact inverse of
+`Session::MayReportVehicle`, and the pair is the invariant `sessiontest` pins:
+for a given car and a given player, exactly one of "may I describe it" and
+"should I be told about a hit on it" is true, and which one never depends on
+anything but the driver.
+
+Nothing is recorded on the server. A hit is not a state a joiner has to be
+handed — the health it produced lives on the owner's machine and reaches the
+session on the snapshot that has always carried it (§2.8.1).
+
+`PROTOCOL_VERSION` is deliberately left at **22**. Nothing existing moved and no
+layout changed, so the number is the lead's to assign at the merge — the same
+way version 18 collected ten branches that each left theirs blank, and the same
+way §1.19 left 19.
+### 1.21 A car nobody is driving: one machine settles it, everybody else pins it
+
+Protocol 22 settled who owns a car with somebody in it — the player in seat 0,
+named by the server, and nobody else may report it. It left the gap between an
+exit and the next enter owned by nobody, and §5.8.1's rule for that gap is
+that every machine holds the car at the last transform the session gave it,
+with its controls and velocities at rest.
+
+**That is right for a car standing in the street and wrong for one that was
+still moving when the session stopped having a driver for it.** The pin is
+applied *after* physics, every frame, so whatever pose the car was in at that
+instant is permanent. And `CVehicle::CanPedEnterCar` (`0x005522F0`) refuses a
+car whose `up.z` is **inside** ±0.1 — a car on its side, not one upright —
+while `CPed::SeekCar` (`0x004D3F90`) answers that refusal with
+`RestorePreviousState` and no timeout. A car that goes onto its side while
+nobody is recorded driving it is a car nobody can ever get into again, on every
+machine, for the rest of the session.
+
+That pose is not exotic. `CVehicle::CanPedExitCar` (`0x005523C0`) refuses to
+let anyone step out of a car doing more than `0.005` — so a player cannot get
+out of a rolling car by hand. They *leave* one by dying in it, by being jacked
+out of it, or by disconnecting, and all three run through
+`Session::NoteExitVehicle`.
+
+#### 1.21.1 Custody
+
+A driverless car gets a **custodian**: one machine, named by the server, that
+stops correcting the car and lets its own engine finish what the car was
+doing, streaming the result on the `C_VehicleState` the protocol already has.
+Every observer follows it on the interpolation that already exists. When the
+car comes to rest the custodian says so and the session goes back to nobody
+simulating it — the pinned, zero-bandwidth, perfectly still behaviour a parked
+car has always had, unchanged line for line.
+
+**Custody is the exception; rest is the rule.** A car with no custodian takes
+exactly the code path it took before any of this, which is what makes the
+common case — a car parked on the street for ten minutes — provably
+unregressed rather than merely re-tuned.
+
+#### 1.21.2 Why the last driver and not the host
+
+`roadmap.md` §5.8 says an ownerless world entity is the host's, and for a
+*fact* about a car nobody owns that is right: the host is one machine and it is
+always there. It is the wrong machine to run a car's **physics** on. GTA III
+streams around one player (`roadmap.md` §2.1) and keeps one island's collision
+in memory (§2.2), so a host on the other side of the river would be simulating
+a car with no ground under it and reporting the fall — and every observer would
+follow it down, which is a worse bug than the one being fixed.
+
+The player who has just stepped out is standing next to the car with the
+collision loaded around it and was simulating it a frame ago. That is the whole
+argument, and it is also why custody is short: `VEHICLE_SETTLE_MS` (2 s) on the
+custodian's own clock, after which the car is handed back whether or not it
+settled.
+
+#### 1.21.3 What the server arbitrates
+
+Nothing a client decides for itself. A machine is the custodian when, and only
+when, it has been told so by `S_VehicleCustody`. `Session::MayReportVehicle`
+reads driver and custodian as a **precedence**, not a union:
+
+```
+the driver, if there is one; otherwise the custodian; otherwise nobody
+```
+
+so even a record that somehow held both still names exactly one reporter. Two
+machines can no more both be the custodian than both be the driver, which is
+the same discipline and for the same reason: both bugs protocol 22 fixed were a
+client working out an ownership for itself and being right from where it stood.
+
+Custody ends four ways, and only the first costs a packet:
+
+| | |
+|---|---|
+| the custodian's `C_VehicleSettled` | refused from anybody else |
+| a new driver | `NoteEnterVehicle` clears it; the `S_EnterVehicle` already says it |
+| the car's destruction | `DestroyVehicle` clears it; a wreck has nothing left to settle |
+| the custodian disconnecting | `RemovePeer` clears it; handed to nobody, not to the next player along |
+
+`S_VehicleCustody` is always sent **after** the `S_ExitVehicle` that created the
+vacancy, on the same reliable ordered channel — the mirror of 22's
+loser-before-winner rule, and what guarantees no client holds a driver and a
+custodian for one car at the same instant.
+
+#### 1.21.4 When a car has stopped
+
+Asked of the engine, and agreeing with it rather than second-guessing it.
+`CPhysical::ProcessControl` (`0x00495F10`) counts quiet frames in
+`m_nStaticFrames` (`+0xED`), and on the frame that takes the counter past ten
+it sets `bIsStatic`, zeroes both velocity vectors outright and returns without
+applying either. Any moving frame puts the counter back to zero.
+
+So the custodian's test is `bIsStatic` **or** a run of `VEHICLE_REST_FRAMES`
+(11) consecutive quiet samples, and quiet means `CanPedExitCar`'s own numbers —
+`|moveSpeed|² ≤ 0.005` and every component of `turnSpeed` within `0.01`. Those
+are the tightest gates in the engine, which is the point: a car handed back to
+the pinned world has to be one a player can get into **and** out of, and the
+exit gate is eight times stricter about speed than the entry gate.
+
+A run rather than an instant, because one still sample is not rest — a car at
+the top of a bounce reads still for exactly one frame, and handing it back
+there pins it in mid-air, which is the same bug reached by being impatient.
+
+**What this deliberately does not do** is right a car that has landed on its
+side. Nothing in GTA III does, single player included, so the car stays there
+and stays unenterable — which is fidelity (`roadmap.md` §5.5), not a residual.
+The bug was the pin, never the pose.
+
+### 1.22 Getting into somebody else's traffic is an ownership change
+
+`roadmap.md` §5.8.1's last paragraph and `population.md` §1.3.1 both name this
+and neither fixed it. An ambient car belongs to the machine whose `CCarCtrl`
+made it and that ownership never moves. `CorrectAmbientCarReplica` only
+*guards*: it stops correcting a replica the local player is driving, so the car
+moves on that screen while the session goes on telling everybody else where its
+original host thinks it is.
+
+**It becomes a session car, which is the claim the session already has.** Not
+something narrower, and the reason is one thing the ambient roster cannot
+carry: **a seat**. An `AmbientCar` has an owner and no seats, so a player at
+the wheel is invisible to it — every observer would go on drawing that player's
+ped in the road beside the car, which is exactly the bug the seat work fixed
+for session cars. Damage, destruction and the backfill's record of a car's
+condition all ride the session car as well; the ambient row only ever carried a
+transform.
+
+It is also the answer the codebase already gives from the other side.
+`population.cpp`'s `SweepHostedCars` already retires a hosted car and hands it
+to the M2 claim path the moment the *local* player gets into one of its own.
+This is that, applied to the machine holding the replica.
+
+#### 1.22.1 No new claim packet, and nothing created or destroyed
+
+The claim is `C_EnterVehicle` exactly as it is, sent with the netId the session
+already has for the car. netIds are one space (`Session::AllocNetId` is one
+counter for players, vehicles, ambient peds and ambient cars), so a number that
+names an `AmbientCar` can never also name a `Vehicle` — the server tells which
+kind of claim it is holding by looking, and there was nothing to add.
+
+The server promotes the row **under the same netId**, and `S_CarPromoted` tells
+every machine to move its bookkeeping across. That is what lets every machine
+keep the `CVehicle` it already has:
+
+| machine | what it has | what changes |
+|---|---|---|
+| the new driver | a replica CoopIII built | the row; the object is untouched |
+| any observer | a replica CoopIII built | the row; the object is untouched |
+| the original host | a car its **own engine** made | the row, plus it stops hosting it |
+
+The last one is why the netId is kept. A promotion that despawned and
+respawned would have that machine run the deleting destructor on one of the
+player's own traffic cars — the thing `RemoteVehicle::ours` exists to prevent —
+and would flicker the car on every other screen as well. The promoted row is
+marked `ours` on exactly that machine, so the roster can never destroy it.
+
+The AI driver its own `CCarCtrl` put at the wheel comes out through the seat
+path that already exists: `S_EnterVehicle` records the driver,
+`Client::UpdateRemoteSeats` carries it out, and `SeatPedInCar` opens by calling
+`EvictSeatOccupant` for precisely this case.
+
+**Seat 0 only.** A passenger in somebody else's traffic changes nothing about
+who is steering it, and promoting a car because somebody got into the back
+would take it off the machine still driving it.
+
+### 1.23 Shooting somebody else's traffic
+
+Found by the replica-death work (`population.md` §5.7.4) and confirmed against
+the binary and the code. A replica of somebody else's traffic car had no
+protection at all. `SpawnAmbientCarReplica` set no proof flag,
+`CorrectAmbientCarReplica` set only `bCollisionProof`, and both detours in
+`game/vehicle.cpp` only refused cars with a recorded remote driver. So bullets,
+fire and blasts took health off the replica, and at zero the observer ran
+`CAutomobile::BlowUpCar` on a car its host never touched. `BlowUpCar`
+(`0x0053BC60`) reads no proof flag, only `bCanBeDamaged` at `0x0053BC69`, and it
+kills a seated occupant through `CPed::SetDead` (`0x0053BDCD` driver,
+`0x0053BE2F` passengers), which is where most replica pedestrian deaths came
+from. The shell then followed the host's stream around town, since nothing in
+the correction checks for a wreck.
+
+#### 1.23.1 The host decides
+
+The machine whose `CCarCtrl` made the car. It already streams the car, and
+`UNOWNED_AMBIENT` already makes it the only machine that may say the car blew
+up, so the health that leads there is the same decision.
+
+The worry with a host is distance (§1.21.2 gives custody to the last driver
+rather than the host for that reason). It doesn't apply here. §1.21.2 is about
+running a car's physics on a machine that may not have it loaded. A traffic car
+only exists while its host keeps it: `CCarCtrl::PossiblyRemoveVehicle` measures
+an unlocked random car's distance from the host's own player (`0x0041869B`) and
+deletes it past that (`CWorld::Remove` at `0x0041870E`), and the replicas go
+with it on `C_CarDespawn`. So whenever there is a replica to shoot, the host has
+the car and the ground under it. Applying a hit is arithmetic on that car, not
+a simulation of it.
+
+It also buys something no observer could do: on the host, `InflictDamage`'s
+`RANDOM_VEHICLE` arm (`0x00551A27`) runs on a car with a real autopilot, so the
+AI driver floors it or bails out the way it does in single player. A replica's
+status is `STATUS_ABANDONED` and that arm never ran anywhere before.
+
+#### 1.23.2 Refused together, and the hit still gets there
+
+On an observer, both detours treat a replica like a car somebody else drives:
+`CVehicle::InflictDamage` is refused and `BlowUpCar` is refused.
+`game/vehicle.h` has the decision as `ClassifyCar` / `DecideCarDamage` /
+`MayBlowUpCar`, and `clienttest` checks the two halves agree for every car and
+every cause. Refusing only the blow-up would leave the car at zero health on
+fire for good, which is §1.11.1 again.
+
+A hit the local player lands with a ray or a melee reach
+(`IsForwardableDamage`) goes to the host as `C_CarHit` (`0x6C`). The server
+sends it on as `S_CarHit` (`0x6D`) to the car's owner and nobody else
+(`Session::CarHitRecipient`), and the host feeds it into its own
+`InflictDamage` with the shooter's ped as the culprit. The body is
+`VehicleHitBody`, the same three fields as `C_VehicleHit`. It is a separate pair
+because the server finds the owner in a different table by a different rule.
+
+The replica can only end one way: the host's `C_UnownedBlowUp`, applied
+through `BlowUpCarAsOwnerSaid`, which is the one call the detour lets through.
+
+The detours aren't the whole of it. Three writers take health off a car without
+calling `InflictDamage`: the upside-down drain at `0x0052F472` (above
+`VehicleDamage`'s `bCollisionProof` test), `CFire::ProcessFire` writing 75.0f on
+the car of a burning occupant at `0x00479959`, and the engine-status drain at
+`0x005347E0`. So `CorrectAmbientCarReplica` writes the host's health back every
+frame after physics, and holds the fire timer (`+0x530`) at zero, the same split
+`ApplyRemoteVehicle` makes for a driven car.
+
+The health comes from the car stream. `AmbientCarState`'s two pad bytes are now
+`health`, in whole points; 0 means "not said" and the receiver keeps what it
+had. So the smoke and the flames show up on every screen when the host's car
+starts burning, and not only when it blows up.
+
+#### 1.23.3 Explosions
+
+A blast is refused on the replica and not forwarded. Every machine replays the
+explosion at the agreed position (§1.9.3), so the host's own copy of the blast
+reaches the host's car and decides it. If that kills the car,
+`C_UnownedBlowUp` brings the wreck to everybody at the host's transform. Each
+blast is counted once, on the machine that owns the car, and the observer's
+copy never takes damage it could double.
+
+Fire is refused and not forwarded for the same reason. A `CFire` on a car can
+be lit by a replayed explosion as easily as by a flamethrower, and
+`InflictDamage` can't tell which, so forwarding fire would count the host's own
+fire twice. The flamethrower therefore does nothing to somebody else's traffic,
+the same as it already did to a car somebody else drives. That is the one
+weapon this leaves out. *(§1.24 takes it back in, from the ignition rather
+than the damage.)*
+
+#### 1.23.4 Parked cars
+
+Not in scope, and unchanged. A car generator's car is the map's, it exists on
+every machine and nobody hosts it, so there is no owner to send a hit to. Each
+machine damages its own copy, a replayed blast reaches every copy the same way,
+and `UNOWNED_PARKED` carries a wreck from whoever sees it first. Health between
+the first shot and the wreck can differ between screens. The wreck can't.
+
+#### 1.23.5 Also fixed on the way
+
+A promoted traffic car (§1.22) never went into the table the protocol-23 detours
+read, because `SpawnRemoteVehicle` never ran for it. On every observer,
+including the old host, it was a car somebody drives that this machine still
+damaged and blew up on its own, and whose hits never reached the driver.
+`AdoptPromotedCar` now registers it.
+
+The same gap had one more car in it: the one you claimed yourself. The claimer
+keeps a roster row for its own car (`RemoteVehicle::ours`) but the table only
+got rows from `SpawnRemoteVehicle` and `AdoptPromotedCar`, and neither runs for
+it. So once you got out and somebody else drove it, your engine still dented
+and wrecked your copy on its own, and your shots never reached them. A car you
+parked and then blew up here also went unreported, because without a row the
+wreck had no `UNOWNED_SESSION` name. The claim reply now registers it
+(`AdoptClaimedVehicle`), and when the session drops an `ours` car the row goes
+with it (`ReleaseOwnVehicle`) instead of outliving the session with the last
+driver's id in it. No wire change.
+
+#### 1.23.6 Packets
+
+| opcode | packet | channel | to |
+|---|---|---|---|
+| `0x6C` | `C_CarHit` - 12 bytes, `VehicleHitBody` | `CH_EVENT` | server |
+| `0x6D` | `S_CarHit` - 13 bytes, `attackerId` + body | `CH_EVENT` | **the car's host alone** |
+
+`AmbientCarState::health` (`u16`, was `pad[2]`) on the existing car stream.
+`PROTOCOL_VERSION` is left for the merge; protocol.h has the unnumbered entry.
+
+### 1.24 A flame is an ignition, and the owner lights it
+
+§1.19.4, §1.20 and §1.23.3 all left the flamethrower out for the same reason:
+by the time its damage reaches `InflictDamage` it is just a fire, and a fire
+lit by a replayed explosion looks the same. That's true, and it's the wrong
+place to look. The flamethrower never calls `InflictDamage` at all.
+`addresses.h` has the whole path; the short version:
+
+```
+CWeapon::Fire -> FireAreaEffect (0x00561E00) -> CShotInfo::AddShot (0x0055BD70)
+every frame   -> CShotInfo::Update (0x0055BFF0), per slot:
+  for each of the source ped's m_nearPeds: in control, close enough,
+      not bFireProof (0x0055C1D9) -> StartFire(ped, source, 0.8f, 1)  0x0055C232
+  every 4th frame: SetCarsOnFire(pos, 4.0f, source)                   0x0055C26C
+      -> StartFire(car, source, 0.8f, 1)                              0x004B3F9C
+then CFire::ProcessFire -> InflictDamage(m_pSource, 9, 1.2 * timestep)
+```
+
+So the flame's own act is the ignition, and inside `CShotInfo::Update` it is
+still recognisable: every `StartFire` made while that function runs is the
+flamethrower's, and `fleeFrom` is the slot's own source. Ours when both hold,
+`combat.h` `IsOurFlame`. Our molotov names our ped too, but its fire comes out
+of `CExplosion::Update`, outside the window. Another player's replayed flame
+is inside the window, but its source is our copy of their ped.
+
+**What travels.** The ignition, on the packet that already carries a hit on
+that target: `C_PedDamage`, `C_VehicleHit` or `C_CarHit`, cause 9, amount 0.
+Cause 9 never meant damage on those packets - `IsForwardableDamage` has always
+refused it and every receiver checks - so it can mean "our flame reached
+this". At most once a second per target.
+
+**Who lights it.** The owner, with its own `StartFire` on its own entity and
+the shooter's ped as `fleeFrom`, after the two tests the shooter couldn't make:
+`bFireProof` on the real entity and, for a car, not a wreck. The owner's `CFire`
+does all the burning, so the damage, the death and the wreck happen where the
+entity lives and travel on the packets that already carry them.
+
+**Pedestrians need one more step.** A replica is `bFireProof`, so on the
+shooter's machine `CShotInfo::Update` skips it one test before `StartFire`.
+After `Update` returns, the shooter walks the same `m_nearPeds` with the same
+position and radius and the same tests, minus the proof flag
+(`FlameReachesPed`). Cars need nothing extra: a replica car isn't fire proof,
+so `SetCarsOnFire` reaches `StartFire` and the detour sees it there. The
+engine still lights our copy of that car. Nothing tells this machine the
+owner's car is burning, so that fire is the only one our player sees. It
+can't do damage: its `InflictDamage` is refused on a car we don't own, and
+cause 9 is still never forwarded as damage.
+
+**No double count.** The owner already lit part of this before: every machine
+replays our flamethrower, so the owner's own engine runs a `CShotInfo` off its
+copy of our ped and lights what that reaches. Its copy is 100 ms old and aims
+along its body, not our camera, so it misses things our screen hit, and the
+packet covers those. When both land on one target nothing doubles, because
+`StartFire` refuses an entity that is already burning (`0x004795A6` for a ped,
+`0x004795DD` for a car) and fire damage is per `CFire`, not per ignition. A
+fire from a replayed explosion never reaches the packet at all.
+
+**Seeing it.** Entity fires never travel, so the owner's fire on its own
+pedestrian was visible on the owner's screen only: the replica is
+`bFireProof` and nothing on an observer can light it. The owner now says so in
+the ped stream - `AmbientPedState::flags`, the byte that used to be padding,
+bit `AMBIENT_PED_ON_FIRE` when the real ped's `m_pFire` is set - and every
+observer puts the same visual-only fire on the replica that a burning player
+gets (§1.10.7): `ped.cpp`'s transcription of `StartFire`'s tail with the AI
+arm left out, `PlanRemoteFire` deciding it, and out a second after the owner
+stops saying so. A car needs nothing like this: the shooter's own copy of the
+car is lit by the flame directly (above), and a traffic car's health already
+rides its stream, so the owner's smoke shows everywhere.
+
+**Molotovs** are not this shape and need nothing. Their fire comes from the
+explosion (`CExplosion::Update`'s molotov arm, table `0x00602E34` entry 1,
+calls `SetPedsOnFire` and `SetCarsOnFire` with a 6.0 radius), and every machine
+replays that explosion at the thrower's position (§1.9.3), so each owner
+lights its own entities.
+
+**Players are unchanged.** A flame on a remote player is still the victim's
+own business (§1.10.6): their machine's replay of our flame lights them, and
+friendly fire gates the damage.
+
+**Mixed builds** lose the feature and misread nothing. An older owner drops
+cause 9 at `IsForwardableDamage`, where it always did, and an older server
+relays the packet without reading the cause.
+
+### 1.25 A cheat runs where what it changes is owned
+
+[docs/cheats.md](cheats.md) is the investigation and the table; this is the wire.
+
+A cheat runs on the machine of the player who typed it, and ten of the 23 in
+retail 1.0 change something that machine does not own in a session. Typed on a
+non-host, `PEASOUP` lasted until the next `S_WorldState` put the host's sky
+back. `TIMEFLIESWHENYOU` had a non-host's clock racing the host's and being
+jumped back every second. `ITSALLGOINGMAAAD` turned the typist's own
+pedestrians and nobody else's.
+
+So the client detours `CPad::AddToPCCheatString`, the only way into a cheat on
+PC, and in a session decides before anything runs:
+
+- **the typist's own** (13) run where they were typed and never go on the wire
+- **the four skies** go to the host as `C_Cheat` and are not run by a
+  non-host at all; the host runs `CWeather::ForceWeatherNow` and sends
+  `C_WorldState` at once rather than waiting out its 1 Hz limiter
+- **the clock's speed and the crowd** (5) run on the typist's machine and then
+  go to everybody, carrying the state they left behind so a receiver arrives
+  there instead of flipping a toggle
+- **BANGBANGBANG** runs where it was typed; its wrecks travel by §1.11 and §1.23
+
+A receiver brings itself to the state by calling the engine's own handlers
+(`PlanRoutedCheat`), never by writing the globals. The server relays by
+`CheatRelayFor` and keeps the last state of each everybody-cheat for the
+backfill; an emptied session forgets them.
+
+#### 1.25.1 Packets
+
+| opcode | packet | channel | to |
+|---|---|---|---|
+| `0xF0` | `C_Cheat` - 7 bytes, `CheatBody` (`cheat` `u8`, `state` `u8`) | `CH_EVENT` | server |
+| `0xF1` | `S_Cheat` - 8 bytes, `playerId` + body | `CH_EVENT` | the host alone for a sky, everybody but the typist otherwise; replayed to a joiner from `INVALID_PLAYER` |
+
+`S_Welcome.flags` bits 6-7 carry `CheatRule`. `PROTOCOL_VERSION` is left for the
+merge; protocol.h has the unnumbered entry.
+
 ## 2. Design decisions
 
 ### 2.1 Topology: dedicated server, client-authoritative players
@@ -2319,6 +3354,14 @@ struct PacketHeader {
 Remote entities buffer ~100 ms of snapshots and render interpolated between the
 two straddling `sendTimeMs`. If the buffer underruns, extrapolate using the last
 `m_vecMoveSpeed` for at most ~250 ms, then freeze.
+
+`m_vecMoveSpeed` is metres per engine step, and a step is 1/50 s
+(`CPhysical::ApplyMoveSpeed` multiplies it by `CTimer::ms_fTimeStep`, which
+`CTimer::Update` sets to frame milliseconds × 0.05). It goes on the wire in that
+unit, since receivers also write it back into the engine, and is multiplied by
+50 where it enters an interpolation buffer (`MoveSpeedToMps` in
+`client/src/interp.h`, which has the addresses). The helicopter is the one
+exception: `HeliStateBody::velocity` is m/s on the wire.
 
 Position is never hard-set except on spawn or when the error exceeds ~5 m
 (teleport/desync recovery). Writing `SetPosition()` raw every frame fights the
@@ -2492,6 +3535,10 @@ Two rules, and the second is the converse of the observer rule in §1.2:
   them at construction, so every machine picks its own set the moment it
   spawns the car, and two players who joined together already disagree.
   Roadmap §5.9.
+- **An arrest.** Unlike a death there is nothing to rebuild: a busted player
+  is alive, standing or sitting where the cop caught them, and their
+  snapshots say so. The police station reaches the session as a respawn
+  (§1.10.8), which is what moves a joiner's copy of them.
 - **Chat history.** A joiner starts with an empty log. Nothing reconstructs a
   conversation from a session it was not in, and no game in this category
   tries.
@@ -2548,7 +3595,7 @@ model that doesn't exist yet.
 | Opcode | Name | Ch | Payload |
 |---|---|---|---|
 | 0x01 | `C_HELLO` | 1 | protocol version, nickname, model id |
-| 0x02 | `S_WELCOME` | 1 | your `playerId`, your `netId`, server tick rate, world state, `hostPlayerId` (§2.7), session flags - friendly fire (§1.10.3) and ammo sync (§1.9.6) |
+| 0x02 | `S_WELCOME` | 1 | your `playerId`, your `netId`, server tick rate, world state, `hostPlayerId` (§2.7), session flags - friendly fire (§1.10.3), ammo sync (§1.9.6), the wanted rule (bits 2-3), the rampage rule (bits 4-5) and the cheat rule (bits 6-7, §1.24) |
 | 0x03 | `S_PLAYER_JOIN` | 1 | `playerId`, `netId`, nickname, model id, transform, then condition: health `float`, armour `float`, weapon `u8`, flags `u8` (`PJF_POS_VALID`, `PJF_DEAD`), death anim `u16` (§2.8.1) |
 | 0x04 | `S_PLAYER_LEAVE` | 1 | `playerId`, reason |
 | 0x10 | `C_PLAYER_STATE` | 0 | pos `float[3]`, heading `float`, `m_vecMoveSpeed` `float[3]`, `m_nMoveState` `u8`, `m_nPedState` `u8`, anim `u16` + time `float` + speed `float`, partial anim `u16` + time `float`, health `float`, armour `float`, weapon `u8`, the held weapon's ammo (clip `u16` + total `u32`, §1.9.6), aim yaw/pitch `float[2]`, flags `u8` (71 bytes) |
@@ -2572,6 +3619,10 @@ model that doesn't exist yet.
 | 0x40 | `S_WORLD_STATE` | 1 | game hour/minute, both weather types, `hostPlayerId` (§2.7) |
 | 0x41 | `C_WORLD_STATE` | 1 | the host's own hour/minute and weather pair; dropped from anyone else |
 | 0x50 | `C_CHAT` / 0x51 `S_CHAT` | 1 | `playerId`, text |
+| 0x68 | `C_PED_DAMAGE` / 0x69 `S_PED_DAMAGE` | 1 | a hit one machine's player landed on a pedestrian another machine hosts: `netId` `u16`, weapon `u8`, amount `float`, piece `u8`, direction `u8` - `CPed::InflictDamage`'s own five arguments less the culprit pointer; `S_` also carries `attackerId` and goes to **the ped's owner alone** (§1.19). The only ambient packet that travels *towards* an owner, so the ownership test is inverted: refused *to* the owner, accepted from anybody else. Friendly fire has no say - a pedestrian is not a player |
+| 0x6A | `C_VEHICLE_HIT` / 0x6B `S_VEHICLE_HIT` | 1 | a hit one machine's player landed on a car another player is **driving**: `netId` `u16`, weapon `u8`, amount `float` — `CVehicle::InflictDamage`'s own three arguments less the culprit pointer; `S_` also carries `attackerId` and goes to **the driver alone** (§1.21). The same inverted ownership test as `C_PED_DAMAGE`, and the exact inverse of `Session::MayReportVehicle`: refused *to* the driver, accepted from anybody else, refused outright for a car with no driver. No health, no position, no shot vector. Friendly fire has no say — a car is not a player |
+| 0x6C | `C_CAR_HIT` / 0x6D `S_CAR_HIT` | 1 | the same three fields as `C_VEHICLE_HIT`, for a replica of somebody else's **traffic**; `S_` also carries `attackerId` and goes to **the car's host alone** (§1.23). Refused *to* the host, accepted from anybody else, refused for a wreck or a netId that isn't traffic any more |
+| 0x6E-0x6F | - | - | Reserved for the rest of that direction |
 | 0x80 | `C_PICKUP_CLAIM` | 1 | `PickupIdent`: pos `float[3]`, model index `i16`, type `u8`, flags `u8` (§1.13). Sent on approach, at 4 m |
 | 0x81 | `S_PICKUP_TAKEN` | 1 | `playerId` + `PickupIdent`. To everyone **except** the collector, whose own engine already removed their copy (§1.13.3) |
 | 0x82 | `S_PICKUP_DENIED` | 1 | `PickupIdent`. To the loser alone; nothing to undo, because the engine never saw an object there |
@@ -2579,7 +3630,8 @@ model that doesn't exist yet.
 | 0x84 | `S_PICKUP_GRANT` | 1 | `PickupIdent`. To the claimant alone. A *reservation* - nothing is removed anywhere until a collection is reported (§1.13.3) |
 | 0x85 | `C_PICKUP_COLLECTED` | 1 | `PickupIdent`. The holder's engine actually took it. Detected, not decided |
 | 0x86 | `C_PICKUP_DROP` / 0x87 `S_PICKUP_DROP` | 1 | `PickupIdent` + quantity; `S_` also carries the owner's `playerId` (§1.13) |
-| 0x88-0x8F | - | - | Reserved for pickups |
+| 0x88-0x8D | `C_RAMPAGE_START` .. `S_RAMPAGE_END` | 1 | the shared rampage: start, the session's frenzy, one kill, an ending ([rampage.md](rampage.md) §5) |
+| 0x8E | `C_RAMPAGE_CAR` / 0x8F `S_RAMPAGE_CAR` | 1 | one car wreck that counted toward a vehicle rampage, from the machine that decided it: `frenzyId` `u16`, model `u16`, key (`kind` `u8`, pad, `id` `u16`) - `UNOWNED_PARKED` or `UNOWNED_SESSION` for a car several machines can decide, `0xFF` otherwise. `S_` also carries `byPlayer` and goes to everybody but the reporter. A keyed car counts once per frenzy on the server and on every client ([rampage.md](rampage.md) §9) |
 | 0xA0 | `C_GARAGE_STATE` | 1 | `deviating` `u32`, one bit per garage: "my own state machine has this garage away from where this type of garage rests" (§1.16.3). Sent on change only |
 | 0xA1 | `S_GARAGE_STATE` | 1 | `playerId` + the mask. To everyone except the sender, and replayed in the backfill for every player whose mask is non-zero |
 | 0xA2 | `C_RESPRAY` / 0xA3 `S_RESPRAY` | 1 | `vehicleNetId` `u16`, `garage` `u8`, `colour1` `u8`, `colour2` `u8`; `S_` also carries `playerId`. The colours are read off the car the owner's engine painted, because `ChooseVehicleColour` is a per-machine round robin (§1.16.5). The wanted level is deliberately not here (§1.16.6) |
@@ -2590,6 +3642,8 @@ model that doesn't exist yet.
 | 0xC2-0xCF | - | - | Reserved for breakable objects - where a knocked-over lamp post came to rest is the named open half (`objects.md` §8) |
 | 0xD8 | `C_PED_DEATH` / 0xD9 `S_PED_DEATH` | 1 | an ambient pedestrian his host's engine killed: `netId` `u16`, anim `u16`. Host-only, like the despawn and the limb, and the one of the three the server **keeps** - a joiner is handed the corpse (`population.md` §5) |
 | 0xDA-0xDF | - | - | Reserved beside it, for whatever else only a ped's host can witness |
+| 0xF0 | `C_CHEAT` / 0xF1 `S_CHEAT` | 1 | a cheat that changes something its typist's machine does not own: `cheat` `u8` (`CheatId`), `state` `u8` - what it left the typist's engine at, never "toggle". `S_` also carries the typist's `playerId`, or `INVALID_PLAYER` for a joiner's replay. A sky goes to **the host alone**; the clock-speed, riot and armed-crowd cheats to everybody but the typist; nothing else is ever sent. Dropped by the server unless the session's `CheatRule` allows it (§1.24, [cheats.md](cheats.md)) |
+| 0xF2-0xF7 | - | - | Reserved for the rest of the cheat block |
 
 ---
 

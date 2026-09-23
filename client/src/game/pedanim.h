@@ -233,11 +233,12 @@ inline bool FiniteOr(float value, float fallback, float &out) {
 //                Their machine is where their fire actually is, so this is
 //                the only authority on whether that player is alight.
 //   ours         the fire currently on that ped is the one CoopIII lit for
-//                them. A remote ped can pick up a fire from the local engine
-//                instead - CShotInfo::Update does not check bFireProof
-//                (addresses.h) - and that fire arrives with SetFlee and
-//                PED_ON_FIRE attached, which is the one thing this whole
-//                feature is built to keep out of the pose stream.
+//                them. Any other fire on it came from the local engine, and
+//                that fire arrives with SetFlee and PED_ON_FIRE attached,
+//                which is the one thing this whole feature is built to keep
+//                out of the pose stream. (Retail cannot actually light a
+//                bFireProof ped - CShotInfo::Update tests the flag at
+//                0x0055C1D9, addresses.h - so this is a seatbelt.)
 //   inControl    CPed::IsPedInControl, the engine's own gate. False for a
 //                seated, dying or dead ped, and the reason this is a loop
 //                and not an event handler.
@@ -288,6 +289,18 @@ inline FireAction PlanRemoteFire(bool wantBurning, bool haveFire, bool ours,
 // observer needs neither, because the owner is going to say so again in
 // 40 ms or not at all.
 constexpr uint32_t REMOTE_FIRE_MS = 1000;
+
+// The wantBurning above, for a pedestrian somebody else hosts.
+//
+// A player restates PF_ON_FIRE 25 times a second for as long as they are
+// connected. A pedestrian's row only comes while he is one of the twelve his
+// host streams (protocol.h, MAX_PED_STATES), so the last thing said about him
+// can be old news. It counts for REMOTE_FIRE_MS and then the replica stops
+// burning, which is the same cap the fire itself carries. Unsigned, so a
+// WallClock wrap still reads as a short gap.
+inline bool AmbientPedShouldBurn(bool saidBurning, uint32_t saidAtMs, uint32_t nowMs) {
+	return saidBurning && nowMs - saidAtMs < REMOTE_FIRE_MS;
+}
 
 // A coordinate about to reach the sector grid.
 //

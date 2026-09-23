@@ -10,15 +10,30 @@
 // crashes.
 
 #include "client.h"
+#include "game/boat.h"
 #include "game/cardamage.h"
+#include "game/carlife.h"
 #include "game/combat.h"
+#include "game/darkel.h"
 #include "game/garage.h"
+#include "game/heli.h"
+#include "game/heligun.h"
+#include "game/horn.h"
+#include "game/melee.h"
 #include "game/movinglist.h"
 #include "game/nametag.h"
+#include "game/observed.h"
 #include "game/pedanim.h"
 #include "game/pickup.h"
+#include "game/population.h"
 #include "game/radar.h"
+#include "game/sessionclock.h"
+#include "game/vehicle.h"
 #include "game/wanted.h"
+#include "liftbridgetime.h"
+#include "lighttime.h"
+#include "planetime.h"
+#include "traintime.h"
 
 #include <chrono>
 #include <cmath>
@@ -26,6 +41,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace coopiii;
@@ -147,7 +163,45 @@ struct Recorder {
 	int              vehicleSpawns   = 0;
 	int              vehicleDespawns = 0;
 	int              vehicleApplies  = 0;
+	// WorldBridge::UpdateTrafficAllowance, and how many cars had been built
+	// when it last ran.
+	int              trafficAllowances       = 0;
+	int              vehicleSpawnsAtAllowance = 0;
 	int              vehicleAtRest   = 0;
+	// WorldBridge::SurrenderVehicleSeat - the losing end of a carjack.
+	int              vehicleSurrenders = 0;
+
+	// Custody of a car nobody is driving (protocol.h, S_VehicleCustody).
+	// `carAtRest` is what the engine would answer about the car this machine
+	// is settling; the default is "still moving", because a settle that ended
+	// on its first frame would test nothing.
+	int              observedSamples  = 0;
+	bool             observedSampleOk = true;
+	int              atRestCalls      = 0;
+	bool             carAtRest        = false;
+	// Whether the car we are settling is on fire. Not, by default.
+	bool             carBurning       = false;
+	// What the engine would say about the dents on a car: the one we are
+	// settling, and the one we are driving. Undamaged by default, so no test
+	// written before these existed ever sees a report go out.
+	int               observedDamageSamples = 0;
+	VehicleDamageBody observedDamage{};
+	VehicleDamageBody localDamage{};
+	// A traffic car that has stopped being traffic (S_CarPromoted).
+	int              promotedAdoptions    = 0;
+	bool             lastPromotionWasOurs = false;
+	// A car the local player claimed, registered with the detours' table
+	// when the claim comes back, and let go of when the session drops it.
+	int              claimedAdoptions = 0;
+	int              ownReleases      = 0;
+	// Vehicle handles the fake pool no longer honours, as if the engine had
+	// reaped the car. Everything else resolves.
+	std::vector<int32_t> reapedVehicleHandles;
+	// The engine ref of the ambient replica the local player is at the wheel
+	// of, or -1 for on foot. Matched against the row's own handle, the same
+	// way localVehicleHandle is, so a test that puts the player in one car
+	// does not accidentally claim another.
+	int32_t          ambientDrivenHandle = -1;
 	// What shape a car was told it is in, and whether the parts were told to
 	// fly off. The flag is the interesting one: a live change makes them fly,
 	// a spawn or a backfill must not, or a joiner is greeted by a shower of
@@ -157,6 +211,9 @@ struct Recorder {
 	bool              lastDamageFlying = false;
 	int              vehicleCorrections = 0;
 	VehicleTransform lastCorrection  = {};
+	// What the row said about the horn when it was handed to the correction,
+	// which is the call the engine seam sounds it from.
+	bool             lastCorrectionHorn = false;
 	VehicleStateBody lastVehicleBody = {};
 	int              nextVehicleHandle = 1;
 
@@ -164,6 +221,9 @@ struct Recorder {
 	// player is on foot, which is the default.
 	bool     drivingLocally = false;
 	uint16_t localModel     = 90;
+	// The m_vecMoveSpeed both vehicle samplers report, in the engine's unit.
+	// Zero unless a test is about it.
+	Vec3     sampledMoveSpeed = {};
 	// The engine ref of the car the local player is in, as
 	// SampleLocalVehicleHandle would report it. -1 is "a car from our own
 	// world", which is every car for anybody who was in the session when it
@@ -204,6 +264,17 @@ struct Recorder {
 	bool     animEntry       = false;
 	uint8_t  animProgress    = SEAT_RUNNING;
 	int      seatAnimBegins  = 0;
+	// Which door the last animated entry was asked to use, as a seat number.
+	// 0xFF until one is. This is the byte the whole intent packet exists to
+	// carry, so a test that does not look at it is not testing the fix.
+	uint8_t  lastSeatDoor    = 0xFF;
+
+	// What our own engine says we are doing about a car right now, and how
+	// many times it was asked. The sampler is cheap and runs every tick; the
+	// packet must not.
+	bool          localEntryActive  = false;
+	LocalCarEntry localEntry{};
+	int           localEntrySamples = 0;
 	int      seatAnimPolls   = 0;
 	int      seatAnimAborts  = 0;
 	int      exitAnimBegins  = 0;
@@ -279,6 +350,31 @@ struct Recorder {
 	UnownedWreckOutcome unownedOutcome = UnownedWreckOutcome::Wrecked;
 	std::vector<UnownedBlast> unownedBlasts;
 
+	// Hits somebody else landed on the car *this* machine is driving. The one
+	// packet about a claimed car that travels towards its owner.
+	int            vehicleHits        = 0;
+	VehicleHitBody lastVehicleHit{};
+	// The attacker slot the client resolved, or 0xFF for none - recorded as an
+	// id rather than a pointer for the same reason pedDamageAttacker is: a null
+	// attacker is a real and ordinary case, not a failure.
+	uint8_t        vehicleHitAttacker = 0xFF;
+	uint16_t       lastVehicleHitRow  = INVALID_NETID;
+	// Whether Client handed it over as the car's custodian rather than its
+	// driver, which changes what the engine end checks.
+	bool           lastVehicleHitSettling = false;
+	// And the outbound queue, so the send path's filters can be exercised
+	// without a socket.
+	std::vector<VehicleHitBody> localVehicleHits;
+	int                         vehicleHitDrains = 0;
+
+	// The traffic pair (§1.23): hits on a car this machine hosts, and hits the
+	// detour queued against somebody else's.
+	int                         carHits        = 0;
+	VehicleHitBody              lastCarHit{};
+	uint8_t                     carHitAttacker = 0xFF;
+	std::vector<VehicleHitBody> localCarHits;
+	int                         carHitDrains   = 0;
+
 	// The traffic half of the same thing, through game/population.cpp rather
 	// than game/vehicle.cpp - a hosted car's netId rather than a name the map
 	// hands out.
@@ -315,6 +411,11 @@ struct Recorder {
 	uint8_t    appliedWeather    = 0xFF;
 	uint8_t    appliedWeatherOld = 0xFF;
 
+	// The session clock, as PreFrame last handed it over.
+	int      sessionClockCalls  = 0;
+	bool     sessionClockValid  = false;
+	uint32_t sessionClockOffset = 0;
+
 	// Pickups. `grantsConsumed` counts grants the seam could actually use;
 	// `grantFails` makes the next one report that the object has gone, which
 	// is the case the client has to turn back into a release rather than sit
@@ -342,6 +443,8 @@ struct Recorder {
 	int      ambientPedSpawns   = 0;
 	int      ambientPedDespawns = 0;
 	int      ambientApplies     = 0;
+	int      ambientFires       = 0;
+	bool     lastAmbientFireSaid = false;
 	Pose     lastAmbientPose{};
 	int      nextAmbientPedHandle = 1;
 
@@ -369,12 +472,29 @@ struct Recorder {
 	// destroy, so the ordering is the thing being pinned, not the effect.
 	int      unseatsAtLastAmbientKill = -1;
 
+	// Hits somebody else's player landed on a pedestrian *this* machine hosts.
+	// The direction the two above do not have.
+	int           pedDamages         = 0;
+	PedDamageBody lastPedDamage{};
+	// The attacker slot the client resolved, or 0xFF for none. Recorded as an
+	// id rather than a pointer for the same reason `damageAttacker` is: a null
+	// attacker is a real and ordinary case, not a failure.
+	uint8_t       pedDamageAttacker  = 0xFF;
+
 	// The traffic driver. `attempts` counts calls and `seats` the ones that
 	// took, the same split the player seating uses and for the same reason.
 	int      ambientSeatAttempts = 0;
 	int      ambientSeats        = 0;
 	int      ambientUnseats      = 0;
 	uint16_t lastAmbientSeatCar  = INVALID_NETID;
+	// What CorrectAmbientCarReplica was last told to write into the horn.
+	uint8_t  lastAmbientHornTimer = 0;
+	// And into the siren byte, and whether the host named a driver for it.
+	bool     lastAmbientSirenOn   = false;
+	bool     lastAmbientDriverSaid = false;
+	int      ambientCorrections   = 0;
+	// And where it was told to put the car.
+	VehicleTransform lastAmbientCarAt{};
 	uint8_t  lastAmbientSeatIdx  = 0xFF;
 	bool     refuseAmbientSeating = false;
 	// The engine has taken the ped replica away underneath us. What the real
@@ -382,13 +502,92 @@ struct Recorder {
 	// checking the vtable, the stub is simply told.
 	bool     ambientReplicaTaken  = false;
 	int      ambientLivenessChecks = 0;
+	// What CPools::GetPed would find the replica's m_nPedState to be. The
+	// stub feeds it to the real game::ReplicaDiedUnasked, so the client loop
+	// is driven by the same decision the engine seam makes rather than by a
+	// second copy of it that only agrees with itself.
+	uint32_t ambientReplicaState = game::PEDSTATE_NONE;
+	int      ambientDeathsRecovered = 0;
 	// How many unseats had happened by the time the last ambient car
 	// despawn ran. Destroying a car under a seated ped leaves that ped
 	// following a null pointer, so the order is the thing being pinned.
 	int      unseatsAtLastAmbientCarDespawn = -1;
+
+	// ---- the seat key, on this machine --------------------------------
+	//
+	// The local half of riding in somebody else's car. The engine walks the
+	// player to the door and that takes about a second, so `localSeatAnswer`
+	// is what SeatLocalPlayerIn says on the frame of the press and
+	// `localPollAnswer` is what PollLocalSeatEntry says afterwards - which is
+	// the whole shape of the thing being tested, because the bug was *when*
+	// the session gets told rather than what it gets told.
+	bool     wantSeatToggle   = false;
+	bool     localIsPassenger = false;
+	int32_t  localSeatAnswer  = SEAT_LOCAL_WALKING;
+	uint8_t  localSeatAsked   = 2;
+	int32_t  localPollAnswer  = SEAT_LOCAL_WALKING;
+	int      localSeatCalls   = 0;
+	int      localPollCalls   = 0;
+	int      localUnseats     = 0;
+	int32_t  lastSeatHandle   = -1;
+
+	// ---- rampages (game/darkel.h) --------------------------------------
+	//
+	// What the seam was asked to write into CDarkel, which is the whole of
+	// what a rampage packet does on the receiving side.
+	int      rampageRuleSets   = 0;
+	uint8_t  rampageRule       = 0xFF;
+	int      rampageOpens      = 0;
+	uint16_t rampageKillsNeeded = 0;
+	uint32_t rampageElapsedMs  = 0;
+	int      rampageCredits    = 0;
+	uint16_t rampageLastModel  = 0;
+	uint8_t  rampageLastWeapon = 0;
+	bool     rampageLastHead   = false;
+	int      rampageVerdicts   = 0;
+	uint8_t  rampageVerdict    = 0;
+	int      rampageResets     = 0;
+	int      rampageCarCredits = 0;
+	uint16_t rampageCarModel   = 0;
+	UnownedVehicleKey rampageCarKey{};
+
+	// Breakable street objects. The seam that produces these lives in
+	// game/object.cpp and needs a running engine; what Client owns, and what
+	// these record, is the routing - which packet reaches the bridge and
+	// which one is dropped because it is our own words coming back.
+	int            objectBreaks   = 0;
+	ObjectBreakBody lastObjectBreak{};
+	int            objectRests    = 0;
+	ObjectRestBody lastObjectRest{};
 };
 
 Recorder g_rec;
+
+// ---- the detours' table, over a fake pool ----------------------------------
+//
+// game/observed.h is the real table game/vehicle.cpp keeps; only the pool is
+// made up. A handle resolves to a pointer derived from it unless a test has
+// reaped it, which is CPools::GetVehicle's behaviour in the only way the table
+// can see it. The stubs below write to it at the same moments the engine seam
+// does (SpawnRemoteVehicle, DespawnRemoteVehicle, AdoptPromotedCar,
+// AdoptClaimedVehicle, ReleaseOwnVehicle, NoteVehicleHolders), so a test can
+// ask what the two detours would conclude.
+game::ObservedTable<64> g_observedHere;
+
+void *FakeVehicleAt(int32_t handle) {
+	if (handle < 0)
+		return nullptr;
+	for (int32_t h : g_rec.reapedVehicleHandles)
+		if (h == handle)
+			return nullptr;
+	return reinterpret_cast<void *>(static_cast<uintptr_t>(handle) * 16u + 0x10000u);
+}
+
+// The one writer of who else holds a car, as game/vehicle.cpp has it.
+void RecNoteVehicleHolders(uint16_t netId, uint8_t driverPlayerId,
+                           uint8_t custodianPlayerId, bool weSettle) {
+	g_observedHere.NoteHolders(netId, driverPlayerId, custodianPlayerId, weSettle);
+}
 
 void RecRequestModel(uint16_t id) { g_rec.modelRequests.push_back(id); }
 bool RecIsModelReady(uint16_t)    { return g_rec.modelReady; }
@@ -425,13 +624,20 @@ bool RecSpawnVehicle(RemoteVehicle &v) {
 	// the time this is called they are lost for that car's whole life.
 	g_rec.lastSpawnExtra1 = v.extra1;
 	g_rec.lastSpawnExtra2 = v.extra2;
+	g_observedHere.Remember(v.poolHandle, v.netId, &FakeVehicleAt);
 	return true;
 }
 
 void RecDespawnVehicle(RemoteVehicle &v) {
+	g_observedHere.Forget(v.netId);
 	v.poolHandle = -1;
 	++g_rec.vehicleDespawns;
 	g_rec.unseatsAtLastVehicleDespawn = g_rec.unseats;
+}
+
+void RecUpdateTrafficAllowance() {
+	++g_rec.trafficAllowances;
+	g_rec.vehicleSpawnsAtAllowance = g_rec.vehicleSpawns;
 }
 
 bool RecSeat(RemotePlayer &, RemoteVehicle &v, uint8_t seat) {
@@ -446,8 +652,17 @@ bool RecSeat(RemotePlayer &, RemoteVehicle &v, uint8_t seat) {
 
 void RecUnseat(RemotePlayer &) { ++g_rec.unseats; }
 
-bool RecBeginSeat(RemotePlayer &, RemoteVehicle &v, uint8_t seat) {
+bool RecSampleLocalCarEntry(LocalCarEntry &out) {
+	++g_rec.localEntrySamples;
+	if (!g_rec.localEntryActive)
+		return false;
+	out = g_rec.localEntry;
+	return true;
+}
+
+bool RecBeginSeat(RemotePlayer &, RemoteVehicle &v, uint8_t seat, uint8_t doorSeat) {
 	++g_rec.seatAnimBegins;
+	g_rec.lastSeatDoor = doorSeat;
 	if (!g_rec.animEntry)
 		return false;
 	g_rec.lastSeatVehicle = v.netId;
@@ -490,6 +705,41 @@ uint8_t RecDrainUnownedBlasts(UnownedBlast *out, uint8_t max) {
 	while (n < max && !g_rec.unownedBlasts.empty()) {
 		out[n++] = g_rec.unownedBlasts.front();
 		g_rec.unownedBlasts.erase(g_rec.unownedBlasts.begin());
+	}
+	return n;
+}
+
+void RecApplyRemoteVehicleHit(RemoteVehicle &vehicle, RemotePlayer *attacker,
+                              const VehicleHitBody &body, bool settling) {
+	++g_rec.vehicleHits;
+	g_rec.lastVehicleHitSettling = settling;
+	g_rec.lastVehicleHit     = body;
+	g_rec.lastVehicleHitRow  = vehicle.netId;
+	g_rec.vehicleHitAttacker = attacker ? attacker->playerId : 0xFF;
+}
+
+void RecApplyHostedCarHit(uint16_t, RemotePlayer *attacker, const VehicleHitBody &body) {
+	++g_rec.carHits;
+	g_rec.lastCarHit     = body;
+	g_rec.carHitAttacker = attacker ? attacker->playerId : 0xFF;
+}
+
+uint8_t RecDrainLocalCarHits(VehicleHitBody *out, uint8_t max) {
+	++g_rec.carHitDrains;
+	uint8_t n = 0;
+	while (n < max && !g_rec.localCarHits.empty()) {
+		out[n++] = g_rec.localCarHits.front();
+		g_rec.localCarHits.erase(g_rec.localCarHits.begin());
+	}
+	return n;
+}
+
+uint8_t RecDrainLocalVehicleHits(VehicleHitBody *out, uint8_t max) {
+	++g_rec.vehicleHitDrains;
+	uint8_t n = 0;
+	while (n < max && !g_rec.localVehicleHits.empty()) {
+		out[n++] = g_rec.localVehicleHits.front();
+		g_rec.localVehicleHits.erase(g_rec.localVehicleHits.begin());
 	}
 	return n;
 }
@@ -599,9 +849,10 @@ uint8_t RecDrainLocalCombat(CombatEvent *out, uint8_t max) {
 	return n;
 }
 
-void RecCorrectVehicle(RemoteVehicle &, const VehicleTransform &at) {
+void RecCorrectVehicle(RemoteVehicle &v, const VehicleTransform &at) {
 	++g_rec.vehicleCorrections;
-	g_rec.lastCorrection = at;
+	g_rec.lastCorrection     = at;
+	g_rec.lastCorrectionHorn = v.hornSounding;
 }
 
 bool RecSampleWorld(WorldState &out) {
@@ -618,6 +869,12 @@ void RecApplyWorldTime(uint8_t hour, uint8_t minute) {
 	g_rec.appliedMinute = minute;
 }
 
+void RecSetSessionClock(bool valid, uint32_t offsetMs) {
+	++g_rec.sessionClockCalls;
+	g_rec.sessionClockValid  = valid;
+	g_rec.sessionClockOffset = offsetMs;
+}
+
 void RecApplyWorldWeather(uint8_t weather, uint8_t weatherOld) {
 	++g_rec.weatherApplies;
 	g_rec.appliedWeather    = weather;
@@ -626,7 +883,90 @@ void RecApplyWorldWeather(uint8_t weather, uint8_t weatherOld) {
 
 void RecReleaseWorldWeather() { ++g_rec.weatherReleases; }
 
-void RecRestVehicle(RemoteVehicle &) { ++g_rec.vehicleAtRest; }
+void RecRestVehicle(RemoteVehicle &) {
+	++g_rec.vehicleAtRest;
+}
+
+// Custody of a car nobody is driving. The sampler stands in for reading a
+// CVehicle off its roster row, and the rest test for asking the engine
+// whether it has stopped - which is the only thing that ends a settle short
+// of the timeout.
+bool RecSampleObservedVehicle(RemoteVehicle &, VehicleStateBody &out) {
+	++g_rec.observedSamples;
+	if (!g_rec.observedSampleOk)
+		return false;
+	out           = VehicleStateBody{};
+	out.pos       = {11.0f, 12.0f, 13.0f};
+	out.rot       = {0.0f, 0.0f, 0.0f, 1.0f};
+	out.moveSpeed = g_rec.sampledMoveSpeed;
+	out.health    = 1000.0f;
+	return true;
+}
+
+bool RecVehicleAtRest(RemoteVehicle &) {
+	++g_rec.atRestCalls;
+	return g_rec.carAtRest;
+}
+
+bool RecVehicleBurning(RemoteVehicle &) { return g_rec.carBurning; }
+
+bool RecSampleObservedVehicleDamage(RemoteVehicle &, VehicleDamageBody &out) {
+	++g_rec.observedDamageSamples;
+	out = g_rec.observedDamage;
+	return true;
+}
+
+bool RecSampleLocalVehicleDamage(VehicleDamageBody &out) {
+	if (!g_rec.drivingLocally)
+		return false;
+	out = g_rec.localDamage;
+	return true;
+}
+
+void RecAdoptPromotedCar(RemoteVehicle &v, bool weHostedIt) {
+	++g_rec.promotedAdoptions;
+	g_rec.lastPromotionWasOurs = weHostedIt;
+	if (!g_observedHere.Find(FakeVehicleAt(v.poolHandle), &FakeVehicleAt))
+		g_observedHere.Remember(v.poolHandle, v.netId, &FakeVehicleAt);
+}
+
+void RecAdoptClaimedVehicle(RemoteVehicle &v) {
+	++g_rec.claimedAdoptions;
+	void *const car = FakeVehicleAt(v.poolHandle);
+	if (!car)
+		return;
+	if (game::ObservedRow *const o = g_observedHere.Find(car, &FakeVehicleAt)) {
+		o->driverPlayerId    = 0xFF;
+		o->custodianPlayerId = 0xFF;
+		o->weSettle          = false;
+	} else
+		g_observedHere.Remember(v.poolHandle, v.netId, &FakeVehicleAt);
+}
+
+void RecReleaseOwnVehicle(RemoteVehicle &v) {
+	++g_rec.ownReleases;
+	g_observedHere.Forget(v.netId);
+}
+
+bool RecLocalDrivesAmbientCar(const RemoteAmbientCar &car) {
+	return g_rec.ambientDrivenHandle >= 0 &&
+	       g_rec.ambientDrivenHandle == car.poolHandle;
+}
+
+bool RecLocalDrivesVehicle(const RemoteVehicle &vehicle);
+
+// The engine half of the handover. In the real thing this takes the local
+// player out of the driver's seat; here it does what that makes true, which is
+// that the engine stops saying we drive anything - so a test gets the same
+// consequence the game does without an engine.
+bool RecSurrenderVehicleSeat(RemoteVehicle &vehicle) {
+	++g_rec.vehicleSurrenders;
+	if (!RecLocalDrivesVehicle(vehicle))
+		return false;
+	g_rec.drivingLocally     = false;
+	g_rec.localVehicleHandle = -1;
+	return true;
+}
 
 void RecApplyVehicle(RemoteVehicle &, const VehicleStateBody &body) {
 	++g_rec.vehicleApplies;
@@ -643,8 +983,9 @@ void RecApplyVehicleDamage(RemoteVehicle &, const VehicleDamageBody &body,
 bool RecSampleLocalVehicle(VehicleStateBody &out) {
 	if (!g_rec.drivingLocally)
 		return false;
-	out        = VehicleStateBody{};
-	out.health = 1000.0f;
+	out           = VehicleStateBody{};
+	out.moveSpeed = g_rec.sampledMoveSpeed;
+	out.health    = 1000.0f;
 	return true;
 }
 
@@ -713,8 +1054,17 @@ void RecDespawnAmbientPed(RemoteAmbientPed &p) {
 // false re-arms the spawn without anything else having to know.
 bool RecAmbientReplicaIsAlive(RemoteAmbientPed &p) {
 	++g_rec.ambientLivenessChecks;
-	if (!g_rec.ambientReplicaTaken)
-		return true;
+	if (!g_rec.ambientReplicaTaken) {
+		// The third condition, and the real one: a replica our own engine put
+		// in the ground with nothing in the session having asked. The real
+		// function destroys the body before it re-arms, because a corpse
+		// CanBeDeleted refuses would lie there for good, so the stub counts a
+		// despawn where the taken-by-the-engine arm below does not.
+		if (!game::ReplicaDiedUnasked(g_rec.ambientReplicaState, p.dead))
+			return true;
+		++g_rec.ambientDeathsRecovered;
+		++g_rec.ambientPedDespawns;
+	}
 	p.poolHandle           = -1;
 	p.spawnPending         = true;
 	p.seatedVehicleNetId   = INVALID_NETID;
@@ -724,6 +1074,11 @@ bool RecAmbientReplicaIsAlive(RemoteAmbientPed &p) {
 void RecApplyAmbientPed(RemoteAmbientPed &, const Pose &at) {
 	++g_rec.ambientApplies;
 	g_rec.lastAmbientPose = at;
+}
+
+void RecApplyAmbientPedFire(RemoteAmbientPed &ped) {
+	++g_rec.ambientFires;
+	g_rec.lastAmbientFireSaid = ped.fireSaid;
 }
 
 bool RecSpawnAmbientCar(RemoteAmbientCar &c) {
@@ -738,7 +1093,13 @@ void RecDespawnAmbientCar(RemoteAmbientCar &c) {
 	g_rec.unseatsAtLastAmbientCarDespawn = g_rec.ambientUnseats;
 }
 
-void RecCorrectAmbientCar(RemoteAmbientCar &, const VehicleTransform &) {}
+void RecCorrectAmbientCar(RemoteAmbientCar &c, const VehicleTransform &at) {
+	g_rec.lastAmbientHornTimer = c.hornTimer;
+	g_rec.lastAmbientSirenOn    = c.sirenOn;
+	g_rec.lastAmbientDriverSaid = c.driverSaid;
+	g_rec.lastAmbientCarAt     = at;
+	++g_rec.ambientCorrections;
+}
 
 bool RecSeatAmbientPed(RemoteAmbientPed &, RemoteAmbientCar &car, uint8_t seat) {
 	++g_rec.ambientSeatAttempts;
@@ -761,6 +1122,12 @@ bool RecKillAmbientReplica(RemoteAmbientPed &p, uint16_t animId) {
 	g_rec.lastAmbientKillAnim = animId;
 	g_rec.unseatsAtLastAmbientKill = g_rec.ambientUnseats;
 	return true;
+}
+
+void RecApplyRemotePedDamage(RemotePlayer *attacker, const PedDamageBody &body) {
+	++g_rec.pedDamages;
+	g_rec.lastPedDamage     = body;
+	g_rec.pedDamageAttacker = attacker ? attacker->playerId : 0xFF;
 }
 
 bool RecRemoveAmbientBodyPart(RemoteAmbientPed &p, uint8_t node, int8_t direction) {
@@ -803,9 +1170,101 @@ void RecApplyRemoteRespray(RemoteVehicle *vehicle, const ResprayBody &body) {
 	g_rec.lastRespray       = body;
 }
 
+// The local player, as the seat key's range test reads them. At the origin,
+// so any car the vehicle helpers put down is within SEAT_RANGE_M.
+bool RecSampleLocalPlayer(PlayerStateBody &out) {
+	out        = PlayerStateBody{};
+	out.pos    = {10.0f, 20.0f, 30.0f};
+	out.health = 1000.0f;
+	return true;
+}
+
+bool RecLocalWantsSeatToggle() {
+	const bool want     = g_rec.wantSeatToggle;
+	g_rec.wantSeatToggle = false;   // an edge, the same as the real one
+	return want;
+}
+
+bool RecLocalIsPassenger() { return g_rec.localIsPassenger; }
+
+int32_t RecSeatLocalPlayerIn(int32_t handle, uint8_t *seatAsked) {
+	++g_rec.localSeatCalls;
+	g_rec.lastSeatHandle = handle;
+	if (g_rec.localSeatAnswer == SEAT_LOCAL_WALKING && seatAsked)
+		*seatAsked = g_rec.localSeatAsked;
+	return g_rec.localSeatAnswer;
+}
+
+int32_t RecPollLocalSeatEntry() {
+	++g_rec.localPollCalls;
+	return g_rec.localPollAnswer;
+}
+
+bool RecUnseatLocalPlayer() {
+	++g_rec.localUnseats;
+	g_rec.localIsPassenger = false;
+	return true;
+}
+
+void RecSetRampageRule(uint8_t rule) {
+	++g_rec.rampageRuleSets;
+	g_rec.rampageRule = rule;
+}
+
+void RecApplyRampageOpen(uint16_t killsNeeded, uint32_t elapsedMs) {
+	++g_rec.rampageOpens;
+	g_rec.rampageKillsNeeded = killsNeeded;
+	g_rec.rampageElapsedMs   = elapsedMs;
+}
+
+void RecCreditRampageKill(uint16_t model, uint8_t weapon, bool headshot) {
+	++g_rec.rampageCredits;
+	g_rec.rampageLastModel  = model;
+	g_rec.rampageLastWeapon = weapon;
+	g_rec.rampageLastHead   = headshot;
+}
+
+void RecApplyRampageVerdict(uint8_t outcome) {
+	++g_rec.rampageVerdicts;
+	g_rec.rampageVerdict = outcome;
+}
+
+void RecResetRampage() { ++g_rec.rampageResets; }
+
+void RecCreditRampageCar(uint16_t model, const UnownedVehicleKey &key) {
+	++g_rec.rampageCarCredits;
+	g_rec.rampageCarModel = model;
+	g_rec.rampageCarKey   = key;
+}
+
+void RecObjectBroken(const ObjectBreakBody &body) {
+	++g_rec.objectBreaks;
+	g_rec.lastObjectBreak = body;
+}
+
+void RecObjectSettled(const ObjectRestBody &body) {
+	++g_rec.objectRests;
+	g_rec.lastObjectRest = body;
+}
+
 WorldBridge RecordingBridge() {
 	g_rec = Recorder{};
+	g_observedHere.Clear();
 	WorldBridge b;
+	b.SetRampageRule      = &RecSetRampageRule;
+	b.ApplyRampageOpen    = &RecApplyRampageOpen;
+	b.CreditRampageKill   = &RecCreditRampageKill;
+	b.CreditRampageCar    = &RecCreditRampageCar;
+	b.ApplyRampageVerdict = &RecApplyRampageVerdict;
+	b.ResetRampage        = &RecResetRampage;
+	b.ObjectBroken        = &RecObjectBroken;
+	b.ObjectSettled       = &RecObjectSettled;
+	b.SampleLocalPlayer     = &RecSampleLocalPlayer;
+	b.LocalWantsSeatToggle  = &RecLocalWantsSeatToggle;
+	b.LocalIsPassenger      = &RecLocalIsPassenger;
+	b.SeatLocalPlayerIn     = &RecSeatLocalPlayerIn;
+	b.PollLocalSeatEntry    = &RecPollLocalSeatEntry;
+	b.UnseatLocalPlayer     = &RecUnseatLocalPlayer;
 	b.RequestModel    = &RecRequestModel;
 	b.IsModelReady    = &RecIsModelReady;
 	b.SpawnRemote     = &RecSpawn;
@@ -817,20 +1276,34 @@ WorldBridge RecordingBridge() {
 	b.SampleLocalVehicleHandle   = &RecSampleLocalVehicleHandle;
 	b.SpawnRemoteVehicle         = &RecSpawnVehicle;
 	b.DespawnRemoteVehicle       = &RecDespawnVehicle;
+	b.AdoptClaimedVehicle        = &RecAdoptClaimedVehicle;
+	b.ReleaseOwnVehicle          = &RecReleaseOwnVehicle;
 	b.ApplyRemoteVehicle         = &RecApplyVehicle;
 	b.RestRemoteVehicle          = &RecRestVehicle;
 	b.ApplyRemoteVehicleDamage   = &RecApplyVehicleDamage;
 	b.CorrectRemoteVehicle       = &RecCorrectVehicle;
+	b.SampleObservedVehicle      = &RecSampleObservedVehicle;
+	b.VehicleAtRest              = &RecVehicleAtRest;
+	b.VehicleBurning             = &RecVehicleBurning;
+	b.SampleObservedVehicleDamage = &RecSampleObservedVehicleDamage;
+	b.SampleLocalVehicleDamage    = &RecSampleLocalVehicleDamage;
 	b.SeatRemotePed              = &RecSeat;
 	b.UnseatRemotePed            = &RecUnseat;
 	b.BeginSeatRemotePed         = &RecBeginSeat;
 	b.PollSeatRemotePed          = &RecPollSeat;
 	b.AbandonSeatRemotePed       = &RecAbandonSeat;
 	b.BeginUnseatRemotePed       = &RecBeginUnseat;
+	b.SampleLocalCarEntry        = &RecSampleLocalCarEntry;
 	b.BlowUpRemoteVehicle        = &RecBlowUpVehicle;
 	b.DrainLocalVehicleBlasts    = &RecDrainLocalBlasts;
 	b.WreckUnownedVehicle        = &RecWreckUnowned;
 	b.DrainUnownedBlasts         = &RecDrainUnownedBlasts;
+	b.DrainLocalVehicleHits      = &RecDrainLocalVehicleHits;
+	b.ApplyRemoteVehicleHit      = &RecApplyRemoteVehicleHit;
+	b.NoteVehicleHolders         = &RecNoteVehicleHolders;
+	b.UpdateTrafficAllowance     = &RecUpdateTrafficAllowance;
+	b.DrainLocalCarHits         = &RecDrainLocalCarHits;
+	b.ApplyHostedCarHit          = &RecApplyHostedCarHit;
 
 	b.DrainLocalCombat    = &RecDrainLocalCombat;
 	b.ReplayRemoteShot    = &RecReplayShot;
@@ -845,24 +1318,30 @@ WorldBridge RecordingBridge() {
 	b.SampleLocalWantedLevel = &RecSampleWanted;
 	b.WriteLocalWantedLevel  = &RecWriteWanted;
 
-	b.LocalDrivesVehicle = &RecLocalDrivesVehicle;
+	b.LocalDrivesVehicle   = &RecLocalDrivesVehicle;
+	b.SurrenderVehicleSeat = &RecSurrenderVehicleSeat;
 
 	b.SampleWorld         = &RecSampleWorld;
 	b.ApplyWorldTime      = &RecApplyWorldTime;
 	b.ApplyWorldWeather   = &RecApplyWorldWeather;
 	b.ReleaseWorldWeather = &RecReleaseWorldWeather;
+	b.SetSessionClock     = &RecSetSessionClock;
 
 	b.SpawnAmbientReplica     = &RecSpawnAmbientPed;
 	b.DespawnAmbientReplica   = &RecDespawnAmbientPed;
 	b.AmbientReplicaIsAlive   = &RecAmbientReplicaIsAlive;
 	b.ApplyAmbientPedState    = &RecApplyAmbientPed;
+	b.ApplyAmbientPedFire     = &RecApplyAmbientPedFire;
 	b.SeatAmbientPed          = &RecSeatAmbientPed;
 	b.UnseatAmbientPed        = &RecUnseatAmbientPed;
 	b.RemoveAmbientBodyPart   = &RecRemoveAmbientBodyPart;
 	b.KillAmbientReplica      = &RecKillAmbientReplica;
+	b.ApplyRemotePedDamage    = &RecApplyRemotePedDamage;
 	b.SpawnAmbientCarReplica  = &RecSpawnAmbientCar;
 	b.DespawnAmbientCarReplica = &RecDespawnAmbientCar;
 	b.CorrectAmbientCarReplica = &RecCorrectAmbientCar;
+	b.LocalDrivesAmbientCar    = &RecLocalDrivesAmbientCar;
+	b.AdoptPromotedCar         = &RecAdoptPromotedCar;
 	b.WreckAmbientCarReplica   = &RecWreckAmbientCar;
 	b.DrainAmbientWrecks       = &RecDrainAmbientWrecks;
 
@@ -1085,6 +1564,86 @@ void TestLeavingReleasesGarages() {
 // to. Nothing relays a client its own packet today; the point is that nothing
 // has to promise not to, because two machines each holding a door on the
 // other's say-so is a door neither of them can release.
+// A knocked-over lamp post, from the client's side of the seam.
+//
+// game/object.cpp is what decides an object broke and who is entitled to say
+// so, and none of that can run without a game. What Client owns is the
+// routing, and the routing has one rule in it worth pinning: a report that
+// comes back stamped with our own id is dropped. It matters more for the
+// resting place than for the break - replaying our own break would push a
+// change-then-smash object one step further than our own engine took it, and
+// applying our own resting place would write a matrix we are in the middle of
+// producing.
+void TestAKnockedOverPostArrivesAndOurOwnDoesNot() {
+	std::printf("\nstreet objects: which reports reach the engine seam\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(3), CH_EVENT));
+
+	S_ObjectBroken broke;
+	InitHeader(broke, 1000);
+	broke.playerId          = 1;
+	broke.body.ident.pos    = {100.0f, -200.0f, 15.0f};
+	broke.body.ident.modelIndex = 1393;
+	broke.body.amount       = 480.0f;
+	broke.body.state        = OBJ_BREAK_RENDER_DAMAGED | OBJ_BREAK_UPROOTED;
+	c.HandleMessage(Wrap(broke, CH_EVENT));
+	Check(g_rec.objectBreaks == 1, "somebody else's break reaches the seam");
+	Check((g_rec.lastObjectBreak.state & OBJ_BREAK_UPROOTED) != 0,
+	      "carrying the bit that says the post also came loose");
+
+	S_ObjectSettled rest;
+	InitHeader(rest, 1010);
+	rest.playerId           = 1;
+	rest.body.ident.pos     = {100.0f, -200.0f, 15.0f};
+	rest.body.ident.modelIndex = 1393;
+	rest.body.right         = {1.0f, 0.0f, 0.0f};
+	rest.body.forward       = {0.0f, 0.0f, -1.0f};
+	rest.body.up            = {0.0f, 1.0f, 0.0f};
+	rest.body.pos           = {101.2f, -200.4f, 13.9f};
+	c.HandleMessage(Wrap(rest, CH_EVENT));
+	Check(g_rec.objectRests == 1, "and so does where it came to rest");
+	Check(g_rec.lastObjectRest.pos.x == 101.2f &&
+	          g_rec.lastObjectRest.forward.z == -1.0f,
+	      "unchanged - the matrix is the reporter's, not something we derive");
+
+	// The ident is still the placement, three metres from where the object is
+	// now lying. That is the whole reason the key could not be the entity's
+	// own position: by the time this packet exists, the object has moved, and
+	// on two machines it has moved in two different directions.
+	Check(g_rec.lastObjectRest.ident.pos.x == 100.0f &&
+	          g_rec.lastObjectRest.ident.pos.z == 15.0f,
+	      "and it is named by where the map put it, not by where it ended up");
+
+	S_ObjectBroken ours = broke;
+	ours.playerId = 3;
+	c.HandleMessage(Wrap(ours, CH_EVENT));
+	Check(g_rec.objectBreaks == 1, "our own break does not come back to us");
+
+	S_ObjectSettled oursRest = rest;
+	oursRest.playerId = 3;
+	c.HandleMessage(Wrap(oursRest, CH_EVENT));
+	Check(g_rec.objectRests == 1, "nor our own resting place");
+}
+
+// Wired is not connected, the distinction pickup.h paid for once already. A
+// client that has a bridge but no socket must not claim a report went out.
+void TestNoSocketMeansNoObjectReportWentOut() {
+	std::printf("\nstreet objects: a report with nowhere to go\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+
+	ObjectBreakBody body{};
+	body.ident.modelIndex = 1393;
+	Check(!c.ReportObjectBroken(body),
+	      "a break with no session says so rather than claiming it was shared");
+
+	ObjectRestBody rest{};
+	rest.ident.modelIndex = 1393;
+	Check(!c.ReportObjectSettled(rest),
+	      "and so does a resting place - the seam counts the two apart");
+}
+
 void TestOurOwnGarageMaskIsNotHeldAgainstUs() {
 	std::printf("\ngarages: our own mask is not somebody else's\n");
 	Client c;
@@ -1388,6 +1947,18 @@ S_EnterVehicle MakeEnter(uint8_t playerId, uint16_t netId, uint8_t seat = 0) {
 	return e;
 }
 
+S_EnteringVehicle MakeEntering(uint8_t playerId, uint16_t netId, uint8_t seat,
+                               uint8_t door) {
+	S_EnteringVehicle e;
+	InitHeader(e, 1000);
+	e.playerId   = playerId;
+	e.body       = EnteringVehicleBody{};
+	e.body.netId = netId;
+	e.body.seat  = seat;
+	e.body.door  = door;
+	return e;
+}
+
 S_ExitVehicle MakeExit(uint8_t playerId, uint16_t netId) {
 	S_ExitVehicle e;
 	InitHeader(e, 2000);
@@ -1645,6 +2216,176 @@ void TestAnimatedEntryIsTriedBeforeTheWarp() {
 	Check(g_rec.seatAnimAborts == 0, "and with nothing to give back");
 }
 
+// ---- and getting in through the door the owner actually used --------------
+//
+// Everything above this line is about an entry the session has already
+// confirmed. These are about the second before that: the owner's engine has
+// started the entry and nothing has confirmed anything yet.
+
+void TestAnIntentOpensTheDoorTheOwnerUsed() {
+	std::printf("\ngetting in through the near door, not the seat's door\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+
+	g_rec.animEntry    = true;
+	g_rec.animProgress = SEAT_RUNNING;
+
+	// Seat 0 through the front-right door: somebody who pressed the enter key
+	// standing on the passenger side. The engine opens the near door and
+	// shuffles them across inside, and an observer that opens the driver's
+	// door instead drags the replica round the car to it.
+	c.HandleMessage(Wrap(MakeEntering(1, 80, 0, 1), CH_EVENT));
+	c.Tick();
+	Check(g_rec.seatAnimBegins == 1,
+	      "the entry starts on the intent, before any claim");
+	Check(g_rec.lastSeatDoor == 1, "through the door the owner said, not seat 0's");
+	Check(g_rec.lastSeatIndex == 0, "into the seat the owner said");
+	Check(c.PlayerSlot(1).Entering(), "she is on her way in");
+	Check(g_rec.seatAttempts == 0, "and nothing was warped on a promise");
+
+	// The engine finishes it. The claim has still not arrived, and that is
+	// the normal case: it is sent at the end of the owner's entry and this
+	// one ended first.
+	g_rec.animProgress = SEAT_DONE;
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated(), "she gets in without waiting for the claim");
+	Check(g_rec.seatAttempts == 0, "still never warped");
+
+	// And the claim, when it turns up, agrees with what already happened.
+	c.HandleMessage(Wrap(MakeEnter(1, 80, 0), CH_EVENT));
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated(), "the claim confirms rather than redoes it");
+	Check(g_rec.seatAnimBegins == 1, "no second entry is played");
+	Check(g_rec.unseats == 0, "and she is not taken out and put back");
+}
+
+void TestOurOwnEntryIsAnnouncedOnceAndRearmed() {
+	std::printf("\ntelling the session we are getting in, once\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.Tick();   // which is what actually builds the car and gives it a handle
+	// The pool slot the session's car landed in. Our engine hands back the
+	// same number for the car we are climbing into, and matching on it is the
+	// only thing that turns "that car over there" into a netId - two identical
+	// parked cars side by side are an ordinary sight in Liberty City.
+	const int32_t handle = c.VehicleByNetId(80)->poolHandle;
+
+	g_rec.localEntryActive = true;
+	g_rec.localEntry       = LocalCarEntry{handle, 0, 1};
+
+	c.TickEnteringForTest();
+	Check(c.AnnouncedEntryHandleForTest() == handle, "the entry is announced");
+
+	// Twenty-five of these run inside one entry. None of them is a packet.
+	const int after = g_rec.localEntrySamples;
+	c.TickEnteringForTest();
+	c.TickEnteringForTest();
+	Check(g_rec.localEntrySamples == after + 2, "the ped is still asked each tick");
+	Check(c.AnnouncedEntryHandleForTest() == handle,
+	      "and nothing new is said while nothing has changed");
+
+	// The entry ends, one way or the other, and the next one has to be able
+	// to say so - including a second entry into the same car through the same
+	// door, which is what walking away and coming back looks like.
+	g_rec.localEntryActive = false;
+	c.TickEnteringForTest();
+	Check(c.AnnouncedEntryHandleForTest() == -1, "the next entry is re-armed");
+}
+
+void TestAnIntentNeverWarps() {
+	std::printf("\nan intent is not a seat\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+
+	// The engine refuses to animate it - the car is rolling, the door is in
+	// use, whatever. On a confirmed seat this is the frame the warp happens.
+	// On an intent it must not be: nothing has said she is in that car, only
+	// that she started getting into it.
+	g_rec.animEntry = false;
+	c.HandleMessage(Wrap(MakeEntering(1, 80, 0, 0), CH_EVENT));
+	c.Tick();
+	c.Tick();
+	Check(g_rec.seatAnimBegins == 1, "the door was offered");
+	Check(g_rec.seatAttempts == 0, "and she was NOT put in the seat");
+	Check(!c.PlayerSlot(1).Seated(), "she is still on foot");
+
+	// The claim is what changes that, and when it comes the ordinary path
+	// runs: one attempt at the door, then the warp behind it.
+	c.HandleMessage(Wrap(MakeEnter(1, 80, 0), CH_EVENT));
+	c.Tick();
+	Check(g_rec.seats == 1, "the claim seats her");
+	Check(c.PlayerSlot(1).Seated(), "the roster agrees");
+}
+
+void TestAnIntentDoesNotTakeAnOccupiedSeat() {
+	std::printf("\nan intent does not pull anybody out of a seat\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+	FeedPosition(c, 2);
+	c.Tick();
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+
+	// Bob is driving, and the session says so.
+	g_rec.animEntry = false;
+	c.HandleMessage(Wrap(MakeEnter(2, 80, 0), CH_EVENT));
+	c.Tick();
+	Check(c.PlayerSlot(2).Seated(), "Bob has the wheel");
+
+	// Alice starts jacking him. Her intent must not make room: starting the
+	// entry would evict Bob's replica a second before the server has decided
+	// anything, which is this machine deciding that Bob left a car.
+	const int begins = g_rec.seatAnimBegins;
+	g_rec.animEntry  = true;
+	c.HandleMessage(Wrap(MakeEntering(1, 80, 0, 0), CH_EVENT));
+	c.Tick();
+	c.Tick();
+	Check(g_rec.seatAnimBegins == begins, "her entry is not started on the intent");
+	Check(c.PlayerSlot(2).Seated(), "and Bob is still driving");
+	Check(!c.PlayerSlot(1).Entering(), "she is waiting for the session to decide");
+
+	// Which it does, in the order protocol 22 fixed: the loser first, then
+	// the winner. From there the ordinary path runs.
+	c.HandleMessage(Wrap(MakeExit(2, 80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 80, 0), CH_EVENT));
+	c.Tick();
+	Check(g_rec.seatAnimBegins == begins + 1, "the claim starts it");
+	Check(!c.PlayerSlot(2).Seated(), "and Bob is out");
+}
+
+void TestAnAbandonedEntryDoesNotLeaveHerInTheCar() {
+	std::printf("\nan entry nobody ever confirmed\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+
+	g_rec.animEntry    = true;
+	g_rec.animProgress = SEAT_DONE;
+	c.HandleMessage(Wrap(MakeEntering(1, 80, 0, 0), CH_EVENT));
+	c.Tick();   // starts it
+	c.Tick();   // and the poll that finds it finished
+	Check(c.PlayerSlot(1).Seated(), "the entry finished on this machine");
+
+	// And the claim never comes: on her machine she was shot out of the
+	// doorway, or gave up. Nothing retracts an intent, because nothing on the
+	// wire describes an entry that did not happen - so it has to lapse, and
+	// everything it caused has to go with it.
+	Check(c.PlayerSlot(1).enterIntentNetId != INVALID_NETID,
+	      "the intent is still standing meanwhile");
+	c.LapseEnterIntentForTest(1);   // as if the four seconds had passed
+	c.Tick();
+	Check(!c.PlayerSlot(1).Seated(),
+	      "she is taken back out of a car the session never said she was in");
+	Check(g_rec.unseats >= 1, "through the ordinary way out");
+}
+
 void TestARefusedAnimationWarpsOnTheSameFrame() {
 	std::printf("\nan entry the engine will not start\n");
 	Client c;
@@ -1843,6 +2584,180 @@ void TestExitAnimationStartsFromTheSnapshot() {
 	Check(g_rec.unseats >= 1, "and the plain teardown still runs behind it");
 }
 
+// ---- and telling the session at the right moment ---------------------------
+//
+// "Cuando entra con la G sí hace la animación, pero la puerta no se le abre al
+// que está manejando el auto."
+//
+// The other machine's door is opened by its own replica entry and by nothing
+// else: a door is swung frame by frame by the entering ped's animation, and no
+// packet in this protocol carries an open door. So the announcement has to
+// reach the other machine while there is still an entry left to play. It used
+// to be sent when the engine finished seating the player - about a second and
+// a half late - and by then the replica entry either started against a ped the
+// pose stream had already carried into the car, or never ran.
+//
+// A car within SEAT_RANGE_M of RecSampleLocalPlayer's position, which every
+// one of these needs.
+void PutACarNextToUs(Client &c) {
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.Tick();
+}
+
+void TestTheSeatIsAnnouncedWhenTheWalkStarts() {
+	std::printf("\nthe seat goes on the wire when the entry starts\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	PutACarNextToUs(c);
+
+	g_rec.wantSeatToggle  = true;
+	g_rec.localSeatAnswer = SEAT_LOCAL_WALKING;
+	g_rec.localSeatAsked  = 2;
+	c.TickSeat();
+	Check(g_rec.localSeatCalls == 1, "the engine was asked to walk us to the door");
+	Check(g_rec.lastSeatHandle >= 0, "for the car the roster named");
+	Check(c.PendingSeatNetId() == 80, "the entry is in flight");
+	Check(c.LocalSeatNetId() == 80,
+	      "and the session has already been told, so the other machines can "
+	      "open the same door at the same time");
+
+	// Still walking. Nothing new goes out and nothing is taken back.
+	g_rec.localPollAnswer = SEAT_LOCAL_WALKING;
+	c.TickSeat();
+	c.TickSeat();
+	Check(g_rec.localPollCalls == 2, "the entry is driven every tick");
+	Check(g_rec.localSeatCalls == 1, "and not started a second time");
+	Check(c.LocalSeatNetId() == 80, "the announcement stands while it runs");
+
+	// The engine hands over the seat it was asked for, so there is nothing to
+	// correct and no second packet to send.
+	g_rec.localPollAnswer  = 2;
+	g_rec.localIsPassenger = true;
+	c.TickSeat();
+	Check(c.PendingSeatNetId() == INVALID_NETID, "the entry is over");
+	Check(c.LocalSeatNetId() == 80, "and we are recorded as riding in it");
+}
+
+void TestAnEntryThatNeverFinishesTakesItsSeatBack() {
+	std::printf("\nan entry that never finished gives the seat back\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	PutACarNextToUs(c);
+
+	g_rec.wantSeatToggle  = true;
+	g_rec.localSeatAnswer = SEAT_LOCAL_WALKING;
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == 80, "announced at the start");
+
+	// The car was destroyed under us, or the deadline ran out and the warp
+	// behind it could not seat us either.
+	g_rec.localPollAnswer  = SEAT_LOCAL_REFUSED;
+	g_rec.localIsPassenger = false;
+	c.TickSeat();
+	Check(c.PendingSeatNetId() == INVALID_NETID, "the entry is over");
+
+	// The retraction is the ordinary exit, on the next tick, because the seat
+	// now reads empty. Nothing was invented for this case.
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == INVALID_NETID,
+	      "and the session is told we are not in it after all");
+}
+
+void TestASeatThatCameOutDifferentIsCorrected() {
+	std::printf("\nthe engine gave a different seat from the one we asked for\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	PutACarNextToUs(c);
+
+	// The slot has to be picked before the walk - the engine's entry animates
+	// to a door - and a second is long enough for another ped to take it.
+	g_rec.wantSeatToggle  = true;
+	g_rec.localSeatAnswer = SEAT_LOCAL_WALKING;
+	g_rec.localSeatAsked  = 1;
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == 80, "seat 1 announced");
+
+	g_rec.localPollAnswer  = 3;
+	g_rec.localIsPassenger = true;
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == 80,
+	      "still the same car, and the session has been told the real seat");
+	Check(c.PendingSeatNetId() == INVALID_NETID, "with nothing left in flight");
+}
+
+void TestTheWarpFallbackStillAnnouncesExactlyOnce() {
+	std::printf("\nthe warp fallback still announces, and only once\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	PutACarNextToUs(c);
+
+	// A car on its roof, or moving: game/seat.cpp warps instead, and hands
+	// back a seat on the frame of the press.
+	g_rec.wantSeatToggle  = true;
+	g_rec.localSeatAnswer = 2;
+	c.TickSeat();
+	Check(c.PendingSeatNetId() == INVALID_NETID, "there is no walk to drive");
+	Check(c.LocalSeatNetId() == 80, "and the session was told straight away");
+	Check(g_rec.localPollCalls == 0, "nothing polls an entry that never started");
+
+	// And it is not announced again on the next tick.
+	g_rec.localIsPassenger = true;
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == 80, "still one seat, still the same car");
+}
+
+// The other half of the reported bug, and the one that made it look like the
+// door simply did not exist.
+//
+// The server broadcasts an enter back to the sender too - that is how a driver
+// learns the netId of the car it claimed. A passenger's copy was being read
+// the same way, so m_localVehicleNetId ended up naming a car we are not
+// driving; SendLocalVehicle then read "not driving, but we have a car", which
+// is its definition of having just got out, and sent C_ExitVehicle for the car
+// we had got into one tick earlier. Every other machine took us straight back
+// out of the seat, about forty milliseconds in - before the door had moved.
+void TestOurOwnPassengerSeatIsNotReadAsACarWeDrive() {
+	std::printf("\nour own passenger seat is not a car we are driving\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	PutACarNextToUs(c);
+
+	g_rec.wantSeatToggle  = true;
+	g_rec.localSeatAnswer = SEAT_LOCAL_WALKING;
+	g_rec.localSeatAsked  = 2;
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == 80, "we said we were getting in");
+
+	// It comes back off the server, addressed to us, as every enter does.
+	S_EnterVehicle mine;
+	InitHeader(mine, 1000);
+	mine.playerId   = 0;   // our own id, from MakeWelcome(0)
+	mine.body       = EnterVehicleBody{};
+	mine.body.netId = 80;
+	mine.body.seat  = 2;
+	c.HandleMessage(Wrap(mine, CH_EVENT));
+	Check(c.LocalVehicleNetId() == INVALID_NETID,
+	      "a seat beside the driver is not a car of ours to report");
+
+	// Which is what stops the spurious exit: with no car of ours, there is
+	// nothing for SendLocalVehicle to say we got out of.
+	g_rec.drivingLocally = false;
+	c.TickLocalVehicle();
+	Check(c.LocalSeatNetId() == 80, "so the seat survives the next tick");
+
+	// The driver's seat still works exactly as it did.
+	S_EnterVehicle driving;
+	InitHeader(driving, 1100);
+	driving.playerId   = 0;
+	driving.body       = EnterVehicleBody{};
+	driving.body.netId = 81;
+	driving.body.seat  = 0;
+	c.HandleMessage(Wrap(driving, CH_EVENT));
+	Check(c.LocalVehicleNetId() == 81, "the wheel is still a claim we answer");
+}
+
 void TestExitAnimationIsNotStartedOnFoot() {
 	std::printf("\na get-out animation for somebody who is not in a car\n");
 	Client c;
@@ -2004,6 +2919,185 @@ void TestVehicleCorrectionStopsWithTheVehicle() {
 	c.Tick();
 	Check(g_rec.vehicleCorrections == before,
 	      "a despawned vehicle is not corrected into existence");
+}
+
+// ---- the horn (game/horn.h) --------------------------------------------------
+//
+// The engine half is three writes in vehicle.cpp and none of it runs here.
+// What runs here is every decision that leads to them: which value a replica
+// is given, when a snapshot carries the bit, and when a row says to sound it.
+
+// The rhythm table is the engine's, and the one fact the replay rests on is a
+// column of it. If somebody "fixes" HORN_REPLAY_TIMER to the 1 the sender has,
+// this is the test that says why that is silence.
+void TestHornReplayValueSoundsInEveryRhythm() {
+	std::printf("\nthe horn: which timer value a replica can be given\n");
+	using namespace game;
+
+	bool all = true;
+	for (int p = 0; p < HORN_PATTERNS; ++p)
+		all = all && ReplicaHornAudible(static_cast<uint8_t>(p), HORN_REPLAY_TIMER);
+	Check(all, "42 sounds in all eight rhythms, whichever the replica holds");
+
+	bool anyAtOne = false;
+	for (int p = 0; p < HORN_PATTERNS; ++p)
+		anyAtOne = anyAtOne || ReplicaHornAudible(static_cast<uint8_t>(p), 1);
+	Check(!anyAtOne, "the honker's own 1 is silent in every rhythm on a replica");
+
+	bool anyAt44 = false;
+	for (int p = 0; p < HORN_PATTERNS; ++p)
+		anyAt44 = anyAt44 || ReplicaHornAudible(static_cast<uint8_t>(p), 44);
+	Check(!anyAt44, "and so is 44, the value that re-picks the rhythm");
+	Check(!ReplicaHornAudible(0, 45) && !ReplicaHornAudible(0, 255),
+	      "above 44 the audio clamps to 44, so still silent");
+	Check(!ReplicaHornAudible(0, 0), "a zero timer is no horn");
+	Check(!ReplicaHornAudible(HORN_PATTERNS, HORN_REPLAY_TIMER),
+	      "a rhythm index past the table is refused rather than read");
+
+	// Spot checks against the bytes at 0x00606AB8, one per row, chosen where
+	// the rows differ from each other.
+	Check(HORN_PATTERN_TABLE[0][17] == 0 && HORN_PATTERN_TABLE[1][17] == 1,
+	      "rows 0 and 1 part at column 17");
+	Check(HORN_PATTERN_TABLE[2][12] == 0 && HORN_PATTERN_TABLE[3][7] == 0,
+	      "rows 2 and 3 have their first gaps where the image has them");
+	Check(HORN_PATTERN_TABLE[4][10] == 1 && HORN_PATTERN_TABLE[4][11] == 0,
+	      "row 4 is one long blast, ending at column 10");
+	Check(HORN_PATTERN_TABLE[5][5] == 0 && HORN_PATTERN_TABLE[5][8] == 1,
+	      "row 5 is two short ones");
+	Check(HORN_PATTERN_TABLE[6][41] == 1 && HORN_PATTERN_TABLE[7][38] == 1 &&
+	          HORN_PATTERN_TABLE[7][39] == 0,
+	      "rows 6 and 7 end where the image says");
+}
+
+// The sending end. The bit rides an unreliable snapshot, so a tap only one
+// snapshot saw is sent twice - lose either and it still lands.
+void TestHornRidesOneSnapshotPastTheEnd() {
+	std::printf("\nthe horn: what the snapshot carries\n");
+	using game::HornOnWire;
+	using game::HornTail;
+
+	HornTail t;
+	Check(!HornOnWire(false, t) && !HornOnWire(false, t),
+	      "no horn, no bit");
+
+	const bool tap1 = HornOnWire(true, t);
+	const bool tap2 = HornOnWire(false, t);
+	const bool tap3 = HornOnWire(false, t);
+	Check(tap1 && tap2 && !tap3,
+	      "a tap one snapshot saw goes out in two, and then stops");
+
+	HornTail held;
+	bool     allHeld = true;
+	for (int i = 0; i < 10; ++i)
+		allHeld = allHeld && HornOnWire(true, held);
+	Check(allHeld, "a held horn is in every snapshot while it is held");
+	Check(HornOnWire(false, held), "and in one more after it is let go");
+	Check(!HornOnWire(false, held), "and then not");
+
+	HornTail again;
+	HornOnWire(true, again);
+	HornOnWire(false, again);   // the tail
+	Check(HornOnWire(true, again) && HornOnWire(false, again) &&
+	          !HornOnWire(false, again),
+	      "a second tap during the tail starts its own tail");
+}
+
+// The receiving end, as a pure decision.
+void TestReplicaHornDecision() {
+	std::printf("\nthe horn: when a replica sounds it\n");
+	using game::ReplicaHornSounds;
+	using game::HORN_FRESH_MS;
+
+	const uint32_t at = 50000;
+	Check(ReplicaHornSounds(VEH_HORN, true, false, at, at + 10),
+	      "a fresh snapshot with the bit, somebody driving: honk");
+	Check(!ReplicaHornSounds(VEH_ENGINE_ON | VEH_LIGHTS, true, false, at, at + 10),
+	      "no bit, no honk");
+	Check(!ReplicaHornSounds(VEH_HORN, false, false, at, at + 10),
+	      "nobody at the wheel cannot be honking, whatever the snapshot said");
+	Check(!ReplicaHornSounds(VEH_HORN, true, true, at, at + 10),
+	      "a wreck does not honk");
+	Check(!ReplicaHornSounds(VEH_HORN, true, false, 0, at),
+	      "no snapshot yet - flags from a spawn - is never a honk");
+	Check(ReplicaHornSounds(VEH_HORN, true, false, at, at + HORN_FRESH_MS),
+	      "still believed at the freshness limit");
+	Check(!ReplicaHornSounds(VEH_HORN, true, false, at, at + HORN_FRESH_MS + 1),
+	      "and not a millisecond past it, so a driver who stops sending "
+	      "stops honking");
+	Check(ReplicaHornSounds(VEH_HORN, true, false, 0xFFFFFFF0u, 0x00000010u),
+	      "across the clock's wrap, 32 ms is 32 ms");
+	Check(!ReplicaHornSounds(VEH_HORN, true, false, 0xFFFFFF00u, 0x00000010u),
+	      "and 272 ms is stale");
+}
+
+// And through the client, which is where the row is stamped and the decision
+// is made on the frame it is carried out.
+void TestReplicaHornThroughTheClient() {
+	std::printf("\nthe horn: through the client, frame by frame\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	g_rec.modelReady = true;
+
+	// The server's backfill remembers the last snapshot's flags, horn and
+	// all. A joiner must not be greeted by that.
+	S_VehicleSpawn spawn = MakeVehicleSpawn(80);
+	spawn.flags          = VEH_ENGINE_ON | VEH_HORN;
+	c.HandleMessage(Wrap(spawn, CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 80), CH_EVENT));
+	c.Tick();
+	Check(g_rec.vehicleSpawns == 1, "the car is built");
+	Check(!g_rec.lastCorrectionHorn,
+	      "a spawn that says horn is not a honk - it is not a snapshot");
+
+	S_VehicleState honk = MakeVehicleState(1, 80, 12.0f);
+	honk.body.flags     = VEH_ENGINE_ON | VEH_HORN;
+	c.HandleMessage(Wrap(honk, CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastCorrectionHorn, "alice's snapshot says horn: sounded");
+	c.Tick();
+	c.Tick();
+	Check(g_rec.lastCorrectionHorn,
+	      "and still sounded on the frames between snapshots - the engine "
+	      "zeroes it every frame, so it is re-said every frame");
+	Check((g_rec.lastVehicleBody.flags & VEH_HORN) != 0,
+	      "the row handed to ApplyRemoteVehicle still carries the bit");
+
+	S_VehicleState quiet = MakeVehicleState(1, 80, 13.0f);
+	quiet.hdr.sendTimeMs = 1040;   // not InitHeader, which zeroes the packet
+	quiet.body.flags = VEH_ENGINE_ON;
+	c.HandleMessage(Wrap(quiet, CH_SNAPSHOT));
+	c.Tick();
+	Check(c.VehicleByNetId(80)->last.pos.x == 13.0f,
+	      "(that snapshot reached the row - the checks below mean something)");
+	Check(!g_rec.lastCorrectionHorn, "her next snapshot lets go: silent");
+
+	S_VehicleState honk2 = MakeVehicleState(1, 80, 14.0f);
+	honk2.hdr.sendTimeMs = 1080;   // not InitHeader, which zeroes the packet
+	honk2.body.flags = VEH_ENGINE_ON | VEH_HORN;
+	c.HandleMessage(Wrap(honk2, CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastCorrectionHorn, "honking again");
+	c.HandleMessage(Wrap(MakeExit(1, 80), CH_EVENT));
+	c.Tick();
+	Check(!g_rec.lastCorrectionHorn,
+	      "she gets out with the key down: the exit ends it, not a snapshot");
+
+	// And a driver who simply stops sending. The only test here that waits
+	// on the real clock, because the row is stamped with it on arrival.
+	c.HandleMessage(Wrap(MakeEnter(1, 80), CH_EVENT));
+	S_VehicleState honk3 = MakeVehicleState(1, 80, 15.0f);
+	honk3.hdr.sendTimeMs = 1120;   // not InitHeader, which zeroes the packet
+	honk3.body.flags = VEH_ENGINE_ON | VEH_HORN;
+	c.HandleMessage(Wrap(honk3, CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastCorrectionHorn, "back in, honking");
+	std::this_thread::sleep_for(
+	    std::chrono::milliseconds(game::HORN_FRESH_MS + 60));
+	c.Tick();
+	Check(!g_rec.lastCorrectionHorn,
+	      "and silent once nothing has arrived for longer than HORN_FRESH_MS");
 }
 
 // ---- a car blowing up ------------------------------------------------------
@@ -2589,6 +3683,25 @@ void TestShotIsReplayedOncePerPacket() {
 	Check(g_rec.shotsReplayed == 3, "and ticking does not fire any of them again");
 }
 
+void TestADriveByRoundReachesTheSeamWhole() {
+	std::printf("\na drive-by round goes to the seam like any shot\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+
+	// The client does not know which weapons the engine replays and which it
+	// only draws - that is combat.cpp's - so 19 is not filtered here, and the
+	// trail length riding in `speed` arrives untouched.
+	S_Shot s = MakeShot(1, 19 /*uzi drive-by*/);
+	s.body.speed = 17.5f;
+	c.HandleMessage(Wrap(s, CH_EVENT));
+	Check(g_rec.shotsReplayed == 1, "one round, one call");
+	Check(g_rec.lastShot.weapon == 19 && g_rec.lastShot.speed == 17.5f,
+	      "with the weapon and the trail length the wire carried");
+	c.Tick();
+	Check(g_rec.shotsReplayed == 1, "and it is not drawn again next frame");
+}
+
 void TestOurOwnShotsAreNotReplayed() {
 	std::printf("\nour own shots come back and are ignored\n");
 	Client c;
@@ -2878,6 +3991,204 @@ void TestLifeStateMachine() {
 	// subtraction has to read that as a small elapsed time, not a huge one.
 	Check(KillCreditFor(42, 0xFFFFF000u, 0x00000100u, WINDOW) == 42,
 	      "a clock that wrapped is still a recent attacker");
+}
+
+// ---- busted ----------------------------------------------------------------
+//
+// An arrest never touches health: it stays where it was, and the police
+// station hands back 100 like a hospital does. So the health machine above is
+// blind to it, and a player who was busted used to reach the police station
+// on everybody else's screen as a snapshot that jumped across the map. The ped
+// state is what sees it - CCopPed::SetArrestPlayer writes PED_ARRESTED and the
+// station's CPlayerPed::SetInitialState writes PED_IDLE over it.
+
+PlayerStateBody LifeSample(float health, uint8_t pedState, float x = 5.0f) {
+	PlayerStateBody b{};
+	b.pos      = {x, 20.0f, 3.0f};
+	b.health   = health;
+	b.pedState = pedState;
+	return b;
+}
+
+void TestAnArrestIsNoticedByThePedState() {
+	std::printf("\nnoticing our own arrest\n");
+	constexpr uint8_t IDLE     = 1;
+	constexpr uint8_t ARRESTED = WIRE_PEDSTATE_ARRESTED;
+
+	Check(LocalLifeEventFor(100.0f, IDLE, false, false) == LifeEvent::NOTHING,
+	      "alive and walking about");
+	Check(LocalLifeEventFor(100.0f, ARRESTED, false, false) == LifeEvent::BUSTED,
+	      "PED_ARRESTED is an arrest, with full health");
+	Check(LocalLifeEventFor(100.0f, ARRESTED, false, true) == LifeEvent::NOTHING,
+	      "noted once, not on every one of the hundred samples it lasts");
+	Check(LocalLifeEventFor(100.0f, IDLE, false, true) == LifeEvent::RESPAWNED,
+	      "and leaving it is the police station, which goes out as a respawn");
+	Check(LocalLifeEventFor(55.0f, IDLE, false, true) == LifeEvent::RESPAWNED,
+	      "whatever health that sample happens to carry");
+
+	// A death beats an arrest. SetArrestPlayer clears m_bCanBeDamaged so it
+	// should not happen, but if it did the corpse has to be announced.
+	Check(LocalLifeEventFor(0.0f, ARRESTED, false, true) == LifeEvent::DIED,
+	      "dying while arrested is a death");
+	Check(LocalLifeEventFor(std::numeric_limits<float>::quiet_NaN(), ARRESTED, false,
+	                        false) == LifeEvent::DIED,
+	      "and a NaN is still dead, not busted");
+
+	// Without an arrest in it, it is exactly the old machine.
+	const float   healths[] = {100.0f, 1.0f, 0.0f, -5.0f};
+	const uint8_t states[]  = {0, IDLE, 44, 48, 49, 54};
+	bool          same      = true;
+	for (float h : healths)
+		for (uint8_t s : states)
+			for (bool announced : {false, true})
+				same = same && LocalLifeEventFor(h, s, announced, false) ==
+				                   LifeEventFor(h, announced);
+	Check(same, "no arrest in it, no difference from the death-only machine");
+
+	// And through the client, one sample at a time.
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+
+	c.TickLocalLifeForTest(LifeSample(100.0f, IDLE));
+	Check(!c.ArrestNotedForTest() && !c.DeathAnnouncedForTest(), "nothing to say");
+
+	c.TickLocalLifeForTest(LifeSample(100.0f, ARRESTED));
+	Check(c.ArrestNotedForTest(), "busted is noted");
+	Check(!c.DeathAnnouncedForTest(), "and is not a death");
+	for (int i = 0; i < 100; ++i)
+		c.TickLocalLifeForTest(LifeSample(100.0f, ARRESTED));
+	Check(c.ArrestNotedForTest(), "and stays noted for the four seconds it lasts");
+
+	c.TickLocalLifeForTest(LifeSample(100.0f, IDLE, 1200.0f));
+	Check(!c.ArrestNotedForTest(), "the police station clears it");
+	Check(!c.DeathAnnouncedForTest(), "without anybody having died");
+
+	// Busted and then killed: the death takes over, and the flag goes with
+	// it so the hospital does not produce a second respawn.
+	c.TickLocalLifeForTest(LifeSample(100.0f, ARRESTED));
+	c.TickLocalLifeForTest(LifeSample(0.0f, 49));
+	Check(c.DeathAnnouncedForTest() && !c.ArrestNotedForTest(),
+	      "a death while arrested is a death, and only a death");
+	c.TickLocalLifeForTest(LifeSample(100.0f, IDLE));
+	Check(!c.DeathAnnouncedForTest() && !c.ArrestNotedForTest(),
+	      "and one respawn ends both");
+
+	// A dropped connection forgets it, like it forgets a death.
+	c.TickLocalLifeForTest(LifeSample(100.0f, ARRESTED));
+	c.ClearRosterForTest();
+	Check(!c.ArrestNotedForTest(), "a new session has not been told we were busted");
+}
+
+// What everybody else sees at the other end: a player who was never dead
+// arriving at the police station. S_Respawn is the same packet a hospital
+// sends and it does the same thing, which is the point of using it.
+void TestABustedPlayerComesBackAtThePoliceStation() {
+	std::printf("\na remote player leaves the police station\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 80), CH_EVENT));
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated(), "she was busted sitting in her car");
+
+	// Arrested in the seat with no drag - the door was blocked, or the cop
+	// caught her climbing in. The snapshots say PED_ARRESTED and she stays
+	// exactly where she is.
+	const int unseatsBefore = g_rec.unseats;
+	S_PlayerState held      = MakeState(1, 3000, 5.0f);
+	held.body.pedState      = WIRE_PEDSTATE_ARRESTED;
+	c.HandleMessage(Wrap(held, CH_SNAPSHOT));
+	c.Tick();
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated(), "an arrest in the seat keeps her in it");
+	Check(g_rec.unseats == unseatsBefore, "nothing takes her out");
+
+	const int despawnsBefore = g_rec.despawns;
+	c.HandleMessage(Wrap(MakeRespawn(1, 1200.0f), CH_EVENT));
+	Check(!c.PlayerSlot(1).Seated(), "the police station is not in her car");
+	Check(g_rec.unseats == unseatsBefore + 1, "she comes out of the seat first");
+	Check(g_rec.despawns == despawnsBefore + 1, "and the ped is rebuilt");
+	Check(g_rec.kills == 0, "nobody was killed on the way");
+	Check(c.PlayerSlot(1).last.pos.x == 1200.0f, "seeded at the police station");
+
+	// Not put back behind the wheel: the respawn dropped the standing
+	// instruction, the same as it does for a death.
+	const int seatsBefore = g_rec.seats;
+	FeedPosition(c, 1);
+	c.Tick();
+	c.Tick();
+	Check(g_rec.seats == seatsBefore, "and not seated again");
+}
+
+// A cop at a stopped car drags the driver out, then arrests him. On his own
+// screen that is CPed::SetBeingDraggedFromCar and the JACKEDCAR animation. On
+// everybody else's it used to be nothing: the replica sat in the seat until
+// the S_ExitVehicle at the end of the drag, then stood up beside the car.
+void TestADragTakesThemOutOfTheSeat() {
+	std::printf("\na remote player dragged out of a car\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 80), CH_EVENT));
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated(), "in the car");
+
+	const int unseatsBefore = g_rec.unseats;
+	const int seatsBefore   = g_rec.seats;
+	S_PlayerState dragged   = MakeState(1, 3000, 5.0f);
+	dragged.body.pedState   = WIRE_PEDSTATE_DRAG_FROM_CAR;
+	c.HandleMessage(Wrap(dragged, CH_SNAPSHOT));
+	c.Tick();
+	Check(!c.PlayerSlot(1).Seated(), "the seat stands down on the snapshot");
+	Check(g_rec.unseats == unseatsBefore + 1, "through the ordinary unseat");
+	Check(c.PlayerSlot(1).draggedFromNetId == 80, "remembering which car");
+	Check(c.PlayerSlot(1).seatVehicleNetId == 80,
+	      "while the session still says she is in it, because nothing has said "
+	      "otherwise yet");
+
+	// Halfway out the cop arrests her. Still coming out of the door.
+	S_PlayerState busted = MakeState(1, 3040, 5.0f);
+	busted.body.pedState = WIRE_PEDSTATE_ARRESTED;
+	c.HandleMessage(Wrap(busted, CH_SNAPSHOT));
+	c.Tick();
+	c.Tick();
+	Check(!c.PlayerSlot(1).Seated() && g_rec.seats == seatsBefore,
+	      "PED_ARRESTED after a drag does not put her back");
+
+	// The exit lands. The latch has nothing left to do.
+	c.HandleMessage(Wrap(MakeExit(1, 80), CH_EVENT));
+	c.Tick();
+	Check(c.PlayerSlot(1).draggedFromNetId == INVALID_NETID, "the exit ends the latch");
+	Check(g_rec.seats == seatsBefore, "and she is on foot, where she landed");
+}
+
+void TestTheDragLatch() {
+	std::printf("\nwhen a drag keeps somebody out of their seat\n");
+	constexpr uint16_t CAR  = 80;
+	constexpr uint8_t  IDLE = 1, GETUP = 37;
+
+	Check(DragLatchFor(INVALID_NETID, CAR, WIRE_PEDSTATE_DRIVING) == INVALID_NETID,
+	      "sitting in it is not being dragged out of it");
+	Check(DragLatchFor(INVALID_NETID, CAR, WIRE_PEDSTATE_ARRESTED) == INVALID_NETID,
+	      "busted in the seat is not a drag either");
+	Check(DragLatchFor(INVALID_NETID, CAR, WIRE_PEDSTATE_DRAG_FROM_CAR) == CAR,
+	      "PED_DRAG_FROM_CAR is");
+	Check(DragLatchFor(CAR, CAR, WIRE_PEDSTATE_ARRESTED) == CAR,
+	      "held through the arrest that follows it");
+	Check(DragLatchFor(CAR, CAR, GETUP) == CAR,
+	      "and through a snapshot that beat the exit here");
+	Check(DragLatchFor(CAR, INVALID_NETID, IDLE) == INVALID_NETID,
+	      "dropped when the session takes the seat away");
+	Check(DragLatchFor(CAR, 81, WIRE_PEDSTATE_DRIVING) == INVALID_NETID,
+	      "or gives them a different one");
+	Check(DragLatchFor(CAR, CAR, WIRE_PEDSTATE_DRIVING) == INVALID_NETID,
+	      "or when they report sitting in a car again");
+	Check(DragLatchFor(INVALID_NETID, INVALID_NETID, WIRE_PEDSTATE_DRAG_FROM_CAR) ==
+	          INVALID_NETID,
+	      "no seat, nothing to keep them out of");
 }
 
 // ---- animation / weapon / aim decisions -----------------------------------
@@ -4113,6 +5424,511 @@ void TestTheHostKeepsItsOwnClock() {
 	      "and a host that never followed anyone leaves its own sky alone");
 }
 
+// ---- the trains (traintime.h) and the session clock (sessiontime.h) --------
+
+void TestTrainCycleIsTheEnginesMask() {
+	std::printf("\nwhere a train is in its loop\n");
+	// UpdateTrains: `lea eax,[edx+ebx] / and eax,1FFFFh`, ebx += 10000h per
+	// train, and the same with 3FFFFh for the subway.
+	Check(TrainCycleMs(0x12345, EL_PERIOD_MS, 0) == 0x12345, "El train 0 is the clock, masked");
+	Check(TrainCycleMs(0x12345, EL_PERIOD_MS, 1) == 0x02345,
+	      "El train 1 is half a loop on, and wraps");
+	Check(TrainCycleMs(0x12345, SUBWAY_PERIOD_MS, 3) == 0x02345,
+	      "subway train 3 is three quarters on, and wraps");
+
+	// The whole reason one number is enough: two clocks that agree modulo
+	// the subway's period agree about every train on both lines.
+	const uint32_t a = 0x0003A1C7, b = a + 7 * SUBWAY_PERIOD_MS;
+	bool same = true;
+	for (uint32_t i = 0; i < 2; ++i)
+		same = same && TrainCycleMs(a, EL_PERIOD_MS, i) == TrainCycleMs(b, EL_PERIOD_MS, i);
+	for (uint32_t i = 0; i < 4; ++i)
+		same = same && TrainCycleMs(a, SUBWAY_PERIOD_MS, i) == TrainCycleMs(b, SUBWAY_PERIOD_MS, i);
+	Check(same, "clocks equal modulo 0x40000 put all six trains in the same place");
+
+	// And half a subway period out is the El's whole period, so the El can't
+	// tell and the subway can.
+	const uint32_t c = a + EL_PERIOD_MS;
+	Check(TrainCycleMs(a, EL_PERIOD_MS, 0) == TrainCycleMs(c, EL_PERIOD_MS, 0),
+	      "0x20000 out is invisible on the El");
+	Check(TrainCycleMs(a, SUBWAY_PERIOD_MS, 0) != TrainCycleMs(c, SUBWAY_PERIOD_MS, 0),
+	      "and is not on the subway");
+
+	// A uint32 wrap is just another multiple of the period.
+	Check(TrainCycleMs(0xFFFFFFFFu, SUBWAY_PERIOD_MS, 0) == SUBWAY_PERIOD_MS - 1 &&
+	          TrainCycleMs(0u, SUBWAY_PERIOD_MS, 0) == 0,
+	      "the wrap of the clock is a wrap of the loop");
+}
+
+void TestSessionTimeWarmsUpBySnapping() {
+	std::printf("\nthe session clock's first samples\n");
+	SessionTimeBase t;
+	Check(!t.Valid(), "nothing until the server has said something");
+
+	// ENet's placeholder round trip is 500 ms, so the first estimate is a
+	// quarter of a second out...
+	t.AddSample(10000, 0, 500);
+	Check(t.Valid() && t.OffsetMs() == 10250, "the first sample is taken whole");
+
+	// ...and the next one, with a real round trip, drags it straight back
+	// rather than slewing there over five seconds.
+	t.AddSample(11000, 1000, 20);
+	Check(t.OffsetMs() == 10010, "a better round trip replaces it at once while warming up");
+	t.AddSample(12000, 2000, 20);
+	Check(t.Snaps() == 3, "every warm-up sample is a snap");
+	Check(t.Now(2000) == 12010, "and the session time is the server's plus half a round trip");
+}
+
+void TestSessionTimePicksTheLeastDelayedSample() {
+	std::printf("\na late packet is not a slow clock\n");
+	SessionTimeBase t;
+	for (uint32_t i = 0; i < SessionTimeBase::WARMUP_SAMPLES; ++i)
+		t.AddSample(10000 + i * 1000, i * 1000, 0);
+	const uint32_t before = t.TargetOffsetMs();
+
+	// Retransmitted, queued behind a frame, whatever: it arrived 30 ms after
+	// it was stamped, so it looks like a server 30 ms behind.
+	t.AddSample(20000, 10030, 0);
+	Check(t.TargetOffsetMs() == before, "a delayed sample doesn't pull the estimate back");
+
+	// A sample can't arrive before it was sent, so a larger raw offset is a
+	// fresher reading, and it wins.
+	t.AddSample(21000 + 5, 11000, 0);
+	Check(t.TargetOffsetMs() == before + 5, "the least-delayed sample in the window wins");
+}
+
+void TestSessionTimeSlewsWithoutRunningBackwards() {
+	std::printf("\ncorrecting the session clock\n");
+	SessionTimeBase t;
+	for (uint32_t i = 0; i < SessionTimeBase::WARMUP_SAMPLES; ++i)
+		t.AddSample(10000 + i * 1000, i * 1000, 0);
+	Check(t.OffsetMs() == 10000, "warmed up");
+
+	// 40 ms fresher than anything so far: slide, don't jump.
+	uint32_t local = 3000;
+	t.AddSample(13040, local, 0);
+	Check(t.TargetOffsetMs() == 10040 && t.OffsetMs() == 10000,
+	      "a small error is not applied at once");
+
+	uint32_t prev = t.Now(local);
+	bool monotonic = true, overshot = false;
+	for (int frame = 0; frame < 20; ++frame) {
+		local += 16;
+		t.Tick(local);
+		monotonic = monotonic && static_cast<int32_t>(t.Now(local) - prev) > 0;
+		overshot  = overshot || t.OffsetMs() > 10040;
+		prev      = t.Now(local);
+	}
+	Check(t.OffsetMs() == 10016, "320 ms of frames buys 16 ms of correction");
+	for (int frame = 0; frame < 100; ++frame) {
+		local += 16;
+		t.Tick(local);
+		overshot = overshot || t.OffsetMs() > 10040;
+	}
+	Check(t.OffsetMs() == 10040 && !overshot, "and it arrives without overshooting");
+
+	// Now the other way. Sixteen samples 200 ms behind push the old ones out
+	// of the window, and the clock has to come back.
+	for (size_t i = 0; i < SessionTimeBase::WINDOW; ++i) {
+		local += 1000;
+		t.AddSample(local + 9840, local, 0);
+	}
+	Check(t.TargetOffsetMs() == 9840 && t.OffsetMs() == 10040,
+	      "a clock found to be ahead is not jumped back");
+	prev = t.Now(local);
+	for (int frame = 0; frame < 400; ++frame) {
+		local += 16;
+		t.Tick(local);
+		monotonic = monotonic && static_cast<int32_t>(t.Now(local) - prev) > 0;
+		prev      = t.Now(local);
+	}
+	Check(t.OffsetMs() == 9840, "it slides back to the server");
+	Check(monotonic, "and the session time never ran backwards on the way");
+
+	// A hitch of ten seconds is not ten seconds of correction.
+	t.AddSample(local + 1000 + 9840 + 600, local + 1000, 0);
+	local += 1000;
+	t.Tick(local + 10000);
+	Check(t.OffsetMs() == 9840 + 50, "a long frame is capped at one second's worth");
+}
+
+void TestSessionTimeJumpsToADifferentClock() {
+	std::printf("\na different clock altogether\n");
+	SessionTimeBase t;
+	for (uint32_t i = 0; i < SessionTimeBase::WARMUP_SAMPLES; ++i)
+		t.AddSample(10000 + i * 1000, i * 1000, 0);
+	t.AddSample(3000 + 60000, 3000, 0);
+	Check(t.OffsetMs() == 60000, "a minute out is jumped, not slewed");
+	Check(t.Snaps() == SessionTimeBase::WARMUP_SAMPLES + 1, "and counted as a snap");
+
+	t.Reset();
+	Check(!t.Valid() && t.Snaps() == 0, "a reset forgets everything");
+}
+
+void TestSessionTimeAcrossTheWrap() {
+	std::printf("\nthe session clock and a uint32 wrap\n");
+	SessionTimeBase t;
+	t.AddSample(0xFFFFFF00u, 100, 0);
+	t.AddSample(0x000002E8u, 1100, 0);   // 0xFFFFFF00 + 1000, wrapped
+	Check(t.Now(1100) == 0x000002E8u, "the server's wrap is just arithmetic");
+	t.AddSample(0x000006D0u + 7, 2100, 0);
+	Check(t.Now(2100) == 0x000006D0u + 7, "and so is the comparison of two samples across it");
+}
+
+void TestTrainsRunOnTheServersClock() {
+	std::printf("\nthe session's trains\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	Check(!c.SessionTime().Valid(), "not connected, the trains are the engine's");
+
+	S_Welcome w          = MakeWelcome(1, 0, /*host=*/0);
+	w.hdr.sendTimeMs     = 5000000;
+	c.HandleMessage(Wrap(w, CH_EVENT));
+	const int32_t err =
+	    static_cast<int32_t>(c.SessionTime().Now(WallClock::NowMs()) - 5000000u);
+	Check(c.SessionTime().Valid() && err >= 0 && err < 1000,
+	      "the welcome's header is the server's clock, and we take it");
+
+	// Everything else the server sends on somebody's behalf carries the
+	// sender's clock. Player 0's snapshot says nothing about the server.
+	const uint32_t target = c.SessionTime().TargetOffsetMs();
+	c.HandleMessage(Wrap(MakeState(0, 123, 1.0f), CH_SNAPSHOT));
+	Check(c.SessionTime().TargetOffsetMs() == target, "a relayed header is not a sample");
+
+	S_WorldState ws  = MakeWorldState(0, 12, 0);
+	ws.hdr.sendTimeMs = 5000000 + 1000;
+	c.HandleMessage(Wrap(ws, CH_EVENT));
+	Check(c.SessionTime().Valid(), "world packets keep it fed");
+
+	c.PreFrame();
+	Check(g_rec.sessionClockCalls == 1 && g_rec.sessionClockValid &&
+	          g_rec.sessionClockOffset == c.SessionTime().OffsetMs(),
+	      "PreFrame hands it to the engine side, before CGame::Process");
+
+	c.ClearRosterForTest();
+	c.PreFrame();
+	Check(g_rec.sessionClockCalls == 2 && !g_rec.sessionClockValid,
+	      "a lost session gives the trains back to CTimer");
+
+	// The host is not special here, unlike the time of day.
+	Client h;
+	h.SetBridge(RecordingBridge());
+	S_Welcome hw      = MakeWelcome(0, 0, /*host=*/0);
+	hw.hdr.sendTimeMs = 7000000;
+	h.HandleMessage(Wrap(hw, CH_EVENT));
+	Check(h.IsHost() && h.SessionTime().Valid(), "the host's trains follow the server too");
+}
+
+// ---- the planes (planetime.h) ----------------------------------------------
+
+void TestPlaneCycleIsTheEnginesMask() {
+	std::printf("\nwhere a plane is in its loop\n");
+	// UpdatePlanes: `lea eax,[edx+ecx] / and eax,7FFFFh`, ecx += 2AAAAh per
+	// airliner; `lea ecx,[edx+2AAAAh]` and `lea ecx,[edx+55554h]` for the
+	// second and third Dodo.
+	Check(PlaneCycleMs(0x12345, 0) == 0x12345, "plane 0 is the clock, masked");
+	Check(PlaneCycleMs(0x12345, 1) == 0x12345 + 0x2AAAA, "plane 1 is a third of a loop on");
+	Check(PlaneCycleMs(0, 2) == 0x55554, "plane 2 is the engine's 55554h, not 0x80000 * 2 / 3");
+	Check(PlaneCycleMs(0x7FFFF, 1) == 0x2AAA9, "and wraps at the loop's end");
+
+	const uint32_t a = 0x0006B2F1, b = a + 5 * PLANE_PERIOD_MS;
+	bool same = true;
+	for (uint32_t i = 0; i < PLANES_PER_PATH; ++i)
+		same = same && PlaneCycleMs(a, i) == PlaneCycleMs(b, i);
+	Check(same, "clocks equal modulo 0x80000 put every plane in the same place");
+
+	// The subway's period is not enough for the sky: two clocks that agree
+	// about every train can still disagree about every plane. The session
+	// clock is one number, so it agrees about both.
+	const uint32_t c = a + SUBWAY_PERIOD_MS;
+	Check(TrainCycleMs(a, SUBWAY_PERIOD_MS, 0) == TrainCycleMs(c, SUBWAY_PERIOD_MS, 0) &&
+	          PlaneCycleMs(a, 0) != PlaneCycleMs(c, 0),
+	      "0x40000 out is invisible to the trains and not to the planes");
+
+	Check(PlaneCycleMs(0xFFFFFFFFu, 0) == PLANE_PERIOD_MS - 1 && PlaneCycleMs(0u, 0) == 0,
+	      "the wrap of the clock is a wrap of the loop");
+}
+
+void TestMissionCessnaKeepsItsSchedule() {
+	std::printf("\na mission Cessna on the session clock\n");
+	// The script stamps the start with CTimer's value; UpdatePlanes flies it
+	// from `t - start`. Whatever the two clocks are, moving the start with
+	// the clock has to leave that difference exactly where it was.
+	struct Case {
+		uint32_t ours, session, start;
+	};
+	const Case cases[] = {
+	    {100000, 100000, 90000},              // no session: nothing moves
+	    {100000, 5000000, 90000},             // session well ahead
+	    {5000000, 100000, 4990000},           // session behind
+	    {0x00000100u, 0xFFFFFF00u, 0xFFFFF000u},   // our clock has wrapped
+	    {0xFFFFFF00u, 0x00000100u, 0xFFFFF000u},   // the session's has
+	    {100000, 100000 + 0x80000000u, 99999},     // as far apart as 2^32 allows
+	};
+	bool elapsedKept = true, roundTrip = true, landingKept = true, pathKept = true;
+	for (const Case &k : cases) {
+		const uint32_t shifted = MissionStartOnSessionClock(k.start, k.ours, k.session);
+		elapsedKept = elapsedKept && k.session - shifted == k.ours - k.start;
+		roundTrip   = roundTrip &&
+		            MissionStartOnOurClock(shifted, k.ours, k.session) == k.start;
+		// The two tests UpdatePlanes makes on the difference.
+		landingKept = landingKept &&
+		              ((k.session - shifted >= DRUG_RUN_CESNA_FLIGHT_MS) ==
+		               (k.ours - k.start >= DRUG_RUN_CESNA_FLIGHT_MS));
+		pathKept = pathKept &&
+		           ((k.session - shifted) & 0x1FFFF) == ((k.ours - k.start) & 0x1FFFF);
+	}
+	Check(elapsedKept, "the flight time is what single player would see");
+	Check(roundTrip, "and the start goes back exactly after the call");
+	Check(landingKept && pathKept, "so it lands, and flies, on the same schedule");
+
+	// What it is for. Ten seconds into the drug run, on a session clock five
+	// minutes ahead of ours: left alone, UpdatePlanes would land it at once.
+	const uint32_t ours = 1000000, start = ours - 10000, session = ours + 300000;
+	Check(session - start >= DRUG_RUN_CESNA_FLIGHT_MS,
+	      "unshifted, the session clock lands a Cessna that has just taken off");
+	Check(session - MissionStartOnSessionClock(start, ours, session) == 10000,
+	      "shifted, it is ten seconds into its flight");
+	Check(DROP_OFF_CESNA_FLIGHT_MS == 0x7F448 && DRUG_RUN_CESNA_FLIGHT_MS == 0x1F448,
+	      "the flight times are the engine's immediates");
+}
+
+
+// ---- the traffic lights (lighttime.h) --------------------------------------
+
+void TestLightsAreTheEnginesThresholds() {
+	std::printf("\nwhat a traffic light shows\n");
+	// The immediates in LightForCars1 (0x00455760), LightForCars2
+	// (0x00455790) and LightForPeds (0x004557D0), each after `and eax,3FFFh`.
+	struct Row {
+		uint32_t t;
+		uint8_t  cars1, cars2, peds;
+	};
+	const Row rows[] = {
+	    {0, CAR_LIGHT_GREEN, CAR_LIGHT_RED, PED_LIGHT_DONT_WALK},
+	    {4999, CAR_LIGHT_GREEN, CAR_LIGHT_RED, PED_LIGHT_DONT_WALK},
+	    {5000, CAR_LIGHT_AMBER, CAR_LIGHT_RED, PED_LIGHT_DONT_WALK},
+	    {5999, CAR_LIGHT_AMBER, CAR_LIGHT_RED, PED_LIGHT_DONT_WALK},
+	    {6000, CAR_LIGHT_RED, CAR_LIGHT_GREEN, PED_LIGHT_DONT_WALK},
+	    {10999, CAR_LIGHT_RED, CAR_LIGHT_GREEN, PED_LIGHT_DONT_WALK},
+	    {11000, CAR_LIGHT_RED, CAR_LIGHT_AMBER, PED_LIGHT_DONT_WALK},
+	    {11999, CAR_LIGHT_RED, CAR_LIGHT_AMBER, PED_LIGHT_DONT_WALK},
+	    {12000, CAR_LIGHT_RED, CAR_LIGHT_RED, PED_LIGHT_WALK},
+	    {15383, CAR_LIGHT_RED, CAR_LIGHT_RED, PED_LIGHT_WALK},
+	    {15384, CAR_LIGHT_RED, CAR_LIGHT_RED, PED_LIGHT_WALK_BLINK},
+	    {16383, CAR_LIGHT_RED, CAR_LIGHT_RED, PED_LIGHT_WALK_BLINK},
+	    {16384, CAR_LIGHT_GREEN, CAR_LIGHT_RED, PED_LIGHT_DONT_WALK},
+	};
+	bool all = true;
+	for (const Row &r : rows)
+		all = all && CarLights1(r.t) == r.cars1 && CarLights2(r.t) == r.cars2 &&
+		      PedLights(r.t) == r.peds;
+	Check(all, "every threshold is the engine's immediate, on both sides of it");
+	Check(LIGHT_PERIOD_MS == 16384 && CARS1_AMBER_FROM_MS == 5000 &&
+	          CARS2_AMBER_FROM_MS == 11000 && PEDS_BLINK_FROM_MS == 15384,
+	      "a 16.384 s cycle: 1388h, 1770h, 2AF8h, 2EE0h, 3C18h");
+
+	// What the three have to agree on, over the whole cycle: the two
+	// directions never both go, and nobody is told to walk into traffic.
+	bool neverBothGo = true, walkOnlyOnRed = true, cars1Order = true;
+	for (uint32_t t = 0; t < LIGHT_PERIOD_MS; ++t) {
+		neverBothGo = neverBothGo &&
+		              (CarLights1(t) == CAR_LIGHT_RED || CarLights2(t) == CAR_LIGHT_RED);
+		if (PedLights(t) != PED_LIGHT_DONT_WALK)
+			walkOnlyOnRed = walkOnlyOnRed && CarLights1(t) == CAR_LIGHT_RED &&
+			                CarLights2(t) == CAR_LIGHT_RED;
+		// Green, amber, red and never back within a cycle.
+		if (t > 0)
+			cars1Order = cars1Order && CarLights1(t) >= CarLights1(t - 1);
+	}
+	Check(neverBothGo, "one of the two directions is red at every millisecond");
+	Check(walkOnlyOnRed, "pedestrians only walk while both are red");
+	Check(cars1Order, "and a light goes green, amber, red without stepping back");
+
+	Check(CarLights1(0xFFFFFFFFu) == CarLights1(LIGHT_PERIOD_MS - 1) &&
+	          PedLights(0u) == PED_LIGHT_DONT_WALK,
+	      "the wrap of the clock is a wrap of the cycle");
+}
+
+void TestLightsAgreeOnTheSessionClock() {
+	std::printf("\nthe same lights on two machines\n");
+	// Two players whose saves put their CTimers nowhere near each other, and
+	// whose wall clocks started at different times. They hear one server.
+	const uint32_t oursA = 1234567, oursB = 98765;
+	uint32_t       wallA = 5000, wallB = 777000;
+	SessionTimeBase a, b;
+	for (uint32_t i = 0; i < SessionTimeBase::WARMUP_SAMPLES + 2; ++i) {
+		const uint32_t server = 40000000 + i * 1000;
+		a.AddSample(server, wallA, 20);
+		b.AddSample(server, wallB, 20);
+		wallA += 1000;
+		wallB += 1000;
+	}
+	// Ten minutes of frames, at the same instant on both.
+	bool sameLights = true, oursDiffer = false;
+	for (uint32_t ms = 0; ms < 600000; ms += 16) {
+		const uint32_t sa = a.Now(wallA + ms), sb = b.Now(wallB + ms);
+		sameLights = sameLights && CarLights1(sa) == CarLights1(sb) &&
+		             CarLights2(sa) == CarLights2(sb) && PedLights(sa) == PedLights(sb);
+		oursDiffer = oursDiffer || CarLights1(oursA + ms) != CarLights1(oursB + ms);
+	}
+	Check(oursDiffer, "on their own CTimers the two junctions disagree");
+	Check(sameLights, "on the session clock every light agrees, every frame");
+
+	const uint32_t s = 0x0012A5C3;
+	Check(CarLights2(s) == CarLights2(s + 9 * LIGHT_PERIOD_MS) &&
+	          PedLights(s) == PedLights(s + 9 * LIGHT_PERIOD_MS),
+	      "clocks equal modulo 16384 show the same lights");
+	Check(CarLights1(s) != CarLights1(s + LIGHT_PERIOD_MS / 2),
+	      "and half a cycle out is a different light");
+}
+
+void TestLightsFallBackWithoutASession() {
+	std::printf("\nthe lights without a session\n");
+	// The real engine-side clock (game/sessionclock.cpp), wired to a real
+	// Client the way dllmain wires it. When it says no, game/lights.cpp calls
+	// the engine's own function, which reads CTimer.
+	WorldBridge wb = RecordingBridge();
+	game::AddSessionClockToBridge(wb);
+	Client c;
+	c.SetBridge(wb);
+
+	c.PreFrame();
+	uint32_t t = 0;
+	Check(!game::SessionClockThisFrame(t) && !game::SessionClockNow(t),
+	      "not connected: no session clock, the lights are CTimer's");
+
+	S_Welcome w      = MakeWelcome(1, 0, /*host=*/0);
+	w.hdr.sendTimeMs = 9000000;
+	c.HandleMessage(Wrap(w, CH_EVENT));
+	c.PreFrame();
+	uint32_t      first = 0;
+	const bool    on    = game::SessionClockThisFrame(first);
+	const int32_t err =
+	    static_cast<int32_t>(first - c.SessionTime().Now(WallClock::NowMs()));
+	Check(on && err <= 0 && err > -1000, "connected: the lights read the server's clock");
+
+	// Hold the frame until the wall clock has visibly moved on.
+	const uint32_t start = WallClock::NowMs();
+	while (WallClock::NowMs() - start < 3) {
+	}
+	uint32_t again = 0, now = 0;
+	game::SessionClockThisFrame(again);
+	game::SessionClockNow(now);
+	Check(again == first && now != first,
+	      "every light asked in one frame gets the same time, as from CTimer");
+
+	c.PreFrame();
+	uint32_t next = 0;
+	game::SessionClockThisFrame(next);
+	Check(static_cast<int32_t>(next - first) >= 3, "and the next frame takes a new one");
+
+	c.ClearRosterForTest();
+	c.PreFrame();
+	Check(!game::SessionClockThisFrame(t),
+	      "a lost session gives the lights back to CTimer on the next frame");
+}
+
+// ---- the lift bridge (liftbridgetime.h) ------------------------------------
+
+void TestBridgeStatesAreTheEnginesThresholds() {
+	std::printf("\nwhere the lift bridge is in its cycle\n");
+	// CBridge::Update: `sub edx,[008F2BC0h] / and edx,0FFFFh`, then 2710h,
+	// 9C40h, C350h, EA60h.
+	Check(BridgeStateAt(0) == BRIDGE_LOWERING && BridgeStateAt(9999) == BRIDGE_LOWERING,
+	      "the first ten seconds it comes down");
+	Check(BridgeStateAt(10000) == BRIDGE_DOWN && BridgeStateAt(39999) == BRIDGE_DOWN,
+	      "thirty seconds down");
+	Check(BridgeStateAt(40000) == BRIDGE_ABOUT_TO_RAISE &&
+	          BridgeStateAt(49999) == BRIDGE_ABOUT_TO_RAISE,
+	      "ten seconds of warning");
+	Check(BridgeStateAt(50000) == BRIDGE_RAISING && BridgeStateAt(59999) == BRIDGE_RAISING,
+	      "ten seconds going up");
+	Check(BridgeStateAt(60000) == BRIDGE_UP && BridgeStateAt(65535) == BRIDGE_UP,
+	      "and up for the rest of the 65.536 s");
+	Check(BridgePhaseMs(5, 10) == 65531, "the elapsed time is taken modulo 2^16");
+}
+
+void TestBridgeFollowsTheSessionClock() {
+	std::printf("\nthe lift bridge on the session clock\n");
+	struct Case {
+		uint32_t ours, session;
+	};
+	const Case cases[] = {
+	    {100000, 100000},             // the two clocks agree: a zero epoch, moved
+	    {100000, 5000000},
+	    {5000000, 100000},
+	    {0x00000100u, 0xFFFFFF00u},   // ours has wrapped
+	    {0xFFFFFF00u, 0x00000100u},   // the session's has
+	    {77, 77 + 0x80000000u},
+	};
+	bool phase = true, stamped = true;
+	for (const Case &k : cases) {
+		const uint32_t epoch = BridgeEpochForSession(k.ours, k.session);
+		phase   = phase && BridgePhaseMs(k.ours, epoch) == (k.session & 0xFFFF);
+		stamped = stamped && epoch != 0;
+	}
+	Check(phase, "Update, reading CTimer, computes the session clock's phase");
+	Check(stamped, "and never finds a zero epoch, which it would restamp");
+
+	const uint32_t session = 31415926;
+	Check(BridgeStateAt(BridgePhaseMs(1000, BridgeEpochForSession(1000, session))) ==
+	          BridgeStateAt(BridgePhaseMs(9876543, BridgeEpochForSession(9876543, session))),
+	      "two CTimers, one session clock: both players see the same bridge");
+
+	// The session ends, the epoch stays where the last call left it, and
+	// CTimer carries on: so does the bridge, from where it was.
+	const uint32_t ours = 200000, last = 7654321;
+	const uint32_t epoch = BridgeEpochForSession(ours, last);
+	Check(BridgePhaseMs(ours + 16, epoch) == ((last + 16) & 0xFFFF),
+	      "leaving the session doesn't move the bridge");
+}
+
+void TestBridgeLinksSurviveAJump() {
+	std::printf("\nthe bridge's traffic links when the clock jumps\n");
+	// Model the engine: Init lights the links, 4 after 3 lights them, 3 after
+	// 2 puts them out, nothing else touches them. Then apply the rule. The
+	// links have to be right for wherever the bridge now is, from any state to
+	// any state, with and without Init in between.
+	bool allRight = true;
+	for (int32_t before = BRIDGE_LOCKED; before <= BRIDGE_RAISING; ++before)
+		for (int32_t after = BRIDGE_LOCKED; after <= BRIDGE_RAISING; ++after)
+			for (int init = 0; init < 2; ++init) {
+				bool links = BridgeLinksLit(before);
+				if (init)
+					links = true;
+				if (after == BRIDGE_ABOUT_TO_RAISE && before == BRIDGE_DOWN)
+					links = true;
+				if (after == BRIDGE_DOWN && before == BRIDGE_LOWERING)
+					links = false;
+				switch (LinksAfterBridgeUpdate(before, after, init != 0)) {
+				case BridgeLinks::Leave: break;
+				case BridgeLinks::Light: links = true; break;
+				case BridgeLinks::PutOut: links = false; break;
+				}
+				allRight = allRight && links == BridgeLinksLit(after);
+			}
+	Check(allRight, "whatever the jump, the links end up right for the bridge");
+
+	// On an unbroken cycle it never does anything: the engine's edges are
+	// enough there, as in single player.
+	bool steadyIsFree = LinksAfterBridgeUpdate(BRIDGE_LOCKED, BRIDGE_LOWERING, false) ==
+	                    BridgeLinks::Leave;
+	for (uint32_t t = 16; t < 3 * BRIDGE_PERIOD_MS; t += 16)
+		steadyIsFree = steadyIsFree &&
+		               LinksAfterBridgeUpdate(BridgeStateAt((t - 16) & 0xFFFF),
+		                                      BridgeStateAt(t & 0xFFFF),
+		                                      false) == BridgeLinks::Leave;
+	Check(steadyIsFree, "a bridge going round its cycle is left to the engine");
+
+	Check(LinksAfterBridgeUpdate(BRIDGE_DOWN, BRIDGE_UP, false) == BridgeLinks::Light,
+	      "joining with the bridge down and finding it up stops the traffic");
+	Check(LinksAfterBridgeUpdate(BRIDGE_UP, BRIDGE_DOWN, false) == BridgeLinks::PutOut,
+	      "and the other way lets it over");
+	Check(LinksAfterBridgeUpdate(BRIDGE_DOWN, BRIDGE_DOWN, true) == BridgeLinks::PutOut,
+	      "a save loaded with the bridge down doesn't leave it shut for 30 s");
+}
+
 void TestWelcomeSetsTheClockStraightAway() {
 	std::printf("\njoining a session already in progress\n");
 	Client c;
@@ -4940,6 +6756,156 @@ void TestOurOwnReportsHoldTheCarWeParked() {
 	c.TickLocalVehicle();
 	Check(!c.VehicleByNetId(80)->interp.Empty(),
 	      "and fills with what we are reporting about it");
+}
+
+// ---- being jacked -----------------------------------------------------------
+//
+// The three things the owner reported on the 2026-09-23 build are one defect
+// and this is it: a car has no handover. "Volvió a pasar lo de que se bugeó y
+// el auto no avanza o va hacia atrás. O también me pasó que solo iba para
+// adelante solo sin que yo apriete la W." And, from the other side of a jack:
+// "le robé el auto a otro jugador y no puedo salir de él... en la pantalla del
+// otro jugador el auto quedó estático en el lugar viejo."
+//
+// A carjack happens in exactly one process. The jacker's engine plays the
+// animation, drags the replica out of the seat and puts its own player behind
+// the wheel; the victim's engine is never told anything and still has *its*
+// player behind the wheel. Every ownership guard in the vehicle seam asks
+// CVehicle::m_pDriver, so both machines answer "we drive it" and both refuse
+// to apply the other's state - the car drives away on one screen and stands
+// still on the other, and each end is behaving correctly given what it can see.
+//
+// The server breaks the tie, because nothing either client can look at does
+// (Session::NoteEnterVehicle). What is below is the losing client doing as it
+// is told.
+
+void TestBeingJackedHandsTheCarOver() {
+	std::printf("\nsomebody jacks the car we are driving\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	const int32_t handle = GiveUsTheSessionsCar(c);
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	Check(handle > 0, "we are at the wheel of the session's car 80");
+
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 80, 0), CH_EVENT));
+	Check(c.LocalVehicleNetId() == 80, "and the session says it is ours");
+
+	// Alice jacks it. This is the only witness: nothing in this process saw
+	// her do it.
+	c.HandleMessage(Wrap(MakeEnter(1, 80, 0), CH_EVENT));
+	const RemoteVehicle *v = c.VehicleByNetId(80);
+	Check(v != nullptr && v->driverPlayerId == 1, "alice is recorded at its wheel");
+	Check(v->surrendered, "so the row says we have lost it, engine or no engine");
+	Check(c.LocalVehicleNetId() == INVALID_NETID,
+	      "and we stop being its owner in the session");
+
+	// The handover, once, and then the car is one we watch. Before this
+	// existed, m_localVehicleNetId stayed at 80 and DrivenLocally stayed true,
+	// so every snapshot alice sent was thrown away and the car sat in the
+	// street here while she drove it away there.
+	const int corrections = g_rec.vehicleCorrections;
+	c.Tick();
+	Check(g_rec.vehicleSurrenders == 1, "the seat is handed over");
+	c.Tick();
+	Check(g_rec.vehicleSurrenders == 1, "once, not once a frame");
+	Check(g_rec.vehicleCorrections > corrections,
+	      "and her transform is written onto the car again");
+}
+
+void TestALostCarIsNotClaimedStraightBack() {
+	std::printf("\nthe car we lost is not taken back\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsTheSessionsCar(c);
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 80, 0), CH_EVENT));
+
+	// Jacked, but with the engine still insisting we are the driver - which is
+	// the real state on the victim's machine until the handover runs, and is
+	// the state the claim path has to survive. The bridge is emptied of the
+	// handover so the test can hold that state for as long as it likes.
+	WorldBridge b = RecordingBridge();
+	// RecordingBridge resets the recorder, so put the car back.
+	g_rec.modelReady         = true;
+	g_rec.drivingLocally     = true;
+	g_rec.localVehicleHandle = c.VehicleByNetId(80)->poolHandle;
+	b.SurrenderVehicleSeat   = nullptr;
+	c.SetBridge(b);
+
+	c.HandleMessage(Wrap(MakeEnter(1, 80, 0), CH_EVENT));
+	Check(c.VehicleByNetId(80)->surrendered, "the row says we lost it");
+
+	// Two things must not happen here, and they are the two arms of the claim.
+	// It must not re-claim car 80 - that is a tug of war at the claim rate,
+	// and a handover the loser can undo is not a handover. And it must not
+	// fall through to the "unknown car" arm either, which would register the
+	// CVehicle we are sitting in under a *second* netId and leave every other
+	// machine holding two cars for it.
+	c.TickLocalVehicle();
+	c.TickLocalVehicle();
+	Check(c.LocalVehicleNetId() == INVALID_NETID, "and we do not take it back");
+	Check(c.VehicleCount() == 1, "nor register it a second time");
+	Check(c.VehicleByNetId(80)->driverPlayerId == 1, "it is still alice's");
+}
+
+void TestGettingBackOutAndInIsAnOrdinaryClaimAgain() {
+	std::printf("\ngetting back into a car we were jacked out of\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsTheSessionsCar(c);
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 80, 0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 80, 0), CH_EVENT));
+	c.Tick();   // the handover; the stub takes us out of the seat
+	Check(!g_rec.drivingLocally, "we are out of it");
+
+	// `surrendered` is a statement about a contradiction, not a punishment.
+	// It has to lapse the moment the engine agrees we are not driving the car,
+	// or the row would refuse to be claimed for the rest of the session.
+	//
+	// One more frame for it, and that is the real shape rather than an
+	// allowance the test makes: the flag is cleared by asking the engine, and
+	// the pass that hands the seat over has already asked. Nothing depends on
+	// which frame it clears in - all it gates is a claim, and there is nothing
+	// to claim until the player gets into something.
+	c.Tick();
+	Check(!c.VehicleByNetId(80)->surrendered,
+	      "and the row stops saying we lost it, because there is nothing left "
+	      "to contradict");
+
+	// Alice parks it and walks off; we get in again. An ordinary claim.
+	c.HandleMessage(Wrap(MakeExit(1, 80), CH_EVENT));
+	g_rec.drivingLocally     = true;
+	g_rec.localVehicleHandle = c.VehicleByNetId(80)->poolHandle;
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 80, 0), CH_EVENT));
+	Check(c.LocalVehicleNetId() == 80, "so the same car can be ours again");
+	Check(c.VehicleCount() == 1, "and it is still one car");
+}
+
+void TestACarWeAreOnlyWatchingChangingDriverIsNotAHandover() {
+	std::printf("\nsomebody else's car changing hands\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.Tick();
+
+	// Two other players trading a car between them is the ordinary case and
+	// must cost nothing: the guards already say the car is not ours, so there
+	// is no contradiction to resolve and nobody's seat to hand over.
+	c.HandleMessage(Wrap(MakeEnter(1, 80, 0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(2, 80, 0), CH_EVENT));
+	c.Tick();
+	Check(c.VehicleByNetId(80)->driverPlayerId == 2, "bob took it from alice");
+	Check(!c.VehicleByNetId(80)->surrendered, "and nothing of ours was surrendered");
+	Check(g_rec.vehicleSurrenders == 0, "so the engine was never asked to hand a seat over");
 }
 
 void TestACarFromOurOwnWorldIsStillClaimedNormally() {
@@ -6294,7 +8260,7 @@ S_CarSpawn MakeAmbientCarSpawn(uint16_t netId, uint8_t owner = 1) {
 S_PedStates MakePedStates(uint8_t owner, uint16_t netId, uint32_t timeMs,
                           float x, uint16_t animId = 0,
                           uint16_t vehicleNetId = INVALID_NETID,
-                          uint8_t seat = 0) {
+                          uint8_t seat = 0, uint8_t flags = 0) {
 	S_PedStates s{};
 	InitHeader(s, timeMs);
 	s.ownerPlayerId      = owner;
@@ -6303,7 +8269,7 @@ S_PedStates MakePedStates(uint8_t owner, uint16_t netId, uint32_t timeMs,
 	s.peds[0].animId       = animId;
 	s.peds[0].vehicleNetId = vehicleNetId;
 	s.peds[0].seat         = seat;
-	s.peds[0].pad          = 0;
+	s.peds[0].flags        = flags;
 	s.peds[0].pos          = {x, 20.0f, 30.0f};
 	s.peds[0].heading      = 0.0f;
 	return s;
@@ -6336,6 +8302,52 @@ void TestAmbientPedIsToldWhereItIs() {
 	const int before = g_rec.ambientApplies;
 	c.Tick();
 	Check(g_rec.ambientApplies == before + 1, "and it is driven into the engine");
+}
+
+void TestABurningPedestrianBurnsOnEveryScreen() {
+	std::printf("a pedestrian his host has set alight burns here too\n");
+
+	// The bit lives where the padding was, so nothing moved.
+	Check(offsetof(AmbientPedState, flags) == 7 && sizeof(AmbientPedState) == 24,
+	      "the flags byte is the old pad byte, and the row is still 24 bytes");
+
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(c);
+
+	c.HandleMessage(Wrap(MakePedStates(1, 500, 2000, 77.0f, 1, INVALID_NETID, 0,
+	                                   AMBIENT_PED_ON_FIRE),
+	                     CH_SNAPSHOT));
+	const RemoteAmbientPed *p = c.AmbientPed(500);
+	Check(p != nullptr && p->fireSaid, "the host's word that he is burning is kept");
+	Check(p != nullptr && WallClock::NowMs() - p->fireSaidMs < 1000,
+	      "with when we heard it, on our own clock");
+
+	const int before = g_rec.ambientFires;
+	c.Tick();
+	Check(g_rec.ambientFires == before + 1 && g_rec.lastAmbientFireSaid,
+	      "and the replica is asked to burn, every frame");
+
+	c.HandleMessage(Wrap(MakePedStates(1, 500, 2100, 77.0f, 1), CH_SNAPSHOT));
+	c.Tick();
+	Check(p != nullptr && !p->fireSaid && !g_rec.lastAmbientFireSaid,
+	      "and to stop the moment the host says he has gone out");
+
+	// Only his host may say it, the same as for his position.
+	c.HandleMessage(Wrap(MakePedStates(2, 500, 2200, 77.0f, 1, INVALID_NETID, 0,
+	                                   AMBIENT_PED_ON_FIRE),
+	                     CH_SNAPSHOT));
+	Check(p != nullptr && !p->fireSaid, "a row from anybody else changes nothing");
+
+	// And the hold: a pedestrian who drops out of his host's twelve stops
+	// getting rows, and his fire stops being vouched for.
+	Check(AmbientPedShouldBurn(true, 5000, 5000) && AmbientPedShouldBurn(true, 5000, 5999),
+	      "a fresh word keeps him burning");
+	Check(!AmbientPedShouldBurn(true, 5000, 6000),
+	      "a second-old one does not - the same cap the fire itself has");
+	Check(!AmbientPedShouldBurn(false, 5000, 5000), "nor does being told he's fine");
+	Check(AmbientPedShouldBurn(true, 0xFFFFFF00u, 0x00000100u),
+	      "and a clock wrap in between is a short gap, not a long one");
 }
 
 // ---- limbs (protocol version 17) -------------------------------------------
@@ -6510,6 +8522,1187 @@ void TestARebuiltReplicaDiesAgain() {
 	c.Tick();
 	Check(g_rec.ambientPedSpawns == 2, "a new replica is built");
 	Check(g_rec.ambientKills == 2, "and it is killed on the frame it appears");
+}
+
+// ---- shooting somebody else's pedestrian -----------------------------------
+//
+// The direction the two blocks above do not have. Whether the pedestrian
+// actually flinches needs a running game; what is pinned here is everything
+// around it - that the hit reaches the seam, that the blame resolves and a hit
+// with nobody to blame still lands, that it is carried out on the packet rather
+// than recorded on a row, that a build without the seam is silent rather than
+// broken, and the one constraint the engine puts on the whole feature.
+
+S_PedDamage MakePedDamage(uint8_t attackerId, uint16_t netId, uint8_t weapon = 3,
+                          float amount = 12.0f, uint8_t piece = 0,
+                          uint8_t direction = 2) {
+	S_PedDamage d;
+	InitHeader(d, 1000);
+	d.attackerId    = attackerId;
+	d.body.netId    = netId;
+	d.body.weapon   = weapon;
+	d.body.amount   = amount;
+	d.body.piece    = piece;
+	d.body.direction = direction;
+	return d;
+}
+
+void TestAHitOnOurPedestrianReachesTheEngine() {
+	std::printf("\na hit somebody else landed on one of our pedestrians\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+
+	// No spawn packet and no roster row: this is the one inbound ambient
+	// packet about a pedestrian *this* machine hosts, so `m_peds` has nothing
+	// in it and the netId is resolved behind the bridge.
+	c.HandleMessage(Wrap(MakePedDamage(1, 700, /*weapon=*/5, /*amount=*/34.0f,
+	                                   /*piece=*/3, /*direction=*/1),
+	                     CH_EVENT));
+	Check(g_rec.pedDamages == 1, "it goes straight to the seam");
+	Check(g_rec.lastPedDamage.netId == 700,
+	      "naming the pedestrian the shooter shot");
+	Check(g_rec.lastPedDamage.weapon == 5 && g_rec.lastPedDamage.amount == 34.0f,
+	      "with the cause and the raw amount the shooter's own InflictDamage had");
+	Check(g_rec.lastPedDamage.piece == 3 && g_rec.lastPedDamage.direction == 1,
+	      "and the piece and the side, which pick the limb and the knockdown");
+	Check(g_rec.pedDamageAttacker == 1, "credited to the player who fired");
+
+	// Carried out on the packet, not recorded and reconciled. A hit is not a
+	// standing fact about a pedestrian the way a death is - it is a thing that
+	// happened to whoever was standing there - so a frame changes nothing.
+	const int applied = g_rec.pedDamages;
+	c.Tick();
+	c.Tick();
+	Check(g_rec.pedDamages == applied, "and it is not replayed every frame");
+}
+
+void TestAHitWithNobodyToBlameStillLands() {
+	std::printf("a hit from a player whose ped we do not have still lands\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+
+	// Slot 5 has never joined, so there is no attacker to credit. The
+	// pedestrian is hurt anyway: the blame is for the engine's bookkeeping and
+	// the shot happened either way, exactly as it does for a player's hit.
+	c.HandleMessage(Wrap(MakePedDamage(5, 701), CH_EVENT));
+	Check(g_rec.pedDamages == 1, "the hit lands");
+	Check(g_rec.pedDamageAttacker == 0xFF, "with nobody to credit it to");
+
+	// And a packet naming us as the attacker of a hit on our own pedestrian is
+	// not a thing the server sends - the ownership test in Server::OnPedDamage
+	// is inverted precisely to stop it. If one arrives anyway it is still our
+	// ped, so the hit is still ours to apply; what it must not do is credit us
+	// as a remote player, because we are not one.
+	c.HandleMessage(Wrap(MakePedDamage(/*attackerId=*/0, 701), CH_EVENT));
+	Check(g_rec.pedDamages == 2 && g_rec.pedDamageAttacker == 0xFF,
+	      "and a hit addressed from our own slot credits nobody");
+}
+
+void TestNoPedDamageSeamIsSilentNotBroken() {
+	std::printf("a build with no seam to apply a hit with says so\n");
+	Client c;
+	WorldBridge bare = RecordingBridge();
+	bare.ApplyRemotePedDamage = nullptr;
+	c.SetBridge(bare);
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+
+	c.HandleMessage(Wrap(MakePedDamage(1, 702), CH_EVENT));
+	Check(g_rec.pedDamages == 0, "nothing is applied and nothing crashes");
+}
+
+// ---- shooting somebody else's car (protocol.h, VehicleHitBody) -------------
+//
+// The pedestrian exchange above with the nouns changed, and one thing it does
+// not have: a car this machine is driving is a car this machine already holds a
+// roster row for, so the inbound half has a row to check and the ped's does
+// not. Everything that can be decided without an engine is decided in these
+// tests; what needs one - the detour's refusal, and CVehicle::InflictDamage
+// itself - is game/vehicle.cpp's and is exercised by hand.
+
+S_VehicleHit MakeVehicleHit(uint8_t attackerId, uint16_t netId,
+                            uint8_t weapon = 3, float amount = 25.0f) {
+	S_VehicleHit h;
+	InitHeader(h, 1000);
+	h.attackerId  = attackerId;
+	h.body.netId  = netId;
+	h.body.weapon = weapon;
+	h.body.amount = amount;
+	return h;
+}
+
+// Puts the local player at the wheel of car 77, the way the session does it:
+// an S_EnterVehicle addressed to our own slot. That is what fills
+// m_localVehicleNetId, and DrivenLocally is what every guard below asks.
+void GiveUsCar77(Client &c) {
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleSpawn(77), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(0, 77), CH_EVENT));
+}
+
+void TestAHitOnOurCarReachesTheEngine() {
+	std::printf("\na hit somebody else landed on the car we are driving\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsCar77(c);
+	Check(c.LocalVehicleNetId() == 77, "we are driving car 77");
+
+	c.HandleMessage(Wrap(MakeVehicleHit(1, 77, /*weapon=*/5, /*amount=*/34.0f),
+	                     CH_EVENT));
+	Check(g_rec.vehicleHits == 1, "it goes straight to the seam");
+	Check(g_rec.lastVehicleHitRow == 77, "against our own roster row");
+	Check(g_rec.lastVehicleHit.weapon == 5 && g_rec.lastVehicleHit.amount == 34.0f,
+	      "with the cause and the raw amount the shooter's own InflictDamage had");
+	Check(g_rec.vehicleHitAttacker == 1, "credited to the player who fired");
+
+	// Carried out on the packet, not recorded and reconciled. A hit is not a
+	// standing fact about a car the way its dents are - it is a thing that
+	// happened to whoever was at the wheel - so a frame changes nothing, and
+	// the health it produced leaves on the snapshot that already carries one.
+	const int applied = g_rec.vehicleHits;
+	c.Tick();
+	c.Tick();
+	Check(g_rec.vehicleHits == applied, "and it is not replayed every frame");
+}
+
+void TestAHitOnACarWeAreNotDrivingIsRefused() {
+	std::printf("a hit addressed to us about a car that is not ours\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsCar77(c);
+
+	// Alice's car, which this machine only watches. Ours is not the machine
+	// entitled to take health off it, and the whole point of the change is
+	// that it stopped doing so - applying one because a packet asked would put
+	// the rule back exactly where it was, only politely.
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleHit(1, 80), CH_EVENT));
+	Check(g_rec.vehicleHits == 0, "nothing is applied to a car we only watch");
+
+	// And one about a car the session has never named.
+	c.HandleMessage(Wrap(MakeVehicleHit(1, 999), CH_EVENT));
+	Check(g_rec.vehicleHits == 0, "nor to a car nobody has ever heard of");
+
+	// Once we get out of our own, hits about it stop landing too: nobody is
+	// driving it, so nobody is entitled to decide its condition, and a burst
+	// still in flight when we stepped out must not go on hurting it.
+	c.HandleMessage(Wrap(MakeExit(0, 77), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleHit(1, 77), CH_EVENT));
+	Check(g_rec.vehicleHits == 0, "nor to the car we have just got out of");
+}
+
+void TestAHitWithNobodyToBlameStillLandsOnOurCar() {
+	std::printf("a hit from a player whose ped we do not have still lands\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsCar77(c);
+
+	// Slot 5 never joined, so there is nobody to credit. The car is hurt
+	// anyway: the blame buys the scorch marks and m_pSetOnFireEntity, and the
+	// shot happened either way - exactly as it does for a player's hit and a
+	// pedestrian's.
+	c.HandleMessage(Wrap(MakeVehicleHit(5, 77), CH_EVENT));
+	Check(g_rec.vehicleHits == 1, "the hit lands");
+	Check(g_rec.vehicleHitAttacker == 0xFF, "with nobody to credit it to");
+
+	// And one addressed from our own slot. The server's ownership test is
+	// inverted precisely to stop it ever being sent; if one turns up anyway it
+	// is still our car, so it is still ours to apply - what it must not do is
+	// credit us as a remote player, because we are not one.
+	c.HandleMessage(Wrap(MakeVehicleHit(/*attackerId=*/0, 77), CH_EVENT));
+	Check(g_rec.vehicleHits == 2 && g_rec.vehicleHitAttacker == 0xFF,
+	      "and a hit addressed from our own slot credits nobody");
+}
+
+void TestAWreckTakesNoMoreHits() {
+	std::printf("a hit that arrives after our car has already blown up\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsCar77(c);
+
+	S_VehicleBlowUp blast;
+	InitHeader(blast, 2000);
+	blast.playerId  = 0;
+	blast.body      = VehicleBlowUpBody{};
+	blast.body.netId = 77;
+	blast.body.pos   = {1.0f, 2.0f, 3.0f};
+	blast.body.rot   = {0.0f, 0.0f, 0.0f, 1.0f};
+	c.HandleMessage(Wrap(blast, CH_EVENT));
+
+	// The rest of a burst that was in the air when it went up. Refused here as
+	// well as by the server and by the engine - CVehicle::InflictDamage leaves
+	// at 0x00551A10 for a car at zero health - because three cheap refusals
+	// beat one round trip per round.
+	c.HandleMessage(Wrap(MakeVehicleHit(1, 77), CH_EVENT));
+	Check(g_rec.vehicleHits == 0, "a wreck takes no more hits");
+}
+
+void TestNoVehicleHitSeamIsSilentNotBroken() {
+	std::printf("a build with no seam to apply a car hit with says so\n");
+	Client c;
+	WorldBridge bare = RecordingBridge();
+	bare.ApplyRemoteVehicleHit = nullptr;
+	c.SetBridge(bare);
+	GiveUsCar77(c);
+
+	c.HandleMessage(Wrap(MakeVehicleHit(1, 77), CH_EVENT));
+	Check(g_rec.vehicleHits == 0, "nothing is applied and nothing crashes");
+}
+
+void TestWhichHitsAreWorthSending() {
+	std::printf("which of our own hits are worth a packet\n");
+
+	// Pure, so it is checked directly rather than through a socket the test
+	// harness does not have. Each "no" is a race that really happens in the
+	// milliseconds between the trigger and the send.
+	RemoteVehicle v;
+	v.active         = true;
+	v.netId          = 80;
+	v.driverPlayerId = 1;
+
+	Check(VehicleHitIsWorthSending(v, INVALID_NETID),
+	      "a car somebody else is driving is worth telling the session about");
+
+	RemoteVehicle gone = v;
+	gone.active        = false;
+	Check(!VehicleHitIsWorthSending(gone, INVALID_NETID),
+	      "a row the roster has dropped is not");
+
+	RemoteVehicle parked  = v;
+	parked.driverPlayerId = INVALID_PLAYER;
+	Check(VehicleHitIsWorthSending(parked, INVALID_NETID),
+	      "and a session car nobody holds is too - the server makes the shooter "
+	      "its custodian, or its health is the last snapshot for good");
+
+	RemoteVehicle settling     = parked;
+	settling.custodianPlayerId = 1;
+	Check(VehicleHitIsWorthSending(settling, INVALID_NETID),
+	      "and a car nobody is in that somebody is settling is theirs, and is");
+
+	RemoteVehicle wreck = v;
+	wreck.destroyed     = true;
+	Check(!VehicleHitIsWorthSending(wreck, INVALID_NETID),
+	      "nor a car the session has already written off");
+
+	Check(!VehicleHitIsWorthSending(v, /*localVehicleNetId=*/80),
+	      "nor one we have got into since firing at it");
+	Check(VehicleHitIsWorthSending(v, /*localVehicleNetId=*/77),
+	      "but driving some other car changes nothing");
+}
+
+void TestACarHitCarriesThreeFieldsBecauseTheEngineTakesThree() {
+	std::printf("a car's hit is a ped's minus the two a car does not have\n");
+
+	// CPed::InflictDamage closes `ret 14h` - five dword arguments - and
+	// CVehicle::InflictDamage closes `ret 0Ch`, three. The wire carries four of
+	// the ped's five (the culprit cannot travel) and two of the car's three,
+	// plus the netId that names the target on each. A car has no pedPiece and
+	// no hit direction because there is no limb to take off and no knockdown
+	// animation to choose.
+	Check(sizeof(VehicleHitBody) + 4 == sizeof(PedDamageBody),
+	      "exactly the piece, the direction and the two melee bytes smaller");
+	Check(sizeof(S_VehicleHit) == sizeof(C_VehicleHit) + 1,
+	      "and the relay adds the attacker's slot and nothing else");
+
+	// No health anywhere in it, and that is the field whose absence is
+	// load-bearing: writing a health destroys nothing and arms the engine's
+	// five-second fire timer under somebody else's car (§1.11.1). Checked by
+	// size rather than by name, because a field added later would show up here
+	// before anybody read the comment.
+	Check(sizeof(VehicleHitBody) == 7,
+	      "netId, weapon and amount - no health, no position, no shot vector");
+
+	// And the two directions do not share an opcode. C_VehicleDamage is
+	// absolute cosmetic state sent BY the driver and merged as a maximum; this
+	// is a delta sent TO the driver and never merged.
+	Check(C_VehicleHit::OPCODE != C_VehicleDamage::OPCODE &&
+	          S_VehicleHit::OPCODE != S_VehicleDamage::OPCODE,
+	      "they are four different packets, not one packet with a flag");
+}
+
+// ---- shooting somebody else's traffic (docs/protocol.md §1.23) -------------
+//
+// The detours themselves need an engine. What they decide doesn't, and it
+// lives in game/vehicle.h as ClassifyCar / DecideCarDamage / MayBlowUpCar so
+// every case can be walked here.
+
+void TestWhoMayDamageACar() {
+	std::printf("\nwho gets to take health off a car, and blow it up\n");
+	using game::CarDamageVerdict;
+	using game::CarOwner;
+	using game::ClassifyCar;
+	using game::DecideCarDamage;
+	using game::MayBlowUpCar;
+
+	// ClassifyCar(authorised, weDrive, remoteDriver, remoteCustodian,
+	//             trafficReplica)
+	Check(ClassifyCar(false, false, false, false, false) == CarOwner::Local,
+	      "a car nobody else has a claim on is this engine's");
+	Check(ClassifyCar(false, false, true, false, false) == CarOwner::RemoteDriver,
+	      "a session car somebody else drives is theirs");
+	Check(ClassifyCar(false, false, false, true, false) == CarOwner::RemoteCustodian,
+	      "a session car somebody else is settling is theirs too");
+	Check(ClassifyCar(false, false, true, true, false) == CarOwner::RemoteDriver,
+	      "a driver outranks a custodian, as in Session::MayReportVehicle");
+	Check(ClassifyCar(false, false, false, false, true) == CarOwner::RemoteHost,
+	      "a traffic replica is its host's");
+	Check(ClassifyCar(false, true, false, false, true) == CarOwner::Local,
+	      "a replica we have taken the wheel of is ours before the promotion lands");
+	Check(ClassifyCar(false, true, true, false, false) == CarOwner::Local,
+	      "and so is a car we jacked before the session caught up");
+	Check(ClassifyCar(false, true, false, true, false) == CarOwner::Local,
+	      "and one we got back into while somebody was still settling it");
+	Check(ClassifyCar(true, false, false, false, true) == CarOwner::Local &&
+	          ClassifyCar(true, false, true, false, false) == CarOwner::Local &&
+	          ClassifyCar(true, false, false, true, false) == CarOwner::Local,
+	      "CoopIII applying somebody's report is always let through");
+
+	// The two halves have to agree on every car, or a replica sits at zero
+	// health on fire (damage let through, blow-up refused) or blows up
+	// without ever being hurt (the other way round).
+	bool agree = true;
+	for (int bits = 0; bits < 32; ++bits) {
+		const CarOwner owner =
+		    ClassifyCar((bits & 1) != 0, (bits & 2) != 0, (bits & 4) != 0,
+		                (bits & 8) != 0, (bits & 16) != 0);
+		for (int weapon = 0; weapon < 256; ++weapon) {
+			const bool applies =
+			    DecideCarDamage(owner, true, false, static_cast<uint8_t>(weapon)) ==
+			    CarDamageVerdict::Apply;
+			if (applies != MayBlowUpCar(owner))
+				agree = false;
+		}
+	}
+	Check(agree, "damage and blow-up are refused together, for every car and cause");
+
+	// What a replica does with each cause the local player could land on it.
+	bool bulletsGo = true, otherStays = true;
+	for (int weapon = 0; weapon < 256; ++weapon) {
+		const CarDamageVerdict v =
+		    DecideCarDamage(CarOwner::RemoteHost, true, false,
+		                    static_cast<uint8_t>(weapon));
+		if (IsForwardableDamage(static_cast<uint8_t>(weapon))) {
+			if (v != CarDamageVerdict::Forward)
+				bulletsGo = false;
+		} else if (v != CarDamageVerdict::Refuse) {
+			otherStays = false;
+		}
+	}
+	Check(bulletsGo, "every ray and melee reach we land on a replica goes to its host");
+	Check(otherStays, "everything else is refused here and sent nowhere");
+	Check(DecideCarDamage(CarOwner::RemoteHost, true, false, WEAPONTYPE_EXPLOSION) ==
+	          CarDamageVerdict::Refuse,
+	      "a blast is refused and not forwarded - the host's replay of it counts");
+	Check(DecideCarDamage(CarOwner::RemoteHost, true, false, WEAPONTYPE_FLAMETHROWER) ==
+	          CarDamageVerdict::Refuse,
+	      "and so is fire, which can be a replayed explosion's");
+	Check(DecideCarDamage(CarOwner::RemoteHost, false, false, WEAPONTYPE_M16) ==
+	          CarDamageVerdict::Refuse,
+	      "a city NPC's shot at a replica is refused and not forwarded");
+	Check(DecideCarDamage(CarOwner::RemoteHost, true, true, WEAPONTYPE_M16) ==
+	          CarDamageVerdict::Refuse,
+	      "nor is a round into a shell");
+	Check(DecideCarDamage(CarOwner::RemoteDriver, true, false, WEAPONTYPE_UZI) ==
+	          CarDamageVerdict::Forward,
+	      "protocol 23 is unchanged: a driven car's hit still goes to its driver");
+	Check(DecideCarDamage(CarOwner::RemoteCustodian, true, false, WEAPONTYPE_UZI) ==
+	              CarDamageVerdict::Forward &&
+	          !MayBlowUpCar(CarOwner::RemoteCustodian),
+	      "a settling car's hit goes to its custodian, and it can't blow up here");
+	Check(DecideCarDamage(CarOwner::RemoteCustodian, true, false,
+	                      WEAPONTYPE_EXPLOSION) == CarDamageVerdict::Refuse,
+	      "a blast on it is refused - the custodian's replay of it counts");
+	Check(DecideCarDamage(CarOwner::Local, false, false, WEAPONTYPE_EXPLOSION) ==
+	          CarDamageVerdict::Apply,
+	      "and a car that is ours, or nobody's, takes whatever the engine gives it");
+}
+
+// ---- a replayed shot on something this machine owns -----------------------
+//
+// combat.h, ReplayedShotMayDamage. The shooter forwards what their round did
+// to their copy, and the same round is replayed here through CWeapon::Fire.
+// For every target, exactly one of the two may take the health.
+
+void TestAReplayedShotCountsOnce() {
+	std::printf("\na replayed shot and a forwarded hit count once between them\n");
+	using game::CarDamageVerdict;
+	using game::CarOwner;
+	using game::ClassifyReplayCar;
+	using game::ClassifyReplayPed;
+	using game::DecideCarDamage;
+	using game::ReplayedShotMayDamage;
+	using game::ReplayMayAddExplosion;
+	using game::ReplayTarget;
+	using game::ShooterForwardsHitOn;
+
+	// Every round a replay can land is a cause the shooter forwards, so the
+	// refusal below covers all of them. Shotgun included: FireShotgun hits
+	// every ped type, where DoBulletImpact skips the shooter's own.
+	bool allForwardable = true;
+	for (int w = 0; w < 256; ++w)
+		if (IsInstantHitWeapon(static_cast<uint8_t>(w)) &&
+		    !IsForwardableDamage(static_cast<uint8_t>(w)))
+			allForwardable = false;
+	Check(allForwardable, "every instant-hit weapon's damage is one the shooter forwards");
+
+	struct Row {
+		ReplayTarget target;
+		bool         forwarded;
+		const char  *what;
+	};
+	const Row rows[] = {
+	    {ReplayTarget::NamedHostedPed,   true,  "a pedestrian we host and the session named"},
+	    {ReplayTarget::UnnamedHostedPed, false, "a pedestrian we host, not yet named"},
+	    {ReplayTarget::UnsyncedPed,      false, "a mission or script character"},
+	    {ReplayTarget::CarWeDrive,       true,  "the car we are driving"},
+	    {ReplayTarget::CarWeSettle,      true,  "the car we are settling"},
+	    {ReplayTarget::NamedHostedCar,   true,  "a traffic car we host and the session named"},
+	    {ReplayTarget::UnnamedHostedCar, false, "a traffic car we host, not yet named"},
+	    {ReplayTarget::NobodysCar,       false, "a parked car, or a session car nobody holds"},
+	};
+	for (const Row &r : rows) {
+		Check(ShooterForwardsHitOn(r.target) == r.forwarded, r.what);
+		bool rounds = true, other = true;
+		for (int w = 0; w < 256; ++w) {
+			const bool may = ReplayedShotMayDamage(r.target, static_cast<uint8_t>(w));
+			if (IsForwardableDamage(static_cast<uint8_t>(w))) {
+				if (may == r.forwarded)
+					rounds = false;
+			} else if (!may) {
+				other = false;
+			}
+		}
+		Check(rounds, r.forwarded
+		                  ? "  a replayed round takes no health off it"
+		                  : "  a replayed round is the only way the shot reaches it, so it lands");
+		Check(other, "  and a blast or a fire the replay set off still reaches it");
+	}
+
+	bool never = true;
+	for (int w = 0; w < 256; ++w)
+		if (ReplayedShotMayDamage(ReplayTarget::LocalPlayer, static_cast<uint8_t>(w)) ||
+		    ReplayedShotMayDamage(ReplayTarget::OtherMachines, static_cast<uint8_t>(w)))
+			never = false;
+	Check(never, "the local player and other machines' things: nothing, whatever the cause");
+
+	// Cars, against the shooter's own detour. How their machine sees each of
+	// our cars, then: they forward exactly when we refuse the replay.
+	struct Pair {
+		ReplayTarget ours;
+		CarOwner     theirs;
+		const char  *what;
+	};
+	const Pair pairs[] = {
+	    {ReplayTarget::CarWeDrive,       CarOwner::RemoteDriver,    "our car: driven, to them"},
+	    {ReplayTarget::CarWeSettle,      CarOwner::RemoteCustodian, "our settle: custody, to them"},
+	    {ReplayTarget::NamedHostedCar,   CarOwner::RemoteHost,      "our traffic: a replica, to them"},
+	    {ReplayTarget::UnnamedHostedCar, CarOwner::Local,           "unnamed traffic: theirs to damage"},
+	    {ReplayTarget::NobodysCar,       CarOwner::Local,           "a parked car: theirs to damage too"},
+	};
+	for (const Pair &p : pairs) {
+		bool once = true;
+		for (int w = 0; w < 256; ++w) {
+			const bool forwards =
+			    DecideCarDamage(p.theirs, true, false, static_cast<uint8_t>(w)) ==
+			    CarDamageVerdict::Forward;
+			const bool replay = ReplayedShotMayDamage(p.ours, static_cast<uint8_t>(w));
+			if (IsForwardableDamage(static_cast<uint8_t>(w)) && forwards == replay)
+				once = false;
+		}
+		Check(once, p.what);
+	}
+
+	// A named pedestrian is a replica on the shooter's machine, and
+	// HookedInflictDamage forwards a round on a replica for exactly the
+	// forwardable causes.
+	bool pedOnce = true;
+	for (int w = 0; w < 256; ++w)
+		if (ReplayedShotMayDamage(ReplayTarget::NamedHostedPed, static_cast<uint8_t>(w)) ==
+		    IsForwardableDamage(static_cast<uint8_t>(w)))
+			pedOnce = false;
+	Check(pedOnce, "a named pedestrian: their C_PedDamage or our replay, never both");
+
+	// ClassifyReplayCar(owner, weDrive, weSettle, hostedTraffic, named)
+	Check(ClassifyReplayCar(CarOwner::Local, true, false, false, false) ==
+	          ReplayTarget::CarWeDrive,
+	      "at our wheel: the car we drive");
+	Check(ClassifyReplayCar(CarOwner::Local, true, true, true, true) ==
+	          ReplayTarget::CarWeDrive,
+	      "the wheel outranks everything else about it");
+	Check(ClassifyReplayCar(CarOwner::Local, false, true, false, false) ==
+	          ReplayTarget::CarWeSettle,
+	      "our custody");
+	Check(ClassifyReplayCar(CarOwner::Local, false, false, true, true) ==
+	          ReplayTarget::NamedHostedCar,
+	      "our named traffic");
+	Check(ClassifyReplayCar(CarOwner::Local, false, false, true, false) ==
+	          ReplayTarget::UnnamedHostedCar,
+	      "our traffic still inside its naming round trip");
+	Check(ClassifyReplayCar(CarOwner::Local, false, false, false, false) ==
+	          ReplayTarget::NobodysCar,
+	      "anything else local is nobody's");
+	Check(ClassifyReplayCar(CarOwner::RemoteDriver, false, false, false, false) ==
+	              ReplayTarget::OtherMachines &&
+	          ClassifyReplayCar(CarOwner::RemoteCustodian, false, false, false, false) ==
+	              ReplayTarget::OtherMachines &&
+	          ClassifyReplayCar(CarOwner::RemoteHost, false, false, false, false) ==
+	              ReplayTarget::OtherMachines,
+	      "a car another machine holds is theirs");
+
+	// ClassifyReplayPed(hosted, named)
+	Check(ClassifyReplayPed(true, true) == ReplayTarget::NamedHostedPed &&
+	          ClassifyReplayPed(true, false) == ReplayTarget::UnnamedHostedPed &&
+	          ClassifyReplayPed(false, false) == ReplayTarget::UnsyncedPed &&
+	          ClassifyReplayPed(false, true) == ReplayTarget::UnsyncedPed,
+	      "pedestrians: named, unnamed, or not the session's at all");
+
+	// The explosions a replay may add here.
+	Check(!ReplayMayAddExplosion(EXPLOSION_GRENADE) &&
+	          !ReplayMayAddExplosion(EXPLOSION_MOLOTOV) &&
+	          !ReplayMayAddExplosion(EXPLOSION_ROCKET),
+	      "not a projectile's - the thrower says where it went off");
+	Check(!ReplayMayAddExplosion(EXPLOSION_BARREL),
+	      "not a barrel's - the shooter relays their own as C_Explosion");
+	Check(ReplayMayAddExplosion(3) && ReplayMayAddExplosion(4) &&
+	          ReplayMayAddExplosion(EXPLOSION_HELI),
+	      "a car the replayed round finished goes up, or BlowUpCar is left half done");
+	Check(ReplayMayAddExplosion(-1), "a negative type is not ours to judge");
+}
+
+// ---- what a round does to the local player's body -------------------------
+//
+// combat.h, LocalPlayerHitReaction. The reaction goes with the damage: a
+// replayed round never moves us, and a forwarded hit plays what the engine's
+// own fire path for that weapon would have.
+
+void TestAReplayedRoundDoesNotMoveUs() {
+	std::printf("\na replayed round never moves us, the forwarded hit does\n");
+	using game::EngineHitReaction;
+	using game::HitAnimHoldOver;
+	using game::HitReaction;
+	using game::HitReactionRule;
+	using game::LocalPlayerHitReaction;
+	using game::REPLAY_HIT_ANIM_HOLD;
+	using game::ShotgunMayKnockDown;
+	using game::TowardShooter;
+
+	bool still = true;
+	for (int w = 0; w < 256; ++w)
+		for (int seated = 0; seated < 2; ++seated)
+			if (LocalPlayerHitReaction(true, static_cast<uint8_t>(w), seated != 0).kind !=
+			    HitReaction::None)
+				still = false;
+	Check(still, "a replayed round: no reaction for any cause, on foot or seated");
+
+	// Both kinds of session, counting what one round that hit us on the
+	// shooter's screen does here. Friendly fire off, the server drops the
+	// C_Damage and the replay is all that arrives. On, both arrive.
+	const uint8_t guns[] = {game::WEAPONTYPE_COLT45, game::WEAPONTYPE_UZI,
+	                        game::WEAPONTYPE_SHOTGUN, game::WEAPONTYPE_AK47,
+	                        game::WEAPONTYPE_M16};
+	for (int ff = 0; ff < 2; ++ff) {
+		bool once = true;
+		for (uint8_t w : guns) {
+			int reactions = 0;
+			if (LocalPlayerHitReaction(true, w, false).kind != HitReaction::None)
+				++reactions;
+			if (ff && LocalPlayerHitReaction(false, w, false).kind != HitReaction::None)
+				++reactions;
+			if (reactions != ff)
+				once = false;
+		}
+		Check(once, ff ? "friendly fire on: one reaction per hit, and it's the forwarded one"
+		               : "friendly fire off: a teammate's round never moves us");
+	}
+
+	// A forwarded hit with no replay behind it - the replay missed here. One
+	// row per fire path, from the disassembly in addresses.h.
+	struct Row {
+		uint8_t     weapon;
+		HitReaction kind;
+		bool        inControl, holdGate, withDir;
+		uint32_t    holdMs;
+		const char *what;
+	};
+	const Row rows[] = {
+	    {game::WEAPONTYPE_COLT45, HitReaction::Flinch, true, true, true, 1000,
+	     "pistol: DoBulletImpact's flinch, held a second"},
+	    {game::WEAPONTYPE_UZI, HitReaction::Flinch, true, true, true, 1000,
+	     "uzi: the same"},
+	    {game::WEAPONTYPE_AK47, HitReaction::Flinch, true, true, true, 2500,
+	     "AK: the same, held two and a half"},
+	    {game::WEAPONTYPE_M16, HitReaction::Flinch, true, true, true, 2500,
+	     "M16: the same as the AK"},
+	    {game::WEAPONTYPE_SNIPERRIFLE, HitReaction::Flinch, true, false, false, 0,
+	     "sniper: CBulletInfo's flinch, front anim, no hold"},
+	    {game::WEAPONTYPE_UZI_DRIVEBY, HitReaction::Flinch, false, false, true, 0,
+	     "drive-by: FireInstantHitFromCar's flinch, no gate"},
+	    {game::WEAPONTYPE_SHOTGUN, HitReaction::Knockdown, false, false, false, 0,
+	     "shotgun: FireShotgun's shove and knockdown"},
+	};
+	for (const Row &r : rows) {
+		const HitReactionRule got = LocalPlayerHitReaction(false, r.weapon, false);
+		Check(got.kind == r.kind && got.inControl == r.inControl &&
+		          got.holdGate == r.holdGate && got.withDir == r.withDir &&
+		          got.holdMs == r.holdMs,
+		      r.what);
+	}
+	Check(LocalPlayerHitReaction(false, game::WEAPONTYPE_UNARMED, false).kind ==
+	              HitReaction::None &&
+	          LocalPlayerHitReaction(false, game::WEAPONTYPE_BASEBALLBAT, false).kind ==
+	              HitReaction::None,
+	      "fists and the bat: nothing here, melee reacts through the fight code");
+	bool seatedStill = true;
+	for (uint8_t w : guns)
+		if (LocalPlayerHitReaction(false, w, true).kind != HitReaction::None)
+			seatedStill = false;
+	Check(seatedStill, "seated: a forwarded hit doesn't shove or flinch us either");
+
+	// Only a cause the shooter forwards can arrive as C_Damage at all.
+	bool onlyForwarded = true;
+	for (int w = 0; w < 256; ++w)
+		if (EngineHitReaction(static_cast<uint8_t>(w)).kind != HitReaction::None &&
+		    !IsForwardableDamage(static_cast<uint8_t>(w)))
+			onlyForwarded = false;
+	Check(onlyForwarded, "every cause with a reaction is one C_Damage can carry");
+
+	// The direction off the wire picks one of four anims per block.
+	bool fourDirs = true;
+	for (int d = 0; d < 256; ++d)
+		if (IsKnownDamageDirection(static_cast<uint8_t>(d)) && d > 3)
+			fourDirs = false;
+	Check(fourDirs, "a direction that gets through is 0..3, so 1Dh + dir stays a shot anim");
+
+	// The gates, unsigned the way the binary compares them.
+	Check(HitAnimHoldOver(1000, 1001) && !HitAnimHoldOver(1001, 1001) &&
+	          !HitAnimHoldOver(5000, 1001),
+	      "the flinch waits for the hold: `jae` skips it while the delay isn't over");
+	const uint32_t nows[] = {0u, 1u, 2999u, 3000u, 123456u, 0xFFFFFFFEu, 0xFFFFFFFFu};
+	bool shut = true;
+	for (uint32_t now : nows)
+		if (HitAnimHoldOver(REPLAY_HIT_ANIM_HOLD, now))
+			shut = false;
+	Check(shut, "the hold a replay parks is never over, at any time");
+
+	Check(ShotgunMayKnockDown(0, 10000) && ShotgunMayKnockDown(7000, 10000) &&
+	          !ShotgunMayKnockDown(7001, 10000),
+	      "the shotgun knocks us down again only three seconds after getting up");
+	Check(!ShotgunMayKnockDown(0xFFFFFFFFu, 10000),
+	      "and never out of a fall SetFall made timeless");
+	Check(ShotgunMayKnockDown(0, 1000),
+	      "early in a session now - 3000 wraps, exactly like the engine's add");
+
+	const Vec3 north{0.0f, 1.0f, 0.0f};
+	const Vec3 dirs[] = {TowardShooter(north, 0), TowardShooter(north, 1),
+	                     TowardShooter(north, 2), TowardShooter(north, 3),
+	                     TowardShooter(north, 5)};
+	Check(dirs[0].x == 0.0f && dirs[0].y == 1.0f, "direction 0: the shooter is in front");
+	Check(dirs[1].x == -1.0f && dirs[1].y == 0.0f,
+	      "direction 1: on the left, a quarter turn anticlockwise");
+	Check(dirs[2].x == 0.0f && dirs[2].y == -1.0f, "direction 2: behind");
+	Check(dirs[3].x == 1.0f && dirs[3].y == 0.0f, "direction 3: on the right");
+	Check(dirs[4].x == dirs[1].x && dirs[4].y == dirs[1].y, "and only the low two bits count");
+}
+
+void TestTrafficHealthOnTheWire() {
+	std::printf("\na traffic car's health rides the old padding\n");
+	Check(EncodeAmbientHealth(1000.0f) == 1000, "full is 1000");
+	Check(EncodeAmbientHealth(249.6f) == 250 && EncodeAmbientHealth(249.4f) == 249,
+	      "whole points, rounded");
+	Check(EncodeAmbientHealth(0.0f) == 1 && EncodeAmbientHealth(-40.0f) == 1,
+	      "a live car never encodes to the 'unsaid' value");
+	Check(EncodeAmbientHealth(std::numeric_limits<float>::quiet_NaN()) ==
+	          AMBIENT_HEALTH_UNSAID,
+	      "NaN is not a health");
+	Check(EncodeAmbientHealth(1.0e9f) == 65535, "and a huge one clamps");
+
+	float h = 777.0f;
+	Check(!DecodeAmbientHealth(AMBIENT_HEALTH_UNSAID, h) && h == 777.0f,
+	      "unsaid leaves the old value alone");
+	Check(DecodeAmbientHealth(240, h) && h == 240.0f, "anything else is the number");
+
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(610), CH_EVENT));
+	Check(c.AmbientCar(610) && c.AmbientCar(610)->health == 1000.0f,
+	      "a replica starts at full health");
+
+	S_CarStates s{};
+	InitHeader(s, 2000);
+	s.ownerPlayerId      = 1;
+	s.count              = 1;
+	s.cars[0].netId      = 610;
+	s.cars[0].health     = 240;
+	s.cars[0].rot        = {0.0f, 0.0f, 0.0f, 1.0f};
+	c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+	Check(c.AmbientCar(610)->health == 240.0f, "and takes what its host streams");
+
+	s.hdr.sendTimeMs = 2100;
+	s.cars[0].health = AMBIENT_HEALTH_UNSAID;
+	c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+	Check(c.AmbientCar(610)->health == 240.0f,
+	      "a row that doesn't say keeps the last value");
+
+	s.hdr.sendTimeMs = 2200;
+	s.ownerPlayerId  = 2;
+	s.cars[0].health = 5;
+	c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+	Check(c.AmbientCar(610)->health == 240.0f,
+	      "and a machine that doesn't host it says nothing about it");
+}
+
+// A traffic car honking on its host, through OnCarStates and the per-frame
+// correction. The pure half is in siren.cpp; this is the row being stamped
+// and the countdown reaching the seam.
+void TestTrafficHornThroughTheClient() {
+	std::printf("\na traffic car's horn, through the client\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(620), CH_EVENT));
+	c.Tick();
+	Check(g_rec.ambientCarSpawns == 1, "the replica is built");
+	Check(g_rec.ambientCorrections > 0 && g_rec.lastAmbientHornTimer == 0,
+	      "and corrected every frame, silent");
+
+	auto batch = [](uint32_t at, uint8_t owner, uint8_t mask) {
+		S_CarStates s{};
+		InitHeader(s, at);
+		s.ownerPlayerId = owner;
+		s.count         = 2;
+		s.hornMask      = mask;
+		s.cars[0].netId = 999;   // a car this machine has never heard of
+		s.cars[0].rot   = {0.0f, 0.0f, 0.0f, 1.0f};
+		s.cars[1].netId = 620;
+		s.cars[1].rot   = {0.0f, 0.0f, 0.0f, 1.0f};
+		return s;
+	};
+
+	c.HandleMessage(Wrap(batch(2000, 1, CarStateHornBit(1)), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastAmbientHornTimer == 44,
+	      "the host says row 1 is honking: the replica starts at 44");
+	c.Tick();
+	Check(g_rec.lastAmbientHornTimer == 43, "and counts down one a frame");
+
+	c.HandleMessage(Wrap(batch(2100, 1, CarStateHornBit(0)), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastAmbientHornTimer == 0,
+	      "a bit on somebody else's row is not this car's");
+
+	c.HandleMessage(Wrap(batch(2200, 1, CarStateHornBit(1)), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastAmbientHornTimer == 44, "honking again, from the top");
+	c.HandleMessage(Wrap(batch(2300, 1, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastAmbientHornTimer == 0, "the next batch lets go: silent at once");
+
+	c.HandleMessage(Wrap(batch(2400, 2, CarStateHornBit(1)), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastAmbientHornTimer == 0,
+	      "a machine that doesn't host it can't make it honk");
+
+	c.HandleMessage(Wrap(batch(2500, 1, CarStateHornBit(1)), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastAmbientHornTimer == 44, "back on");
+	std::this_thread::sleep_for(
+	    std::chrono::milliseconds(game::HORN_FRESH_MS + 60));
+	c.Tick();
+	Check(g_rec.lastAmbientHornTimer == 0,
+	      "and silent once its host has said nothing for HORN_FRESH_MS");
+}
+
+// A police car in somebody else's traffic with its siren on: the bit off the
+// row, held between rows, and the driver the host's ped rows name for it.
+void TestTrafficSirenThroughTheClient() {
+	std::printf("\na traffic car's siren, through the client\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(c, 530);
+	c.HandleMessage(Wrap(MakeAmbientPedSpawn(531, 1, 12.0f), CH_EVENT));
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(630), CH_EVENT));
+	c.Tick();
+	Check(g_rec.ambientCarSpawns == 1 && !g_rec.lastAmbientSirenOn,
+	      "the replica is built with its siren off");
+
+	auto batch = [](uint32_t at, uint8_t owner, uint8_t sirens, bool withCar = true) {
+		S_CarStates s{};
+		InitHeader(s, at);
+		s.ownerPlayerId = owner;
+		s.count         = 2;
+		s.sirenMask     = sirens;
+		s.cars[0].netId = 998;
+		s.cars[0].rot   = {0.0f, 0.0f, 0.0f, 1.0f};
+		s.cars[1].netId = withCar ? 630 : 997;
+		s.cars[1].rot   = {0.0f, 0.0f, 0.0f, 1.0f};
+		return s;
+	};
+
+	c.HandleMessage(Wrap(batch(2000, 1, CarStateSirenBit(0)), CH_SNAPSHOT));
+	c.Tick();
+	Check(!g_rec.lastAmbientSirenOn, "a bit on somebody else's row is not this car's");
+
+	c.HandleMessage(Wrap(batch(2100, 1, CarStateSirenBit(1)), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastAmbientSirenOn, "the host says row 1's siren is on: it's on here");
+	Check(!g_rec.lastAmbientDriverSaid, "nobody named at the wheel yet");
+
+	c.HandleMessage(Wrap(batch(2200, 1, 0, /*withCar=*/false), CH_SNAPSHOT));
+	c.Tick();
+	std::this_thread::sleep_for(
+	    std::chrono::milliseconds(game::HORN_FRESH_MS + 60));
+	c.Tick();
+	Check(g_rec.lastAmbientSirenOn,
+	      "a batch without it, and a quiet spell, leave it as last seen");
+
+	c.HandleMessage(Wrap(batch(2300, 2, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastAmbientSirenOn, "a machine that doesn't host it can't turn it off");
+
+	c.HandleMessage(Wrap(MakePedStates(1, 531, 2300, 12.0f, 0, /*vehicleNetId=*/630,
+	                                   /*seat=*/1),
+	                     CH_SNAPSHOT));
+	c.Tick();
+	Check(!g_rec.lastAmbientDriverSaid, "a passenger is not a driver");
+
+	c.HandleMessage(Wrap(MakePedStates(2, 530, 2300, 10.0f, 0, 630, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(!g_rec.lastAmbientDriverSaid,
+	      "nor is a driver named by a machine that doesn't host the ped");
+
+	c.HandleMessage(Wrap(MakePedStates(1, 530, 2400, 10.0f, 0, 630, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.lastAmbientDriverSaid, "the host puts somebody in seat 0: a driver");
+
+	c.HandleMessage(Wrap(MakePedStates(1, 530, 2500, 10.0f), CH_SNAPSHOT));
+	c.Tick();
+	Check(!g_rec.lastAmbientDriverSaid && g_rec.lastAmbientSirenOn,
+	      "he gets out: lights still on, nobody at the wheel");
+
+	c.HandleMessage(Wrap(batch(2600, 1, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(!g_rec.lastAmbientSirenOn, "the next row with it says off: off");
+}
+
+S_CarHit MakeCarHit(uint8_t attackerId, uint16_t netId, uint8_t weapon = 3,
+                    float amount = 25.0f) {
+	S_CarHit h;
+	InitHeader(h, 1000);
+	h.attackerId  = attackerId;
+	h.body.netId  = netId;
+	h.body.weapon = weapon;
+	h.body.amount = amount;
+	return h;
+}
+
+void TestAHitOnOurTrafficReachesTheEngine() {
+	std::printf("a hit somebody landed on a replica of our traffic\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+
+	c.HandleMessage(Wrap(MakeCarHit(1, 610, /*weapon=*/5, /*amount=*/34.0f), CH_EVENT));
+	Check(g_rec.carHits == 1, "it goes straight to the seam, by netId");
+	Check(g_rec.lastCarHit.netId == 610 && g_rec.lastCarHit.weapon == 5 &&
+	          g_rec.lastCarHit.amount == 34.0f,
+	      "with the three fields the shooter's own InflictDamage had");
+	Check(g_rec.carHitAttacker == 1, "credited to the player who fired");
+
+	c.HandleMessage(Wrap(MakeCarHit(5, 610), CH_EVENT));
+	Check(g_rec.carHits == 2 && g_rec.carHitAttacker == 0xFF,
+	      "a shooter we don't know still lands the hit, blaming nobody");
+	c.HandleMessage(Wrap(MakeCarHit(0, 610), CH_EVENT));
+	Check(g_rec.carHits == 3 && g_rec.carHitAttacker == 0xFF,
+	      "and one claiming to be us is not blamed on our own ped");
+
+	const int applied = g_rec.carHits;
+	c.Tick();
+	c.Tick();
+	Check(g_rec.carHits == applied, "applied on the packet, not every frame");
+
+	WorldBridge bare = RecordingBridge();
+	bare.ApplyHostedCarHit = nullptr;
+	Client d;
+	d.SetBridge(bare);
+	d.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	d.HandleMessage(Wrap(MakeCarHit(1, 610), CH_EVENT));
+	Check(g_rec.carHits == 0, "a build with no seam drops it without crashing");
+}
+
+void TestWhichTrafficHitsAreWorthSending() {
+	std::printf("which hits on a traffic replica go to its host\n");
+	RemoteAmbientCar car;
+	car.active        = true;
+	car.netId         = 610;
+	car.ownerPlayerId = 1;
+	Check(CarHitIsWorthSending(car, 0), "a live replica somebody else hosts");
+
+	RemoteAmbientCar gone = car;
+	gone.active = false;
+	Check(!CarHitIsWorthSending(gone, 0), "not a row the roster has dropped");
+	RemoteAmbientCar wreck = car;
+	wreck.destroyed = true;
+	Check(!CarHitIsWorthSending(wreck, 0), "not a car the host already burned out");
+	RemoteAmbientCar mine = car;
+	mine.claimPending = true;
+	Check(!CarHitIsWorthSending(mine, 0),
+	      "not one we're driving and have asked to promote");
+	Check(!CarHitIsWorthSending(car, 1), "not one the session says we host");
+	RemoteAmbientCar orphan = car;
+	orphan.ownerPlayerId = INVALID_PLAYER;
+	Check(!CarHitIsWorthSending(orphan, 0), "not one with no host at all");
+
+	// The send path drains the queue whether or not anything goes out, so a
+	// hit on a car the roster no longer has can't pile up behind it.
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(610), CH_EVENT));
+	VehicleHitBody hit{};
+	hit.netId  = 610;
+	hit.weapon = WEAPONTYPE_AK47;
+	hit.amount = 30.0f;
+	g_rec.localCarHits.push_back(hit);
+	hit.netId = 9999;
+	g_rec.localCarHits.push_back(hit);
+	c.TickCarHitsForTest();
+	Check(g_rec.carHitDrains == 1 && g_rec.localCarHits.empty(),
+	      "one drain takes both, the known car and the unknown one");
+}
+
+void TestAPedHitIsItsOwnKindOfEvent() {
+	std::printf("a hit on a pedestrian and a hit on a player are two events\n");
+
+	// The two netIds name different tables on the server - a player slot and a
+	// row in the ambient roster - so they are two packets and two relays. A
+	// single kind with a "which" byte would put one packet's routing in a byte
+	// nobody reading the wire could check.
+	CombatEvent onAPlayer;
+	onAPlayer.kind               = CombatEvent::DAMAGE;
+	onAPlayer.damage.victimNetId = 100;
+
+	CombatEvent onAPed;
+	onAPed.kind            = CombatEvent::PED_DAMAGE;
+	onAPed.pedDamage.netId = 100;
+
+	Check(onAPlayer.kind != onAPed.kind, "the drain can tell them apart");
+	Check(sizeof(PedDamageBody) == sizeof(DamageBody),
+	      "and they are the same five arguments of the same engine function");
+
+	// The queue is the bridge's and the drain is bounded, the same as every
+	// other combat event. Checked through the recorder rather than the socket,
+	// because PostFrame needs a live one.
+	g_rec = Recorder{};
+	for (int i = 0; i < 3; ++i)
+		g_rec.localCombat.push_back(onAPed);
+	CombatEvent   scratch[8];
+	const uint8_t n = RecDrainLocalCombat(scratch, 8);
+	Check(n == 3, "three queued, three drained");
+	Check(scratch[0].kind == CombatEvent::PED_DAMAGE &&
+	          scratch[0].pedDamage.netId == 100,
+	      "and they come back out as what they went in as");
+}
+
+void TestAPedInACarCannotBeShotToDeath() {
+	std::printf("the one thing the engine will not let this feature do\n");
+
+	// Measured, not reasoned. CPed::InflictDamage's in-vehicle arm at
+	// 0x004EACF3 sends everything but WEAPONTYPE_DROWNING to 0x004EADD0, which
+	// writes 1.0f into m_fHealth and answers "did not die".
+	Check(CanKillPedInVehicle(WEAPONTYPE_DROWNING),
+	      "drowning is the only death there is for a ped in a seat");
+	Check(!CanKillPedInVehicle(WEAPONTYPE_COLT45) &&
+	          !CanKillPedInVehicle(WEAPONTYPE_M16) &&
+	          !CanKillPedInVehicle(WEAPONTYPE_ROCKETLAUNCHER) &&
+	          !CanKillPedInVehicle(WEAPONTYPE_UNARMED),
+	      "and nothing else is, however much damage it carries");
+
+	// The consequence, walked over every byte a weapon field can hold rather
+	// than asserted: no cause this wire can carry is able to kill a ped in a
+	// car. Drowning happens on the machine the ped is drowning on and is not
+	// forwardable, so the two lists do not intersect - which is why the apply
+	// path does not special-case a seated ped and must never synthesise a
+	// death the engine declined to give.
+	int both = 0;
+	for (int w = 0; w < 256; ++w) {
+		const uint8_t weapon = static_cast<uint8_t>(w);
+		if (IsForwardableDamage(weapon) && CanKillPedInVehicle(weapon))
+			++both;
+	}
+	Check(both == 0,
+	      "nothing that may be forwarded can kill a ped in a seat, over all 256 "
+	      "causes");
+}
+
+// ---- our flame reaching what another machine owns --------------------------
+//
+// combat.h, IsOurFlame and below. The flamethrower lights; the fire burns.
+// What the wire carries is the ignition, recognised inside CShotInfo::Update
+// by its source, and never the burning.
+
+void TestOnlyOurOwnFlameIsForwarded() {
+	std::printf("\nonly our own flamethrower's ignition goes to the owner\n");
+
+	Check(IsOurFlame(/*insideShotInfoUpdate=*/true, /*fleeFromIsLocalPlayer=*/true),
+	      "our flame, lit inside CShotInfo::Update with our ped as the source");
+
+	// The double count this has to rule out. Our own molotov and rocket name
+	// our ped as the source too, but their fires come out of
+	// CExplosion::Update, and the owner replays that explosion and lights its
+	// own entities from it.
+	Check(!IsOurFlame(false, true),
+	      "not our molotov's or our rocket's fire: same source, but it comes out "
+	      "of CExplosion::Update and every machine lights its own from the replay");
+	// Somebody else's flamethrower, replayed here: it is in the window, and
+	// its source is our copy of their ped. Their machine forwards it.
+	Check(!IsOurFlame(true, false),
+	      "not another player's replayed flame, which is theirs to forward");
+	Check(!IsOurFlame(false, false),
+	      "and not another player's replayed explosion");
+
+	// And the burning itself is never forwarded, only the ignition. Our fire on
+	// our copy of somebody's car hits CVehicle::InflictDamage with cause 9
+	// every frame; forwarding that would be sixty packets a second and a
+	// second lot of damage on top of the owner's own fire.
+	Check(!IsForwardableDamage(WEAPONTYPE_FLAMETHROWER),
+	      "cause 9 is still not forwardable as damage");
+	Check(DecideCarDamage(CarOwner::RemoteHost, true, false, WEAPONTYPE_FLAMETHROWER) ==
+	              CarDamageVerdict::Refuse &&
+	          DecideCarDamage(CarOwner::RemoteDriver, true, false,
+	                          WEAPONTYPE_FLAMETHROWER) == CarDamageVerdict::Refuse &&
+	          DecideCarDamage(CarOwner::RemoteCustodian, true, false,
+	                          WEAPONTYPE_FLAMETHROWER) == CarDamageVerdict::Refuse,
+	      "so our fire on our copy of their car is refused here and not sent");
+	Check(DecideCarDamage(CarOwner::Local, false, false, WEAPONTYPE_FLAMETHROWER) ==
+	          CarDamageVerdict::Apply,
+	      "while the owner's own fire on its own car does the damage");
+
+	Check(!FlameGoesToOwner(CarOwner::Local),
+	      "a car we drive or host burns here and nobody is told");
+	Check(FlameGoesToOwner(CarOwner::RemoteDriver) &&
+	          FlameGoesToOwner(CarOwner::RemoteCustodian) &&
+	          FlameGoesToOwner(CarOwner::RemoteHost),
+	      "a car anybody else holds gets the ignition");
+}
+
+void TestFlameReachIsTheEngines() {
+	std::printf("the flame reaches a pedestrian by CShotInfo::Update's own test\n");
+
+	// 0x0055C148: the radius is floored at 1.0f.
+	Check(FlameReachesPed(0.9f, 0.2f), "a young flame still reaches one unit");
+	Check(!FlameReachesPed(1.0f, 0.2f), "and the compare is strict, like fcomp's");
+
+	// 0x0055C1CB compares the squared distance against the radius itself.
+	// Transcribed, not corrected: a replica is reached exactly when the real
+	// pedestrian would have been.
+	Check(FlameReachesPed(3.0f, 4.0f), "1.7 away from a radius-4 flame is inside");
+	Check(!FlameReachesPed(5.0f, 4.0f),
+	      "2.2 away is not, because the engine never squares the radius");
+
+	const float nan = std::numeric_limits<float>::quiet_NaN();
+	Check(!FlameReachesPed(nan, 4.0f) && !FlameReachesPed(0.5f, nan),
+	      "a NaN reaches nobody, same as the x87 compare");
+}
+
+void TestAFlameOnTheWireIsAnIgnition() {
+	std::printf("cause 9 on a hit packet means light it\n");
+
+	Check(IsFlameIgnition(WEAPONTYPE_FLAMETHROWER), "cause 9 is the ignition");
+
+	// The two readings of a hit packet never overlap, so a receiver can branch
+	// on the ignition first and the damage path never sees one - and a build
+	// from before this, which only has the damage path, drops it.
+	int both = 0, ignitions = 0;
+	for (int w = 0; w < 256; ++w) {
+		const uint8_t weapon = static_cast<uint8_t>(w);
+		if (IsFlameIgnition(weapon))
+			++ignitions;
+		if (IsFlameIgnition(weapon) && IsForwardableDamage(weapon))
+			++both;
+	}
+	Check(ignitions == 1, "one cause, and only one, is an ignition");
+	Check(both == 0, "and no cause is both an ignition and a hit, over all 256");
+
+	// The owner makes the two tests the shooter could not.
+	Check(OwnerLightsFlame(false, false), "the owner lights what can burn");
+	Check(!OwnerLightsFlame(true, false), "not something bFireProof on its machine");
+	Check(!OwnerLightsFlame(false, true), "and not a wreck");
+}
+
+void TestAFlameIsReportedOnceASecond() {
+	std::printf("a flame standing on somebody is reported once a second\n");
+
+	FlameReportThrottle t;
+	Check(t.Due(FlameTargetKind::Pedestrian, 700, 5000), "the first reach goes out");
+	Check(!t.Due(FlameTargetKind::Pedestrian, 700, 5016),
+	      "the next frame's does not");
+	Check(!t.Due(FlameTargetKind::Pedestrian, 700, 5999), "nor anything inside the second");
+	Check(t.Due(FlameTargetKind::Pedestrian, 700, 6000), "then again, once");
+	Check(t.Due(FlameTargetKind::Pedestrian, 701, 6001), "another pedestrian is his own");
+	Check(t.Due(FlameTargetKind::Traffic, 700, 6002),
+	      "and a traffic car under the same number is a different thing");
+	Check(t.Due(FlameTargetKind::DrivenCar, 700, 6003),
+	      "as is a session car under it");
+
+	// The timer is CTimer's, which wraps. Unsigned subtraction still reads the
+	// gap across the wrap.
+	FlameReportThrottle w;
+	Check(w.Due(FlameTargetKind::Pedestrian, 1, 0xFFFFFF00u), "just before the wrap");
+	Check(!w.Due(FlameTargetKind::Pedestrian, 1, 0x00000010u),
+	      "0x110 ms later, across it, is still too soon");
+	Check(w.Due(FlameTargetKind::Pedestrian, 1, 0x00000400u), "and 1.28 s later is not");
+
+	// More burning targets than rows costs an early repeat for the stalest
+	// one, never a missed first report.
+	FlameReportThrottle full;
+	for (uint16_t id = 0; id < FlameReportThrottle::ROWS; ++id)
+		full.Due(FlameTargetKind::Pedestrian, id, 100u + id);
+	Check(full.Due(FlameTargetKind::Pedestrian, 999, 200),
+	      "a seventeenth target is still reported");
+	Check(full.Due(FlameTargetKind::Pedestrian, 0, 201),
+	      "at the cost of the stalest row, which may report again early");
+	Check(!full.Due(FlameTargetKind::Pedestrian, 15, 202),
+	      "while the freshest keep their place");
+}
+
+void TestAFlameReachesTheSeamLikeAHit() {
+	std::printf("an ignition off the wire reaches the seam like any hit\n");
+
+	// The client does not read the cause on any of the three packets, which
+	// is what lets them carry an ignition without a routing change here or on
+	// the server (Session::PedDamageRecipient and friends take no weapon).
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+
+	c.HandleMessage(Wrap(MakePedDamage(1, 700, WEAPONTYPE_FLAMETHROWER, 0.0f,
+	                                   PEDPIECE_TORSO, 0),
+	                     CH_EVENT));
+	Check(g_rec.pedDamages == 1 &&
+	          g_rec.lastPedDamage.weapon == WEAPONTYPE_FLAMETHROWER &&
+	          g_rec.lastPedDamage.amount == 0.0f,
+	      "a flame on one of our pedestrians, with no amount");
+	Check(g_rec.pedDamageAttacker == 1, "blaming the player whose flame it was");
+
+	c.HandleMessage(Wrap(MakeCarHit(1, 610, WEAPONTYPE_FLAMETHROWER, 0.0f), CH_EVENT));
+	Check(g_rec.carHits == 1 && g_rec.lastCarHit.weapon == WEAPONTYPE_FLAMETHROWER,
+	      "a flame on our traffic");
+
+	Client d;
+	d.SetBridge(RecordingBridge());
+	GiveUsCar77(d);
+	d.HandleMessage(Wrap(MakeVehicleHit(1, 77, WEAPONTYPE_FLAMETHROWER, 0.0f), CH_EVENT));
+	Check(g_rec.vehicleHits == 1 &&
+	          g_rec.lastVehicleHit.weapon == WEAPONTYPE_FLAMETHROWER,
+	      "and a flame on the car we are driving");
 }
 
 void TestADyingDriverLeavesHisSeatFirst() {
@@ -6897,6 +10090,208 @@ void TestASeatedReplicaTakenByTheEngineKeepsItsInstruction() {
 	Check(g_rec.ambientSeats == seatsBefore + 1,
 	      "so the rebuilt ped is put back in it");
 	Check(c.AmbientPed(517)->Seated(), "and he is driving again");
+}
+
+// ---- a replica that dies on its own (docs/population.md §5.6) --------------
+//
+// The last case §5 left open, and the answer to it is that nothing goes on
+// the wire: an observer's copy of somebody else's pedestrian dying is this
+// machine being wrong, not this machine knowing something. These pin the
+// arithmetic that decision rests on, all of it read out of the retail image.
+
+// The measurement the whole choice turned on. If the proof flags were a
+// complete switch then setting them would be the fix and none of the rest of
+// this would exist - so the table is checked rather than trusted, the same way
+// docs/protocol.md §1.10.2 checks the vehicle one.
+void TestWhichPedDamageCausesTheProofFlagsMiss() {
+	std::printf("\nsix of CPed::InflictDamage's causes read no proof flag\n");
+
+	using game::PedProof;
+	using game::PedProofForDamageCause;
+
+	Check(PedProofForDamageCause(game::WEAPONTYPE_UNARMED) == PedProof::Melee &&
+	          PedProofForDamageCause(game::WEAPONTYPE_BASEBALLBAT) ==
+	              PedProof::Melee,
+	      "a fist and a bat read bMeleeProof");
+	Check(PedProofForDamageCause(game::WEAPONTYPE_COLT45) == PedProof::Bullet &&
+	          PedProofForDamageCause(game::WEAPONTYPE_SNIPERRIFLE) ==
+	              PedProof::Bullet,
+	      "the six guns read bBulletProof");
+	Check(PedProofForDamageCause(game::WEAPONTYPE_FLAMETHROWER) == PedProof::Fire,
+	      "the flamethrower reads bFireProof");
+	Check(PedProofForDamageCause(game::WEAPONTYPE_ROCKETLAUNCHER) ==
+	              PedProof::Explosion &&
+	          PedProofForDamageCause(game::WEAPONTYPE_GRENADE) ==
+	              PedProof::Explosion &&
+	          PedProofForDamageCause(game::WEAPONTYPE_MOLOTOV) ==
+	              PedProof::Explosion &&
+	          PedProofForDamageCause(game::WEAPONTYPE_EXPLOSION) ==
+	              PedProof::Explosion,
+	      "the four blasts read bExplosionProof");
+	Check(PedProofForDamageCause(game::WEAPONTYPE_RAMMEDBYCAR) ==
+	              PedProof::Collision &&
+	          PedProofForDamageCause(game::WEAPONTYPE_RUNOVERBYCAR) ==
+	              PedProof::Collision &&
+	          PedProofForDamageCause(game::WEAPONTYPE_FALL) == PedProof::Collision,
+	      "a car and a fall read bCollisionProof");
+
+	// The two the code names by hand, because they are the two that actually
+	// bit: a replica standing in water drowned locally, and the default arm
+	// is whatever nobody thought of.
+	Check(!game::PedProofFlagsStopCause(game::WEAPONTYPE_DROWNING),
+	      "drowning reads nothing - 0x004EABAD sets the animation and jumps "
+	      "straight to the arithmetic");
+	Check(!game::PedProofFlagsStopCause(game::WEAPONTYPE_UZI_DRIVEBY),
+	      "and a drive-by lands in the default arm with no flag either");
+
+	// And the whole range, so a seventh cannot be added without this failing.
+	// 0..21 have an arm (`cmp eax,15h / ja` at 0x004EA5A2); 22 and up do not.
+	int leaksInRange = 0;
+	for (int cause = 0; cause < 256; ++cause) {
+		const bool stopped =
+		    game::PedProofFlagsStopCause(static_cast<uint8_t>(cause));
+		if (cause > 21) {
+			if (stopped)
+				++g_failures;
+			continue;
+		}
+		if (!stopped)
+			++leaksInRange;
+	}
+	Check(leaksInRange == 6,
+	      "exactly six of the twenty-two arms read no flag at all");
+	Check(true, "and everything from 22 up falls into the default with them");
+}
+
+// The refusal itself, which is one test on the object rather than on the
+// cause - that being the point of the table above.
+void TestALocalDeathOfSomebodyElsesPedestrianIsRefused() {
+	std::printf("\nonly the host decides that its pedestrian is dead\n");
+
+	using game::PlanReplicaSetDie;
+	using game::SetDieVerdict;
+
+	Check(PlanReplicaSetDie(/*isReplica=*/true, /*sessionAsked=*/false) ==
+	          SetDieVerdict::RefuseAndHeal,
+	      "our engine killing somebody else's ped is refused");
+
+	// The one bug a refusal like this is guaranteed to introduce if nobody
+	// writes it down: KillAmbientReplica carries out a death the host
+	// reported by calling the engine's own CPed::SetDie, through the same
+	// address and so through the same detour.
+	Check(PlanReplicaSetDie(/*isReplica=*/true, /*sessionAsked=*/true) ==
+	          SetDieVerdict::Run,
+	      "but the session's own kill goes through");
+
+	Check(PlanReplicaSetDie(/*isReplica=*/false, /*sessionAsked=*/false) ==
+	          SetDieVerdict::Run,
+	      "and a pedestrian we host dies normally - that death is ours to "
+	      "announce");
+	Check(PlanReplicaSetDie(/*isReplica=*/false, /*sessionAsked=*/true) ==
+	          SetDieVerdict::Run,
+	      "as does one nobody has a name for yet");
+}
+
+// CAutomobile::BlowUpCar is the one death in the image that can reach a
+// seated replica without going anywhere near CPed::SetDie, so which of its
+// two arms a ped takes decides whether the refusal can see it at all.
+void TestBlowUpCarsTwoArmsOnItsOccupants() {
+	std::printf("\nwhich arm of BlowUpCar an occupant takes\n");
+
+	Check(game::BlowUpCarDestroysOccupant(game::PEDSTATE_DRIVING),
+	      "a ped at the wheel goes through CPed::SetDead and is flagged for "
+	      "destruction");
+	Check(!game::BlowUpCarUsesSetDieOnOccupant(game::PEDSTATE_DRIVING),
+	      "so no guard on CPed::SetDie can ever see it");
+
+	Check(game::BlowUpCarUsesSetDieOnOccupant(game::PEDSTATE_IDLE) &&
+	          game::BlowUpCarUsesSetDieOnOccupant(game::PEDSTATE_DIE),
+	      "anything else takes the SetDie arm, which the refusal does see");
+	Check(!game::BlowUpCarDestroysOccupant(game::PEDSTATE_IDLE),
+	      "and is not flagged for destruction");
+}
+
+// The backstop, which is what covers the arm the refusal cannot see - and
+// anything else nobody has found, because it tests the state and not the
+// route.
+void TestADeadReplicaIsOnlyRebuiltIfNobodyAskedForIt() {
+	std::printf("\na corpse nobody asked for is not a corpse\n");
+
+	Check(game::ReplicaDiedUnasked(game::PEDSTATE_DIE, /*sessionSaysDead=*/false),
+	      "PED_DIE with nothing on the wire is our own engine's mistake");
+	Check(game::ReplicaDiedUnasked(game::PEDSTATE_DEAD, false),
+	      "and so is PED_DEAD");
+
+	// Without this the recovery is a resurrection machine: every corpse the
+	// host legitimately reported would be rebuilt on the frame after
+	// KillAmbientReplica laid it down, and killed again on the one after
+	// that, for as long as the body lay there.
+	Check(!game::ReplicaDiedUnasked(game::PEDSTATE_DIE, true) &&
+	          !game::ReplicaDiedUnasked(game::PEDSTATE_DEAD, true),
+	      "a death the session reported stays down");
+
+	Check(!game::ReplicaDiedUnasked(game::PEDSTATE_IDLE, false) &&
+	          !game::ReplicaDiedUnasked(game::PEDSTATE_DRIVING, false),
+	      "and a replica that is merely standing or driving is alive");
+}
+
+// The client loop's half, through the stub, which runs the real decision.
+void TestAReplicaOurOwnEngineKilledIsRebuilt() {
+	std::printf("\na replica our own engine killed is rebuilt from the host\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(c, 530);
+	c.Tick();
+	Check(g_rec.ambientPedSpawns == 1, "one replica");
+
+	// One frame of this machine's engine being wrong. The same shape as the
+	// engine taking the replica away: noticed and rebuilt in the same frame,
+	// because the row still knows the model, the owner and the pose.
+	g_rec.ambientReplicaState = game::PEDSTATE_DEAD;
+	c.Tick();
+	g_rec.ambientReplicaState = game::PEDSTATE_NONE;
+
+	Check(g_rec.ambientDeathsRecovered == 1, "noticed once");
+	Check(g_rec.ambientPedDespawns == 1,
+	      "the body is taken away rather than abandoned - CanBeDeleted would "
+	      "refuse to collect it");
+	Check(g_rec.ambientPedSpawns == 2, "and rebuilt in the same frame");
+	Check(c.AmbientPed(530) != nullptr && c.AmbientPed(530)->poolHandle >= 0,
+	      "the row names the new one");
+	Check(!c.AmbientPed(530)->dead,
+	      "and the session still says this pedestrian is alive, because he is");
+
+	for (int i = 0; i < 10; ++i)
+		c.Tick();
+	Check(g_rec.ambientPedSpawns == 2, "it stays one ped");
+	Check(g_rec.ambientKills == 0 && g_rec.ambientKillAttempts == 0,
+	      "and nothing was killed - the host's copy never died, so the death "
+	      "pass has nothing to carry out");
+}
+
+void TestACorpseTheSessionReportedIsNotResurrected() {
+	std::printf("a corpse the host reported is left where it fell\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(c, 531);
+	c.Tick();
+	c.HandleMessage(Wrap(MakePedDeath(531, /*animId=*/17), CH_EVENT));
+	c.Tick();
+	Check(g_rec.ambientKills == 1, "the host's death is carried out");
+
+	// And now the replica reads dead for the rest of the session, because it
+	// is. The recovery must not touch it: rebuilding here would put a live
+	// pedestrian back on his feet in a session that knows he is dead, and the
+	// death pass would kill him again on the next frame, forever.
+	const int spawnsBefore = g_rec.ambientPedSpawns;
+	g_rec.ambientReplicaState = game::PEDSTATE_DEAD;
+	for (int i = 0; i < 10; ++i)
+		c.Tick();
+	g_rec.ambientReplicaState = game::PEDSTATE_NONE;
+
+	Check(g_rec.ambientDeathsRecovered == 0, "nothing is recovered");
+	Check(g_rec.ambientPedSpawns == spawnsBefore, "nothing is rebuilt");
+	Check(g_rec.ambientKills == 1, "and nothing is killed a second time");
 }
 
 // ---- the wanted level (docs/wanted.md) ------------------------------------
@@ -7394,6 +10789,3341 @@ void TestADeathCauseIsNamed() {
 	      "an in-car death that is not drowning reads as a finding");
 }
 
+// ---------------------------------------------------------------------------
+// A car nobody is driving (protocol.h, S_VehicleCustody)
+// ---------------------------------------------------------------------------
+//
+// The bug these are about: a car left leaning against a wall is pinned in that
+// pose for ever, on every machine, and can never be entered again. Nothing
+// re-reports a driverless car, so whatever transform it had at the instant its
+// driver left is written back onto it after physics, every frame, for the rest
+// of the session. CVehicle::CanPedEnterCar (0x005522F0) then refuses it - and
+// refuses it for a car on its *side*, up.z inside +-0.1, not outside it, which
+// is worth pinning as a number because it reads backwards from how the symptom
+// is described.
+//
+// What these check is the decision, because that is where it lives: one
+// machine simulates, everybody else follows, and the moment nobody is settling
+// it the behaviour goes back to being exactly what it was.
+
+// The session's car 80, spawned, with nobody in it.
+void ParkOneCar(Client &c, uint16_t netId = 80) {
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(netId), CH_EVENT));
+	c.Tick();
+}
+
+S_VehicleCustody MakeCustody(uint16_t netId, uint8_t playerId) {
+	S_VehicleCustody p;
+	InitHeader(p, 1000);
+	p.netId    = netId;
+	p.playerId = playerId;
+	p.pad      = 0;
+	return p;
+}
+
+void TestAParkedCarWithNoCustodianIsStillPinnedAndRested() {
+	std::printf("\na parked car nobody is settling: nothing changes at all\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+
+	const int corrections = g_rec.vehicleCorrections;
+	const int rests       = g_rec.vehicleAtRest;
+	c.Tick();
+	c.Tick();
+	c.Tick();
+
+	// This is the check that says the common case did not regress. A car
+	// standing in the street for ten minutes is the thing pinning is right
+	// for: it costs nothing, it cannot drift, and every machine agrees on it
+	// to the bit. Custody is the exception and this is the rule, so the rule
+	// has to be reachable without it.
+	Check(g_rec.vehicleCorrections == corrections + 3,
+	      "still put back after every single frame of physics");
+	Check(g_rec.vehicleAtRest > rests,
+	      "and still rested, so its last driver's velocity cannot pin it");
+	Check(c.VehicleByNetId(80)->custodianPlayerId == INVALID_PLAYER,
+	      "and nobody has been asked to simulate it");
+}
+
+void TestTheCarWeAreSettlingIsNeitherRestedNorPinned() {
+	std::printf("\nthe machine settling a car stops correcting it\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+
+	c.HandleMessage(Wrap(MakeCustody(80, /*us=*/0), CH_EVENT));
+	Check(c.VehicleByNetId(80)->custodianPlayerId == 0, "the session has asked us");
+
+	const int corrections = g_rec.vehicleCorrections;
+	const int rests       = g_rec.vehicleAtRest;
+	const int applies     = g_rec.vehicleApplies;
+	c.Tick();
+	c.Tick();
+	c.Tick();
+
+	// All three, and each one for its own reason. The correction is what
+	// makes a pose permanent, so it has to stop or nothing else matters. The
+	// rest write would hold the velocities at zero, so gravity could never
+	// accumulate and the car would never fall. And the apply would write the
+	// *previous driver's* controls back onto a car we are now simulating.
+	Check(g_rec.vehicleCorrections == corrections,
+	      "not corrected, so one frame of gravity finally gets to finish");
+	Check(g_rec.vehicleAtRest == rests, "not rested, so the fall can start");
+	Check(g_rec.vehicleApplies == applies,
+	      "and not handed its last driver's controls either");
+}
+
+void TestSomebodyElseSettlingACarIsFollowedAndNotRested() {
+	std::printf("\nwatching somebody else settle a car\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeVehicleState(1, 80, 15.0f), CH_SNAPSHOT));
+
+	c.HandleMessage(Wrap(MakeCustody(80, /*somebody else=*/1), CH_EVENT));
+
+	const int corrections = g_rec.vehicleCorrections;
+	const int rests       = g_rec.vehicleAtRest;
+	const int applies     = g_rec.vehicleApplies;
+	c.Tick();
+	c.Tick();
+
+	Check(g_rec.vehicleCorrections > corrections,
+	      "an observer still follows it every frame");
+	Check(g_rec.vehicleApplies > applies,
+	      "and still animates it off what its custodian reports");
+	// The one thing that changes for an observer. Resting zeroes the
+	// velocities, and a tumbling car with zero velocity has still wheels, a
+	// sleeping suspension and no engine note - it slides rather than falls.
+	Check(g_rec.vehicleAtRest == rests,
+	      "but does not rest it, because somebody really is moving it");
+}
+
+void TestASettleEndsOnARunOfQuietSamplesAndNotOnOne() {
+	std::printf("\nwhen a settling car is called finished\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+
+	g_rec.carAtRest = false;
+	for (int i = 0; i < 20; ++i)
+		c.TickCustody();
+	Check(!c.VehicleByNetId(80)->settleReported,
+	      "a car that is still moving is not handed back");
+	Check(g_rec.observedSamples >= 20,
+	      "and it is being reported on the session's behalf while it moves");
+
+	// One still sample is not rest. A car at the top of a bounce reads still
+	// for exactly one frame, and handing it back there leaves it pinned in
+	// mid-air - the same bug, reached by being impatient about it.
+	g_rec.carAtRest = true;
+	c.TickCustody();
+	g_rec.carAtRest = false;
+	c.TickCustody();
+	Check(c.VehicleByNetId(80)->restFrames == 0,
+	      "one quiet sample followed by a moving one is not a run");
+	Check(!c.VehicleByNetId(80)->settleReported, "so it is still ours");
+
+	g_rec.carAtRest = true;
+	for (int i = 0; i < VEHICLE_REST_FRAMES; ++i)
+		c.TickCustody();
+	Check(c.VehicleByNetId(80)->settleReported,
+	      "a full run of quiet samples hands it back");
+
+	// Once. The row keeps the custodian until the server's own answer comes
+	// round, so without this it would say so on every tick in between.
+	const int samples = g_rec.observedSamples;
+	c.TickCustody();
+	c.TickCustody();
+	Check(g_rec.observedSamples == samples,
+	      "and it stops reporting the car the moment it has said so");
+}
+
+void TestASettleThatNeverSettlesIsGivenUpOn() {
+	std::printf("\na car that will not settle\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+
+	// Bouncing on a kerb for ever, or a custodian that has walked out of the
+	// streamer's range and is simulating something that is no longer really
+	// there. Either way the window is bounded, and what it falls back to is
+	// the behaviour that was there before custody existed.
+	g_rec.carAtRest = false;
+	RemoteVehicle *v = const_cast<RemoteVehicle *>(c.VehicleByNetId(80));
+	v->settleEndsAtMs = 0;   // as if VEHICLE_SETTLE_MS had already elapsed
+	c.TickCustody();
+	Check(v->settleReported, "the window closes whether or not the car stopped");
+}
+
+void TestADriverEndsOurSettle() {
+	std::printf("\nsomebody gets into a car we are settling\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeJoin(1, "bob"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	Check(c.VehicleByNetId(80)->custodianPlayerId == 0, "we are settling it");
+
+	S_EnterVehicle enter;
+	InitHeader(enter, 1000);
+	enter.playerId   = 1;
+	enter.body       = EnterVehicleBody{};
+	enter.body.netId = 80;
+	enter.body.seat  = 0;
+	c.HandleMessage(Wrap(enter, CH_EVENT));
+
+	Check(c.VehicleByNetId(80)->custodianPlayerId == INVALID_PLAYER,
+	      "and a driver ends that with no packet spent saying so");
+
+	const int corrections = g_rec.vehicleCorrections;
+	c.Tick();
+	Check(g_rec.vehicleCorrections > corrections,
+	      "so we are back to following the car its driver is reporting");
+}
+
+void TestACustodianLeavingReleasesTheCarHere() {
+	std::printf("\nthe machine settling a car disconnects\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeJoin(1, "bob"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeCustody(80, 1), CH_EVENT));
+
+	const int rests = g_rec.vehicleAtRest;
+	c.Tick();
+	Check(g_rec.vehicleAtRest == rests, "while bob has it, nobody rests it");
+
+	S_PlayerLeave left;
+	InitHeader(left, 1000);
+	left.playerId = 1;
+	left.reason   = 0;
+	c.HandleMessage(Wrap(left, CH_EVENT));
+
+	Check(c.VehicleByNetId(80)->custodianPlayerId == INVALID_PLAYER,
+	      "an ownership does not outlive the player who held it");
+	c.Tick();
+	Check(g_rec.vehicleAtRest > rests,
+	      "so the car goes back to being rested and pinned like any parked one");
+}
+
+// ---------------------------------------------------------------------------
+// A traffic car that has stopped being traffic (protocol.h, S_CarPromoted)
+// ---------------------------------------------------------------------------
+
+S_CarPromoted MakeCarPromoted(uint16_t netId, uint8_t driver, uint8_t wasOwner) {
+	S_CarPromoted p;
+	InitHeader(p, 1000);
+	p.netId            = netId;
+	p.driverPlayerId   = driver;
+	p.wasOwnerPlayerId = wasOwner;
+	p.body             = MakeAmbientCarSpawn(netId, wasOwner).body;
+	return p;
+}
+
+void TestTakingTheWheelOfSomebodyElsesTrafficClaimsIt() {
+	std::printf("\ngetting into somebody else's traffic\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(300, /*owner=*/1), CH_EVENT));
+	c.Tick();
+	const RemoteAmbientCar *car = c.AmbientCar(300);
+	Check(car != nullptr && car->poolHandle >= 0, "we have a replica of it");
+
+	c.TickAmbientClaims();
+	Check(!c.AmbientCar(300)->claimPending, "standing next to it claims nothing");
+
+	// Now at its wheel. Up to here the roster said nothing at all: the
+	// correction pass quietly stepped aside and the session went on telling
+	// everybody else where its old owner thought the car was.
+	g_rec.ambientDrivenHandle = car->poolHandle;
+	c.TickAmbientClaims();
+	Check(c.AmbientCar(300)->claimPending, "taking the wheel asks for it");
+
+	// Once, not once a tick. The claim is reliable, so it gets there.
+	c.TickAmbientClaims();
+	c.TickAmbientClaims();
+	Check(c.AmbientCar(300)->claimPending, "and only asks once");
+
+	// Out again before the answer came back, so a later entry asks afresh.
+	g_rec.ambientDrivenHandle = -1;
+	c.TickAmbientClaims();
+	Check(!c.AmbientCar(300)->claimPending, "getting out drops the claim");
+}
+
+void TestATrafficCarIsNotAlsoClaimedAsABrandNewOne() {
+	std::printf("\nthe traffic car that must not be registered twice\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(300, /*owner=*/1), CH_EVENT));
+	c.Tick();
+	const int32_t handle = c.AmbientCar(300)->poolHandle;
+
+	// At the wheel of it, and the ordinary vehicle path sees exactly what it
+	// sees for any car: the local player is driving something the session has
+	// not named. ObservedVehicleWeAreDriving looks in the *vehicle* roster and
+	// this car is not in it, so without the guard the claim falls through to
+	// "introduce an unknown car" and the session allocates a second netId for
+	// a CVehicle it already has - which is roadmap.md §5.8.1 case 2 reached
+	// from the other roster, and every observer then holds two cars, one
+	// following the driver and one frozen.
+	g_rec.drivingLocally      = true;
+	g_rec.localVehicleHandle  = handle;
+	g_rec.ambientDrivenHandle = handle;
+
+	c.TickLocalVehicle();
+	Check(!c.VehicleClaimPending(),
+	      "the vehicle path leaves it alone, because it is not an unknown car");
+	Check(c.LocalVehicleNetId() == INVALID_NETID, "and names nothing yet");
+
+	c.TickAmbientClaims();
+	Check(c.AmbientCar(300)->claimPending,
+	      "the promotion path asks for it instead, under the number the "
+	      "session already has");
+}
+
+void TestAPromotedTrafficCarKeepsItsObjectAndItsNumber() {
+	std::printf("\na traffic car becomes a session car\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(300, /*owner=*/1), CH_EVENT));
+	c.Tick();
+	const int32_t handle   = c.AmbientCar(300)->poolHandle;
+	const int     despawns = g_rec.ambientCarDespawns;
+	const int     spawns   = g_rec.vehicleSpawns;
+
+	c.HandleMessage(Wrap(MakeCarPromoted(300, /*driver=*/2, /*wasOwner=*/1), CH_EVENT));
+	c.Tick();
+
+	Check(c.AmbientCar(300) == nullptr, "the traffic row is gone");
+	const RemoteVehicle *v = c.VehicleByNetId(300);
+	Check(v != nullptr, "and a vehicle row has taken it over");
+	// The whole point: one CVehicle, one netId, nothing built and nothing
+	// destroyed. A promotion that despawned and respawned would flicker the
+	// car on every screen, and on the machine that made it would delete one
+	// of the player's own traffic cars.
+	Check(v != nullptr && v->netId == 300, "under the same netId");
+	Check(v != nullptr && v->poolHandle == handle, "holding the same object");
+	Check(g_rec.ambientCarDespawns == despawns, "nothing was destroyed");
+	Check(g_rec.vehicleSpawns == spawns, "and nothing was built");
+	Check(g_rec.promotedAdoptions == 1, "the engine seam was told once");
+	Check(!g_rec.lastPromotionWasOurs,
+	      "and told that this is a replica, not a car our own engine made");
+	Check(v != nullptr && !v->ours,
+	      "so the roster may destroy it later, as it may any replica");
+}
+
+void TestTheMachineThatMadeTheCarNeverDestroysIt() {
+	std::printf("\nthe machine whose engine made the promoted car\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	// We are player 1, and the car about to be promoted was ours as traffic.
+	c.HandleMessage(Wrap(MakeWelcome(1), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(300, /*owner=*/2), CH_EVENT));
+	c.Tick();
+	const int32_t handle = c.AmbientCar(300)->poolHandle;
+
+	c.HandleMessage(Wrap(MakeCarPromoted(300, /*driver=*/2, /*wasOwner=*/1), CH_EVENT));
+	const RemoteVehicle *v = c.VehicleByNetId(300);
+	Check(v != nullptr && v->poolHandle == handle, "we keep the car we had");
+	Check(g_rec.lastPromotionWasOurs,
+	      "and the seam is told this one is our own engine's work");
+	Check(v != nullptr && v->ours,
+	      "which is what keeps the deleting destructor away from it - a car "
+	      "this engine made is not CoopIII's to destroy, possibly with a "
+	      "player in it, because a socket closed");
+
+	const int despawns = g_rec.vehicleDespawns;
+	S_VehicleDespawn gone;
+	InitHeader(gone, 1000);
+	gone.netId = 300;
+	c.HandleMessage(Wrap(gone, CH_EVENT));
+	Check(g_rec.vehicleDespawns == despawns,
+	      "so even the session dropping it does not delete it here");
+}
+
+// ---------------------------------------------------------------------------
+// The car we claimed, as the two vehicle detours see it
+// ---------------------------------------------------------------------------
+//
+// CVehicle::InflictDamage and BlowUpCar are detoured in game/vehicle.cpp and
+// decide from four things: is the local player at the wheel, does the
+// Observed table have a row naming a driver, or a custodian, and is it a
+// traffic replica. This is that decision, over the real table, with the local
+// player's own car as the subject. The expressions for "driven" and
+// "settling" are copied from the two detours, and have to stay the same as
+// theirs.
+struct DetourView {
+	game::CarOwner         owner;
+	game::CarDamageVerdict shot;       // our player's M16 round
+	bool                   mayBlowUp;
+	bool                   wreckNamed; // a blast here goes out as UNOWNED_SESSION
+};
+
+DetourView WhatTheDetoursSee(int32_t handle, bool weDrive) {
+	const game::ObservedRow *const o =
+	    weDrive ? nullptr : g_observedHere.Find(FakeVehicleAt(handle), &FakeVehicleAt);
+	const bool driven   = o != nullptr && o->driverPlayerId != 0xFF;
+	const bool settling = o != nullptr && !driven && o->custodianPlayerId != 0xFF;
+	const bool unheld   = o != nullptr && !driven && !settling && !o->weSettle;
+	DetourView view{};
+	view.owner      = game::ClassifyCar(false, weDrive, driven, settling, false, unheld);
+	view.shot       = game::DecideCarDamage(view.owner, true, false, WEAPONTYPE_M16);
+	view.mayBlowUp  = game::MayBlowUpCar(view.owner);
+	view.wreckNamed = !weDrive && view.mayBlowUp && o != nullptr;
+	return view;
+}
+
+// Claims one of our own engine's cars as net 364, as player 0, with alice
+// (player 1) in the session. The handle is 4242 and resolves in the fake pool.
+void ClaimOurOwnCar(Client &c) {
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	g_rec.modelReady         = true;
+	g_rec.drivingLocally     = true;
+	g_rec.localVehicleHandle = 4242;
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 364), CH_EVENT));
+}
+
+void TestTheObservedTable() {
+	std::printf("\nthe table the vehicle detours read\n");
+	game::ObservedTable<4> t;
+	g_rec = Recorder{};
+
+	Check(t.Remember(10, 80, &FakeVehicleAt), "a row goes in");
+	Check(t.Find(FakeVehicleAt(10), &FakeVehicleAt) != nullptr &&
+	          t.Find(FakeVehicleAt(10), &FakeVehicleAt)->netId == 80,
+	      "and is found by the car, not by the number");
+	Check(t.Find(FakeVehicleAt(10), &FakeVehicleAt)->driverPlayerId == 0xFF,
+	      "with nobody at the wheel until the roster says otherwise");
+
+	t.NoteHolders(80, 2, 0xFF, false);
+	Check(t.Find(FakeVehicleAt(10), &FakeVehicleAt)->driverPlayerId == 2,
+	      "the driver is written onto the row");
+	t.NoteHolders(80, 0xFF, 3, false);
+	Check(t.Find(FakeVehicleAt(10), &FakeVehicleAt)->driverPlayerId == 0xFF &&
+	          t.Find(FakeVehicleAt(10), &FakeVehicleAt)->custodianPlayerId == 3,
+	      "and a custodian, once nobody drives it");
+	t.NoteHolders(80, 2, 3, false);
+	Check(t.Find(FakeVehicleAt(10), &FakeVehicleAt)->custodianPlayerId == 0xFF,
+	      "but never alongside a driver");
+	t.NoteHolders(80, 0xFF, 0xFF, true);
+	Check(t.Find(FakeVehicleAt(10), &FakeVehicleAt)->weSettle,
+	      "our own custody is written onto the row");
+	t.NoteHolders(80, 2, 0xFF, true);
+	Check(!t.Find(FakeVehicleAt(10), &FakeVehicleAt)->weSettle,
+	      "but not beside a driver - a driver ends a custody");
+	t.NoteHolders(80, 0xFF, 3, true);
+	Check(!t.Find(FakeVehicleAt(10), &FakeVehicleAt)->weSettle,
+	      "nor beside somebody else's");
+	t.NoteHolders(80, 0xFF, 0xFF, false);
+	Check(!t.Find(FakeVehicleAt(10), &FakeVehicleAt)->weSettle,
+	      "and it goes when the roster stops saying it");
+
+	// Rebuilt under the same netId after the engine reaped it: one row, the
+	// new car's, and the old handle matches nothing.
+	g_rec.reapedVehicleHandles.push_back(10);
+	Check(t.Find(FakeVehicleAt(10), &FakeVehicleAt) == nullptr,
+	      "a reaped car matches nothing");
+	t.Remember(11, 80, &FakeVehicleAt);
+	Check(t.Count() == 1, "a rebuilt car replaces its old row rather than adding one");
+
+	// Four slots; one taken. A reaped row is free again even if nobody said
+	// ForgetObserved for it.
+	t.Remember(20, 81, &FakeVehicleAt);
+	t.Remember(21, 82, &FakeVehicleAt);
+	t.Remember(22, 83, &FakeVehicleAt);
+	Check(!t.Remember(23, 84, &FakeVehicleAt), "a full table says so");
+	g_rec.reapedVehicleHandles.push_back(21);
+	Check(t.Remember(23, 84, &FakeVehicleAt),
+	      "and a row whose car the engine has taken is reused");
+
+	t.Forget(84);
+	Check(t.Find(FakeVehicleAt(23), &FakeVehicleAt) == nullptr, "a forgotten row is gone");
+	g_rec = Recorder{};
+}
+
+void TestOurClaimedCarIsInTheDetoursTable() {
+	std::printf("\nthe car we claimed, through its three owners\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ClaimOurOwnCar(c);
+	const RemoteVehicle *v = c.VehicleByNetId(364);
+	Check(v != nullptr && v->ours && v->poolHandle == 4242, "our own car, claimed as 364");
+	Check(g_rec.claimedAdoptions == 1, "the engine seam was told about it");
+	Check(g_observedHere.Count() == 1, "and the detours' table has a row for it");
+
+	// (a) We are driving it. The table is not even asked: our engine damages
+	// and blows up our own car exactly as single player does.
+	DetourView d = WhatTheDetoursSee(4242, /*weDrive=*/true);
+	Check(d.owner == game::CarOwner::Local && d.mayBlowUp &&
+	          d.shot == game::CarDamageVerdict::Apply,
+	      "(a) at our wheel it is ours to dent and to blow up");
+
+	// (b) Out of it, nobody driving. Still this engine's to damage, and now a
+	// wreck here has a name the session knows.
+	g_rec.drivingLocally = false;
+	c.TickLocalVehicle();
+	c.Tick();
+	d = WhatTheDetoursSee(4242, false);
+	Check(d.owner == game::CarOwner::Nobody && d.shot == game::CarDamageVerdict::Forward,
+	      "(b) parked and nobody holding it, our round goes to the session, which "
+	      "makes us its custodian");
+	Check(d.mayBlowUp, "(b) and a blast that kills it still wrecks it here");
+	Check(d.wreckNamed,
+	      "(b) and if it blows up here it goes out as the session's car 364, "
+	      "not as nobody's");
+
+	// Custody: we were the last driver, so we settle it. Same answer.
+	c.HandleMessage(Wrap(MakeCustody(364, 0), CH_EVENT));
+	c.Tick();
+	d = WhatTheDetoursSee(4242, false);
+	Check(d.owner == game::CarOwner::Local, "(b) while we settle it, likewise");
+
+	// (c) Alice gets in and drives off. The first frame her state reaches us,
+	// the row names her.
+	c.HandleMessage(Wrap(MakeEnter(1, 364), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleState(1, 364, 15.0f), CH_SNAPSHOT));
+	c.Tick();
+	d = WhatTheDetoursSee(4242, false);
+	Check(d.owner == game::CarOwner::RemoteDriver,
+	      "(c) with alice at the wheel it is hers");
+	Check(d.shot == game::CarDamageVerdict::Forward,
+	      "(c) our shot is refused here and sent to her");
+	Check(!d.mayBlowUp, "(c) and our engine may not blow it up");
+
+	// She parks it. Ours to damage again.
+	c.HandleMessage(Wrap(MakeExit(1, 364), CH_EVENT));
+	c.Tick();
+	d = WhatTheDetoursSee(4242, false);
+	Check(d.owner == game::CarOwner::Nobody && d.wreckNamed,
+	      "once she gets out it is nobody's again");
+
+	// And we take it back: one row still, and ours at the wheel.
+	g_rec.drivingLocally = true;
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 364), CH_EVENT));
+	Check(g_observedHere.Count() == 1, "getting back in does not add a second row");
+	d = WhatTheDetoursSee(4242, true);
+	Check(d.owner == game::CarOwner::Local && d.mayBlowUp,
+	      "and at our wheel it is ours again");
+}
+
+void TestOurClaimedCarJackedOffUsIsRefusedHere() {
+	std::printf("\nthe car we claimed, jacked off us\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ClaimOurOwnCar(c);
+
+	// Alice jacks it. Until the handover runs our engine still has us at the
+	// wheel, and for that frame it is still ours to this engine - the same
+	// rule every session car has had since protocol 22.
+	c.HandleMessage(Wrap(MakeEnter(1, 364), CH_EVENT));
+	Check(c.VehicleByNetId(364)->surrendered, "the row says we lost it");
+	Check(WhatTheDetoursSee(4242, true).owner == game::CarOwner::Local,
+	      "before the handover our engine still has us at the wheel");
+
+	c.HandleMessage(Wrap(MakeVehicleState(1, 364, 15.0f), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.vehicleSurrenders == 1, "the seat is handed over");
+	c.Tick();
+	const DetourView d = WhatTheDetoursSee(4242, false);
+	Check(d.owner == game::CarOwner::RemoteDriver && !d.mayBlowUp &&
+	          d.shot == game::CarDamageVerdict::Forward,
+	      "after it, shooting the car she took off us goes to her and does not "
+	      "wreck our copy");
+}
+
+void TestACarWeTookBackIsNotStillHersInTheTable() {
+	std::printf("\njacking our car back and settling it\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ClaimOurOwnCar(c);
+	g_rec.drivingLocally = false;
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(1, 364), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleState(1, 364, 15.0f), CH_SNAPSHOT));
+	c.Tick();
+	Check(WhatTheDetoursSee(4242, false).owner == game::CarOwner::RemoteDriver,
+	      "alice has our car");
+
+	// We take it off her. The correction pass skips a car we drive or settle,
+	// so it can't be what clears her name off the row - the claim reply and
+	// Client::NoteVehicleHolders are.
+	g_rec.drivingLocally = true;
+	c.Tick();
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 364), CH_EVENT));
+	g_rec.drivingLocally = false;
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeCustody(364, 0), CH_EVENT));
+	c.Tick();
+	c.Tick();
+	const DetourView d = WhatTheDetoursSee(4242, false);
+	Check(d.owner == game::CarOwner::Local && d.mayBlowUp,
+	      "settling it after we got out, it is ours and not still hers");
+}
+
+// ---------------------------------------------------------------------------
+// A car somebody is settling (S_VehicleCustody), as the two detours see it
+// ---------------------------------------------------------------------------
+//
+// The custodian's engine is the only one simulating the car until it hands it
+// back, so it owns the car's condition the way a driver does. Everybody else
+// refuses damage and blow-up on it and forwards their own hits.
+
+// We are player 0 and watch car 80. Alice (1) drives it and gets out, and the
+// session names her its custodian. Bob (2) is there too.
+int32_t WatchAliceSettleCar80(Client &c) {
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleState(1, 80, 15.0f), CH_SNAPSHOT));
+	c.Tick();
+	c.HandleMessage(Wrap(MakeExit(1, 80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeCustody(80, 1), CH_EVENT));
+	c.Tick();
+	return c.VehicleByNetId(80)->poolHandle;
+}
+
+void TestAHitOnACarSomebodyElseIsSettlingIsTheirs() {
+	std::printf("\na car somebody else is settling is theirs to damage\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	const int32_t handle = WatchAliceSettleCar80(c);
+	Check(handle >= 0, "car 80 is here");
+
+	const DetourView d = WhatTheDetoursSee(handle, false);
+	Check(d.owner == game::CarOwner::RemoteCustodian,
+	      "alice is settling it, so it is hers");
+	Check(d.shot == game::CarDamageVerdict::Forward,
+	      "our shot is refused here and sent to her, like a shot at a car she drives");
+	Check(!d.mayBlowUp, "and our engine may not blow it up");
+	Check(VehicleHitIsWorthSending(*c.VehicleByNetId(80), INVALID_NETID),
+	      "the hit is worth a packet - the server has somebody to give it to");
+
+	c.Tick();
+	c.Tick();
+	Check(WhatTheDetoursSee(handle, false).owner == game::CarOwner::RemoteCustodian,
+	      "and it stays hers from frame to frame, correction pass or not");
+
+	// Her wreck comes back as UNOWNED_SESSION and is replayed here once.
+	const int blasts = g_rec.blowUps;
+	c.HandleMessage(Wrap(MakeUnownedBlowUp(80, UNOWNED_SESSION, 1), CH_EVENT));
+	c.Tick();
+	Check(g_rec.blowUps == blasts + 1 && g_rec.lastBlowUpNetId == 80,
+	      "her wreck is replayed here, once");
+	c.HandleMessage(Wrap(MakeUnownedBlowUp(80, UNOWNED_SESSION, 1), CH_EVENT));
+	c.Tick();
+	Check(g_rec.blowUps == blasts + 1, "and a second report of it replays nothing");
+}
+
+void TestASettleEndingHandsTheCarBack() {
+	std::printf("\nwhen somebody else's settle ends, the car is nobody's again\n");
+
+	// She says it has stopped and the session hands it back.
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		const int32_t handle = WatchAliceSettleCar80(c);
+		c.HandleMessage(Wrap(MakeCustody(80, INVALID_PLAYER), CH_EVENT));
+		c.Tick();
+		const DetourView d = WhatTheDetoursSee(handle, false);
+		Check(d.owner == game::CarOwner::Nobody && d.mayBlowUp && d.wreckNamed,
+		      "settled: nobody's again, and a wreck here is UNOWNED_SESSION");
+		Check(VehicleHitIsWorthSending(*c.VehicleByNetId(80), INVALID_NETID),
+		      "and a hit we queued before it ended goes out - the server gives "
+		      "us the car to settle");
+	}
+
+	// She quits halfway through. Handed to nobody, not to the next player.
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		const int32_t handle = WatchAliceSettleCar80(c);
+		S_PlayerLeave leave;
+		InitHeader(leave, 2000);
+		leave.playerId = 1;
+		leave.reason   = LEAVE_QUIT;
+		c.HandleMessage(Wrap(leave, CH_EVENT));
+		c.Tick();
+		Check(WhatTheDetoursSee(handle, false).owner == game::CarOwner::Nobody,
+		      "custodian gone: nobody's, not the next player's");
+	}
+
+	// Bob gets in before it has stopped. A driver ends a custody.
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		const int32_t handle = WatchAliceSettleCar80(c);
+		c.HandleMessage(Wrap(MakeEnter(2, 80), CH_EVENT));
+		c.Tick();
+		const DetourView d = WhatTheDetoursSee(handle, false);
+		Check(d.owner == game::CarOwner::RemoteDriver && !d.mayBlowUp,
+		      "bob at the wheel: it is his now");
+		const game::ObservedRow *o =
+		    g_observedHere.Find(FakeVehicleAt(handle), &FakeVehicleAt);
+		Check(o && o->driverPlayerId == 2 && o->custodianPlayerId == 0xFF,
+		      "and the row names bob and nobody else");
+	}
+}
+
+void TestOurOwnSettleIsOursToDamage() {
+	std::printf("\nthe car we are settling is ours to damage, and to be shot in\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeCustody(80, /*us=*/0), CH_EVENT));
+	c.Tick();
+	const int32_t handle = c.VehicleByNetId(80)->poolHandle;
+
+	const DetourView d = WhatTheDetoursSee(handle, false);
+	Check(d.owner == game::CarOwner::Local && d.mayBlowUp &&
+	          d.shot == game::CarDamageVerdict::Apply,
+	      "our engine dents it and may blow it up");
+	Check(d.wreckNamed, "and a wreck here goes out as UNOWNED_SESSION");
+
+	// Her replayed round is not. Everything she hits it with comes to us as
+	// C_VehicleHit, so a replay of the same round must not take health too.
+	const game::ObservedRow *row =
+	    g_observedHere.Find(FakeVehicleAt(handle), &FakeVehicleAt);
+	Check(row && row->weSettle, "the detours' row knows the custody is ours");
+	Check(game::ClassifyReplayCar(d.owner, false, row && row->weSettle, false, false) ==
+	              game::ReplayTarget::CarWeSettle &&
+	          !game::ReplayedShotMayDamage(game::ReplayTarget::CarWeSettle,
+	                                       WEAPONTYPE_M16),
+	      "so a replayed round leaves its health to her forwarded hit");
+
+	// Alice shoots it. The server sends her hit to us.
+	c.HandleMessage(Wrap(MakeVehicleHit(1, 80, /*weapon=*/5, /*amount=*/30.0f),
+	                     CH_EVENT));
+	Check(g_rec.vehicleHits == 1 && g_rec.lastVehicleHitRow == 80,
+	      "her hit reaches the engine seam");
+	Check(g_rec.lastVehicleHitSettling,
+	      "marked as a custody hit, so the engine end checks for an empty seat");
+	Check(g_rec.vehicleHitAttacker == 1, "credited to her");
+
+	// Not handed back the moment it stops: the rest of her burst is coming.
+	g_rec.carAtRest = true;
+	for (int i = 0; i < VEHICLE_REST_FRAMES; ++i)
+		c.TickCustody();
+	Check(!c.VehicleByNetId(80)->settleReported,
+	      "a car shot a moment ago is kept, at rest or not");
+
+	// We tell the session it has stopped. The server may still route one
+	// more hit to us before it has read that.
+	const_cast<RemoteVehicle *>(c.VehicleByNetId(80))->holdUntilMs = 0;
+	c.TickCustody();
+	Check(c.VehicleByNetId(80)->settleReported, "we have said we are finished");
+	c.HandleMessage(Wrap(MakeVehicleHit(1, 80), CH_EVENT));
+	Check(g_rec.vehicleHits == 1,
+	      "a hit after that is dropped - we don't report the car any more");
+	c.Tick();
+	row = g_observedHere.Find(FakeVehicleAt(handle), &FakeVehicleAt);
+	Check(row && !row->weSettle,
+	      "and from then on a replayed round is the only way her shot reaches it");
+
+	c.HandleMessage(Wrap(MakeCustody(80, INVALID_PLAYER), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleHit(1, 80), CH_EVENT));
+	Check(g_rec.vehicleHits == 1, "and so is one after the session took it back");
+}
+
+void TestAHitThatLandsAfterOurSettleEnded() {
+	std::printf("\na hit for our settle that lands after it ended\n");
+
+	// Alice got in before it arrived. It's her car and her engine's hit.
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		ParkOneCar(c);
+		c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+		c.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+		c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+		c.Tick();
+		c.HandleMessage(Wrap(MakeEnter(1, 80), CH_EVENT));
+		Check(c.VehicleByNetId(80)->custodianPlayerId == INVALID_PLAYER,
+		      "her getting in ended our custody");
+		c.HandleMessage(Wrap(MakeVehicleHit(2, 80), CH_EVENT));
+		Check(g_rec.vehicleHits == 0, "bob's late hit is not ours to apply");
+	}
+
+	// A wreck takes nothing, custody or not.
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		ParkOneCar(c);
+		c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+		c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+		c.HandleMessage(Wrap(MakeUnownedBlowUp(80, UNOWNED_SESSION, 1), CH_EVENT));
+		c.Tick();
+		c.HandleMessage(Wrap(MakeVehicleHit(1, 80), CH_EVENT));
+		Check(g_rec.vehicleHits == 0, "the rest of a burst into a wreck is dropped");
+	}
+}
+
+// ---- a session car nobody holds, and who owns its fire ----------------------
+//
+// Every machine writes the session's last health onto a parked session car
+// every frame, so a hit taken locally lasted one frame and the car never
+// caught fire. A hit on one now makes the shooter its custodian, and a
+// custodian keeps a burning car until it goes up.
+
+void TestACarNobodyHoldsIsShotThroughTheSession() {
+	std::printf("\na session car nobody holds, as the detours see it\n");
+	using game::CarDamageVerdict;
+	using game::CarOwner;
+	using game::ClassifyCar;
+	using game::DecideCarDamage;
+
+	Check(ClassifyCar(false, false, false, false, false, true) == CarOwner::Nobody,
+	      "a row naming nobody is Nobody");
+	Check(ClassifyCar(false, true, false, false, false, true) == CarOwner::Local &&
+	          ClassifyCar(true, false, false, false, false, true) == CarOwner::Local &&
+	          ClassifyCar(false, false, true, false, false, true) == CarOwner::RemoteDriver &&
+	          ClassifyCar(false, false, false, true, false, true) == CarOwner::RemoteCustodian,
+	      "and anybody actually holding it outranks that");
+
+	Check(DecideCarDamage(CarOwner::Nobody, true, false, WEAPONTYPE_M16) ==
+	          CarDamageVerdict::Forward,
+	      "our round goes to the session");
+	Check(DecideCarDamage(CarOwner::Nobody, false, false, WEAPONTYPE_M16) ==
+	          CarDamageVerdict::Refuse,
+	      "a replay of somebody else's takes nothing - theirs went out too");
+	Check(DecideCarDamage(CarOwner::Nobody, true, true, WEAPONTYPE_M16) ==
+	          CarDamageVerdict::Refuse,
+	      "nor does anything fired into a wreck");
+	Check(DecideCarDamage(CarOwner::Nobody, false, false, WEAPONTYPE_EXPLOSION) ==
+	              CarDamageVerdict::Apply &&
+	          DecideCarDamage(CarOwner::Nobody, true, false, WEAPONTYPE_GRENADE) ==
+	              CarDamageVerdict::Apply,
+	      "a blast still lands on every copy, as it always did");
+	Check(DecideCarDamage(CarOwner::Nobody, true, false, WEAPONTYPE_FLAMETHROWER) ==
+	              CarDamageVerdict::Refuse &&
+	          game::FlameGoesToOwner(CarOwner::Nobody),
+	      "a fire takes nothing here, and our flame goes to the session instead");
+	Check(game::MayBlowUpCar(CarOwner::Nobody),
+	      "and it may still go up here - a blast that kills it kills it everywhere");
+}
+
+void TestWhatBurningMeansToACustodian() {
+	std::printf("\nwhen the car we settle is on fire\n");
+	using game::VehicleOnFire;
+	Check(VehicleOnFire(game::VEHICLE_TYPE_CAR, 249.0f, false, false) &&
+	          !VehicleOnFire(game::VEHICLE_TYPE_CAR, 250.0f, false, false),
+	      "a car under 250, the fire block's own test (0x00534510)");
+	Check(VehicleOnFire(game::VEHICLE_TYPE_BOAT, 149.0f, false, false) &&
+	          !VehicleOnFire(game::VEHICLE_TYPE_BOAT, 200.0f, false, false),
+	      "a boat under 150 (0x0053F917)");
+	Check(VehicleOnFire(game::VEHICLE_TYPE_CAR, 1000.0f, false, true),
+	      "or a CFire on it, before the health has got there");
+	Check(!VehicleOnFire(game::VEHICLE_TYPE_CAR, 0.0f, true, true),
+	      "and never a wreck");
+	Check(!VehicleOnFire(-1, 0.0f, false, false), "nor something that is neither");
+}
+
+void TestOurHitOnACarNobodyHoldsComesBackToUs() {
+	std::printf("\nour hit on a car nobody holds\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.Tick();
+	const int32_t handle = c.VehicleByNetId(80)->poolHandle;
+
+	DetourView d = WhatTheDetoursSee(handle, false);
+	Check(d.owner == game::CarOwner::Nobody && d.shot == game::CarDamageVerdict::Forward,
+	      "nobody holds car 80, so our round is refused here and sent");
+	Check(VehicleHitIsWorthSending(*c.VehicleByNetId(80), INVALID_NETID),
+	      "and it is worth the packet");
+
+	// The server makes us the custodian and sends our own hit back behind it.
+	c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleHit(/*attackerId=*/0, 80, 5, 30.0f), CH_EVENT));
+	Check(g_rec.vehicleHits == 1 && g_rec.lastVehicleHitRow == 80 &&
+	          g_rec.lastVehicleHitSettling,
+	      "it lands in the car we are now settling");
+	Check(g_rec.vehicleHitAttacker == 0xFF, "credited to no remote player - it was us");
+	Check(c.VehicleByNetId(80)->holdUntilMs != 0,
+	      "and the custody is held for the rest of the burst");
+
+	c.Tick();
+	d = WhatTheDetoursSee(handle, false);
+	Check(d.owner == game::CarOwner::Local && d.shot == game::CarDamageVerdict::Apply &&
+	          d.mayBlowUp,
+	      "from then on our engine takes the hits and decides the wreck");
+
+	// Alice is the one who shot it, on another screen: then it's hers.
+	Client o;
+	o.SetBridge(RecordingBridge());
+	ParkOneCar(o);
+	o.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	o.HandleMessage(Wrap(MakeCustody(80, 1), CH_EVENT));
+	o.Tick();
+	d = WhatTheDetoursSee(o.VehicleByNetId(80)->poolHandle, false);
+	Check(d.owner == game::CarOwner::RemoteCustodian && !d.mayBlowUp,
+	      "a car alice shot is hers to burn, and ours never blows it up by itself");
+}
+
+void TestABurningCarIsKeptUntilItGoesUp() {
+	std::printf("\na custodian keeps a burning car\n");
+	Check(CustodyMayEnd(true, false, 5000, 9000, 0, 0),
+	      "stopped and not burning: handed back");
+	Check(CustodyMayEnd(false, false, 9000, 9000, 0, 0), "or out of time");
+	Check(!CustodyMayEnd(true, false, 5000, 9000, 5500, 0),
+	      "but not while a hit is still fresh");
+	Check(!CustodyMayEnd(true, true, 20000, 9000, 0, 10000),
+	      "and never while it burns, stopped and late or not");
+	Check(CustodyMayEnd(true, true, 10000 + CUSTODY_BURN_CAP_MS, 9000, 0, 10000),
+	      "until a burn that has not gone up in CUSTODY_BURN_CAP_MS");
+
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	RemoteVehicle *v   = const_cast<RemoteVehicle *>(c.VehicleByNetId(80));
+	g_rec.carAtRest    = true;
+	g_rec.carBurning   = true;
+	v->settleEndsAtMs  = 0;   // as if VEHICLE_SETTLE_MS had already gone by
+	const int samples  = g_rec.observedSamples;
+	for (int i = 0; i < 30; ++i)
+		c.TickCustody();
+	Check(!v->settleReported,
+	      "a burning car is not handed back, stopped and out of time");
+	Check(v->burnSinceMs != 0, "when it caught fire is written down");
+	Check(g_rec.observedSamples >= samples + 30,
+	      "and its health keeps going out - that is the fire everybody else draws");
+
+	g_rec.carBurning = false;
+	c.TickCustody();
+	Check(v->settleReported && v->burnSinceMs == 0,
+	      "once it stops burning the settle ends as it always did");
+
+	// A burn that stopped running here - a paused game - is let go of.
+	Client c2;
+	c2.SetBridge(RecordingBridge());
+	ParkOneCar(c2);
+	c2.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	RemoteVehicle *v2 = const_cast<RemoteVehicle *>(c2.VehicleByNetId(80));
+	g_rec.carBurning  = true;
+	c2.TickCustody();
+	Check(!v2->settleReported, "burning");
+	v2->burnSinceMs -= CUSTODY_BURN_CAP_MS;
+	c2.TickCustody();
+	Check(v2->settleReported, "and given back once it has burned past the cap");
+
+	g_rec.carBurning = false;
+	g_rec.carAtRest  = false;
+}
+
+void TestOurSettleAfterTakingOverSomebodyElsesIsOurs() {
+	std::printf("\ngetting into a car mid-settle, then settling it ourselves\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	const int32_t handle = WatchAliceSettleCar80(c);
+	Check(WhatTheDetoursSee(handle, false).owner == game::CarOwner::RemoteCustodian,
+	      "alice is settling car 80");
+
+	// We get in before it has stopped. Nothing corrects a car we drive, and
+	// that pass used to be what wrote the table - so the row went on naming
+	// alice as its custodian for as long as we had it.
+	g_rec.drivingLocally     = true;
+	g_rec.localVehicleHandle = handle;
+	c.Tick();
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 80), CH_EVENT));
+	Check(c.VehicleByNetId(80)->custodianPlayerId == INVALID_PLAYER,
+	      "our own claim ends her custody on our roster too");
+	c.Tick();
+
+	// And out again: ours to settle.
+	g_rec.drivingLocally     = false;
+	g_rec.localVehicleHandle = -1;
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	c.Tick();
+	const DetourView d = WhatTheDetoursSee(handle, false);
+	Check(d.owner == game::CarOwner::Local && d.mayBlowUp,
+	      "our own custody car is ours to damage, not still alice's");
+}
+
+// ---- the dents a settling car takes -----------------------------------------
+//
+// Every other machine holds a car in custody pinned and collision-proof, so
+// the custodian's engine is the only one that dents it. Before this the dents
+// only went out from a driver, and a car that rolled into a wall after its
+// driver bailed stayed straight everywhere else for good: the merge is a
+// maximum and nothing ever sent the dent.
+
+VehicleDamageBody DentWord(unsigned panel, uint8_t level) {
+	VehicleDamageBody b{};
+	SetPanelLevel(b.panels, panel, level);
+	return b;
+}
+
+void TestADentWhileWeSettleACarIsSent() {
+	std::printf("\na dent our engine makes while we settle a car\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeCustody(80, /*us=*/0), CH_EVENT));
+
+	c.TickCustody();
+	Check(g_rec.observedDamageSamples == 1, "the car we are settling is read for dents");
+	Check(c.DamageReportsSentForTest() == 0, "an undamaged car says nothing");
+
+	g_rec.observedDamage = DentWord(VEHPANEL_FRONT_LEFT, PANEL_STATUS_SMASHED1);
+	c.TickCustody();
+	Check(c.DamageReportsSentForTest() == 1, "it hits the wall and the dent goes out");
+	Check(c.VehicleByNetId(80)->settleDamagePanels == g_rec.observedDamage.panels,
+	      "and the high-water mark is what we said");
+
+	c.TickCustody();
+	c.TickCustody();
+	Check(c.DamageReportsSentForTest() == 1, "the same dent is not said twice");
+
+	g_rec.observedDamage = DentWord(VEHPANEL_FRONT_LEFT, PANEL_STATUS_MISSING);
+	c.TickCustody();
+	Check(c.DamageReportsSentForTest() == 2, "a worse one is");
+
+	// And the other end of the wire: somebody watching the settle applies it
+	// with the parts flying, like any dent from a driver.
+	Client o;
+	o.SetBridge(RecordingBridge());
+	WatchAliceSettleCar80(o);
+	uint32_t panels = 0;
+	SetPanelLevel(panels, VEHPANEL_FRONT_LEFT, PANEL_STATUS_SMASHED1);
+	o.HandleMessage(Wrap(MakeVehicleDamage(80, panels, 0, /*alice=*/1), CH_EVENT));
+	Check(g_rec.vehicleDamageApplies == 1 && g_rec.lastDamageFlying,
+	      "an observer puts the custodian's dent on its copy");
+}
+
+void TestTheLastDentGoesOutBeforeTheSettle() {
+	std::printf("\nthe dent in the frame a settle ends\n");
+
+	// It comes to rest.
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		ParkOneCar(c);
+		c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+		g_rec.carAtRest = true;
+		for (int i = 0; i + 1 < VEHICLE_REST_FRAMES; ++i)
+			c.TickCustody();
+		Check(!c.VehicleByNetId(80)->settleReported, "one quiet sample short");
+
+		g_rec.observedDamage = DentWord(VEHPANEL_REAR_RIGHT, PANEL_STATUS_SMASHED2);
+		c.TickCustody();
+		Check(c.VehicleByNetId(80)->settleReported, "this pass ends the settle");
+		Check(c.DamageReportsSentForTest() == 1,
+		      "and the dent from it went out on the same pass, ahead of the settle");
+	}
+
+	// Or the window closes on it.
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		ParkOneCar(c);
+		c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+		RemoteVehicle *v = const_cast<RemoteVehicle *>(c.VehicleByNetId(80));
+		v->settleEndsAtMs    = 0;
+		g_rec.observedDamage = DentWord(VEHBUMPER_FRONT, PANEL_STATUS_SMASHED1);
+		c.TickCustody();
+		Check(v->settleReported && c.DamageReportsSentForTest() == 1,
+		      "given up on, and the dent still went out first");
+	}
+}
+
+void TestADentAfterOurSettleIsNotOursToSend() {
+	std::printf("\na dent after our settle is over\n");
+
+	// We said it stopped. The server ends the custody on reading that, so
+	// anything after it would be refused - and is not sent.
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		ParkOneCar(c);
+		c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+		RemoteVehicle *v = const_cast<RemoteVehicle *>(c.VehicleByNetId(80));
+		v->settleEndsAtMs = 0;
+		c.TickCustody();
+		Check(v->settleReported, "we have handed it back");
+
+		g_rec.observedDamage = DentWord(VEHPANEL_WINDSCREEN, PANEL_STATUS_SMASHED1);
+		c.TickCustody();
+		Check(c.DamageReportsSentForTest() == 0, "a dent after that is not sent");
+		c.HandleMessage(Wrap(MakeCustody(80, INVALID_PLAYER), CH_EVENT));
+		c.TickCustody();
+		Check(c.DamageReportsSentForTest() == 0,
+		      "nor once the session has said it is nobody's");
+	}
+
+	// Somebody got in. Their engine dents it now, and they report it.
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		ParkOneCar(c);
+		c.HandleMessage(Wrap(MakeJoin(1, "bob"), CH_EVENT));
+		c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+		c.HandleMessage(Wrap(MakeEnter(1, 80), CH_EVENT));
+		g_rec.observedDamage = DentWord(VEHPANEL_FRONT_RIGHT, PANEL_STATUS_MISSING);
+		c.TickCustody();
+		Check(c.DamageReportsSentForTest() == 0, "a new driver ends our reporting");
+		Check(g_rec.observedDamageSamples == 0, "we don't even look");
+	}
+}
+
+void TestALighterDentIsStillNewsAfterASettle() {
+	std::printf("\na lighter dent after a settle that sent a heavy one\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	const int32_t handle = c.VehicleByNetId(80)->poolHandle;
+
+	c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	g_rec.observedDamage = DentWord(VEHPANEL_FRONT_LEFT, PANEL_STATUS_MISSING);
+	c.TickCustody();
+	Check(c.DamageReportsSentForTest() == 1, "the settle sent a missing wing");
+	c.HandleMessage(Wrap(MakeCustody(80, INVALID_PLAYER), CH_EVENT));
+
+	// We drive it next, after a respray took the wing back. The driver keeps
+	// its own mark, so what the settle said can't hide this.
+	g_rec.drivingLocally     = true;
+	g_rec.localVehicleHandle = handle;
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 80), CH_EVENT));
+	Check(c.LocalVehicleNetId() == 80, "we are its driver");
+	g_rec.localDamage = DentWord(VEHPANEL_FRONT_LEFT, PANEL_STATUS_SMASHED1);
+	c.TickLocalDamageForTest();
+	Check(c.DamageReportsSentForTest() == 2, "our lighter dent as its driver goes out");
+
+	// And out again, into a second settle of the same car. The first one's
+	// mark would call this nothing new; the grant starts a fresh one.
+	g_rec.drivingLocally     = false;
+	g_rec.localVehicleHandle = -1;
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	Check(c.VehicleByNetId(80)->settleDamagePanels == 0,
+	      "a new custody starts with an empty mark");
+	g_rec.observedDamage = DentWord(VEHPANEL_FRONT_LEFT, PANEL_STATUS_SMASHED1);
+	c.TickCustody();
+	Check(c.DamageReportsSentForTest() == 3, "and the lighter dent is news to it");
+}
+
+void TestWhoElseHoldsACar() {
+	std::printf("\nthe names the detours' table is given\n");
+	RemoteVehicle v;
+	v.active = true;
+	v.netId  = 80;
+
+	VehicleHolders h = OtherVehicleHolders(v, 0);
+	Check(h.driver == INVALID_PLAYER && h.custodian == INVALID_PLAYER,
+	      "nobody in it and nobody settling it: nobody");
+
+	v.driverPlayerId = 1;
+	h = OtherVehicleHolders(v, 0);
+	Check(h.driver == 1 && h.custodian == INVALID_PLAYER, "somebody else driving");
+
+	v.driverPlayerId = 0;
+	h = OtherVehicleHolders(v, 0);
+	Check(h.driver == INVALID_PLAYER, "never us - a car we drive is ours");
+
+	v.driverPlayerId    = INVALID_PLAYER;
+	v.custodianPlayerId = 1;
+	h = OtherVehicleHolders(v, 0);
+	Check(h.driver == INVALID_PLAYER && h.custodian == 1, "somebody else settling");
+
+	v.custodianPlayerId = 0;
+	h = OtherVehicleHolders(v, 0);
+	Check(h.custodian == INVALID_PLAYER, "never us settling it either");
+
+	v.driverPlayerId    = 2;
+	v.custodianPlayerId = 1;
+	h = OtherVehicleHolders(v, 0);
+	Check(h.driver == 2 && h.custodian == INVALID_PLAYER,
+	      "a stale custodian beside a driver names nobody");
+
+	v.driverPlayerId = 0;
+	h = OtherVehicleHolders(v, 0);
+	Check(h.driver == INVALID_PLAYER && h.custodian == INVALID_PLAYER,
+	      "and beside us at the wheel it doesn't make the car theirs");
+	Check(!h.weSettle, "nor ours to settle - we drive it");
+
+	// weSettle is TakeReportedVehicleHit's custody half, and nothing else:
+	// the hits other machines forward to us are exactly the ones a replayed
+	// round must not take a second time.
+	bool same = true;
+	const uint8_t ids[] = {0, 1, 2, INVALID_PLAYER};
+	for (uint8_t driver : ids)
+		for (uint8_t custodian : ids)
+			for (int reported = 0; reported < 2; ++reported) {
+				RemoteVehicle r;
+				r.active            = true;
+				r.netId             = 80;
+				r.driverPlayerId    = driver;
+				r.custodianPlayerId = custodian;
+				r.settleReported    = reported != 0;
+				const bool fromHolders = OtherVehicleHolders(r, 0).weSettle;
+				const bool takesHits   = driver == INVALID_PLAYER &&
+				                         TakeReportedVehicleHit(r, false, 0);
+				if (fromHolders != takesHits)
+					same = false;
+			}
+	Check(same, "our custody is named exactly when forwarded hits on it are ours");
+
+	// The receiving end.
+	RemoteVehicle ours;
+	ours.active            = true;
+	ours.netId             = 80;
+	ours.custodianPlayerId = 0;
+	Check(TakeReportedVehicleHit(ours, false, 0), "a hit on our settle is ours");
+	ours.settleReported = true;
+	Check(!TakeReportedVehicleHit(ours, false, 0),
+	      "not after we have said it stopped");
+	ours.settleReported    = false;
+	ours.custodianPlayerId = 1;
+	Check(!TakeReportedVehicleHit(ours, false, 0), "nor somebody else's settle");
+	Check(TakeReportedVehicleHit(ours, true, 0), "a car we drive always is");
+	ours.destroyed = true;
+	Check(!TakeReportedVehicleHit(ours, true, 0), "unless it's a wreck");
+
+	// And the engine's half of it.
+	Check(game::MayTakeReportedHit(true, false, false), "at our wheel: yes");
+	Check(game::MayTakeReportedHit(false, true, true), "settling, empty seat: yes");
+	Check(!game::MayTakeReportedHit(false, false, true),
+	      "settling with somebody at the wheel: no, they're the driver now");
+	Check(!game::MayTakeReportedHit(false, true, false),
+	      "an empty seat alone is not a reason");
+}
+
+void TestWithoutTheRowOurClaimedCarWasOursToWreck() {
+	std::printf("\nthe gap, reproduced: a claimed car with no row\n");
+	Client c;
+	WorldBridge b = RecordingBridge();
+	b.AdoptClaimedVehicle = nullptr;   // the seam as it was before
+	c.SetBridge(b);
+	ClaimOurOwnCar(c);
+	g_rec.drivingLocally = false;
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(1, 364), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleState(1, 364, 15.0f), CH_SNAPSHOT));
+	c.Tick();
+
+	// The roster knows alice is driving. The detours never hear about it.
+	Check(c.VehicleByNetId(364)->driverPlayerId == 1, "the roster has alice at the wheel");
+	const DetourView d = WhatTheDetoursSee(4242, false);
+	Check(d.owner == game::CarOwner::Local && d.mayBlowUp,
+	      "and with no row our engine would have wrecked her car by itself");
+}
+
+void TestOurOwnCarLeavesTheTableWithTheSession() {
+	std::printf("\nour own car is let go of, not destroyed\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ClaimOurOwnCar(c);
+	g_rec.drivingLocally = false;
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(1, 364), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleState(1, 364, 15.0f), CH_SNAPSHOT));
+	c.Tick();
+	Check(WhatTheDetoursSee(4242, false).owner == game::CarOwner::RemoteDriver,
+	      "alice is driving our car");
+
+	// The session goes. The car stays ours and in the street, and the row
+	// that said alice drives it must not outlive her.
+	const int despawns = g_rec.vehicleDespawns;
+	c.ClearRosterForTest();
+	Check(g_rec.vehicleDespawns == despawns, "the car is not destroyed");
+	Check(g_rec.ownReleases == 1, "it is let go of instead");
+	Check(g_observedHere.Count() == 0, "and the detours forget it");
+	Check(WhatTheDetoursSee(4242, false).owner == game::CarOwner::Local,
+	      "so after the session it is single player's car again");
+
+	// Same when the session drops just that car.
+	Client c2;
+	c2.SetBridge(RecordingBridge());
+	ClaimOurOwnCar(c2);
+	S_VehicleDespawn gone;
+	InitHeader(gone, 1000);
+	gone.netId = 364;
+	c2.HandleMessage(Wrap(gone, CH_EVENT));
+	Check(g_rec.vehicleDespawns == 0 && g_rec.ownReleases == 1,
+	      "a despawn lets go of our own car rather than destroying it");
+	Check(g_observedHere.Count() == 0, "and takes its row with it");
+}
+
+void TestAPromotedCarWeHostedLeavesTheTableToo() {
+	std::printf("\nthe promoted car our engine made, dropped by the session\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(1), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(300, /*owner=*/2), CH_EVENT));
+	c.Tick();
+	c.HandleMessage(Wrap(MakeCarPromoted(300, /*driver=*/2, /*wasOwner=*/1), CH_EVENT));
+	Check(c.VehicleByNetId(300)->ours, "our own engine's car, promoted");
+	Check(g_observedHere.Count() == 1, "registered with the detours");
+
+	S_VehicleDespawn gone;
+	InitHeader(gone, 1000);
+	gone.netId = 300;
+	c.HandleMessage(Wrap(gone, CH_EVENT));
+	Check(g_rec.ownReleases == 1 && g_observedHere.Count() == 0,
+	      "dropped by the session, its row goes with it and the car stays");
+}
+
+// ---------------------------------------------------------------------------
+// A copy's life (game/carlife.h)
+// ---------------------------------------------------------------------------
+
+uint8_t By(int createdBy) { return static_cast<uint8_t>(createdBy); }
+
+void TestCopiesDontEatTheTrafficBudget() {
+	std::printf("\nsession copies and the traffic cap\n");
+	using namespace game;
+
+	// 12.0f * CarNumberMultiplier at the default multiplier (0x0059BF9E).
+	const int32_t cap = 12;
+	CarCounters c;
+	c.mission = 12;
+	Check(!GeneratorUnderCap(c, cap),
+	      "twelve copies used to take the whole budget: no traffic at all");
+	Check(GeneratorUnderCap(c, TrafficAllowance(cap, 12)),
+	      "with the allowance the generator carries on");
+	c.random = 11;
+	Check(GeneratorUnderCap(c, TrafficAllowance(cap, 12)), "up to its own twelve");
+	c.random = 12;
+	Check(!GeneratorUnderCap(c, TrafficAllowance(cap, 12)), "and not one more");
+	Check(TrafficAllowance(cap, 0) == cap && TrafficAllowance(cap, -2) == cap,
+	      "no copies, the engine's own cap, and never less");
+
+	// UpdateCarCount's arms (0x004202E0).
+	Check(TrafficSumShare(By(VEHICLE_CREATED_BY_MISSION), true) == 1,
+	      "a mission police car is counted once");
+	Check(TrafficSumShare(By(VEHICLE_CREATED_BY_RANDOM), true) == 2,
+	      "a random one twice, law and random");
+	Check(TrafficSumShare(By(VEHICLE_CREATED_BY_RANDOM), false) == 1 &&
+	          TrafficSumShare(By(VEHICLE_CREATED_BY_PARKED), false) == 1,
+	      "random and parked once");
+	Check(TrafficSumShare(By(VEHICLE_CREATED_BY_PERMANENT), false) == 0 &&
+	          TrafficSumShare(0, false) == 0,
+	      "permanent and garbage not at all");
+}
+
+void TestACopyStaysOutOfTheSave() {
+	std::printf("\nsession copies and the single-player save\n");
+	using namespace game;
+	const uint8_t mission = By(VEHICLE_CREATED_BY_MISSION);
+
+	// CPools::SaveVehiclePool's own test (0x004A21E2).
+	Check(RetailSaveWrites(false, false, VEHICLE_TYPE_CAR, mission) &&
+	          RetailSaveWrites(false, false, VEHICLE_TYPE_BOAT, mission),
+	      "retail saves an empty mission car or boat");
+	Check(!RetailSaveWrites(true, false, VEHICLE_TYPE_CAR, mission) &&
+	          !RetailSaveWrites(false, true, VEHICLE_TYPE_CAR, mission),
+	      "not one with anybody in it");
+	Check(!RetailSaveWrites(false, false, VEHICLE_TYPE_CAR, By(VEHICLE_CREATED_BY_RANDOM)),
+	      "nor traffic");
+	Check(!RetailSaveWrites(false, false, 5, mission), "nor anything but a car or a boat");
+
+	const uint8_t during = CreatedByDuringSave(true, mission);
+	Check(!RetailSaveWrites(false, false, VEHICLE_TYPE_CAR, during),
+	      "a parked copy isn't written");
+	Check(during == By(VEHICLE_CREATED_BY_PERMANENT), "it reads PERMANENT for the call");
+	Check(CreatedByDuringSave(false, mission) == mission,
+	      "a mission car this engine made is still saved");
+	Check(CreatedByDuringSave(true, By(VEHICLE_CREATED_BY_RANDOM)) ==
+	          By(VEHICLE_CREATED_BY_RANDOM),
+	      "and a copy given back to the engine reads what it is");
+}
+
+void TestHowACopyEnds() {
+	std::printf("\nwhat a release does to this machine's car\n");
+	using namespace game;
+	Check(HowToEndCopy(false, false) == CopyEnd::Destroy, "a copy nobody here is in is destroyed");
+	Check(HowToEndCopy(false, true) == CopyEnd::HandToEngine,
+	      "one we're sitting in goes to the engine instead");
+	Check(HowToEndCopy(true, false) == CopyEnd::Leave && HowToEndCopy(true, true) == CopyEnd::Leave,
+	      "and our own engine's car is left alone either way");
+}
+
+void TestTheCopyList() {
+	std::printf("\nthe engine seam's list of copies\n");
+	using namespace game;
+	int   cars[4] = {};
+	void *pool[4] = {&cars[0], &cars[1], &cars[2], &cars[3]};
+	auto  resolve = [&](int32_t h) -> void * { return h >= 0 && h < 4 ? pool[h] : nullptr; };
+
+	CopyList<2> list;
+	Check(list.Add(1, resolve) && list.Add(2, resolve), "two copies fit a list of two");
+	Check(list.Add(1, resolve), "one added twice is still one");
+	Check(!list.Add(3, resolve), "a third doesn't fit");
+	Check(list.Add(-1, resolve), "a dead handle is nothing to add");
+
+	pool[2] = nullptr;   // the engine deleted it by itself
+	Check(list.Add(3, resolve), "the slot of a car the engine took is reused");
+	int live = 0;
+	list.ForEachLive(resolve, [&](void *) { ++live; });
+	Check(live == 2, "and both copies are seen");
+	Check(list.Contains(&cars[3], resolve) && !list.Contains(&cars[2], resolve) &&
+	          !list.Contains(nullptr, resolve),
+	      "Contains goes by the car, not the handle");
+
+	list.Remove(1);
+	Check(!list.Contains(&cars[1], resolve), "a removed copy is gone");
+	list.Clear();
+	live = 0;
+	list.ForEachLive(resolve, [&](void *) { ++live; });
+	Check(live == 0, "and Clear empties it");
+}
+
+void TestTheTrafficAllowanceRunsAfterTheSpawns() {
+	std::printf("\nthe traffic allowance, once a frame\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	const int before = g_rec.trafficAllowances;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.Tick();
+	Check(g_rec.vehicleSpawns == 1, "the copy is built");
+	Check(g_rec.trafficAllowances == before + 1, "the allowance runs once in the frame");
+	Check(g_rec.vehicleSpawnsAtAllowance == 1, "after the car it has to count");
+	c.Tick();
+	c.Tick();
+	Check(g_rec.trafficAllowances == before + 3, "and every frame after");
+}
+
+void TestAReleaseLeavesNobodyWaiting() {
+	std::printf("\na released car nobody is waiting for\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+
+	// Her enter beat the spawn, and the release beat it too.
+	c.HandleMessage(Wrap(MakeEnter(1, 80), CH_EVENT));
+	c.Tick();
+	Check(c.PlayerSlot(1).seatVehicleNetId == 80, "alice is waiting for car 80");
+	S_VehicleDespawn gone;
+	InitHeader(gone, 2000);
+	gone.netId = 80;
+	c.HandleMessage(Wrap(gone, CH_EVENT));
+	Check(c.PlayerSlot(1).seatVehicleNetId == INVALID_NETID,
+	      "the release cancels it, though the car never arrived");
+
+	// The same with the car there and her seated.
+	c.HandleMessage(Wrap(MakeVehicleSpawn(81), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 81), CH_EVENT));
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated(), "seated in 81");
+	gone.netId = 81;
+	c.HandleMessage(Wrap(gone, CH_EVENT));
+	Check(!c.PlayerSlot(1).Seated() && c.PlayerSlot(1).seatVehicleNetId == INVALID_NETID,
+	      "out of it, and not put back");
+	c.Tick();
+	Check(g_rec.seats == 1, "not on the next frame either");
+}
+
+void TestOurCarReleasedUnderUsIsClaimedAgain() {
+	std::printf("\nthe session lets go of the car we're in\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.drivingLocally = true;
+
+	S_EnterVehicle yes;
+	InitHeader(yes, 1000);
+	yes.playerId     = 0;
+	yes.body         = EnterVehicleBody{};
+	yes.body.netId   = 77;
+	yes.body.modelId = 90;
+	c.HandleMessage(Wrap(yes, CH_EVENT));
+	Check(c.LocalVehicleNetId() == 77, "we drive 77");
+
+	S_VehicleDespawn gone;
+	InitHeader(gone, 2000);
+	gone.netId = 78;
+	c.HandleMessage(Wrap(gone, CH_EVENT));
+	Check(c.LocalVehicleNetId() == 77, "another car going changes nothing");
+	gone.netId = 77;
+	c.HandleMessage(Wrap(gone, CH_EVENT));
+	Check(c.LocalVehicleNetId() == INVALID_NETID,
+	      "ours going forgets the name, so the car is claimed afresh");
+}
+
+// ---------------------------------------------------------------------------
+// The two gates, as numbers (addresses.h)
+// ---------------------------------------------------------------------------
+
+void TestTheEntryGateRefusesACarOnItsSideAndNotOneUpsideDown() {
+	std::printf("\nwhat CVehicle::CanPedEnterCar actually refuses\n");
+
+	// Read backwards from the way the bug is described, which is why it is
+	// written down as a predicate and checked here. 0x00552307 compares up.z
+	// with +0.1f and jumps to the velocity tests when it is GREATER;
+	// 0x0055231C compares with -0.1f and jumps there when it is LESS. The
+	// fallthrough - the refusal - is everything in between.
+	Check(game::VehiclePoseAllowsPedThrough(1.0f), "a car on its wheels, obviously");
+	Check(game::VehiclePoseAllowsPedThrough(-1.0f),
+	      "and one on its roof, which is the surprising half and is correct");
+	Check(!game::VehiclePoseAllowsPedThrough(0.0f),
+	      "a car exactly on its side is refused");
+	Check(!game::VehiclePoseAllowsPedThrough(0.1f),
+	      "and so is one at the boundary, because the test is strict");
+	Check(!game::VehiclePoseAllowsPedThrough(-0.1f), "on both sides of it");
+	Check(game::VehiclePoseAllowsPedThrough(0.11f),
+	      "a hair past it and the car is usable again");
+
+	// Which is why a wedged car has to be allowed to fall. Nothing in the
+	// engine rights a car on its side - single player does not either - so
+	// the fix is not to correct the pose, it is to stop pinning the car in it.
+	Check(game::VEH_ENTER_MAX_SPEED_SQ == 0.04f,
+	      "the entry speed gate is sq(0.2f), read out of 0x00602594");
+}
+
+void TestARestedCarPassesBothGates() {
+	std::printf("\nwhen a custodian may call a car finished\n");
+
+	// The tightest numbers in the engine, and deliberately so: a car handed
+	// back to the pinned world has to be one a player can get into AND out
+	// of. The exit gate is eight times stricter about speed than the entry
+	// gate (0.005 against 0.04), so meeting the entry gate alone would hand
+	// back a car whose occupant then cannot get out and has no way to tell
+	// that from the car simply not responding.
+	Check(game::VehicleAtRestNumbers(0.0f, 0.0f, 0.0f, 0.0f), "a still car is at rest");
+	Check(game::VehicleAtRestNumbers(0.004f, 0.009f, -0.009f, 0.009f),
+	      "and so is one just inside every bound");
+	Check(!game::VehicleAtRestNumbers(0.006f, 0.0f, 0.0f, 0.0f),
+	      "a car still rolling is not, at a speed the entry gate would allow");
+	Check(game::VEH_ENTER_MAX_SPEED_SQ > game::VEH_EXIT_MAX_SPEED_SQ,
+	      "which is the point: getting out is stricter than getting in");
+
+	// Per component and not a magnitude, because that is what 0x0055243A,
+	// 0x00552464 and 0x0055248E do - three fabs compares, not one
+	// MagnitudeSqr. A car spinning about one axis at 0.015 fails, although
+	// the magnitude of that vector is well under any squared bound.
+	Check(!game::VehicleAtRestNumbers(0.0f, 0.0f, 0.0f, 0.015f),
+	      "one axis over the turn bound is enough, on its own");
+	Check(!game::VehicleAtRestNumbers(0.0f, -0.015f, 0.0f, 0.0f),
+	      "and the sign of it does not matter");
+}
+
+// ---------------------------------------------------------------------------
+// Boats - docs/roadmap.md M2, client/src/game/boat.h
+// ---------------------------------------------------------------------------
+
+// CREATE_CAR's own choice, read off the model info: m_type at +0x2A has to be
+// MITYPE_VEHICLE and the vehicle type at +0x58 picks the class
+// (CModelInfo::IsBoatModel at 0x0050BB90, the bike test at 0x0043C5ED).
+void TestABoatModelIsBuiltAsABoat() {
+	std::printf("\nwhich class a synced vehicle is built as\n");
+
+	using game::VehicleBuild;
+	using game::VehicleBuildFor;
+
+	Check(VehicleBuildFor(true, game::MITYPE_VEHICLE, game::VEHICLE_TYPE_BOAT) ==
+	          VehicleBuild::Boat,
+	      "a boat model is built as a boat");
+	Check(VehicleBuildFor(true, game::MITYPE_VEHICLE, game::VEHICLE_TYPE_CAR) ==
+	          VehicleBuild::Automobile,
+	      "a car model is built as a CAutomobile, as before");
+
+	// The engine would crash on the first and misread the second. Both came
+	// off a socket here, so both are refused.
+	Check(VehicleBuildFor(false, game::MITYPE_VEHICLE, game::VEHICLE_TYPE_CAR) ==
+	          VehicleBuild::None,
+	      "no model info, nothing built");
+	Check(VehicleBuildFor(true, 6 /* MITYPE_PED */, game::VEHICLE_TYPE_BOAT) ==
+	          VehicleBuild::None,
+	      "a model that is not a vehicle's is refused even when +0x58 says boat");
+	Check(VehicleBuildFor(true, game::MITYPE_VEHICLE, game::VEHICLE_TYPE_BIKE) ==
+	          VehicleBuild::None,
+	      "a bike, which CREATE_CAR builds nothing for either");
+
+	// Left as CREATE_CAR has them. What a synced train is belongs to the
+	// train work, and changing it from here would be deciding it.
+	Check(VehicleBuildFor(true, game::MITYPE_VEHICLE, game::VEHICLE_TYPE_TRAIN) ==
+	          VehicleBuild::Automobile,
+	      "a train model is left where CREATE_CAR leaves it");
+
+	// Size, constructor and the type the constructor stamps, as one set.
+	Check(game::VehicleBuildSize(VehicleBuild::Boat) == 0x484,
+	      "a boat is allocated at CREATE_CAR's `push 484h`");
+	Check(game::VehicleBuildSize(VehicleBuild::Automobile) == 0x5A8,
+	      "a car at `push 5A8h`");
+	Check(game::VehicleBuildSize(VehicleBuild::Boat) <= game::offs::SIZEOF_AUTOMOBILE,
+	      "and a boat fits a slot of a pool strided at 0x5A8");
+	Check(game::VehicleBuildCtor(VehicleBuild::Boat) == 0x0053E3E0 &&
+	          game::VehicleBuildCtor(VehicleBuild::Automobile) == 0x0052C6B0,
+	      "each class gets its own constructor");
+	Check(game::VehicleBuildCtor(VehicleBuild::None) == 0 &&
+	          game::VehicleBuildSize(VehicleBuild::None) == 0,
+	      "and None gets neither");
+	Check(game::VehicleBuildType(VehicleBuild::Boat) == 1 &&
+	          game::VehicleBuildType(VehicleBuild::Automobile) == 0,
+	      "m_vehType as the two constructors write it (0x0053E42A, 0x0052C766)");
+
+	// The car branch joins the road system and the boat branch does not;
+	// the cruise speeds are 9 and 20.
+	Check(game::JoinsRoadSystemOnSpawn(VehicleBuild::Automobile) &&
+	          !game::JoinsRoadSystemOnSpawn(VehicleBuild::Boat),
+	      "only a car is joined to the road system");
+	Check(game::SpawnCruiseSpeed(VehicleBuild::Automobile) == 9.0f &&
+	          game::SpawnCruiseSpeed(VehicleBuild::Boat) == 20.0f,
+	      "cruise speed out of each branch, 9 and 20");
+}
+
+// Every CAutomobile-only write in game/vehicle.cpp and game/ped.cpp, asked of
+// the type the built object carries. A wrong answer here is a write into a
+// boat's own members, which does not crash and does not look like anything.
+void TestTheWritersThatMustNotTouchABoat() {
+	std::printf("\nwhich writers may touch a boat\n");
+
+	const int32_t boat = game::VehicleBuildType(game::VehicleBuild::Boat);
+	const int32_t car  = game::VehicleBuildType(game::VehicleBuild::Automobile);
+
+	// The damage model: CDamageManager at +0x288 and the three appliers.
+	Check(game::HasAutomobileBody(car), "a car has a damage manager at +0x288");
+	Check(!game::HasAutomobileBody(boat),
+	      "a boat does not - +0x288 is its own first float");
+	Check(!game::HasAutomobileBody(game::VEHICLE_TYPE_TRAIN),
+	      "and neither does anything else");
+
+	// The fire timer: the car's is past the end of a boat.
+	Check(game::FireBlowUpTimerOffset(car) == 0x530,
+	      "a car's fire timer is +0x530");
+	Check(game::FireBlowUpTimerOffset(boat) == 0x2CC,
+	      "a boat's is +0x2CC, the one CBoat::ProcessControl adds to at 0x0053FB04");
+	Check(game::FireBlowUpTimerOffset(car) >= game::offs::SIZEOF_BOAT,
+	      "the car's offset lies outside a CBoat");
+	Check(game::FireBlowUpTimerOffset(boat) + sizeof(float) <= game::offs::SIZEOF_BOAT &&
+	          game::FireBlowUpTimerOffset(boat) >= game::offs::SIZEOF_VEHICLE,
+	      "the boat's lies inside it, among CBoat's own members");
+	Check(game::FireBlowUpTimerOffset(game::VEHICLE_TYPE_TRAIN) == 0,
+	      "a type with no known timer is left alone");
+
+	// The seat. SetObjective undoes ENTER_CAR on a boat for a non-player
+	// (0x004D8519), so the warp needs the objective put back, and the
+	// animated entry is not tried.
+	Check(game::SetObjectiveRefusesNonPlayer(boat) &&
+	          !game::SetObjectiveRefusesNonPlayer(car),
+	      "only a boat has its ENTER_CAR objective undone for a replica");
+	Check(!game::ReplicaMayAnimateEntry(boat) && game::ReplicaMayAnimateEntry(car),
+	      "so a replica is warped into a boat and walked to a car");
+
+	// The unseat's liveness test has to know both classes, or a ped in a
+	// boat is never taken out of it before the boat is destroyed.
+	Check(game::IsBuiltVehicleVtable(game::CAutomobile__vtable) &&
+	          game::IsBuiltVehicleVtable(game::CBoat__vtable),
+	      "both built classes pass the unseat's vtable test");
+	Check(!game::IsBuiltVehicleVtable(game::CVehicle__vtable) &&
+	          !game::IsBuiltVehicleVtable(game::CPlaceable__vtable) &&
+	          !game::IsBuiltVehicleVtable(0),
+	      "a destroyed or half-built one does not");
+}
+
+// Nothing on a boat ever sets bIsStatic (CPhysical::ProcessControl skips
+// vehicles at 0x00495F9A and CBoat has no counter of its own), so a boat's
+// settle rests on VehicleAtRestNumbers alone. What makes that enough is that
+// a boat can only be left through SetExitCar, and so through CanPedExitCar's
+// numbers, which are the same ones. Checked on the edges, so that tightening
+// the settle past the exit gate shows up here as a boat that never settles.
+void TestABoatItsDriverCouldLeaveIsAlreadyAtRest() {
+	std::printf("\nhow a boat settles\n");
+
+	const float s = game::VEH_EXIT_MAX_SPEED_SQ;
+	const float t = game::VEH_EXIT_MAX_TURN;
+	Check(game::VehicleAtRestNumbers(s, t, -t, t),
+	      "the fastest a driver may step off at is already at rest");
+	Check(game::VehicleAtRestNumbers(s * 0.5f, 0.0f, t * 0.5f, 0.0f),
+	      "and so is anything slower");
+	Check(!game::VehicleAtRestNumbers(s * 1.5f, 0.0f, 0.0f, 0.0f),
+	      "a boat still coasting faster than that is not, and waits for the window");
+}
+
+// ---------------------------------------------------------------------------
+// Rampages - docs/roadmap.md 5.10, client/src/game/darkel.h
+// ---------------------------------------------------------------------------
+
+// The engine's own qualification test, transcribed into game/darkel.h from
+// CDarkel::RegisterKillByPlayer. Every case below is one of the branches at
+// 0x00420F7C..0x00420FF9 and the numbers are eWeaponType as retail holds it.
+void TestWhichKillsCountTowardARampage() {
+	std::printf("\nwhich kills count, by the engine's own test\n");
+
+	game::FrenzyTargets f;
+	f.weapon = 6;        // M16, what rampage 01 is started with
+	f.model1 = 108;      // GANG05
+	f.model2 = 109;      // GANG06
+
+	Check(game::RampageKillCounts(f, 108, 6, false), "the right gang, the right gun");
+	Check(game::RampageKillCounts(f, 109, 6, false), "and the second model too");
+	Check(!game::RampageKillCounts(f, 110, 6, false), "the wrong gang does not count");
+	Check(!game::RampageKillCounts(f, 108, 2, false), "nor the wrong gun");
+
+	// The five aliases, and they are the reason this is a function rather
+	// than one comparison.
+	Check(game::RampageKillCounts(f, 108, 0x12, false),
+	      "an explosion counts for every rampage there is");
+
+	game::FrenzyTargets uzi;
+	uzi.weapon = 3;
+	uzi.model1 = FRENZY_ANY_PED;
+	Check(game::RampageKillCounts(uzi, 999, 0x13, false),
+	      "a drive-by uzi is an uzi, and ANY_PED takes anybody");
+
+	game::FrenzyTargets ram;
+	ram.weapon = 0x11;   // RUNOVERBYCAR
+	ram.model1 = FRENZY_ANY_PED;
+	Check(game::RampageKillCounts(ram, 7, 0x10, false),
+	      "rammed counts for a run-over rampage");
+
+	game::FrenzyTargets molotov;
+	molotov.weapon = 0x0A;
+	molotov.model1 = FRENZY_ANY_PED;
+	Check(game::RampageKillCounts(molotov, 7, 9, false),
+	      "a flamethrower counts for a molotov rampage");
+
+	// The three headshot rampages rampage.sc starts with 0367.
+	game::FrenzyTargets sniper;
+	sniper.weapon       = 7;
+	sniper.model1       = 112;
+	sniper.needHeadShot = true;
+	Check(!game::RampageKillCounts(sniper, 112, 7, false),
+	      "a body shot does not count when the rampage wants heads");
+	Check(game::RampageKillCounts(sniper, 112, 7, true), "a headshot does");
+
+	// FRENZY_ANY_CAR is the same global with a different sentinel, and it
+	// belongs to RegisterCarBlownUpByPlayer. No pedestrian may satisfy it.
+	game::FrenzyTargets cars;
+	cars.weapon = 8;
+	cars.model1 = FRENZY_ANY_CAR;
+	Check(!game::RampageKillCounts(cars, 7, 8, false),
+	      "a pedestrian never counts toward a vehicle rampage");
+}
+
+void TestARampageOpensAndTheTargetArrives() {
+	std::printf("\nthe session's rampage reaching a client\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+
+	S_Welcome w = MakeWelcome(3);
+	w.flags     = FlagsWithRampageRule(0, RAMPAGE_RULE_SCALED);
+	c.HandleMessage(Wrap(w, CH_EVENT));
+	Check(g_rec.rampageRuleSets == 1 && g_rec.rampageRule == RAMPAGE_RULE_SCALED,
+	      "the seam is told the session's rule on the welcome");
+
+	S_RampageOpen open;
+	InitHeader(open, 1000);
+	open.body.frenzyId    = 7;
+	open.body.killsNeeded = 40;
+	open.body.elapsedMs   = 0;
+	c.HandleMessage(Wrap(open, CH_EVENT));
+	Check(g_rec.rampageOpens == 1 && g_rec.rampageKillsNeeded == 40,
+	      "and the number the session is playing for");
+
+	// A kill from somebody else, for this frenzy.
+	S_RampageKill kill;
+	InitHeader(kill, 1010);
+	kill.byPlayer      = 1;
+	kill.body.frenzyId = 7;
+	kill.body.model    = 108;
+	kill.body.weapon   = 6;
+	kill.body.flags    = RK_F_HEADSHOT;
+	c.HandleMessage(Wrap(kill, CH_EVENT));
+	Check(g_rec.rampageCredits == 1 && g_rec.rampageLastModel == 108 &&
+	          g_rec.rampageLastWeapon == 6 && g_rec.rampageLastHead,
+	      "a kill off the wire reaches our own CDarkel with all three arguments");
+
+	// Our own, echoed back. The server leaves the reporter out, so this
+	// should never arrive - and if it did it would count one kill twice.
+	kill.byPlayer = 3;
+	c.HandleMessage(Wrap(kill, CH_EVENT));
+	Check(g_rec.rampageCredits == 1, "our own kill coming back is not counted again");
+
+	// A straggler for a frenzy that is not the open one.
+	kill.byPlayer      = 1;
+	kill.body.frenzyId = 6;
+	c.HandleMessage(Wrap(kill, CH_EVENT));
+	Check(g_rec.rampageCredits == 1, "and neither is a kill for an older frenzy");
+
+	S_RampageEnd end;
+	InitHeader(end, 1020);
+	end.body.frenzyId = 7;
+	end.body.outcome  = RAMPAGE_PASSED;
+	c.HandleMessage(Wrap(end, CH_EVENT));
+	Check(g_rec.rampageVerdicts == 1 && g_rec.rampageVerdict == RAMPAGE_PASSED,
+	      "the session's verdict is handed to the seam");
+
+	// And the frenzy is shut here too: anything else for it is stale.
+	c.HandleMessage(Wrap(end, CH_EVENT));
+	Check(g_rec.rampageVerdicts == 1, "a second copy of the verdict changes nothing");
+	c.HandleMessage(Wrap(kill, CH_EVENT));
+	Check(g_rec.rampageCredits == 1, "and a kill after the ending is dropped");
+}
+
+void TestNothingIsCreditedWithoutAnOpenFrenzy() {
+	std::printf("\na kill with no rampage open\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+
+	// A client that has not been told a frenzy is open has nothing to credit
+	// against, and this is the ordinary case for anything that arrives out of
+	// order - not an error.
+	S_RampageKill kill;
+	InitHeader(kill, 1000);
+	kill.byPlayer      = 1;
+	kill.body.frenzyId = 4;
+	kill.body.model    = 108;
+	kill.body.weapon   = 6;
+	kill.body.flags    = 0;
+	c.HandleMessage(Wrap(kill, CH_EVENT));
+	Check(g_rec.rampageCredits == 0, "nothing is credited");
+
+	S_RampageEnd end;
+	InitHeader(end, 1001);
+	end.body.frenzyId = 4;
+	end.body.outcome  = RAMPAGE_FAILED;
+	c.HandleMessage(Wrap(end, CH_EVENT));
+	Check(g_rec.rampageVerdicts == 0, "and no verdict is applied");
+}
+
+void TestAWelcomeWithNoRampageBitsSharesAnyway() {
+	std::printf("\na server too old to set the rampage bits\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	// roadmap.md 5.10 is the decision, so it is the default: an unset field
+	// must not mean "off" the way it would if the bits had been chosen the
+	// other way round.
+	Check(g_rec.rampageRule == RAMPAGE_RULE_SHARED,
+	      "the default is shared, which is the decision");
+}
+
+void TestTheRampageBitsDoNotCollideWithTheOtherRules() {
+	std::printf("\nthe session flags do not tread on each other\n");
+	// The wanted work and the ammo work already collided over bit 1 once
+	// (protocol.h, SessionFlags). Two bits later, the same check.
+	uint8_t flags = 0;
+	flags = FlagsWithWantedRule(flags, WANTED_RULE_OFF);
+	flags = FlagsWithRampageRule(flags, RAMPAGE_RULE_SCALED);
+	flags |= SESSION_AMMO_SYNC;
+	flags |= SESSION_FRIENDLY_FIRE;
+	Check(WantedRuleFromFlags(flags) == WANTED_RULE_OFF, "the wanted rule survives");
+	Check(RampageRuleFromFlags(flags) == RAMPAGE_RULE_SCALED, "and the rampage rule");
+	Check((flags & SESSION_AMMO_SYNC) != 0, "and ammo sync");
+	Check((flags & SESSION_FRIENDLY_FIRE) != 0, "and friendly fire");
+	// 3 is not a rule.
+	Check(RampageRuleFromFlags(uint8_t(3 << SESSION_RAMPAGE_SHIFT)) ==
+	          RAMPAGE_RULE_SHARED,
+	      "a value from a newer build falls back to the default");
+}
+
+// ---- vehicle rampages (game/darkel.h, "one car, one count") -------------
+
+UnownedVehicleKey CarKey(uint8_t kind, uint16_t id) {
+	UnownedVehicleKey k{};
+	k.kind = kind;
+	k.pad  = 0;
+	k.id   = id;
+	return k;
+}
+
+void TestWhichCarsCountTowardARampage() {
+	std::printf("\nwhich cars count toward a rampage\n");
+
+	// Rampage 02: `targets ALL_CARS -1 -1 -1`, which is -2 in the first slot.
+	game::FrenzyTargets any;
+	any.weapon = 8;   // rocket launcher, and the car register never reads it
+	any.model1 = FRENZY_ANY_CAR;
+	any.model2 = any.model3 = any.model4 = -1;
+	Check(game::RampageCarCounts(any, 90), "any car counts for ALL_CARS");
+	Check(game::RampageCarCounts(any, 116), "whatever the model");
+
+	game::FrenzyTargets some;
+	some.model1 = 110;
+	some.model2 = 116;
+	some.model3 = some.model4 = -1;
+	Check(game::RampageCarCounts(some, 116), "a listed model counts");
+	Check(!game::RampageCarCounts(some, 90), "an unlisted one doesn't");
+
+	// A pedestrian rampage holds -1 in the first slot. The car register only
+	// compares the first slot against -2, so no car ever counts toward one.
+	game::FrenzyTargets peds;
+	peds.model1 = FRENZY_ANY_PED;
+	Check(!game::RampageCarCounts(peds, 90), "no car counts toward a pedestrian rampage");
+
+	Check(RampageCarKeyed(CarKey(UNOWNED_PARKED, 3)), "a parked car carries a name");
+	Check(RampageCarKeyed(CarKey(UNOWNED_SESSION, 3)),
+	      "so does a session car nobody drives");
+	Check(!RampageCarKeyed(CarKey(UNOWNED_AMBIENT, 3)),
+	      "traffic doesn't: only its host can decide it");
+	Check(!RampageCarKeyed(CarKey(RAMPAGE_CAR_UNKEYED, 3)), "and unkeyed is unkeyed");
+}
+
+void TestTheCarTallyDecision() {
+	std::printf("\nwhether a car that blew up here is ours to count\n");
+	using game::CarWreckTally;
+	using game::TallyCarWreck;
+	Check(TallyCarWreck(false, false, false) == CarWreckTally::Engine,
+	      "no shared frenzy: the register runs as retail");
+	Check(TallyCarWreck(false, true, true) == CarWreckTally::Engine,
+	      "including for a replay, which is what rampages = off means");
+	Check(TallyCarWreck(true, false, false) == CarWreckTally::Count,
+	      "our own engine decided it: count it and say so");
+	Check(TallyCarWreck(true, true, false) == CarWreckTally::Withhold,
+	      "a replay of another machine's wreck is kept off the counter");
+	Check(TallyCarWreck(true, false, true) == CarWreckTally::Withhold,
+	      "and so is a named car the session already counted here");
+
+	game::CountedCars c;
+	Check(!c.Add(CarKey(RAMPAGE_CAR_UNKEYED, 0)), "an unkeyed car is never remembered");
+	Check(!c.Has(CarKey(RAMPAGE_CAR_UNKEYED, 0)), "so it is never 'already counted'");
+	Check(c.Add(CarKey(UNOWNED_PARKED, 7)), "a parked car is");
+	Check(!c.Add(CarKey(UNOWNED_PARKED, 7)), "once");
+	Check(!c.Has(CarKey(UNOWNED_SESSION, 7)), "and the kind is part of the name");
+	c.Clear();
+	Check(!c.Has(CarKey(UNOWNED_PARKED, 7)), "a new frenzy starts with nothing counted");
+
+	for (uint16_t i = 0; i < game::CountedCars::CAPACITY + 1; ++i)
+		c.Add(CarKey(UNOWNED_PARKED, i));
+	Check(!c.Has(CarKey(UNOWNED_PARKED, 0)), "full, the oldest name goes first");
+	Check(c.Has(CarKey(UNOWNED_PARKED, game::CountedCars::CAPACITY)),
+	      "and the newest is kept");
+
+	game::FrenzyTargets any;
+	any.model1 = FRENZY_ANY_CAR;
+	Check(game::CarFromWireCounts(true, any, 90, false), "a car off the wire counts");
+	Check(!game::CarFromWireCounts(false, any, 90, false), "not with no frenzy running");
+	Check(!game::CarFromWireCounts(true, any, 90, true), "nor when it already counted here");
+}
+
+// Two machines' worth of the pure half of game/darkel.cpp, walked through
+// every way a car could count twice or not at all. The engine's own counter
+// is `counter`, the rampage is Rampage 02 (13 cars, any model).
+struct CarTallyMachine {
+	game::FrenzyTargets frenzy;
+	game::CountedCars   counted;
+	int                 counter = 13;
+
+	CarTallyMachine() {
+		frenzy.model1 = FRENZY_ANY_CAR;
+		frenzy.model2 = frenzy.model3 = frenzy.model4 = -1;
+	}
+
+	// Our own BlowUpCar ran. True when it counted and went on the wire.
+	bool Wreck(int32_t model, bool replay, const UnownedVehicleKey &key) {
+		if (game::TallyCarWreck(true, replay, counted.Has(key)) !=
+		    game::CarWreckTally::Count)
+			return false;
+		if (!game::RampageCarCounts(frenzy, model))
+			return false;
+		--counter;
+		counted.Add(key);
+		return true;
+	}
+
+	void FromWire(int32_t model, const UnownedVehicleKey &key) {
+		if (!game::CarFromWireCounts(true, frenzy, model, counted.Has(key)))
+			return;
+		counted.Add(key);
+		--counter;
+	}
+};
+
+void TestEveryCarCountsOnceOnEveryMachine() {
+	std::printf("\na vehicle rampage counts each car once, everywhere\n");
+	CarTallyMachine a, b;
+	const UnownedVehicleKey none = CarKey(RAMPAGE_CAR_UNKEYED, 0);
+
+	// B shoots A's traffic. A's engine decides and counts it; B replays the
+	// host's wreck, which used to count on B as well, and then gets A's relay.
+	Check(a.Wreck(90, false, none), "the host's own wreck counts and is reported");
+	Check(!b.Wreck(90, true, none), "the shooter's replay of it doesn't");
+	b.FromWire(90, none);
+	Check(a.counter == 12 && b.counter == 12, "one car, one count on each machine");
+
+	// A parked car, and each machine's copy went up in its own copy of the
+	// blast before either heard from the other.
+	const UnownedVehicleKey parked = CarKey(UNOWNED_PARKED, 41);
+	Check(a.Wreck(95, false, parked), "A's copy counts");
+	Check(b.Wreck(95, false, parked), "B's copy counts too, independently");
+	a.FromWire(95, parked);
+	b.FromWire(95, parked);
+	Check(a.counter == 11 && b.counter == 11,
+	      "and neither counts the other's report of the same car");
+
+	// The relay arrives before B's own copy goes up (a bomb timer is one to
+	// three seconds and rolled on each machine).
+	const UnownedVehicleKey late = CarKey(UNOWNED_PARKED, 42);
+	a.Wreck(95, false, late);
+	b.FromWire(95, late);
+	Check(!b.Wreck(95, false, late), "a copy that goes up after the relay is held back");
+	Check(a.counter == 10 && b.counter == 10, "still once each");
+
+	// S_UnownedBlowUp reached B first and B replayed the wreck.
+	const UnownedVehicleKey told = CarKey(UNOWNED_PARKED, 43);
+	a.Wreck(95, false, told);
+	Check(!b.Wreck(95, true, told), "a replayed parked car is held back");
+	b.FromWire(95, told);
+	Check(a.counter == 9 && b.counter == 9, "and the relay counts it");
+
+	// A session car nobody was driving, same rules under a different name.
+	const UnownedVehicleKey abandoned = CarKey(UNOWNED_SESSION, 5);
+	b.Wreck(116, false, abandoned);
+	a.Wreck(116, false, abandoned);
+	a.FromWire(116, abandoned);
+	b.FromWire(116, abandoned);
+	Check(a.counter == 8 && b.counter == 8, "an abandoned session car counts once too");
+
+	// A car only B's engine has - traffic A never had a replica of, too far
+	// away. The case that used to count for B and nobody else.
+	Check(b.Wreck(90, false, none), "a car only B has counts on B");
+	a.FromWire(90, none);
+	Check(a.counter == 7 && b.counter == 7, "and now on A");
+
+	// Two different unkeyed cars of the same model are two cars.
+	b.Wreck(90, false, none);
+	a.FromWire(90, none);
+	Check(a.counter == 6 && b.counter == 6, "the same model twice is two cars");
+}
+
+void TestARampageCarReachesTheSeam() {
+	std::printf("\na car off the wire reaching the seam\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(3), CH_EVENT));
+
+	S_RampageCar car;
+	InitHeader(car, 1000);
+	car.byPlayer      = 1;
+	car.body.frenzyId = 9;
+	car.body.model    = 116;
+	car.body.key      = CarKey(UNOWNED_PARKED, 41);
+	c.HandleMessage(Wrap(car, CH_EVENT));
+	Check(g_rec.rampageCarCredits == 0, "nothing with no frenzy open");
+
+	S_RampageOpen open;
+	InitHeader(open, 1001);
+	open.body.frenzyId    = 9;
+	open.body.killsNeeded = 13;
+	open.body.elapsedMs   = 0;
+	c.HandleMessage(Wrap(open, CH_EVENT));
+
+	c.HandleMessage(Wrap(car, CH_EVENT));
+	Check(g_rec.rampageCarCredits == 1 && g_rec.rampageCarModel == 116,
+	      "a car for this frenzy reaches the seam with its model");
+	Check(g_rec.rampageCarKey.kind == UNOWNED_PARKED && g_rec.rampageCarKey.id == 41,
+	      "and its name, which the seam needs to count it once");
+	Check(g_rec.rampageCredits == 0, "and it isn't handed over as a pedestrian");
+
+	car.byPlayer = 3;
+	c.HandleMessage(Wrap(car, CH_EVENT));
+	Check(g_rec.rampageCarCredits == 1, "our own car coming back is dropped");
+
+	car.byPlayer      = 1;
+	car.body.frenzyId = 8;
+	c.HandleMessage(Wrap(car, CH_EVENT));
+	Check(g_rec.rampageCarCredits == 1, "and so is one for an older frenzy");
+}
+
+// tools/clienttest/aimpitch.cpp
+int RunAimPitchTests();
+
+// tools/clienttest/siren.cpp
+int RunSirenTests();
+
+// tools/clienttest/cheats.cpp
+int RunCheatTests();
+
+// tools/clienttest/driveby.cpp
+int RunDriveByTests();
+
+// tools/clienttest/money.cpp
+int RunMoneyTests();
+
+// ---- the police helicopter (helisync.h, game/heli.h) -----------------------
+
+// A recording HeliBridge. Plain function pointers, so the state is a global,
+// the same as g_rec.
+struct HeliRec {
+	// The owner's engine.
+	std::vector<OwnHeliSample> own;
+	std::vector<OwnHeliGone>   gone;
+	int          applies        = 0;
+	bool         applyTakes     = true;
+	uint8_t      lastApplySlot  = 0xFF;
+	int32_t      lastApplyHandle = -1;
+	uint8_t      lastAttacker   = 0xFF;
+	HeliHitBody  lastApplied{};
+	int          resets         = 0;
+
+	// The shooter's.
+	std::vector<LocalHeliHit> hits;
+	int     hitDrains = 0;
+	int     credits   = 0;
+	uint8_t lastCreditSlot = 0xFF;
+
+	// The observer's.
+	bool    modelReady  = true;
+	int     modelAsks   = 0;
+	int     spawns      = 0;
+	int     despawns    = 0;
+	int     poses       = 0;
+	bool    loseNextPose = false;
+	VehicleTransform lastPose{};
+	HeliLook         lastLook{};
+	int     tails       = 0;
+	int     explodes    = 0;
+	Vec3    lastExplodeAt{};
+	bool    lastExplodeHadReplica = false;
+	int     despawnsAtLastExplode = -1;
+	int     nextHandle  = 500;
+
+	// The gun: the owner's rounds, and the observer's drawing of them.
+	std::vector<OwnHeliShot> ownShots;
+	int     draws       = 0;
+	bool    drawTakes   = true;
+	int32_t lastDrawHandle = -1;
+	Vec3    lastDrawSource{};
+	Vec3    lastDrawTarget{};
+
+	// What went out, in order.
+	std::vector<Message> sent;
+};
+HeliRec g_heli;
+
+uint8_t HeliRecSample(OwnHeliSample *out, uint8_t max) {
+	uint8_t n = 0;
+	for (const OwnHeliSample &s : g_heli.own)
+		if (n < max)
+			out[n++] = s;
+	return n;
+}
+uint8_t HeliRecDrainGone(OwnHeliGone *out, uint8_t max) {
+	uint8_t n = 0;
+	for (const OwnHeliGone &g : g_heli.gone)
+		if (n < max)
+			out[n++] = g;
+	g_heli.gone.clear();
+	return n;
+}
+bool HeliRecApply(uint8_t slot, int32_t handle, uint8_t attacker, const HeliHitBody &hit) {
+	++g_heli.applies;
+	g_heli.lastApplySlot   = slot;
+	g_heli.lastApplyHandle = handle;
+	g_heli.lastAttacker    = attacker;
+	g_heli.lastApplied     = hit;
+	return g_heli.applyTakes;
+}
+void HeliRecReset() { ++g_heli.resets; }
+uint8_t HeliRecDrainHits(LocalHeliHit *out, uint8_t max) {
+	++g_heli.hitDrains;
+	uint8_t n = 0;
+	for (const LocalHeliHit &h : g_heli.hits)
+		if (n < max)
+			out[n++] = h;
+	g_heli.hits.clear();
+	return n;
+}
+void HeliRecCredit(uint8_t slot, const Vec3 &) {
+	++g_heli.credits;
+	g_heli.lastCreditSlot = slot;
+}
+bool HeliRecModel() {
+	++g_heli.modelAsks;
+	return g_heli.modelReady;
+}
+bool HeliRecSpawn(RemoteHeli &h) {
+	++g_heli.spawns;
+	h.poolHandle = g_heli.nextHandle++;
+	return true;
+}
+void HeliRecDespawn(RemoteHeli &h) {
+	++g_heli.despawns;
+	h.poolHandle = -1;
+}
+bool HeliRecPose(RemoteHeli &, const VehicleTransform &at, const HeliLook &look) {
+	if (g_heli.loseNextPose) {
+		g_heli.loseNextPose = false;
+		return false;
+	}
+	++g_heli.poses;
+	g_heli.lastPose = at;
+	g_heli.lastLook = look;
+	return true;
+}
+void HeliRecTail(RemoteHeli &) { ++g_heli.tails; }
+void HeliRecExplode(RemoteHeli &h, const Vec3 &at) {
+	++g_heli.explodes;
+	g_heli.lastExplodeAt         = at;
+	g_heli.lastExplodeHadReplica = h.Spawned();
+	g_heli.despawnsAtLastExplode = g_heli.despawns;
+}
+uint8_t HeliRecDrainShots(OwnHeliShot *out, uint8_t max) {
+	uint8_t n = 0;
+	for (const OwnHeliShot &s : g_heli.ownShots)
+		if (n < max)
+			out[n++] = s;
+	g_heli.ownShots.clear();
+	return n;
+}
+bool HeliRecDraw(RemoteHeli &h, const Vec3 &source, const Vec3 &target) {
+	++g_heli.draws;
+	g_heli.lastDrawHandle = h.poolHandle;
+	g_heli.lastDrawSource = source;
+	g_heli.lastDrawTarget = target;
+	return g_heli.drawTakes;
+}
+void HeliRecSend(void *, const void *bytes, size_t len, Channel ch) {
+	Message m;
+	m.opcode  = static_cast<const uint8_t *>(bytes)[0];
+	m.channel = ch;
+	m.data.assign(static_cast<const uint8_t *>(bytes),
+	              static_cast<const uint8_t *>(bytes) + len);
+	g_heli.sent.push_back(m);
+}
+
+HeliBridge HeliRecordingBridge() {
+	g_heli = HeliRec{};
+	HeliBridge b;
+	b.SampleOwnHelis         = &HeliRecSample;
+	b.DrainOwnHeliGone       = &HeliRecDrainGone;
+	b.ApplyHeliHit           = &HeliRecApply;
+	b.ResetHeliSession       = &HeliRecReset;
+	b.DrainLocalHeliHits     = &HeliRecDrainHits;
+	b.CreditHeliShootDown    = &HeliRecCredit;
+	b.RequestHeliModel       = &HeliRecModel;
+	b.SpawnHeliReplica       = &HeliRecSpawn;
+	b.DespawnHeliReplica     = &HeliRecDespawn;
+	b.PoseHeliReplica        = &HeliRecPose;
+	b.BlowTailOffHeliReplica = &HeliRecTail;
+	b.ExplodeHeliReplica     = &HeliRecExplode;
+	b.DrainOwnHeliShots      = &HeliRecDrainShots;
+	b.DrawHeliShot           = &HeliRecDraw;
+	return b;
+}
+
+// A HeliSync wired to the recorder. The bridge has to outlive the sync, so it
+// is a static here the way m_bridge is a member of Client.
+HeliSync &FreshHeliSync() {
+	static HeliBridge bridge;
+	static HeliSync   sync;
+	bridge = HeliRecordingBridge();
+	sync   = HeliSync{};
+	sync.Bind(&bridge, &HeliRecSend, nullptr);
+	return sync;
+}
+
+size_t SentCount(uint8_t opcode) {
+	size_t n = 0;
+	for (const Message &m : g_heli.sent)
+		if (m.opcode == opcode)
+			++n;
+	return n;
+}
+
+template <class T>
+const T *LastSent() {
+	for (auto it = g_heli.sent.rbegin(); it != g_heli.sent.rend(); ++it)
+		if (const T *p = it->as<T>())
+			return p;
+	return nullptr;
+}
+
+S_HeliState MakeHeliState(uint8_t owner, uint16_t serial, uint32_t timeMs,
+                          float x, uint8_t status = HELI_STATUS_CHASE,
+                          uint8_t slot = 0) {
+	S_HeliState s;
+	InitHeader(s, timeMs);
+	s.ownerPlayerId = owner;
+	s.body          = HeliStateBody{};
+	s.body.serial   = serial;
+	s.body.slot     = slot;
+	s.body.status   = status;
+	s.body.pos      = {x, 100.0f, 60.0f};
+	s.body.rot      = {0.0f, 0.0f, 0.0f, 1.0f};
+	s.body.searchLightIntensity = 1.0f;
+	return s;
+}
+
+S_HeliGone MakeHeliGone(uint8_t owner, uint16_t serial, uint8_t reason,
+                        uint8_t credit = INVALID_PLAYER, uint8_t slot = 0) {
+	S_HeliGone g;
+	InitHeader(g, 1000);
+	g.ownerPlayerId       = owner;
+	g.body                = HeliGoneBody{};
+	g.body.serial         = serial;
+	g.body.slot           = slot;
+	g.body.reason         = reason;
+	g.body.creditPlayerId = credit;
+	g.body.pos            = {5.0f, 6.0f, 70.0f};
+	return g;
+}
+
+OwnHeliSample MakeOwnHeli(uint8_t slot, int32_t handle, float x) {
+	OwnHeliSample s;
+	s.handle      = handle;
+	s.body        = HeliStateBody{};
+	s.body.slot   = slot;
+	s.body.status = HELI_STATUS_CHASE;
+	s.body.pos    = {x, 0.0f, 50.0f};
+	s.body.rot    = {0.0f, 0.0f, 0.0f, 1.0f};
+	return s;
+}
+
+void TestTheHeliHitRuleIsTheEngines() {
+	std::printf("a hit on a helicopter costs what TestBulletCollision says\n");
+	game::HeliDamageState h;
+	const uint32_t now = 50000;
+
+	// Every caller of the engine's test passes 4, and the limit is `> 700`
+	// (`cmp dword [eax+308h],2BCh / jbe`), so the 175th bullet leaves it at
+	// exactly 700 and still flying and the 176th brings it down.
+	for (int i = 0; i < 175; ++i)
+		game::ApplyHeliHitRule(h, HELI_HIT_BULLET, 4, now, true);
+	Check(h.bulletDamage == 700 && h.status == HELI_STATUS_HOVER,
+	      "175 rounds of 4 is 700, and 700 is not past the limit");
+	Check(game::HeliHitBringsDown(h, HELI_HIT_BULLET, 4), "the next one would be");
+	game::ApplyHeliHitRule(h, HELI_HIT_BULLET, 4, now, true);
+	Check(h.status == HELI_STATUS_SHOT_DOWN, "the 176th brings it down");
+	Check(h.explosionTimer == now + 10000, "and it goes off ten seconds later");
+	Check(h.angularSpeed > 0.049f && h.angularSpeed < 0.051f,
+	      "spinning at +0.05 when rand() came in under 3FFFh");
+
+	game::ApplyHeliHitRule(h, HELI_HIT_BULLET, 4, now + 3000, false);
+	Check(h.explosionTimer == now + 13000,
+	      "a hit on one already coming down starts the ten seconds again");
+	Check(h.angularSpeed < -0.049f && h.angularSpeed > -0.051f,
+	      "and re-rolls the spin, -0.05 this time");
+
+	game::HeliDamageState catalina;
+	catalina.heliType     = 2;
+	catalina.bulletDamage = 400;
+	game::ApplyHeliHitRule(catalina, HELI_HIT_BULLET, 4, now, true);
+	Check(catalina.status == HELI_STATUS_SHOT_DOWN, "Catalina's comes down past 400");
+
+	game::HeliDamageState proof;
+	proof.bulletProof = true;
+	Check(!game::ApplyHeliHitRule(proof, HELI_HIT_BULLET, 4, now, true) &&
+	          proof.bulletDamage == 0,
+	      "a bulletproof one takes nothing");
+	Check(game::ApplyHeliHitRule(proof, HELI_HIT_ROCKET, 0, now, true) &&
+	          proof.status == HELI_STATUS_SHOT_DOWN,
+	      "and a rocket still brings it down, which reads the other flag");
+
+	game::HeliDamageState rocketProof;
+	rocketProof.explosionProof = true;
+	Check(!game::ApplyHeliHitRule(rocketProof, HELI_HIT_ROCKET, 0, now, true) &&
+	          rocketProof.status == HELI_STATUS_HOVER,
+	      "an explosion-proof one shrugs off a rocket");
+
+	game::HeliDamageState fresh;
+	game::ApplyHeliHitRule(fresh, HELI_HIT_ROCKET, 0, now, true);
+	Check(fresh.status == HELI_STATUS_SHOT_DOWN && fresh.bulletDamage == 0,
+	      "one rocket is enough, and it counts no damage");
+	Check(!game::ApplyHeliHitRule(fresh, 7, 4, now, true), "an unknown kind is refused");
+}
+
+void TestWhenUpdateHelisBlowsItUp() {
+	std::printf("the explosion runs on the frame after the timer, not on it\n");
+	Check(!game::HeliExplodesThisUpdate(HELI_STATUS_SHOT_DOWN, 1000, 1000),
+	      "`jbe` skips it while the time equals the timer");
+	Check(game::HeliExplodesThisUpdate(HELI_STATUS_SHOT_DOWN, 1001, 1000),
+	      "one millisecond past, it goes");
+	Check(!game::HeliExplodesThisUpdate(HELI_STATUS_FLY_AWAY, 5000, 1000),
+	      "only a helicopter that was shot down");
+}
+
+void TestTheFirstHitThatBringsItDownIsTheCredit() {
+	std::printf("whose hit brought the helicopter down\n");
+	uint8_t credit = INVALID_PLAYER;
+	credit = game::HeliCreditAfterHit(credit, HELI_STATUS_CHASE, HELI_STATUS_CHASE, 2);
+	Check(credit == INVALID_PLAYER, "a hit that doesn't bring it down credits nobody");
+	credit = game::HeliCreditAfterHit(credit, HELI_STATUS_CHASE, HELI_STATUS_SHOT_DOWN, 2);
+	Check(credit == 2, "the one that does is the credit");
+	credit = game::HeliCreditAfterHit(credit, HELI_STATUS_SHOT_DOWN,
+	                                  HELI_STATUS_SHOT_DOWN, 5);
+	Check(credit == 2, "and a later hit on the way down doesn't take it");
+}
+
+void TestTheRewardIsTakenBackOnlyWhenItIsExactlyTheEngines() {
+	std::printf("the owner's engine doesn't pay for a helicopter somebody else shot down\n");
+	const game::HeliRewards before{1000, 3, 40, 12};
+	game::HeliRewards after{1250, 4, 42, 14};
+	game::HeliRewards out;
+	Check(game::WithholdHeliRewards(before, after, 1, 1, out) && out.money == 1000 &&
+	          out.helisDestroyed == 3 && out.peopleKilled == 40 && out.copsKilled == 12,
+	      "exactly one helicopter's worth, all four taken back");
+
+	Check(!game::WithholdHeliRewards(before, after, 1, 0, out) && out.money == 1250,
+	      "our own shoot-down is left alone");
+
+	game::HeliRewards two{1500, 5, 44, 16};
+	Check(game::WithholdHeliRewards(before, two, 2, 1, out) && out.money == 1250 &&
+	          out.helisDestroyed == 4,
+	      "two in one call, one of them ours: one taken back");
+
+	game::HeliRewards odd{1300, 4, 42, 14};
+	Check(!game::WithholdHeliRewards(before, odd, 1, 1, out) && out.money == 1300,
+	      "money that moved by something else in the same call is left as it is");
+}
+
+void TestOnlyTheExplodingHelisCrimeIsWithheld() {
+	std::printf("which RegisterCrime_Immediately call is held back\n");
+	Check(game::IsWithheldHeliCrime(12, 0x4D83, 0x1), "slot 0's, while slot 0 is held");
+	Check(game::IsWithheldHeliCrime(12, 0x4D84, 0x2), "slot 1's, while slot 1 is held");
+	Check(!game::IsWithheldHeliCrime(12, 0x4D84, 0x1), "not slot 1's while only 0 is");
+	Check(!game::IsWithheldHeliCrime(12, 0x4D85, 0x3), "not the script helicopter's");
+	Check(!game::IsWithheldHeliCrime(4, 0x4D83, 0x1), "not some other crime");
+	Check(!game::IsWithheldHeliCrime(12, 0x4D83, 0x0), "and nothing outside the call");
+}
+
+void TestAHeliHitOnTheWireIsBounded() {
+	std::printf("what a helicopter hit may carry\n");
+	HeliHitBody b{};
+	b.slot   = 0;
+	b.kind   = HELI_HIT_BULLET;
+	b.damage = 4;
+	Check(IsSaneHeliHit(b), "a bullet with the engine's own 4");
+	b.damage = HELI_HIT_MAX_DAMAGE + 1;
+	Check(!IsSaneHeliHit(b), "not one that would end it in a few packets");
+	b.damage = 0;
+	Check(!IsSaneHeliHit(b), "not a bullet with nothing in it");
+	b.kind = HELI_HIT_ROCKET;
+	Check(IsSaneHeliHit(b), "a rocket carries no damage");
+	b.slot = 2;
+	Check(!IsSaneHeliHit(b), "not the script helicopter's slot");
+	b.slot = 0;
+	b.kind = 9;
+	Check(!IsSaneHeliHit(b), "not a kind nobody defined");
+}
+
+void TestAReplicaIsBuiltAndFollowsTheStream() {
+	std::printf("somebody else's helicopter is built here and follows its owner\n");
+	HeliSync &h = FreshHeliSync();
+	g_heli.modelReady = false;
+
+	h.OnState(MakeHeliState(1, 7, 1000, 10.0f), 0, 5000);
+	Check(h.ActiveCount() == 1, "a state makes a row");
+	h.Tick(5000);
+	Check(g_heli.modelAsks == 1 && g_heli.spawns == 0,
+	      "nothing is built before MI_CHOPPER is loaded");
+
+	g_heli.modelReady = true;
+	h.Tick(5016);
+	Check(g_heli.spawns == 1 && g_heli.poses == 1, "built, then placed in the same frame");
+	Check(h.IsReplica(500), "and the handle is one of ours");
+
+	h.OnState(MakeHeliState(1, 7, 1100, 20.0f), 0, 5100);
+	h.Tick(5200);
+	Check(g_heli.spawns == 1 && g_heli.poses == 2, "a second state moves it, no rebuild");
+	Check(g_heli.lastLook.searchLightIntensity == 1.0f,
+	      "the searchlight is the owner's, not ours");
+
+	h.OnState(MakeHeliState(0, 8, 1100, 20.0f), 0, 5200);
+	Check(h.Find(0, 8) == nullptr, "our own helicopter coming back is dropped");
+	h.OnState(MakeHeliState(1, 9, 1100, 20.0f, HELI_STATUS_CHASE, 2), 0, 5200);
+	Check(h.Find(1, 9) == nullptr, "the script helicopter's slot is not ours to show");
+}
+
+void TestAShotDownHelicopterExplodesHereAndStaysGone() {
+	std::printf("a helicopter shot down on its owner's machine\n");
+	HeliSync &h = FreshHeliSync();
+	h.OnState(MakeHeliState(1, 7, 1000, 10.0f), 0, 5000);
+	h.Tick(5000);
+
+	h.OnGone(MakeHeliGone(1, 7, HELI_GONE_SHOT_DOWN), 0);
+	Check(g_heli.explodes == 1 && g_heli.lastExplodeHadReplica,
+	      "the blast is played on the replica");
+	Check(g_heli.despawnsAtLastExplode == 0 && g_heli.despawns == 1,
+	      "before the replica is taken away, which is what the debris is cut from");
+	Check(g_heli.lastExplodeAt.z == 70.0f, "where the owner's engine blew it up");
+	Check(h.ActiveCount() == 0, "and the row is gone");
+	Check(g_heli.credits == 0, "nobody here is credited when nobody is named");
+
+	h.OnState(MakeHeliState(1, 7, 900, 10.0f), 0, 5050);
+	Check(h.ActiveCount() == 0,
+	      "a state that overtook the C_HeliGone does not build it again");
+
+	h.OnState(MakeHeliState(1, 11, 2000, 10.0f), 0, 6000);
+	h.OnGone(MakeHeliGone(1, 11, HELI_GONE_FLEW_AWAY), 0);
+	Check(g_heli.explodes == 1 && h.ActiveCount() == 0,
+	      "one that flew away is just taken away, no blast");
+}
+
+void TestTheShooterIsCreditedAndNobodyIsPaid() {
+	std::printf("the shooter's machine gets the credit for somebody else's helicopter\n");
+	HeliSync &h = FreshHeliSync();
+	h.OnGone(MakeHeliGone(1, 7, HELI_GONE_SHOT_DOWN, 0, 1), 0);
+	Check(g_heli.credits == 1 && g_heli.lastCreditSlot == 1,
+	      "ours, even with no replica here, and with the owner's slot");
+	h.OnGone(MakeHeliGone(1, 8, HELI_GONE_SHOT_DOWN, 2), 0);
+	Check(g_heli.credits == 1, "somebody else's credit is not ours");
+	h.OnGone(MakeHeliGone(1, 9, HELI_GONE_FLEW_AWAY, 0), 0);
+	Check(g_heli.credits == 1, "and a helicopter that flew away credits nobody");
+	h.OnGone(MakeHeliGone(1, 7, HELI_GONE_SHOT_DOWN, 0, 1), 0);
+	Check(g_heli.credits == 2,
+	      "the sync does not dedupe the credit - the server relays a gone once");
+}
+
+void TestAHelicopterNobodyStreamsClimbsAwayAndGoes() {
+	std::printf("a helicopter whose stream stops is not left hovering\n");
+	HeliSync &h = FreshHeliSync();
+	h.OnState(MakeHeliState(1, 7, 1000, 10.0f), 0, 5000);
+	h.Tick(5000);
+	const float startZ = g_heli.lastPose.pos.z;
+
+	h.Tick(5000 + HELI_STALE_MS);
+	Check(h.ActiveCount() == 1 && g_heli.despawns == 0, "held while it is only late");
+	h.Tick(5000 + HELI_STALE_MS + 16);
+	const RemoteHeli *row = h.Find(1, 7);
+	Check(row && row->orphaned, "abandoned once it is past HELI_STALE_MS");
+
+	h.Tick(5000 + HELI_STALE_MS + 16 + 3000);
+	Check(g_heli.lastPose.pos.z > startZ + 25.0f && g_heli.lastLook.searchLightIntensity == 0.0f,
+	      "climbing, with its searchlight off");
+
+	h.Tick(5000 + HELI_STALE_MS + 16 + HELI_ORPHAN_MAX_MS);
+	Check(h.ActiveCount() == 0 && g_heli.despawns == 1, "and taken away");
+
+	// The height at which the engine itself deletes one flying away.
+	VehicleTransform high;
+	high.pos.z = 145.0f;
+	Check(!OrphanedHeliIsGone(OrphanedHeliAt(high, 0), 0), "not at 145 m");
+	Check(OrphanedHeliIsGone(OrphanedHeliAt(high, 600), 600), "gone past 150 m");
+}
+
+void TestAStreamThatComesBackIsFollowedAgain() {
+	std::printf("a helicopter whose stream resumes is not lost\n");
+	HeliSync &h = FreshHeliSync();
+	h.OnState(MakeHeliState(1, 7, 1000, 10.0f), 0, 5000);
+	h.Tick(5000);
+	h.Tick(5000 + HELI_STALE_MS + 16);
+	Check(h.Find(1, 7) && h.Find(1, 7)->orphaned, "abandoned");
+	h.OnState(MakeHeliState(1, 7, 4000, 30.0f), 0, 8000);
+	Check(h.Find(1, 7) && !h.Find(1, 7)->orphaned, "and taken back when it streams again");
+}
+
+void TestAnOwnerLeavingTakesHisHelicopterAway() {
+	std::printf("a helicopter whose owner leaves the session\n");
+	HeliSync &h = FreshHeliSync();
+	h.OnState(MakeHeliState(1, 7, 1000, 10.0f), 0, 5000);
+	h.OnState(MakeHeliState(2, 3, 1000, 50.0f), 0, 5000);
+	h.Tick(5000);
+	h.OnOwnerLeft(1, 5016);
+	Check(h.Find(1, 7) && h.Find(1, 7)->orphaned && h.Find(1, 7)->ownerLeft,
+	      "his climbs away");
+	Check(h.Find(2, 3) && !h.Find(2, 3)->orphaned, "nobody else's");
+	h.OnState(MakeHeliState(1, 7, 1100, 10.0f), 0, 5100);
+	Check(h.Find(1, 7)->orphaned, "a late state from him changes nothing");
+	h.Tick(5016 + HELI_ORPHAN_MAX_MS);
+	Check(h.Find(1, 7) == nullptr && h.ActiveCount() == 1, "and it goes");
+
+	// The slot is somebody else's now, serials from 1 again.
+	h.OnGone(MakeHeliGone(1, 1, HELI_GONE_FLEW_AWAY), 0);
+	h.OnOwnerLeft(1, 30000);
+	h.OnState(MakeHeliState(1, 1, 1000, 10.0f), 0, 30000);
+	Check(h.Find(1, 1) != nullptr, "a newcomer in the slot isn't refused his serial 1");
+}
+
+void TestTheTailComesOffOnce() {
+	std::printf("the first half of the explosion plays once\n");
+	HeliSync &h = FreshHeliSync();
+	S_HeliState s = MakeHeliState(1, 7, 1000, 10.0f, HELI_STATUS_SHOT_DOWN);
+	h.OnState(s, 0, 5000);
+	h.Tick(5000);
+	Check(g_heli.tails == 0, "not before the owner's engine blew it");
+	s.hdr.sendTimeMs = 1100;
+	s.body.flags     = HELI_FLAG_TAIL_BLOWN;
+	h.OnState(s, 0, 5100);
+	h.Tick(5100);
+	h.Tick(5116);
+	s.hdr.sendTimeMs = 1200;
+	h.OnState(s, 0, 5200);
+	h.Tick(5200);
+	Check(g_heli.tails == 1, "once, however many states carry the flag");
+}
+
+void TestAReplicaTheEngineTookIsBuiltAgain() {
+	std::printf("a replica the engine deleted under us\n");
+	HeliSync &h = FreshHeliSync();
+	h.OnState(MakeHeliState(1, 7, 1000, 10.0f), 0, 5000);
+	h.Tick(5000);
+	g_heli.loseNextPose = true;
+	h.Tick(5016);
+	Check(h.Find(1, 7) && !h.Find(1, 7)->Spawned(), "the handle is dropped");
+	h.Tick(5032);
+	Check(g_heli.spawns == 2, "and it is built again next frame");
+}
+
+void TestOurHelicopterGoesOutUnderASerial() {
+	std::printf("our own helicopter, streamed and ended\n");
+	HeliSync &h = FreshHeliSync();
+	g_heli.own.push_back(MakeOwnHeli(0, 900, 1.0f));
+
+	h.Send(0, 10000);
+	Check(h.OwnSerial(0) == 1, "the first helicopter is serial 1");
+	const C_HeliState *st = LastSent<C_HeliState>();
+	Check(st && st->body.serial == 1 && st->body.slot == 0 && st->body.pos.x == 1.0f,
+	      "and goes out with its serial and its slot");
+	Check(SentCount(OP_C_HELI_STATE) == 1, "one state");
+
+	h.Send(0, 10050);
+	Check(SentCount(OP_C_HELI_STATE) == 1, "not again within 100 ms");
+	h.Send(0, 10100);
+	Check(SentCount(OP_C_HELI_STATE) == 2, "again at HELI_STATE_HZ");
+	Check(g_heli.sent.back().channel == CH_SNAPSHOT, "on the unreliable channel");
+
+	OwnHeliGone g;
+	g.slot           = 0;
+	g.handle         = 900;
+	g.reason         = HELI_GONE_SHOT_DOWN;
+	g.creditPlayerId = 3;
+	g.pos            = {7.0f, 8.0f, 9.0f};
+	g_heli.gone.push_back(g);
+	g_heli.own.clear();
+	h.Send(0, 10200);
+	const C_HeliGone *gone = LastSent<C_HeliGone>();
+	Check(gone && gone->body.serial == 1 && gone->body.reason == HELI_GONE_SHOT_DOWN &&
+	          gone->body.creditPlayerId == 3 && gone->body.pos.z == 9.0f,
+	      "shot down, with the credit and where it went off");
+	Check(SentCount(OP_C_HELI_GONE) == 1, "once");
+	Check(g_heli.sent.back().channel == CH_EVENT, "reliably");
+
+	g_heli.own.push_back(MakeOwnHeli(0, 901, 2.0f));
+	h.Send(0, 70000);
+	Check(h.OwnSerial(0) == 2, "the next one in the same slot is a new serial");
+}
+
+void TestOurHelicopterVanishingIsStillToldOnce() {
+	std::printf("our helicopter leaving its slot without the UpdateHelis detour\n");
+	HeliSync &h = FreshHeliSync();
+	g_heli.own.push_back(MakeOwnHeli(1, 900, 1.0f));
+	h.Send(0, 10000);
+	g_heli.own.clear();
+	h.Send(0, 10016);
+	const C_HeliGone *gone = LastSent<C_HeliGone>();
+	Check(gone && gone->body.reason == HELI_GONE_VANISHED && gone->body.slot == 1 &&
+	          gone->body.creditPlayerId == INVALID_PLAYER,
+	      "a helicopter missing from its slot is gone, with nobody credited");
+	h.Send(0, 10032);
+	Check(SentCount(OP_C_HELI_GONE) == 1, "and said once");
+
+	g_heli.own.push_back(MakeOwnHeli(0, 950, 1.0f));
+	h.Send(0, 20000);
+	g_heli.own[0].handle = 951;
+	h.Send(0, 20016);
+	Check(SentCount(OP_C_HELI_GONE) == 2 && h.OwnSerial(0) == 3,
+	      "a different helicopter in the slot ends the old one and starts a new serial");
+}
+
+void TestAHitOnOurHelicopterReachesTheEngine() {
+	std::printf("somebody else's hit on our helicopter\n");
+	HeliSync &h = FreshHeliSync();
+	g_heli.own.push_back(MakeOwnHeli(0, 900, 1.0f));
+	h.Send(0, 10000);
+
+	S_HeliHit hit;
+	InitHeader(hit, 1000);
+	hit.attackerId         = 2;
+	hit.body               = HeliHitBody{};
+	hit.body.ownerPlayerId = 0;
+	hit.body.slot          = 0;
+	hit.body.serial        = 1;
+	hit.body.kind          = HELI_HIT_BULLET;
+	hit.body.damage        = 4;
+	h.OnHit(hit, 0);
+	Check(g_heli.applies == 1 && g_heli.lastApplyHandle == 900 && g_heli.lastAttacker == 2,
+	      "applied to the helicopter in that slot, from that attacker");
+
+	S_HeliHit stale = hit;
+	stale.body.serial = 5;
+	h.OnHit(stale, 0);
+	Check(g_heli.applies == 1, "not one for a serial we have already ended");
+	S_HeliHit notOurs = hit;
+	notOurs.body.ownerPlayerId = 1;
+	h.OnHit(notOurs, 0);
+	Check(g_heli.applies == 1, "not one addressed to somebody else");
+	S_HeliHit self = hit;
+	self.attackerId = 0;
+	h.OnHit(self, 0);
+	Check(g_heli.applies == 1, "not one from ourselves");
+	S_HeliHit huge = hit;
+	huge.body.damage = 700;
+	h.OnHit(huge, 0);
+	Check(g_heli.applies == 1, "not one that would end it in a packet");
+}
+
+void TestOurHitsOnTheirHelicopterGoToTheOwner() {
+	std::printf("our hits on somebody else's helicopter\n");
+	HeliSync &h = FreshHeliSync();
+	h.OnState(MakeHeliState(1, 7, 1000, 10.0f), 0, 5000);
+	h.Tick(5000);
+
+	LocalHeliHit hit;
+	hit.owner  = 1;
+	hit.slot   = 0;
+	hit.serial = 7;
+	hit.kind   = HELI_HIT_BULLET;
+	hit.damage = 4;
+	g_heli.hits.push_back(hit);
+	LocalHeliHit unknown = hit;
+	unknown.serial = 99;
+	g_heli.hits.push_back(unknown);
+	LocalHeliHit rocket = hit;
+	rocket.kind   = HELI_HIT_ROCKET;
+	rocket.damage = 55;
+	g_heli.hits.push_back(rocket);
+	h.Send(0, 5016);
+
+	Check(g_heli.hits.empty(), "every hit is drained, known or not");
+	Check(SentCount(OP_C_HELI_HIT) == 2, "the two on a helicopter we have go out");
+	const C_HeliHit *last = LastSent<C_HeliHit>();
+	Check(last && last->body.ownerPlayerId == 1 && last->body.serial == 7 &&
+	          last->body.kind == HELI_HIT_ROCKET && last->body.damage == 0,
+	      "addressed to the owner, and a rocket carries no damage");
+
+	RemoteHeli orphan;
+	orphan.active     = true;
+	orphan.owner      = 1;
+	orphan.poolHandle = 5;
+	orphan.orphaned   = true;
+	Check(!HeliHitIsWorthSending(orphan, 0), "not one whose owner has stopped flying it");
+	RemoteHeli unbuilt = orphan;
+	unbuilt.orphaned   = false;
+	unbuilt.poolHandle = -1;
+	Check(!HeliHitIsWorthSending(unbuilt, 0), "not one we never built");
+}
+
+void TestClearingTheSessionTakesEveryReplica() {
+	std::printf("the session ending\n");
+	HeliSync &h = FreshHeliSync();
+	h.OnState(MakeHeliState(1, 7, 1000, 10.0f), 0, 5000);
+	h.OnState(MakeHeliState(2, 4, 1000, 10.0f), 0, 5000);
+	h.Tick(5000);
+	g_heli.own.push_back(MakeOwnHeli(0, 900, 1.0f));
+	h.Send(0, 5000);
+	h.Clear();
+	Check(h.ActiveCount() == 0 && g_heli.despawns == 2, "every replica is destroyed");
+	Check(h.OwnSerial(0) == 0 && g_heli.resets == 1,
+	      "and our own is forgotten, engine credit and all");
+}
+
+void TestTheClientRoutesTheHelicopter() {
+	std::printf("the client hands the helicopter packets to the sync\n");
+	Client c;
+	WorldBridge b  = RecordingBridge();
+	b.heli         = HeliRecordingBridge();
+	c.SetBridge(b);
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+
+	c.HandleMessage(Wrap(MakeHeliState(1, 7, 1000, 10.0f), CH_SNAPSHOT));
+	Check(c.HelisForTest().ActiveCount() == 0,
+	      "a helicopter from somebody the roster doesn't have is dropped");
+
+	c.HandleMessage(Wrap(MakeJoin(1, "bob"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeHeliState(1, 7, 1000, 10.0f), CH_SNAPSHOT));
+	Check(c.HelisForTest().ActiveCount() == 1, "one from a player in the session is kept");
+	c.HelisForTest().Tick(WallClock::NowMs());
+	const RemoteHeli *row = c.HelisForTest().Find(1, 7);
+	Check(row && row->Spawned() && c.IsReplicatedVehicle(row->poolHandle),
+	      "and its replica is a vehicle this machine only watches");
+
+	S_PlayerLeave leave;
+	InitHeader(leave, 2000);
+	leave.playerId = 1;
+	leave.reason   = LEAVE_QUIT;
+	c.HandleMessage(Wrap(leave, CH_EVENT));
+	row = c.HelisForTest().Find(1, 7);
+	Check(row && row->ownerLeft, "his leaving sends it climbing away");
+
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	Check(c.HelisForTest().ActiveCount() == 0, "a new session starts with none");
+}
+
+// ---- velocity units at the buffer ----------------------------------------------
+//
+// Everything on the wire named after m_vecMoveSpeed is in the engine's unit,
+// metres per 1/50 s step, and the buffers extrapolate in m/s (interp.h). Each
+// push site gets a known engine speed and the buffer is asked where the thing
+// is 200 ms past its newest sample. Before the fix every one of these came out
+// at a fiftieth of the distance.
+
+bool CoastedTo(const VehicleInterpBuffer &buf, float x) {
+	VehicleTransform at;
+	return buf.Sample(buf.NewestTimeMs() + 200, at) && NearEnough(at.pos.x, x, 0.01f);
+}
+
+void TestEveryPushSiteConvertsTheEngineSpeed() {
+	std::printf("\nevery interpolation buffer is fed metres per second\n");
+	// 0.5 a step is 25 m/s, 90 km/h: 5 m in 200 ms.
+	const Vec3 carSpeed{0.5f, 0.0f, 0.0f};
+
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+		c.HandleMessage(Wrap(MakeJoin(1, "bob"), CH_EVENT));
+		S_PlayerState s  = MakeState(1, 1000, 0.0f);
+		s.body.moveSpeed = {0.1f, 0.0f, 0.0f};   // a run, 5 m/s
+		c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+		Pose p;
+		Check(c.PlayerSlot(1).interp.Sample(1200, p) && NearEnough(p.pos.x, 1.0f, 0.01f),
+		      "OnPlayerState: a player running at 0.1 a step coasts 1 m in 200 ms");
+		Check(c.PlayerSlot(1).last.moveSpeed.x == 0.1f,
+		      "and the ped is still handed the engine's own number");
+	}
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		ParkOneCar(c);
+		S_VehicleState s = MakeVehicleState(1, 80, 15.0f);
+		s.body.moveSpeed = carSpeed;
+		c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+		Check(CoastedTo(c.VehicleByNetId(80)->interp, 20.0f),
+		      "OnVehicleState: a car at 0.5 a step coasts 5 m in 200 ms");
+		Check(c.VehicleByNetId(80)->last.moveSpeed.x == 0.5f,
+		      "and ApplyRemoteVehicle still gets the raw value to write back");
+	}
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+		c.HandleMessage(Wrap(MakeAmbientCarSpawn(610), CH_EVENT));
+		S_CarStates s{};
+		InitHeader(s, 2000);
+		s.ownerPlayerId   = 1;
+		s.count           = 1;
+		s.cars[0].netId   = 610;
+		s.cars[0].pos     = {40.0f, 50.0f, 60.0f};
+		s.cars[0].rot     = {0.0f, 0.0f, 0.0f, 1.0f};
+		s.cars[0].velocity = carSpeed;
+		c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+		Check(CoastedTo(c.AmbientCar(610)->interp, 45.0f),
+		      "OnCarStates: traffic at 0.5 a step coasts 5 m in 200 ms");
+	}
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		GiveUsTheSessionsCar(c);
+		c.TickLocalVehicle();
+		S_EnterVehicle enter;
+		InitHeader(enter, 1000);
+		enter.playerId   = 0;
+		enter.body       = EnterVehicleBody{};
+		enter.body.netId = 80;
+		enter.body.seat  = 0;
+		c.HandleMessage(Wrap(enter, CH_EVENT));
+		g_rec.sampledMoveSpeed = carSpeed;
+		c.TickLocalVehicle();
+		Check(CoastedTo(c.VehicleByNetId(80)->interp, 5.0f),
+		      "SendLocalVehicle: our own reports go in converted too");
+	}
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		ParkOneCar(c);
+		c.HandleMessage(Wrap(MakeCustody(80, /*us=*/0), CH_EVENT));
+		g_rec.sampledMoveSpeed = carSpeed;
+		c.TickCustody();
+		Check(CoastedTo(c.VehicleByNetId(80)->interp, 16.0f),
+		      "SendCustodyVehicles: so do the reports on a car we are settling");
+	}
+	{
+		// Already m/s on the wire. Converting it again would throw it 50
+		// times too far.
+		Client c;
+		WorldBridge b = RecordingBridge();
+		b.heli        = HeliRecordingBridge();
+		c.SetBridge(b);
+		c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+		c.HandleMessage(Wrap(MakeJoin(1, "bob"), CH_EVENT));
+		S_HeliState s   = MakeHeliState(1, 7, 1000, 10.0f);
+		s.body.velocity = {25.0f, 0.0f, 0.0f};
+		c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+		const RemoteHeli *row = c.HelisForTest().Find(1, 7);
+		Check(row && CoastedTo(row->interp, 15.0f),
+		      "HeliSync::OnState: the helicopter's m/s is pushed as it is");
+	}
+}
+
+// ---- traffic that drops out of its host's nearest eight --------------------
+//
+// The host streams only the eight cars nearest its own player, so a car that
+// falls out of that set just stops appearing in the batch: no despawn, the
+// replica lives on and its buffer keeps its samples. Real time, because the
+// playback clock runs on WallClock; about two seconds of it.
+
+void TestTrafficThatGoesQuietIsHeldOnItsLastRow() {
+	std::printf("\ntraffic whose rows stop, then start again\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(630), CH_EVENT));
+	c.Tick();
+	Check(g_rec.ambientCarSpawns == 1, "the replica is built");
+
+	// The host's car: 25 m/s along x from the spawn point, a row every 100 ms
+	// of the host's own clock while it is one of the eight.
+	const uint32_t start = WallClock::NowMs();
+	auto hostX = [](uint32_t ms) { return 40.0f + 25.0f * ms / 1000.0f; };
+	auto row = [&](uint32_t ms) {
+		S_CarStates s{};
+		InitHeader(s, 50000 + ms);
+		s.ownerPlayerId     = 1;
+		s.count             = 1;
+		s.cars[0].netId     = 630;
+		s.cars[0].pos       = {hostX(ms), 50.0f, 60.0f};
+		s.cars[0].rot       = {0.0f, 0.0f, 0.0f, 1.0f};
+		s.cars[0].velocity  = {0.5f, 0.0f, 0.0f};   // engine units: 25 m/s
+		s.cars[0].health    = 1000;
+		c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+	};
+
+	float    prevX       = g_rec.lastAmbientCarAt.pos.x;
+	float    worstBack   = 0.0f;
+	float    furthestQuiet = 0.0f;
+	float    lastRowX    = 0.0f;
+	float    xLateInQuiet = -1.0f;
+	uint32_t nextRow     = 0;
+	for (;;) {
+		const uint32_t ms = WallClock::NowMs() - start;
+		if (ms >= 2200)
+			break;
+		// Streamed, then out of the eight from 600 to 1400, then back in.
+		const bool streaming = ms < 600 || ms >= 1400;
+		if (ms >= nextRow) {
+			if (streaming) {
+				row(ms);
+				lastRowX = ms < 600 ? hostX(ms) : lastRowX;
+			}
+			nextRow = ms - ms % 100 + 100;
+		}
+		c.Tick();
+		const float x = g_rec.lastAmbientCarAt.pos.x;
+		worstBack = x - prevX < worstBack ? x - prevX : worstBack;
+		prevX     = x;
+		if (ms >= 600 && ms < 1400) {
+			furthestQuiet = x > furthestQuiet ? x : furthestQuiet;
+			if (ms >= 1300 && xLateInQuiet < 0.0f)
+				xLateInQuiet = x;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(16));
+	}
+
+	std::printf("    last row %.2f m, furthest while quiet %.2f m, now %.2f m\n",
+	            lastRowX, furthestQuiet, prevX);
+	Check(furthestQuiet <= lastRowX + 1e-4f,
+	      "never coasted past what its host last said");
+	Check(NearEnough(xLateInQuiet, lastRowX, 1e-4f),
+	      "and 700 ms into the quiet it stands exactly on that row");
+	Check(worstBack >= -1e-4f, "and never moved backwards, going quiet or coming back");
+	Check(prevX > lastRowX + 10.0f, "back in the eight, it has driven on with the stream");
+	Check(g_rec.ambientCarSpawns == 1 && g_rec.ambientCarDespawns == 0,
+	      "the same replica throughout: nothing despawned, nothing built twice");
+	Check(c.AmbientCar(630) != nullptr && c.AmbientCar(630)->poolHandle >= 0,
+	      "still on the roster under its netId");
+}
+
+// ---- the police helicopter's gun (game/heligun.h) ---------------------------
+
+S_HeliShot MakeHeliShot(uint8_t owner, uint16_t serial, uint32_t timeMs,
+                        uint8_t slot = 0) {
+	S_HeliShot s;
+	InitHeader(s, timeMs);
+	s.ownerPlayerId = owner;
+	s.body          = HeliShotBody{};
+	s.body.serial   = serial;
+	s.body.slot     = slot;
+	s.body.source   = {10.0f, 100.0f, 57.0f};
+	s.body.target   = {12.0f, 96.0f, 12.0f};
+	return s;
+}
+
+bool SameVec(const Vec3 &a, const Vec3 &b) { return a.x == b.x && a.y == b.y && a.z == b.z; }
+
+void TestTheHeliGunRulesAreTheEngines() {
+	std::printf("the helicopter's gun, as the engine fires it\n");
+
+	// ProcessControl puts the source 3 m out from the helicopter.
+	const bool both[HELI_POLICE_SLOTS] = {true, true};
+	const Vec3 pos[HELI_POLICE_SLOTS]  = {{0.0f, 0.0f, 50.0f}, {100.0f, 0.0f, 50.0f}};
+	Check(game::HeliShotSlot(Vec3{1.8f, 0.0f, 47.6f}, both, pos) == 0,
+	      "a round 3 m below and out from slot 0 is slot 0's");
+	Check(game::HeliShotSlot(Vec3{100.0f, 3.0f, 50.0f}, both, pos) == 1,
+	      "and one 3 m from slot 1 is slot 1's");
+	Check(game::HeliShotSlot(Vec3{0.0f, 3.04f, 50.0f}, both, pos) == 0,
+	      "float rounding on the engine's side is allowed for");
+	Check(game::HeliShotSlot(Vec3{0.0f, 2.5f, 50.0f}, both, pos) == -1 &&
+	          game::HeliShotSlot(Vec3{0.0f, 3.2f, 50.0f}, both, pos) == -1,
+	      "anything else is not a police helicopter's round");
+	const bool onlyOne[HELI_POLICE_SLOTS] = {false, true};
+	Check(game::HeliShotSlot(Vec3{1.8f, 0.0f, 47.6f}, onlyOne, pos) == -1,
+	      "an empty slot fires nothing");
+
+	// The switch at 0x00563E29.
+	Check(game::HeliImpactFor(-1) == game::HeliImpact::WaterOrNothing &&
+	          game::HeliImpactFor(1) == game::HeliImpact::Building &&
+	          game::HeliImpactFor(2) == game::HeliImpact::Vehicle &&
+	          game::HeliImpactFor(3) == game::HeliImpact::Ped &&
+	          game::HeliImpactFor(4) == game::HeliImpact::Object &&
+	          game::HeliImpactFor(5) == game::HeliImpact::Dummy,
+	      "each thing the line can find gets the engine's arm");
+	Check(game::HeliImpactFor(0) == game::HeliImpact::Silent &&
+	          game::HeliImpactFor(6) == game::HeliImpact::Silent,
+	      "and a type the table has no entry for gets nothing");
+
+	const Vec3 v = game::HeliTracerVelocity(Vec3{0.0f, 0.0f, 0.0f}, Vec3{10.0f, 20.0f, -40.0f});
+	Check(std::fabs(v.x - 1.5f) < 1e-5f && std::fabs(v.y - 3.0f) < 1e-5f &&
+	          std::fabs(v.z + 6.0f) < 1e-5f,
+	      "the tracer flies at 0.15 of the line per step");
+
+	// When it is drawn.
+	Check(HeliShotHoldMs(1000, 1000) == VehicleInterpBuffer::DELAY_MS,
+	      "a round fired with the newest state waits the replica's delay");
+	Check(HeliShotHoldMs(1050, 1000) == VehicleInterpBuffer::DELAY_MS + 50,
+	      "one fired after it waits that much longer");
+	Check(HeliShotHoldMs(850, 1000) == 0, "one the replica is already past goes now");
+	Check(HeliShotHoldMs(5000, 1000) == HELI_SHOT_MAX_HOLD_MS,
+	      "and one far past every state is held no longer than the cap");
+	Check(HeliShotHoldMs(5, 0xFFFFFFF0u) == VehicleInterpBuffer::DELAY_MS + 21,
+	      "across the sender's clock wrapping");
+
+	HeliShotBody b{};
+	b.source = {0.0f, 0.0f, 0.0f};
+	b.target = {1.0f, 0.0f, 0.0f};
+	Check(IsSaneHeliShot(b), "a short line from a police slot is a round");
+	b.slot = 2;
+	Check(!IsSaneHeliShot(b), "the script's slot is not");
+	b.slot     = 0;
+	b.source.y = std::numeric_limits<float>::infinity();
+	Check(!IsSaneHeliShot(b), "nor a line to infinity");
+}
+
+void TestOurHelicoptersRoundsGoOut() {
+	std::printf("the rounds our own helicopter fires go out\n");
+	HeliSync &h = FreshHeliSync();
+	g_heli.own.push_back(MakeOwnHeli(0, 900, 1.0f));
+
+	OwnHeliShot s;
+	s.slot   = 0;
+	s.handle = 900;
+	s.source = {1.0f, 2.0f, 47.0f};
+	s.target = {4.0f, 5.0f, 6.0f};
+	g_heli.ownShots.push_back(s);
+	h.Send(0, 5000);
+
+	Check(SentCount(OP_C_HELI_SHOT) == 1, "one round, one packet");
+	const C_HeliShot *out = LastSent<C_HeliShot>();
+	Check(out && out->body.serial == h.OwnSerial(0) && out->body.serial != 0 &&
+	          out->body.slot == 0,
+	      "under the serial the helicopter itself goes out as, fired the frame it "
+	      "was first seen");
+	Check(out && SameVec(out->body.source, s.source) && SameVec(out->body.target, s.target),
+	      "carrying the two points the engine fired between, unchanged");
+	Check(out && out->hdr.sendTimeMs == 5000, "stamped on the clock its states are");
+	bool unreliable = false;
+	for (const Message &m : g_heli.sent)
+		if (m.opcode == OP_C_HELI_SHOT)
+			unreliable = m.channel == CH_SNAPSHOT;
+	Check(unreliable, "unreliable: a lost round is a tracer nobody sees");
+
+	OwnHeliShot stranger = s;
+	stranger.handle = 901;
+	OwnHeliShot otherSlot = s;
+	otherSlot.slot = 1;
+	OwnHeliShot broken = s;
+	broken.target.x = std::numeric_limits<float>::quiet_NaN();
+	g_heli.ownShots = {stranger, otherSlot, broken};
+	h.Send(0, 5016);
+	Check(SentCount(OP_C_HELI_SHOT) == 1,
+	      "not from a helicopter that isn't the one streamed in that slot, nor a "
+	      "broken one");
+
+	g_heli.ownShots = {s};
+	h.Send(INVALID_PLAYER, 5032);
+	Check(SentCount(OP_C_HELI_SHOT) == 1, "nothing goes out outside a session");
+}
+
+void TestTheirRoundIsDrawnWhenTheReplicaGetsThere() {
+	std::printf("somebody else's helicopter fires on this screen, without hurting anybody\n");
+	HeliSync &h = FreshHeliSync();
+	h.OnState(MakeHeliState(1, 7, 1000, 10.0f), 0, 5000);
+	h.Tick(5000);
+	g_heli.sent.clear();
+
+	const S_HeliShot shot = MakeHeliShot(1, 7, 1000);
+	h.OnShot(shot, 0, 5000);
+	Check(h.PendingShotCount() == 1, "held");
+	h.Tick(5000 + VehicleInterpBuffer::DELAY_MS - 1);
+	Check(g_heli.draws == 0, "not before the replica's playback reaches it");
+	h.Tick(5000 + VehicleInterpBuffer::DELAY_MS);
+	Check(g_heli.draws == 1 && g_heli.lastDrawHandle == 500,
+	      "then drawn once, from the replica");
+	Check(SameVec(g_heli.lastDrawSource, shot.body.source) &&
+	          SameVec(g_heli.lastDrawTarget, shot.body.target),
+	      "between the owner's two points");
+	Check(h.PendingShotCount() == 0, "and let go");
+	Check(g_heli.sent.empty() && g_heli.applies == 0,
+	      "drawing a round sends nothing and applies nothing: the hit was the owner's");
+
+	h.OnShot(MakeHeliShot(1, 7, 700), 0, 5200);
+	h.Tick(5200);
+	Check(g_heli.draws == 2, "a round the replica is already past goes at once");
+
+	g_heli.drawTakes = false;
+	h.OnShot(MakeHeliShot(1, 7, 700), 0, 5300);
+	h.Tick(5300);
+	Check(g_heli.draws == 3 && h.PendingShotCount() == 0,
+	      "a replica the engine took away mid-way just loses the round");
+}
+
+void TestARoundWithNothingToFireFromIsDropped() {
+	std::printf("a round from a helicopter we have no replica of\n");
+	HeliSync &h = FreshHeliSync();
+
+	h.OnShot(MakeHeliShot(1, 7, 1000), 0, 5000);
+	Check(h.PendingShotCount() == 0, "one we never heard of");
+
+	g_heli.modelReady = false;
+	h.OnState(MakeHeliState(1, 7, 1000, 10.0f), 0, 5000);
+	h.Tick(5000);
+	h.OnShot(MakeHeliShot(1, 7, 1000), 0, 5000);
+	Check(h.PendingShotCount() == 0, "one whose replica isn't built yet");
+
+	g_heli.modelReady = true;
+	h.Tick(5016);
+	h.OnShot(MakeHeliShot(1, 7, 1000, 1), 0, 5016);
+	Check(h.PendingShotCount() == 0, "one that names a different slot");
+	h.OnShot(MakeHeliShot(0, 7, 1000), 0, 5016);
+	Check(h.PendingShotCount() == 0, "our own, coming back");
+
+	h.OnShot(MakeHeliShot(1, 7, 1000), 0, 5016);
+	Check(h.PendingShotCount() == 1, "the replica is here now");
+	h.OnGone(MakeHeliGone(1, 7, HELI_GONE_FLEW_AWAY), 0);
+	h.Tick(5500);
+	Check(g_heli.draws == 0 && h.PendingShotCount() == 0,
+	      "and a round held for a helicopter that left before it was drawn is not");
+
+	h.OnState(MakeHeliState(2, 3, 1000, 10.0f), 0, 6000);
+	h.Tick(6000);
+	h.OnShot(MakeHeliShot(2, 3, 1000), 0, 6000);
+	h.OnOwnerLeft(2, 6010);
+	h.Tick(6500);
+	Check(g_heli.draws == 0, "nor for one whose owner left; it is climbing away");
+	h.OnShot(MakeHeliShot(2, 3, 1100), 0, 6600);
+	Check(h.PendingShotCount() == 0, "and nothing more is taken for it");
+
+	h.OnState(MakeHeliState(3, 4, 1000, 10.0f), 0, 7000);
+	h.Tick(7000);
+	h.Tick(7000 + HELI_STALE_MS + 16);
+	h.OnShot(MakeHeliShot(3, 4, 1000), 0, 7000 + HELI_STALE_MS + 16);
+	Check(h.PendingShotCount() == 0, "nor for one whose stream went quiet");
+}
+
+void TestTheRoundsHeldAreBounded() {
+	std::printf("rounds held for replicas are bounded\n");
+	HeliSync &h = FreshHeliSync();
+	h.OnState(MakeHeliState(1, 7, 1000, 10.0f), 0, 5000);
+	h.Tick(5000);
+	for (size_t i = 0; i < MAX_PENDING_HELI_SHOTS + 3; ++i)
+		h.OnShot(MakeHeliShot(1, 7, 1000), 0, 5000);
+	Check(h.PendingShotCount() == MAX_PENDING_HELI_SHOTS, "no more than the queue holds");
+	h.Clear();
+	Check(h.PendingShotCount() == 0, "and the session ending lets them all go");
+	h.Tick(6000);
+	Check(g_heli.draws == 0, "without drawing any of them");
+}
+
+void TestTheClientRoutesTheHelicoptersRounds() {
+	std::printf("the client hands a helicopter's rounds to the sync\n");
+	Client c;
+	WorldBridge b = RecordingBridge();
+	b.heli        = HeliRecordingBridge();
+	c.SetBridge(b);
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "bob"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeHeliState(1, 7, 1000, 10.0f), CH_SNAPSHOT));
+	c.HelisForTest().Tick(WallClock::NowMs());
+
+	c.HandleMessage(Wrap(MakeHeliShot(2, 7, 1000), CH_SNAPSHOT));
+	Check(c.HelisForTest().PendingShotCount() == 0,
+	      "a round from somebody the roster doesn't have is dropped");
+	c.HandleMessage(Wrap(MakeHeliShot(1, 7, 1000), CH_SNAPSHOT));
+	Check(c.HelisForTest().PendingShotCount() == 1, "one from bob's helicopter is held");
+}
+
+// ---- fists and the bat (game/melee.h) ---------------------------------------
+
+void TestMeleeBytesOffTheWire() {
+	std::printf("\nthe two melee bytes, as the owner reads them\n");
+
+	const MeleeTag jab = StrikeTag(6, 4, false);
+	Check(MeleeKind(jab) == MELEE_STRIKE && jab.hitLevel == 4 && jab.melee == MELEE_STRIKE,
+	      "a jab is a strike at the move's own level");
+	const MeleeTag stomp = StrikeTag(FIGHTMOVE_GROUNDKICK, HITLEVEL_GROUND, false);
+	Check((stomp.melee & MELEE_GROUND_KICK) != 0, "the kick at the floor says so");
+	Check((StrikeTag(8, 3, true).melee & MELEE_ARMED) != 0, "and so does a weapon in hand");
+	Check(StrikeTag(8, 200, false).hitLevel == 0, "a level off the end of the table is dropped");
+
+	const MeleeTag r = ReadMeleeTag(WEAPONTYPE_UNARMED, jab.melee, jab.hitLevel);
+	Check(r.melee == jab.melee && r.hitLevel == jab.hitLevel, "a strike reads back as sent");
+	Check(ReadMeleeTag(WEAPONTYPE_BASEBALLBAT, jab.melee, 4).melee == MELEE_NONE,
+	      "a strike never hurts with anything but cause 0");
+	Check(ReadMeleeTag(WEAPONTYPE_UNARMED, MELEE_STRIKE, 0).melee == MELEE_NONE &&
+	          ReadMeleeTag(WEAPONTYPE_UNARMED, MELEE_STRIKE, MELEE_HIT_LEVELS).melee == MELEE_NONE,
+	      "nor at a level no striking move has");
+	Check(ReadMeleeTag(WEAPONTYPE_BASEBALLBAT, MELEE_SWING | MELEE_HEAVY, 0).melee ==
+	          (MELEE_SWING | MELEE_HEAVY),
+	      "a heavy bat swing reads back");
+	Check(ReadMeleeTag(WEAPONTYPE_COLT45, MELEE_SWING, 0).melee == MELEE_NONE,
+	      "a pistol is not a swing");
+	Check(ReadMeleeTag(WEAPONTYPE_BASEBALLBAT, 0x80 | MELEE_SWING, 0).melee == MELEE_NONE &&
+	          ReadMeleeTag(WEAPONTYPE_UNARMED, 3, 4).melee == MELEE_NONE,
+	      "unknown bits and the fourth kind are refused");
+	Check(ReadMeleeTag(WEAPONTYPE_COLT45, 0, 0).melee == MELEE_NONE,
+	      "and a round is not melee at all");
+
+	Check(sizeof(DamageBody) == sizeof(PedDamageBody) &&
+	          offsetof(DamageBody, melee) == offsetof(PedDamageBody, melee),
+	      "one melee layout on a player's hit and a pedestrian's");
+}
+
+void TestMeleeTagRidesTheRelay() {
+	std::printf("\na punch arrives with what the owner needs to play it\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+
+	S_Damage d        = MakeDamage(1, 100, WEAPONTYPE_UNARMED, 9.0f);
+	d.body.melee      = MELEE_STRIKE;
+	d.body.hitLevel   = 4;
+	c.HandleMessage(Wrap(d, CH_EVENT));
+	Check(g_rec.damages == 1 && g_rec.lastDamage.melee == MELEE_STRIKE &&
+	          g_rec.lastDamage.hitLevel == 4,
+	      "a player's punch reaches the seam whole");
+
+	S_PedDamage p      = MakePedDamage(1, 700, WEAPONTYPE_BASEBALLBAT, 25.0f);
+	p.body.melee       = MELEE_SWING | MELEE_HEAVY;
+	c.HandleMessage(Wrap(p, CH_EVENT));
+	Check(g_rec.pedDamages >= 1 && g_rec.lastPedDamage.melee == (MELEE_SWING | MELEE_HEAVY),
+	      "and so does a pedestrian's bat");
+}
+
+void TestTheStruckSideIsTheEngines() {
+	std::printf("\nthe struck ped's half of a punch and a bat, as retail plays it\n");
+
+	// StartFightDefend's arguments.
+	const MeleeTag jab = StrikeTag(6, 4, false);
+	const MeleeTag armedKick = StrikeTag(8, 3, true);
+	Check(DefendHitLevel(jab, WEAPONTYPE_UNARMED, PEDSTATE_IDLE) == 4,
+	      "a strike defends at its move's level");
+	Check(DefendArg(jab, false, 7) == 7 && DefendArg(armedKick, true, 7) == 7,
+	      "with the damage multiplier");
+	Check(DefendArg(armedKick, false, 7) == STRIKE_ARMED_DEFEND,
+	      "or 65h for an armed striker against somebody who isn't a player");
+	const MeleeTag swing = SwingTag(false);
+	Check(DefendHitLevel(swing, WEAPONTYPE_BASEBALLBAT, PEDSTATE_IDLE) == HITLEVEL_HIGH &&
+	          DefendHitLevel(swing, WEAPONTYPE_BASEBALLBAT, PEDSTATE_FALL) == HITLEVEL_GROUND &&
+	          DefendHitLevel(swing, WEAPONTYPE_UNARMED, PEDSTATE_FALL) == HITLEVEL_HIGH,
+	      "a swing is high, and the bat on the floor is ground");
+	Check(DefendArg(swing, true, 99) == SWING_DEFEND, "and always 0Ah");
+
+	Check(StrikeDamageMult(21.0f) == 7 && StrikeDamageMult(60.0f) == 20 &&
+	          StrikeDamageMult(0.0f) == 0 && StrikeDamageMult(-3.0f) == 0,
+	      "the multiplier comes back out of damageMult * 3.0f");
+
+	// Nobody is hit while getting up, and only a player is spared.
+	Check(MeleeSparesVictim(true, PEDSTATE_GETUP) && !MeleeSparesVictim(false, PEDSTATE_GETUP) &&
+	          !MeleeSparesVictim(true, PEDSTATE_IDLE),
+	      "a player getting up is left alone, a pedestrian is not");
+
+	// The strike's knockdown.
+	Check(StrikeKnocksDown(PEDSTATE_IDLE, 45.0f, 35.0f, false, false, false),
+	      "a pedestrian dropping under 40 goes down");
+	Check(!StrikeKnocksDown(PEDSTATE_IDLE, 45.0f, 35.0f, true, false, false),
+	      "a player doesn't at 40");
+	Check(StrikeKnocksDown(PEDSTATE_IDLE, 25.0f, 15.0f, true, false, false),
+	      "everybody does at 20");
+	Check(!StrikeKnocksDown(PEDSTATE_IDLE, 20.0f, 15.0f, true, false, false),
+	      "from above 20, not from 20");
+	Check(StrikeKnocksDown(PEDSTATE_IDLE, 90.0f, 80.0f, true, true, false) &&
+	          StrikeKnocksDown(PEDSTATE_IDLE, 90.0f, 80.0f, false, false, true),
+	      "an armed striker or a one-hit ped always");
+	Check(!StrikeKnocksDown(PEDSTATE_FALL, 25.0f, 15.0f, false, true, true) &&
+	          !StrikeKnocksDown(PEDSTATE_IDLE, 25.0f, 0.0f, false, true, true),
+	      "never somebody already down, or with nothing left");
+
+	// The strike's shove.
+	Check(StrikePushScale(false, false, 7) == 7.0f * STRIKE_PUSH_SCALE,
+	      "the multiplier, times 0.6");
+	Check(StrikePushScale(true, false, 20) == STRIKE_GROUNDKICK_CAP * STRIKE_PUSH_SCALE &&
+	          StrikePushScale(true, false, 5) == 5.0f * STRIKE_GROUNDKICK_MULT * STRIKE_PUSH_SCALE,
+	      "a ground kick at 0.6 of it, up to 4");
+	Check(StrikePushScale(false, true, 9) == STRIKE_DYING_CAP * STRIKE_PUSH_SCALE &&
+	          StrikePushScale(false, true, 5) == 10.0f * STRIKE_PUSH_SCALE &&
+	          StrikePushScale(false, true, 20) == 20.0f * STRIKE_PUSH_SCALE,
+	      "a dying ped twice it, up to 14, below 20 only");
+
+	// The swing.
+	Check(SwingKnocksDown(PEDSTATE_IDLE, 90.0f, 80.0f, true, false),
+	      "the bat drops any pedestrian it hits");
+	Check(!SwingKnocksDown(PEDSTATE_IDLE, 90.0f, 80.0f, true, true) &&
+	          SwingKnocksDown(PEDSTATE_IDLE, 25.0f, 15.0f, true, true),
+	      "a player only under 20");
+	Check(!SwingKnocksDown(PEDSTATE_DIE, 90.0f, 80.0f, true, false),
+	      "and nobody already down");
+	Check(SwingFallMs(true, false) == 3000 && SwingFallMs(true, true) == 1500 &&
+	          SwingFallMs(false, false) == 1500,
+	      "3000 ms for the bat on a pedestrian, which is the image and not re3");
+	Check(SwingShovesDying(PEDSTATE_DIE, false) && !SwingShovesDying(PEDSTATE_DIE, true) &&
+	          !SwingShovesDying(PEDSTATE_DEAD, false),
+	      "a dying ped is shoved, except by the heavy swing");
+
+	// The amount a player takes from a bat.
+	Check(SwingAmountForPlayer(10.0f, true, false, false) == 20.0f,
+	      "twice the weapon's damage, as FireMelee gives a player");
+	Check(SwingAmountForPlayer(100.0f, true, true, false) == 100.0f &&
+	          SwingAmountForPlayer(35.0f, true, false, true) == 35.0f &&
+	          SwingAmountForPlayer(10.0f, false, false, false) == 10.0f,
+	      "not after the heavy swing, adrenaline, or for fists");
+}
+
+void TestCopiesNeverReactToMelee() {
+	std::printf("\nanother machine's ped does not react to a punch here\n");
+	Check(!CopyMayReactToMelee(true, true), "not inside a strike or a swing");
+	Check(CopyMayReactToMelee(true, false), "our own peds still do");
+	Check(CopyMayReactToMelee(false, true), "and outside one nothing changes");
+	Check(IsMeleeCause(WEAPONTYPE_UNARMED) && IsMeleeCause(WEAPONTYPE_BASEBALLBAT) &&
+	          !IsMeleeCause(WEAPONTYPE_COLT45),
+	      "fists and the bat are the two melee causes");
+	Check(IsForwardableDamage(WEAPONTYPE_UNARMED) && IsForwardableDamage(WEAPONTYPE_BASEBALLBAT),
+	      "and both still go to the owner");
+	Check(!IsReplayableWeapon(WEAPONTYPE_UNARMED) && !IsReplayableWeapon(WEAPONTYPE_BASEBALLBAT),
+	      "and neither is replayed, so no copy ever swings");
+	Check(!IsFightMove(-1) && !IsFightMove(NUM_FIGHTMOVES) && IsFightMove(FIGHTMOVE_GROUNDKICK),
+	      "a fight move is bounded before it indexes the table");
+}
+
 int main() {
 	TestWelcome();
 	TestRejectedWelcome();
@@ -7430,6 +14160,8 @@ int main() {
 	TestGarageMaskIsAUnion();
 	TestLeavingReleasesGarages();
 	TestOurOwnGarageMaskIsNotHeldAgainstUs();
+	TestAKnockedOverPostArrivesAndOurOwnDoesNot();
+	TestNoSocketMeansNoObjectReportWentOut();
 	TestNoGarageReportWithoutAWorld();
 	TestResprayFindsTheCar();
 	TestResprayForACarWeDoNotHave();
@@ -7439,10 +14171,19 @@ int main() {
 	TestGarageDeviationIsWhatTravels();
 	TestVehicleCorrectedEveryFrame();
 	TestVehicleCorrectionStopsWithTheVehicle();
+	TestHornReplayValueSoundsInEveryRhythm();
+	TestHornRidesOneSnapshotPastTheEnd();
+	TestReplicaHornDecision();
+	TestReplicaHornThroughTheClient();
 	TestModelChangeRebuildsThePed();
 	TestModelChangeWhileSeated();
 	TestSeatingWaitsForTheCar();
 	TestAnimatedEntryIsTriedBeforeTheWarp();
+	TestAnIntentOpensTheDoorTheOwnerUsed();
+	TestOurOwnEntryIsAnnouncedOnceAndRearmed();
+	TestAnIntentDoesNotTakeAnOccupiedSeat();
+	TestAnIntentNeverWarps();
+	TestAnAbandonedEntryDoesNotLeaveHerInTheCar();
 	TestARefusedAnimationWarpsOnTheSameFrame();
 	TestAnAnimationThatStopsFallsBackToTheWarp();
 	TestAnEntryThatNeverFinishesIsTimedOut();
@@ -7450,6 +14191,11 @@ int main() {
 	TestAnEntryIsAbandonedWhenTheCarGoes();
 	TestAnEntryIsAbandonedWhenThePlayerDies();
 	TestExitAnimationStartsFromTheSnapshot();
+	TestTheSeatIsAnnouncedWhenTheWalkStarts();
+	TestAnEntryThatNeverFinishesTakesItsSeatBack();
+	TestASeatThatCameOutDifferentIsCorrected();
+	TestTheWarpFallbackStillAnnouncesExactlyOnce();
+	TestOurOwnPassengerSeatIsNotReadAsACarWeDrive();
 	TestExitAnimationIsNotStartedOnFoot();
 	TestSeatedPedStopsBeingPositioned();
 	TestCarIsEmptiedBeforeItIsDestroyed();
@@ -7480,6 +14226,7 @@ int main() {
 	TestShotDirectionPrefersTheDrawnTrail();
 	TestShotNeedsAPed();
 	TestShotIsReplayedOncePerPacket();
+	TestADriveByRoundReachesTheSeamWhole();
 	TestOurOwnShotsAreNotReplayed();
 	TestExplosionDoesNotNeedAPed();
 	TestCombatFromAStranger();
@@ -7502,6 +14249,10 @@ int main() {
 	TestRespawnRebuildsThePed();
 	TestFriendlyFireReachesTheBridge();
 	TestLifeStateMachine();
+	TestAnArrestIsNoticedByThePedState();
+	TestABustedPlayerComesBackAtThePoliceStation();
+	TestADragTakesThemOutOfTheSeat();
+	TestTheDragLatch();
 	TestTagDistanceCurve();
 	TestTagSizeIsResolutionIndependent();
 	TestProbeBudget();
@@ -7519,6 +14270,21 @@ int main() {
 	TestClockDriftIsCircular();
 	TestClockOnlyMovesWhenItIsWorthIt();
 	TestTheHostKeepsItsOwnClock();
+	TestTrainCycleIsTheEnginesMask();
+	TestSessionTimeWarmsUpBySnapping();
+	TestSessionTimePicksTheLeastDelayedSample();
+	TestSessionTimeSlewsWithoutRunningBackwards();
+	TestSessionTimeJumpsToADifferentClock();
+	TestSessionTimeAcrossTheWrap();
+	TestTrainsRunOnTheServersClock();
+	TestPlaneCycleIsTheEnginesMask();
+	TestMissionCessnaKeepsItsSchedule();
+	TestLightsAreTheEnginesThresholds();
+	TestLightsAgreeOnTheSessionClock();
+	TestLightsFallBackWithoutASession();
+	TestBridgeStatesAreTheEnginesThresholds();
+	TestBridgeFollowsTheSessionClock();
+	TestBridgeLinksSurviveAJump();
 	TestWelcomeSetsTheClockStraightAway();
 	TestWeatherIsAPairAndIsWrittenEveryTime();
 	TestBecomingTheHostGivesTheSkyBack();
@@ -7538,6 +14304,10 @@ int main() {
 	TestACarWeDriveIsNotCorrectedUnderUs();
 	TestOurOwnReportsHoldTheCarWeParked();
 	TestACarFromOurOwnWorldIsStillClaimedNormally();
+	TestBeingJackedHandsTheCarOver();
+	TestALostCarIsNotClaimedStraightBack();
+	TestGettingBackOutAndInIsAnOrdinaryClaimAgain();
+	TestACarWeAreOnlyWatchingChangingDriverIsNotAHandover();
 	TestClaimingOurOwnCarKeepsARowForIt();
 	TestGettingBackIntoOurOwnCarDoesNotRegisterItTwice();
 	TestOurOwnCarSurvivesTheSessionEnding();
@@ -7565,6 +14335,7 @@ int main() {
 	TestDisconnectGivesThePickupsBackToTheEngine();
 
 	TestAmbientPedIsToldWhereItIs();
+	TestABurningPedestrianBurnsOnEveryScreen();
 	TestALimbComesOffTheReplica();
 	TestALimbForAPedWeDoNotHaveIsDropped();
 	TestANodeThatIsNotALimbIsRefused();
@@ -7573,6 +14344,31 @@ int main() {
 	TestADeathForAPedWeDoNotHaveIsDropped();
 	TestADeathTheEngineRefusedIsRetried();
 	TestARebuiltReplicaDiesAgain();
+	TestAHitOnOurPedestrianReachesTheEngine();
+	TestAHitWithNobodyToBlameStillLands();
+	TestNoPedDamageSeamIsSilentNotBroken();
+	TestAPedHitIsItsOwnKindOfEvent();
+	TestAHitOnOurCarReachesTheEngine();
+	TestAHitOnACarWeAreNotDrivingIsRefused();
+	TestAHitWithNobodyToBlameStillLandsOnOurCar();
+	TestAWreckTakesNoMoreHits();
+	TestNoVehicleHitSeamIsSilentNotBroken();
+	TestWhichHitsAreWorthSending();
+	TestACarHitCarriesThreeFieldsBecauseTheEngineTakesThree();
+	TestWhoMayDamageACar();
+	TestAReplayedShotCountsOnce();
+	TestAReplayedRoundDoesNotMoveUs();
+	TestTrafficHealthOnTheWire();
+	TestTrafficHornThroughTheClient();
+	TestTrafficSirenThroughTheClient();
+	TestAHitOnOurTrafficReachesTheEngine();
+	TestWhichTrafficHitsAreWorthSending();
+	TestAPedInACarCannotBeShotToDeath();
+	TestOnlyOurOwnFlameIsForwarded();
+	TestFlameReachIsTheEngines();
+	TestAFlameOnTheWireIsAnIgnition();
+	TestAFlameIsReportedOnceASecond();
+	TestAFlameReachesTheSeamLikeAHit();
 	TestADyingDriverLeavesHisSeatFirst();
 	TestAmbientPedNobodyStreamsIsHeld();
 	TestAmbientPedStatesFromTheWrongMachine();
@@ -7586,6 +14382,12 @@ int main() {
 	TestRefusedAmbientSeatingIsNotRetriedForever();
 	TestAmbientReplicaTakenByTheEngineIsRebuilt();
 	TestASeatedReplicaTakenByTheEngineKeepsItsInstruction();
+	TestWhichPedDamageCausesTheProofFlagsMiss();
+	TestALocalDeathOfSomebodyElsesPedestrianIsRefused();
+	TestBlowUpCarsTwoArmsOnItsOccupants();
+	TestADeadReplicaIsOnlyRebuiltIfNobodyAskedForIt();
+	TestAReplicaOurOwnEngineKilledIsRebuilt();
+	TestACorpseTheSessionReportedIsNotResurrected();
 	TestDisconnectClearsAmbientPeds();
 
 	TestWantedBitsSurviveTheWire();
@@ -7601,6 +14403,98 @@ int main() {
 	TestTheSessionsWantedRuleArrives();
 	TestACarWeAreDrivingIsNotWrittenToBeforeTheClaimComesBack();
 	TestADeathCauseIsNamed();
+
+	TestAParkedCarWithNoCustodianIsStillPinnedAndRested();
+	TestTheCarWeAreSettlingIsNeitherRestedNorPinned();
+	TestSomebodyElseSettlingACarIsFollowedAndNotRested();
+	TestASettleEndsOnARunOfQuietSamplesAndNotOnOne();
+	TestASettleThatNeverSettlesIsGivenUpOn();
+	TestADriverEndsOurSettle();
+	TestACustodianLeavingReleasesTheCarHere();
+	TestTakingTheWheelOfSomebodyElsesTrafficClaimsIt();
+	TestATrafficCarIsNotAlsoClaimedAsABrandNewOne();
+	TestAPromotedTrafficCarKeepsItsObjectAndItsNumber();
+	TestTheMachineThatMadeTheCarNeverDestroysIt();
+	TestTheObservedTable();
+	TestOurClaimedCarIsInTheDetoursTable();
+	TestOurClaimedCarJackedOffUsIsRefusedHere();
+	TestACarWeTookBackIsNotStillHersInTheTable();
+	TestAHitOnACarSomebodyElseIsSettlingIsTheirs();
+	TestASettleEndingHandsTheCarBack();
+	TestOurOwnSettleIsOursToDamage();
+	TestAHitThatLandsAfterOurSettleEnded();
+	TestACarNobodyHoldsIsShotThroughTheSession();
+	TestWhatBurningMeansToACustodian();
+	TestOurHitOnACarNobodyHoldsComesBackToUs();
+	TestABurningCarIsKeptUntilItGoesUp();
+	TestOurSettleAfterTakingOverSomebodyElsesIsOurs();
+	TestADentWhileWeSettleACarIsSent();
+	TestTheLastDentGoesOutBeforeTheSettle();
+	TestADentAfterOurSettleIsNotOursToSend();
+	TestALighterDentIsStillNewsAfterASettle();
+	TestWhoElseHoldsACar();
+	TestWithoutTheRowOurClaimedCarWasOursToWreck();
+	TestOurOwnCarLeavesTheTableWithTheSession();
+	TestAPromotedCarWeHostedLeavesTheTableToo();
+	TestCopiesDontEatTheTrafficBudget();
+	TestACopyStaysOutOfTheSave();
+	TestHowACopyEnds();
+	TestTheCopyList();
+	TestTheTrafficAllowanceRunsAfterTheSpawns();
+	TestAReleaseLeavesNobodyWaiting();
+	TestOurCarReleasedUnderUsIsClaimedAgain();
+	TestTheEntryGateRefusesACarOnItsSideAndNotOneUpsideDown();
+	TestARestedCarPassesBothGates();
+	TestABoatModelIsBuiltAsABoat();
+	TestTheWritersThatMustNotTouchABoat();
+	TestABoatItsDriverCouldLeaveIsAlreadyAtRest();
+	TestWhichKillsCountTowardARampage();
+	TestARampageOpensAndTheTargetArrives();
+	TestNothingIsCreditedWithoutAnOpenFrenzy();
+	TestAWelcomeWithNoRampageBitsSharesAnyway();
+	TestTheRampageBitsDoNotCollideWithTheOtherRules();
+	TestWhichCarsCountTowardARampage();
+	TestTheCarTallyDecision();
+	TestEveryCarCountsOnceOnEveryMachine();
+	TestARampageCarReachesTheSeam();
+
+	g_failures += RunAimPitchTests();
+	g_failures += RunSirenTests();
+	g_failures += RunCheatTests();
+	g_failures += RunDriveByTests();
+	g_failures += RunMoneyTests();
+	TestTheHeliHitRuleIsTheEngines();
+	TestWhenUpdateHelisBlowsItUp();
+	TestTheFirstHitThatBringsItDownIsTheCredit();
+	TestTheRewardIsTakenBackOnlyWhenItIsExactlyTheEngines();
+	TestOnlyTheExplodingHelisCrimeIsWithheld();
+	TestAHeliHitOnTheWireIsBounded();
+	TestAReplicaIsBuiltAndFollowsTheStream();
+	TestAShotDownHelicopterExplodesHereAndStaysGone();
+	TestTheShooterIsCreditedAndNobodyIsPaid();
+	TestAHelicopterNobodyStreamsClimbsAwayAndGoes();
+	TestAStreamThatComesBackIsFollowedAgain();
+	TestAnOwnerLeavingTakesHisHelicopterAway();
+	TestTheTailComesOffOnce();
+	TestAReplicaTheEngineTookIsBuiltAgain();
+	TestOurHelicopterGoesOutUnderASerial();
+	TestOurHelicopterVanishingIsStillToldOnce();
+	TestAHitOnOurHelicopterReachesTheEngine();
+	TestOurHitsOnTheirHelicopterGoToTheOwner();
+	TestClearingTheSessionTakesEveryReplica();
+	TestTheClientRoutesTheHelicopter();
+	TestEveryPushSiteConvertsTheEngineSpeed();
+	TestTrafficThatGoesQuietIsHeldOnItsLastRow();
+	TestTheHeliGunRulesAreTheEngines();
+	TestOurHelicoptersRoundsGoOut();
+	TestTheirRoundIsDrawnWhenTheReplicaGetsThere();
+	TestARoundWithNothingToFireFromIsDropped();
+	TestTheRoundsHeldAreBounded();
+	TestTheClientRoutesTheHelicoptersRounds();
+	TestMeleeBytesOffTheWire();
+	TestMeleeTagRidesTheRelay();
+	TestTheStruckSideIsTheEngines();
+	TestCopiesNeverReactToMelee();
 
 	std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL",
 	            g_failures, g_failures == 1 ? "" : "s");

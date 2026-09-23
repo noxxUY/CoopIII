@@ -1,13 +1,21 @@
 #include "combat.h"
 
 #include "clock.h"
+// For CreditRemotePedKill. A hit off the wire that kills one of our own
+// pedestrians is the one kill in the game the engine credits to nobody.
+#include "darkel.h"
+#include "driveby.h"
 #include "hook/hook.h"
 #include "log.h"
+#include "melee.h"
 #include "ped.h"
 #include "pedanim.h"
 // For NoteHostedPedDeath. The CPed::SetDie detour lives here and the ambient
 // half of what it witnesses is answered there - see HookedSetDie.
 #include "population.h"
+// For ReportOurFlameOnCar. A flame reaching a car goes out on the vehicle
+// queues, which live there.
+#include "vehicle.h"
 
 #include <cstdio>
 
@@ -49,6 +57,21 @@ namespace {
 //   CBulletTraces::AddTrace           and the one place the streak a player
 //                                     actually sees is decided, which is not
 //                                     the same line as the ray above
+//   CShotInfo::Update                 the only place a flame is still a
+//                                     flame and not just a fire
+//   CFireManager::StartFire           and the one call it makes on the thing
+//                                     it reached
+//   CPed::ReactToAttack               the first thing a round does to a ped
+//   CPed::SetFall                     and the last thing a shotgun round does
+//                                     to one - both kept off the local player
+//                                     for the length of a replay
+//   CWeapon::FireFromCar              a drive-by round, which never goes
+//                                     near CWeapon::Fire (driveby.h)
+//   CPed::FightStrike                 a punch or a kick landing, and
+//   CWeapon::FireMelee                a bat landing - the two windows in which
+//                                     the fight code reacts on a victim
+//   CPed::StartFightDefend            the reaction both of them start with
+//                                     (melee.h)
 
 Detour g_fire;
 Detour g_explode;
@@ -59,6 +82,12 @@ Detour g_lineOfSight;
 Detour g_bulletImpact;
 Detour g_doomAiming;
 Detour g_addTrace;
+Detour g_reactToAttack;
+Detour g_setFall;
+Detour g_fireFromCar;
+Detour g_fightStrike;
+Detour g_fireMelee;
+Detour g_startFightDefend;
 
 // What S_Welcome said about friendly fire (docs/roadmap.md §5.2). Off until
 // a session says otherwise, which is also the right answer for a client that
@@ -80,6 +109,12 @@ struct ReplayGuard {
 	ReplayGuard() { g_replaying = true; }
 	~ReplayGuard() { g_replaying = false; }
 };
+
+// Set for the length of CWeapon::Fire when the shooter is the local player
+// and it isn't a replay. CHeli::TestBulletCollision is called from inside it
+// with no shooter argument, and game/heli.cpp needs to know whose bullet it
+// is testing.
+bool g_localFiring = false;
 
 // Set while CoopIII is applying a hit that already came off the wire.
 //
@@ -112,6 +147,44 @@ bool g_saidHitSent         = false;
 bool g_saidHitApplied      = false;
 bool g_saidHitRefused      = false;
 bool g_saidHitNotForwarded = false;
+
+// The same four questions again, for a hit on a *pedestrian* somebody else
+// hosts, and they need their own lines rather than sharing the ones above.
+//
+// "El remote sigue sin poder hacerle daño a los NPC del host" was reported
+// twice, and what made it hard the second time is that the log for the player
+// direction was working perfectly: `our first hit on a remote player` was in
+// the file, so the chain looked alive. There was simply no line anywhere for a
+// pedestrian, because there was no code - and a direction that does not exist
+// looks exactly like a direction that is broken. So each step of this one says
+// itself once, and between them they answer the same three-part question:
+//
+//   sent          the shooter decided a hit on somebody else's pedestrian
+//   notForwarded  it decided one and the cause is not the shooter's to decide
+//   applied       the machine that owns the ped fed it to its own engine
+//   noMove        it fed it in and the ped's health did not move, which is a
+//                 different bug in a different place and has to read
+//                 differently
+//   gone          the report named a pedestrian this machine no longer has
+//   inCar         the ped was in a seat, where retail 1.0 clamps it to 1.0f
+//                 health and refuses to kill it whatever the hit was
+bool g_saidPedHitSent         = false;
+bool g_saidPedHitNotForwarded = false;
+bool g_saidPedHitApplied      = false;
+bool g_saidPedHitNoMove       = false;
+bool g_saidPedHitGone         = false;
+bool g_saidPedHitInCar        = false;
+
+// A replayed round refused on one of our own named pedestrians, because the
+// shooter's C_PedDamage for it is the hit that counts (combat.h,
+// ReplayedShotMayDamage). And the barrel equivalent, in HookedAddExplosion.
+bool g_saidReplayPedRefused = false;
+bool g_saidReplayBarrel     = false;
+
+// A replayed round reached our own ped and wasn't allowed to move him, and a
+// forwarded hit played the reaction instead (combat.h, LocalPlayerHitReaction).
+bool g_saidReplayReactionFenced = false;
+bool g_saidHitReactionPlayed    = false;
 
 // The same idea for fire, and it needs its own lines rather than sharing the
 // ones above.
@@ -608,6 +681,490 @@ void __fastcall HookedDoBulletImpact(void *self, void * /*edx*/, void *shooter,
 	                                        target, point, aheadX, aheadY);
 }
 
+// ---- fists and the bat, on the striker's machine -----------------------------
+//
+// melee.h has the split. Set for the length of a FightStrike or FireMelee
+// call, whoever is striking: a copy of another machine's ped never reacts to
+// a melee hit here, ours or a local NPC's, because its owner plays that.
+struct MeleeCall {
+	bool     active     = false;
+	void    *striker    = nullptr;
+	MeleeTag tag        = {};
+	bool     adrenaline = false;   // the striker's, for SwingAmountForPlayer
+};
+MeleeCall g_melee;
+
+bool g_saidMeleeFenced  = false;
+bool g_saidMeleeApplied = false;
+
+bool IsOtherMachinesPed(const void *ped) {
+	uint16_t netId = INVALID_NETID;
+	return RemotePlayerForPed(ped, netId) || AmbientReplicaForPed(ped, netId);
+}
+
+bool MeleeKeepsOff(const void *ped) {
+	return ped && !CopyMayReactToMelee(g_melee.active, IsOtherMachinesPed(ped));
+}
+
+void SayMeleeFenced(const char *what) {
+	if (g_saidMeleeFenced)
+		return;
+	g_saidMeleeFenced = true;
+	Log("combat: kept %s off another machine's ped during a melee hit. Its owner "
+	    "plays the reaction from the hit we forward", what);
+}
+
+// The fight code shoves a struck ped and knocks him off his feet with plain
+// writes. On another machine's peds those are put back when the call returns,
+// the same way ReplayBodyFence does it for a replayed round.
+class MeleeScope {
+public:
+	MeleeScope(void *striker, const MeleeTag &tag, bool adrenaline) : m_prev(g_melee) {
+		g_melee.active     = true;
+		g_melee.striker    = striker;
+		g_melee.tag        = tag;
+		g_melee.adrenaline = adrenaline;
+
+		if (!striker)
+			return;
+		const uint16_t count = Field<uint16_t>(striker, PED_NUM_NEAR_PEDS);
+		for (uint16_t i = 0; i < count && i < PED_NEAR_PEDS_MAX; ++i) {
+			void *const ped = Field<void *>(striker, PED_NEAR_PEDS + i * 4u);
+			if (!ped || !IsOtherMachinesPed(ped))
+				continue;
+			Row &r  = m_rows[m_count++];
+			r.ped   = ped;
+			r.speed = ReadVec3(ped, offs::MOVE_SPEED);
+			r.flags = Field<uint8_t>(ped, offs::PED_FLAGS);
+		}
+	}
+	~MeleeScope() {
+		for (int i = 0; i < m_count; ++i) {
+			const Row &r = m_rows[i];
+			WriteVec3(r.ped, offs::MOVE_SPEED, r.speed);
+			uint8_t &flags = Field<uint8_t>(r.ped, offs::PED_FLAGS);
+			flags = static_cast<uint8_t>((flags & ~offs::PED_IS_STANDING) |
+			                             (r.flags & offs::PED_IS_STANDING));
+		}
+		g_melee = m_prev;
+	}
+	MeleeScope(const MeleeScope &)            = delete;
+	MeleeScope &operator=(const MeleeScope &) = delete;
+
+private:
+	struct Row {
+		void   *ped   = nullptr;
+		Vec3    speed = {};
+		uint8_t flags = 0;
+	};
+	MeleeCall m_prev;
+	Row       m_rows[PED_NEAR_PEDS_MAX];
+	int       m_count = 0;
+};
+
+// The melee bytes for a hit InflictDamage is being asked to make right now,
+// if it is the local player's strike or swing.
+MeleeTag LocalMeleeTag(void *damagedBy, uint32_t method) {
+	if (!g_melee.active || !damagedBy || damagedBy != g_melee.striker ||
+	    damagedBy != PlayerPed() || !IsMeleeCause(static_cast<uint8_t>(method)))
+		return MeleeTag{};
+	return g_melee.tag;
+}
+
+// ---- keeping a replayed round off the local player's body -------------------
+//
+// combat.h, LocalPlayerHitReaction, and addresses.h (CPed__ReactToAttack) for
+// the order the engine runs things in. Four reactions reach a ped a round hits
+// before the damage call, and each is stopped for the local player where it's
+// cheapest to stop exactly:
+//
+//   ReactToAttack      detour below. The look, and the order to our followers
+//   SetFall            detour below. The shotgun knockdown
+//   the flinch         DoBulletImpact's own gate, the hit anim delay, held
+//                      shut by ReplayBodyFence. It also covers
+//                      ClearAttackByRemovingAnim, which is what stopped us
+//                      firing
+//   ApplyMoveForce     the shotgun shove. ReplayBodyFence puts the move speed
+//                      and bIsStanding back afterwards, since the local player
+//                      isn't processed while CWeapon::Fire runs
+//
+// Every one of them is only for the local player. Anything else the replay
+// hits reacts the way it always did: a pedestrian this machine hosts still
+// flinches and falls, and ReplayedShotMayDamage still decides its health.
+// The trail, the blood, the sound and the event are untouched.
+
+// __thiscall void CPed::ReactToAttack(CEntity *attacker), `ret 4`.
+using ReactHookFn = void(__fastcall *)(void *, void *, void *);
+
+void __fastcall HookedReactToAttack(void *self, void * /*edx*/, void *attacker) {
+	if (g_replaying && self && self == PlayerPed()) {
+		if (!g_saidReplayReactionFenced) {
+			g_saidReplayReactionFenced = true;
+			Log("combat: a replayed round from a remote player hit our own ped on this "
+			    "screen and was kept from moving us. If it hit on their screen too, "
+			    "their C_Damage brings the reaction along with the health");
+		}
+		return;
+	}
+	if (MeleeKeepsOff(self)) {
+		SayMeleeFenced("ReactToAttack");
+		return;
+	}
+	g_reactToAttack.Original<ReactHookFn>()(self, nullptr, attacker);
+}
+
+// __thiscall void CPed::SetFall(int time, AnimationId anim, bool bSkipAnim),
+// `ret 0Ch`.
+using SetFallThisFn = void(__thiscall *)(void *, int32_t, uint32_t, uint8_t);
+using SetFallHookFn = void(__fastcall *)(void *, void *, int32_t, uint32_t, uint8_t);
+
+void __fastcall HookedSetFall(void *self, void * /*edx*/, int32_t time, uint32_t anim,
+                              uint8_t skipAnim) {
+	if (g_replaying && self && self == PlayerPed())
+		return;
+	if (MeleeKeepsOff(self)) {
+		SayMeleeFenced("the knockdown");
+		return;
+	}
+	g_setFall.Original<SetFallHookFn>()(self, nullptr, time, anim, skipAnim);
+}
+
+// __thiscall void CPed::StartFightDefend(uint8 dir, uint8 hitLevel, uint8 x),
+// `ret 0Ch`. The callers push whole registers, so the three are passed on as
+// they came.
+using DefendThisFn = void(__thiscall *)(void *, uint32_t, uint32_t, uint32_t);
+using DefendHookFn = void(__fastcall *)(void *, void *, uint32_t, uint32_t, uint32_t);
+
+void __fastcall HookedStartFightDefend(void *self, void * /*edx*/, uint32_t dir,
+                                       uint32_t hitLevel, uint32_t x) {
+	if (MeleeKeepsOff(self)) {
+		SayMeleeFenced("the defend");
+		return;
+	}
+	g_startFightDefend.Original<DefendHookFn>()(self, nullptr, dir, hitLevel, x);
+}
+
+// __thiscall bool CPed::FightStrike(CVector &node), `ret 4`.
+using StrikeHookFn = bool(__fastcall *)(void *, void *, void *);
+
+// A copy of another machine's ped never lands a blow here. Nothing is meant to
+// get one this far - no objective, never PED_FIGHT or PED_ATTACK on its own -
+// and this is what makes that a rule rather than a hope.
+bool CopyMayStrike(void *striker) {
+	if (!striker || !IsOtherMachinesPed(striker))
+		return true;
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("combat: another machine's ped tried to land a melee hit on this machine "
+		    "and was stopped. Its owner decides its punches");
+	}
+	return false;
+}
+
+bool __fastcall HookedFightStrike(void *self, void * /*edx*/, void *node) {
+	if (!CopyMayStrike(self))
+		return false;
+	MeleeTag tag;
+	if (self) {
+		const int32_t move  = Field<int32_t>(self, offs::PED_FIGHT_MOVE);
+		const uint8_t level = IsFightMove(move)
+		                          ? *reinterpret_cast<const uint8_t *>(
+		                                tFightMoves + static_cast<size_t>(move) * SIZEOF_FIGHTMOVE +
+		                                FIGHTMOVE_HIT_LEVEL)
+		                          : 0;
+		// FightStrike's own `m_weapons[m_currentWeapon].m_eWeaponType != 0`.
+		const uint8_t slot  = Field<uint8_t>(self, offs::PED_CURRENT_WEAPON);
+		const bool    armed = slot < offs::NUM_WEAPON_SLOTS &&
+		                   Field<uint32_t>(self, offs::PED_WEAPONS +
+		                                             slot * offs::SIZEOF_WEAPON +
+		                                             offs::WEAPON_TYPE) != WEAPONTYPE_UNARMED;
+		tag = StrikeTag(move, level, armed);
+	}
+	MeleeScope scope(self, tag, false);
+	return g_fightStrike.Original<StrikeHookFn>()(self, nullptr, node);
+}
+
+// __thiscall bool CWeapon::FireMelee(CEntity *shooter, CVector &source),
+// `ret 8`. `self` is the weapon.
+using SwingHookFn = bool(__fastcall *)(void *, void *, void *, void *);
+
+bool __fastcall HookedFireMelee(void *self, void * /*edx*/, void *shooter, void *source) {
+	void *striker    = nullptr;
+	bool  heavy      = false;
+	bool  adrenaline = false;
+	if (self && shooter &&
+	    (Field<uint8_t>(shooter, offs::ENTITY_FLAGS) & 7) == offs::ENTITY_TYPE_PED) {
+		if (!CopyMayStrike(shooter))
+			return true;   // what FireMelee answers, having hit nobody
+		striker = shooter;
+		// anim2Playing, the way FireMelee reads it at 0x0055CA57.
+		const uint32_t type = Field<uint32_t>(self, offs::WEAPON_TYPE);
+		void *const clump   = Field<void *>(shooter, offs::RW_OBJECT);
+		if (type <= WEAPONTYPE_LAST_INVENTORY && clump) {
+			using InfoFn  = void *(__cdecl *)(uint32_t);
+			using AssocFn = void *(__cdecl *)(void *, uint32_t);
+			void *const info = Func<InfoFn>(CWeaponInfo__GetWeaponInfo)(type);
+			heavy = info && Func<AssocFn>(RpAnimBlendClumpGetAssociation)(
+			                    clump, Field<uint32_t>(info, WEAPONINFO_ANIM2_TO_PLAY)) != nullptr;
+		}
+		adrenaline = shooter == PlayerPed() &&
+		             Field<uint8_t>(shooter, offs::PLAYER_ADRENALINE) != 0;
+	}
+	MeleeScope scope(striker, SwingTag(heavy), adrenaline);
+	return g_fireMelee.Original<SwingHookFn>()(self, nullptr, shooter, source);
+}
+
+// Held for the length of the CWeapon::Fire call in ReplayRemoteShot.
+//
+// Only fields the fire path writes on a struck ped, and only the local
+// player's. The hit anim delay is parked where DoBulletImpact's `jae` can't
+// pass it and put back to whatever it was, so a real flinch that was already
+// holding keeps its own timer.
+class ReplayBodyFence {
+public:
+	explicit ReplayBodyFence(void *ped) : m_ped(ped) {
+		if (!m_ped)
+			return;
+		m_hold  = Field<uint32_t>(m_ped, offs::PLAYER_HIT_ANIM_DELAY);
+		m_speed = ReadVec3(m_ped, offs::MOVE_SPEED);
+		m_flags = Field<uint8_t>(m_ped, offs::PED_FLAGS);
+		Field<uint32_t>(m_ped, offs::PLAYER_HIT_ANIM_DELAY) = REPLAY_HIT_ANIM_HOLD;
+	}
+	~ReplayBodyFence() {
+		if (!m_ped)
+			return;
+		Field<uint32_t>(m_ped, offs::PLAYER_HIT_ANIM_DELAY) = m_hold;
+		Field<float>(m_ped, offs::MOVE_SPEED)     = m_speed.x;
+		Field<float>(m_ped, offs::MOVE_SPEED + 4) = m_speed.y;
+		Field<float>(m_ped, offs::MOVE_SPEED + 8) = m_speed.z;
+		uint8_t &flags = Field<uint8_t>(m_ped, offs::PED_FLAGS);
+		flags          = static_cast<uint8_t>((flags & ~offs::PED_IS_STANDING) |
+                                     (m_flags & offs::PED_IS_STANDING));
+	}
+	ReplayBodyFence(const ReplayBodyFence &)            = delete;
+	ReplayBodyFence &operator=(const ReplayBodyFence &) = delete;
+
+private:
+	void    *m_ped   = nullptr;
+	uint32_t m_hold  = 0;
+	Vec3     m_speed = {};
+	uint8_t  m_flags = 0;
+};
+
+// The reaction the engine's fire path would have played on the local player
+// for a hit that arrived as C_Damage, played the way that path plays it.
+// Called ahead of InflictDamage, which is the engine's order as well.
+void PlayForwardedHitReaction(void *ped, void *attackerPed, uint8_t weapon,
+                              uint32_t direction) {
+	const HitReactionRule rule =
+	    LocalPlayerHitReaction(false, weapon, Field<bool>(ped, offs::PED_IN_VEHICLE));
+	if (rule.kind == HitReaction::None)
+		return;
+
+	// Every one of those arms skips a dying or dead ped before it reacts
+	// (0x0055FA52, 0x00560F42, 0x005586AE, 0x00562B23).
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+		return;
+
+	void *const clump = Field<void *>(ped, offs::RW_OBJECT);
+	if (!clump)
+		return;   // nothing to animate, and SetFall would blend on it too
+
+	const uint32_t now = Global<uint32_t>(CTimer__m_snTimeInMilliseconds);
+
+	if (rule.kind == HitReaction::Flinch) {
+		using InControlFn = bool(__thiscall *)(void *);
+		using ClearFn     = void(__thiscall *)(void *);
+		using AddFn       = void *(__cdecl *)(void *, int, int);
+
+		if (rule.inControl &&
+		    (!Func<InControlFn>(CPed__IsPedInControl)(ped) ||
+		     (Field<uint8_t>(ped, offs::PED_FLAGS_E) & offs::PED_IS_DUCKING)))
+			return;
+		if (rule.holdGate &&
+		    !HitAnimHoldOver(Field<uint32_t>(ped, offs::PLAYER_HIT_ANIM_DELAY), now))
+			return;
+
+		Func<ClearFn>(CPed__ClearAttackByRemovingAnim)(ped);
+		const uint32_t anim = ANIM_SHOT_FRONT_PARTIAL + (rule.withDir ? direction : 0u);
+		void *const assoc   = Func<AddFn>(CAnimManager__AddAnimation)(
+            clump, ASSOCGRP_STD, static_cast<int>(anim));
+		if (assoc) {
+			Field<float>(assoc, ANIM_BLEND_AMOUNT) = 0.0f;
+			Field<float>(assoc, ANIM_BLEND_DELTA)  = HIT_ANIM_BLEND_DELTA;
+		}
+		if (rule.holdGate)
+			Field<uint32_t>(ped, offs::PLAYER_HIT_ANIM_DELAY) = now + rule.holdMs;
+	} else {
+		using PushFn = void(__thiscall *)(void *, float, float, float);
+
+		// FireShotgun pushes along the line from the fire source. The
+		// attacker's ped stands in for it; without one, the direction the
+		// shooter's engine worked out is turned back into a line.
+		const Vec3 pos = ReadVec3(ped, offs::POSITION);
+		Vec3       toward{};
+		bool       have = false;
+		if (attackerPed) {
+			const Vec3 at = ReadVec3(attackerPed, offs::POSITION);
+			have = UnitDirection(Vec3{at.x - pos.x, at.y - pos.y, 0.0f}, toward);
+		}
+		if (!have) {
+			Vec3 fwd;
+			if (!FlatHeadingDirection(ReadVec3(ped, offs::MATRIX_FWD), fwd))
+				return;
+			toward = TowardShooter(fwd, direction);
+		}
+
+		const bool mayFall = ShotgunMayKnockDown(Field<uint32_t>(ped, offs::PED_GETUP_TIMER), now);
+		uint8_t   &flags   = Field<uint8_t>(ped, offs::PED_FLAGS);
+		if ((flags & offs::PED_IS_STANDING) && mayFall) {
+			flags = static_cast<uint8_t>(flags & ~offs::PED_IS_STANDING);
+			Func<PushFn>(CPhysical__ApplyMoveForce)(ped, toward.x * SHOTGUN_PUSH_FALL,
+			                                        toward.y * SHOTGUN_PUSH_FALL,
+			                                        SHOTGUN_PUSH_FALL_Z);
+		} else {
+			Func<PushFn>(CPhysical__ApplyMoveForce)(ped, toward.x * SHOTGUN_PUSH_STAND,
+			                                        toward.y * SHOTGUN_PUSH_STAND, 0.0f);
+		}
+		if (mayFall)
+			Func<SetFallThisFn>(CPed__SetFall)(ped, SHOTGUN_FALL_MS,
+			                                   ANIM_KO_SKID_FRONT + direction, 0);
+	}
+
+	if (!g_saidHitReactionPlayed) {
+		g_saidHitReactionPlayed = true;
+		Log("combat: played the engine's own hit reaction for a forwarded hit, cause %u "
+		    "direction %u (%s). The replay of the same round doesn't move us any more, "
+		    "so this is the only place it comes from",
+		    weapon, direction,
+		    rule.kind == HitReaction::Knockdown ? "shotgun shove" : "flinch");
+	}
+}
+
+// ---- fists and the bat, on the machine that owns the victim -------------------
+//
+// melee.h. The struck ped's half of FightStrike or FireMelee, played on the
+// real ped from the two melee bytes, in the engine's order around the one
+// InflictDamage call the caller makes.
+using ReactThisFn = void(__thiscall *)(void *, void *);
+using PushThisFn  = void(__thiscall *)(void *, float, float, float);
+
+struct MeleeReaction {
+	bool    play       = false;
+	float   before     = 0.0f;
+	uint8_t damageMult = 0;
+};
+
+// Flat unit vector from the victim toward whoever hit him: his copy here when
+// there is one, else the side the striker's engine said it came from.
+bool TowardAttacker(void *ped, void *attackerPed, uint32_t direction, Vec3 &out) {
+	if (attackerPed) {
+		const Vec3 pos = ReadVec3(ped, offs::POSITION);
+		const Vec3 at  = ReadVec3(attackerPed, offs::POSITION);
+		if (UnitDirection(Vec3{at.x - pos.x, at.y - pos.y, 0.0f}, out))
+			return true;
+	}
+	Vec3 fwd;
+	if (!FlatHeadingDirection(ReadVec3(ped, offs::MATRIX_FWD), fwd))
+		return false;
+	out = TowardShooter(fwd, direction);
+	return true;
+}
+
+// Up to the damage: both paths react and defend first. False when the engine
+// would have left this victim alone, damage and all.
+bool MeleeBeforeDamage(void *ped, bool isPlayer, void *attackerPed, const MeleeTag &tag,
+                       uint8_t weapon, float amount, uint32_t direction, MeleeReaction &out) {
+	out = MeleeReaction{};
+	if (MeleeKind(tag) == MELEE_NONE)
+		return true;
+
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (MeleeSparesVictim(isPlayer, state))
+		return false;
+
+	// In a seat the defend needs him in control and the fall and the shove
+	// have nothing to move. The damage still goes in, and the engine clamps it.
+	if (Field<bool>(ped, offs::PED_IN_VEHICLE) || !Field<void *>(ped, offs::RW_OBJECT))
+		return true;
+
+	out.play       = true;
+	out.before     = Field<float>(ped, offs::PED_HEALTH);
+	out.damageMult = StrikeDamageMult(amount);
+
+	// Not on a player. His ReactToAttack is his gang turning on the attacker,
+	// kept out for the same reason PlayForwardedHitReaction keeps it out.
+	if (!isPlayer && attackerPed && !PedStateDyingOrDead(state))
+		Func<ReactThisFn>(CPed__ReactToAttack)(ped, attackerPed);
+
+	Func<DefendThisFn>(CPed__StartFightDefend)(ped, direction,
+	                                          DefendHitLevel(tag, weapon, state),
+	                                          DefendArg(tag, isPlayer, out.damageMult));
+	return true;
+}
+
+// After the damage: the fall and the shove, off the health either side of it.
+void MeleeAfterDamage(void *ped, bool isPlayer, void *attackerPed, const MeleeTag &tag,
+                      uint8_t weapon, uint32_t direction, const MeleeReaction &r) {
+	if (!r.play)
+		return;
+
+	const float    after  = Field<float>(ped, offs::PED_HEALTH);
+	uint32_t       state  = Field<uint32_t>(ped, offs::PED_STATE);
+	uint8_t       &flags  = Field<uint8_t>(ped, offs::PED_FLAGS);
+	const uint32_t koAnim = ANIM_KO_SKID_FRONT + direction;
+	Vec3           toward{};
+	const bool     haveDir = TowardAttacker(ped, attackerPed, direction, toward);
+
+	if (MeleeKind(tag) == MELEE_STRIKE) {
+		void *const stats  = Field<void *>(ped, offs::PED_STATS);
+		const bool  oneHit = stats && (Field<uint16_t>(stats, offs::PEDSTATS_FLAGS) &
+		                               STAT_ONE_HIT_KNOCKDOWN) != 0;
+		if (StrikeKnocksDown(state, r.before, after, isPlayer,
+		                     (tag.melee & MELEE_ARMED) != 0, oneHit)) {
+			Func<SetFallThisFn>(CPed__SetFall)(ped, 0, koAnim, 0);
+			if (Field<uint32_t>(ped, offs::PED_STATE) == PEDSTATE_FALL)
+				flags = static_cast<uint8_t>(flags & ~offs::PED_IS_STANDING);
+		}
+		state = Field<uint32_t>(ped, offs::PED_STATE);
+		if ((state == PEDSTATE_DIE || !(flags & offs::PED_IS_STANDING)) && haveDir) {
+			flags = static_cast<uint8_t>(flags & ~offs::PED_IS_STANDING);
+			const float k = StrikePushScale((tag.melee & MELEE_GROUND_KICK) != 0,
+			                                state == PEDSTATE_DIE, r.damageMult);
+			Func<PushThisFn>(CPhysical__ApplyMoveForce)(ped, -toward.x * k, -toward.y * k, k);
+		}
+		return;
+	}
+
+	const bool bat   = weapon == WEAPONTYPE_BASEBALLBAT;
+	const bool heavy = (tag.melee & MELEE_HEAVY) != 0;
+	if (!PedStateOnGround(state)) {
+		if (!SwingKnocksDown(state, r.before, after, bat, isPlayer))
+			return;
+		if (haveDir) {
+			flags = static_cast<uint8_t>(flags & ~offs::PED_IS_STANDING);
+			Func<PushThisFn>(CPhysical__ApplyMoveForce)(ped, toward.x * SWING_PUSH,
+			                                            toward.y * SWING_PUSH, SWING_PUSH_Z);
+		}
+		Func<SetFallThisFn>(CPed__SetFall)(ped, SwingFallMs(bat, isPlayer), koAnim, 0);
+	} else if (SwingShovesDying(state, heavy) && haveDir) {
+		flags = static_cast<uint8_t>(flags & ~offs::PED_IS_STANDING);
+		Func<PushThisFn>(CPhysical__ApplyMoveForce)(ped, toward.x * SWING_PUSH,
+		                                            toward.y * SWING_PUSH, SWING_PUSH_Z);
+	}
+}
+
+void SayMeleeApplied(const MeleeTag &tag, uint8_t weapon, bool player) {
+	if (g_saidMeleeApplied)
+		return;
+	g_saidMeleeApplied = true;
+	Log("combat: played the struck side of a %s off the wire on our own %s (cause %u, "
+	    "level %u)", MeleeKind(tag) == MELEE_STRIKE ? "punch" : "swing",
+	    player ? "player" : "pedestrian", weapon, tag.hitLevel);
+}
+
 // __cdecl void CBulletTraces::AddTrace(CVector *start, CVector *target).
 //
 // The streak, and the only thing in this file that measures what the player
@@ -889,7 +1446,7 @@ void RecordLocalExplosion(uint8_t type, const float *pos) {
 // victim's machine, which is the only one that knows their armour and their
 // state.
 void RecordLocalDamage(uint16_t victimNetId, uint32_t method, float damage,
-                       uint32_t piece, uint32_t direction) {
+                       uint32_t piece, uint32_t direction, const MeleeTag &melee = {}) {
 	CombatEvent ev;
 	ev.kind               = CombatEvent::DAMAGE;
 	ev.damage.victimNetId = victimNetId;
@@ -897,6 +1454,29 @@ void RecordLocalDamage(uint16_t victimNetId, uint32_t method, float damage,
 	ev.damage.amount      = damage;
 	ev.damage.piece       = static_cast<uint8_t>(piece);
 	ev.damage.direction   = static_cast<uint8_t>(direction);
+	ev.damage.melee       = melee.melee;
+	ev.damage.hitLevel    = melee.hitLevel;
+	Push(ev);
+}
+
+// The same thing, about a pedestrian somebody else hosts instead of a player.
+//
+// Separate from RecordLocalDamage rather than a flag on it, because the two
+// netIds are not in the same namespace: one names a player slot the server
+// keeps and the other names a row in its ambient table. A single queue entry
+// with a "which kind" byte would have one packet's worth of routing decided by
+// a byte nobody reading the wire could check.
+void RecordLocalPedDamage(uint16_t pedNetId, uint32_t method, float damage,
+                          uint32_t piece, uint32_t direction, const MeleeTag &melee = {}) {
+	CombatEvent ev;
+	ev.kind                = CombatEvent::PED_DAMAGE;
+	ev.pedDamage.netId     = pedNetId;
+	ev.pedDamage.weapon    = static_cast<uint8_t>(method);
+	ev.pedDamage.amount    = damage;
+	ev.pedDamage.piece     = static_cast<uint8_t>(piece);
+	ev.pedDamage.direction = static_cast<uint8_t>(direction);
+	ev.pedDamage.melee     = melee.melee;
+	ev.pedDamage.hitLevel  = melee.hitLevel;
 	Push(ev);
 }
 
@@ -941,8 +1521,10 @@ bool __fastcall HookedFire(void *self, void * /*edx*/, void *shooter,
 		g_localRay.sampling = true;
 	}
 
+	g_localFiring = ours;
 	const bool fired =
 	    g_fire.Original<FireHookFn>()(self, nullptr, shooter, fireSource);
+	g_localFiring = false;
 
 	// Closed only by whoever opened it. Nothing nests today - the replay is
 	// driven from the net drain, not from inside a local shot - and a window
@@ -955,6 +1537,197 @@ bool __fastcall HookedFire(void *self, void * /*edx*/, void *shooter,
 		RecordLocalShot(self, shooter, fireSource, before);
 
 	return fired;
+}
+
+// ---- our drive-by ------------------------------------------------------------
+
+bool g_saidDriveBySent  = false;
+bool g_saidDriveByNoLine = false;
+
+// One round out of our car's window, as the line the engine drew for it.
+// FireInstantHitFromCar traces once and draws once, hit or miss, and both go
+// through the samplers above because the window is open (driveby.h).
+void RecordLocalDriveBy() {
+	DriveByLine line;
+	if (!DriveByLineFrom(g_localRay.trails, g_localRay.trailStart, g_localRay.trailEnd,
+	                     g_localRay.rays, g_localRay.nearEnd, g_localRay.farEnd, line)) {
+		if (!g_saidDriveByNoLine) {
+			g_saidDriveByNoLine = true;
+			Log("combat: a drive-by round of ours drew no trail and traced no line we "
+			    "could read, so nobody else sees it. The damage it did still goes out");
+		}
+		return;
+	}
+
+	CombatEvent ev;
+	ev.kind        = CombatEvent::SHOT;
+	ev.shot.weapon = WEAPONTYPE_UZI_DRIVEBY;
+	ev.shot.origin = line.origin;
+	ev.shot.dir    = line.dir;
+	ev.shot.speed  = line.length;
+	Push(ev);
+
+	if (!g_saidDriveBySent) {
+		g_saidDriveBySent = true;
+		Log("combat: our first drive-by round went out as a shot with weapon %u, from "
+		    "(%.1f %.1f %.1f) along (%.2f %.2f %.2f), a %.1f m trail (%s)",
+		    WEAPONTYPE_UZI_DRIVEBY, line.origin.x, line.origin.y, line.origin.z,
+		    line.dir.x, line.dir.y, line.dir.z, line.length,
+		    g_localRay.trails > 0 ? "the one we drew" : "no trail, the ray's line");
+	}
+}
+
+// __thiscall bool CWeapon::FireFromCar(CAutomobile *shooter, bool left), `ret 8`.
+//
+// Only DoDriveByShootings calls it (0x005641BF), and only for the car the
+// local pad drives, so every call here is ours in practice. The driver test
+// is there anyway, because a car that is status 0 for somebody else's ped is
+// exactly the kind of half-state seat.cpp works to avoid.
+using FireFromCarHookFn = bool(__fastcall *)(void *, void *, void *, uint32_t);
+
+bool __fastcall HookedFireFromCar(void *self, void * /*edx*/, void *car, uint32_t left) {
+	const bool ours = !g_replaying && car &&
+	                  Field<void *>(car, offs::VEH_DRIVER) == PlayerPed();
+	if (ours) {
+		g_localRay          = LocalRay{};
+		g_localRay.sampling = true;
+	}
+
+	const bool fired = g_fireFromCar.Original<FireFromCarHookFn>()(self, nullptr, car, left);
+
+	if (ours) {
+		g_localRay.sampling = false;
+		if (fired)
+			RecordLocalDriveBy();
+	}
+	return fired;
+}
+
+// ---- somebody else's drive-by ------------------------------------------------
+//
+// FireInstantHitFromCar's cosmetic half, call for call, from the round on the
+// wire. The engine's function is never called here: it would aim with
+// DoDriveByAutoAiming around our player, register the gunshot against our
+// player, and take health off whatever it hit - three things this machine
+// does not get to do. The hits were decided on the shooter's machine and
+// arrive as C_Damage, C_PedDamage, C_VehicleHit or C_CarHit like any other.
+
+using AddParticleFn = void *(__cdecl *)(int32_t, const float *, const float *, void *,
+                                        float, int32_t, int32_t, int32_t, int32_t);
+using AddLightFn    = void(__cdecl *)(uint32_t, float, float, float, float, float, float,
+                                      float, float, float, float, uint32_t, uint32_t);
+using WorldLineFn   = bool(__cdecl *)(const float *, const float *, void *, void **,
+                                      uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                      uint32_t, uint32_t);
+using PlayOneShotFn = void(__thiscall *)(void *, int32_t, uint32_t, float);
+using ScriptSoundFn = void(__cdecl *)(uint32_t, const float *);
+
+void PlayOn(void *entity, uint16_t sound, float volume) {
+	const int32_t id = Field<int32_t>(entity, offs::PHYSICAL_AUDIO_ENTITY);
+	if (id < 0)
+		return;
+	Func<PlayOneShotFn>(CAudioEngine__PlayOneShot)(
+	    reinterpret_cast<void *>(DMAudio_Object), id, sound, volume);
+}
+
+// What the far end sounds like: table 0x00603214, less CPed::Say. Found with
+// a line-of-sight query of our own, which fills a col point and nothing else,
+// over the trail plus a hand's width so the surface it ended on is found.
+void DriveByImpact(const float *source, const float *end, const Vec3 &dir, void *ownCar) {
+	constexpr float PAST_END = 0.25f;
+	const float probe[3] = {end[0] + dir.x * PAST_END, end[1] + dir.y * PAST_END,
+	                        end[2] + dir.z * PAST_END};
+	alignas(16) uint8_t colPoint[64] = {};
+	void *victim = nullptr;
+	Func<WorldLineFn>(CWorld__ProcessLineOfSight)(source, probe, colPoint, &victim, 1, 1, 1,
+	                                              1, 1, 1, 0);
+	if (!victim || victim == ownCar)
+		return;   // the no-victim arm plays nothing, and our copy of their car is not a hit
+	const float *const point = reinterpret_cast<const float *>(colPoint);
+	switch (Field<uint8_t>(victim, offs::ENTITY_FLAGS) & 7) {
+	case 1:
+		Func<ScriptSoundFn>(PlayOneShotScriptObject)(SCRIPT_SOUND_BULLET_HIT_GROUND_1, point);
+		break;
+	case 2:
+		PlayOn(victim, SOUND_WEAPON_HIT_VEHICLE, 1.0f);
+		break;
+	case 3:
+		PlayOn(victim, SOUND_WEAPON_HIT_PED, 1.0f);
+		break;
+	case 4:
+		Func<ScriptSoundFn>(PlayOneShotScriptObject)(SCRIPT_SOUND_BULLET_HIT_GROUND_2, point);
+		break;
+	case 5:
+		Func<ScriptSoundFn>(PlayOneShotScriptObject)(SCRIPT_SOUND_BULLET_HIT_GROUND_3, point);
+		break;
+	default:
+		break;
+	}
+}
+
+bool g_saidDriveByDrawn  = false;
+bool g_saidDriveByNoDir  = false;
+bool g_saidDriveByNoSeat = false;
+
+void DrawRemoteDriveBy(RemotePlayer &player, void *ped, const ShotBody &shot) {
+	Vec3 dir;
+	if (!UnitDirection(shot.dir, dir)) {
+		if (!g_saidDriveByNoDir) {
+			g_saidDriveByNoDir = true;
+			Log("combat: a drive-by round from player net %u carried (%.2f %.2f %.2f), "
+			    "which is not a direction, so it was not drawn",
+			    player.netId, shot.dir.x, shot.dir.y, shot.dir.z);
+		}
+		return;
+	}
+
+	// Clamped like every wire position: both ends go into
+	// CWorld::ProcessLineOfSight (pedanim.h, ClampToWorld).
+	float source[3], end[3];
+	source[0] = ClampToWorld(shot.origin.x);
+	source[1] = ClampToWorld(shot.origin.y);
+	if (!FiniteOr(shot.origin.z, 0.0f, source[2]))
+		return;
+	const float length = DriveByTrailLength(shot.speed);
+	end[0] = ClampToWorld(source[0] + dir.x * length);
+	end[1] = ClampToWorld(source[1] + dir.y * length);
+	end[2] = source[2] + dir.z * length;
+
+	void *const car = Field<bool>(ped, offs::PED_IN_VEHICLE)
+	                      ? Field<void *>(ped, offs::PED_MY_VEHICLE)
+	                      : nullptr;
+
+	const float zero[3] = {0.0f, 0.0f, 0.0f};
+	Func<AddParticleFn>(CParticle__AddParticle)(PARTICLE_GUNFLASH, source, zero, nullptr,
+	                                            0.0f, 0, 0, 0, 0);
+	Func<AddLightFn>(CPointLights__AddLight)(0, source[0], source[1], source[2], 0.0f, 0.0f,
+	                                         0.0f, DRIVEBY_LIGHT_RADIUS, 1.0f, 0.8f, 0.0f,
+	                                         0, 0);
+	Func<AddTraceFn>(CBulletTraces__AddTrace)(source, end);
+	DriveByImpact(source, end, dir, car);
+
+	// The report comes from the car, as FireFromCar plays it (0x0055C996). A
+	// ped that is not in one yet here plays it from the ped, whose own
+	// one-shot picks the uzi's sample off the weapon in its hand.
+	PlayOn(car ? car : ped, SOUND_WEAPON_SHOT_FIRED, 0.0f);
+
+	if (car) {
+		player.driveByShotAnim = DriveByAnimForShot(dir, ReadVec3(car, offs::MATRIX_RIGHT));
+		player.driveByShotMs   = WallClock::NowMs();
+	} else if (!g_saidDriveByNoSeat) {
+		g_saidDriveByNoSeat = true;
+		Log("combat: a drive-by round from player net %u arrived while their ped here "
+		    "is not in a car yet; drew the round, and there is no window to lean out of",
+		    player.netId);
+	}
+
+	if (!g_saidDriveByDrawn) {
+		g_saidDriveByDrawn = true;
+		Log("combat: drew our first remote drive-by round - player net %u, from "
+		    "(%.1f %.1f %.1f) along (%.2f %.2f %.2f), %.1f m of trail. Its hits come "
+		    "from their machine, not from this one",
+		    player.netId, source[0], source[1], source[2], dir.x, dir.y, dir.z, length);
+	}
 }
 
 // __cdecl bool CExplosion::AddExplosion(CEntity *explodingEntity,
@@ -976,16 +1749,28 @@ bool __cdecl HookedAddExplosion(void *explodingEntity, void *culprit, int type,
 	// up. Swallowing that left CAutomobile::BlowUpCar half done, with the
 	// car wrecked, its occupants flagged bRemoveFromWorld and no blast, and
 	// a half-torn-down car full of peds is not a state to leave the engine in.
-	if (g_replaying && type >= 0 && IsProjectileExplosion(static_cast<uint8_t>(type)))
+	//
+	// A barrel is refused as well, for the reason in combat.h
+	// (ReplayMayAddExplosion): its culprit is FindPlayerPed() on every machine,
+	// so the shooter already relays it.
+	if (g_replaying && !ReplayMayAddExplosion(type)) {
+		if (type == EXPLOSION_BARREL && !g_saidReplayBarrel) {
+			g_saidReplayBarrel = true;
+			Log("combat: a replayed shot hit an explosive barrel here and we did not "
+			    "blow it up. The shooter's machine did, and its C_Explosion is the "
+			    "one blast");
+		}
 		return false;
+	}
 
 	const bool added = g_explode.Original<AddExplosionFn>()(explodingEntity, culprit,
 	                                                        type, pos, lifetime);
 
 	// Only the local player's own explosions. A car blowing up because the
 	// city AI decided so already happens on every machine - relaying it
-	// would just double it up.
-	if (added && pos && culprit && culprit == PlayerPed() && type >= 0 &&
+	// would just double it up. And never from inside a replay, which is
+	// somebody else's shot even when the engine names our ped.
+	if (added && !g_replaying && pos && culprit && culprit == PlayerPed() && type >= 0 &&
 	    IsKnownExplosionType(static_cast<uint8_t>(type)))
 		RecordLocalExplosion(static_cast<uint8_t>(type), pos);
 
@@ -1027,6 +1812,203 @@ void __cdecl HookedRemoveProjectile(void *info, void *projectile) {
 		g_tracked[slot] = Tracked{};
 	}
 	g_removeProjectile.Original<RemoveProjectileFn>()(info, projectile);
+}
+
+// ---- our flame reaching what another machine owns --------------------------
+//
+// combat.h, IsOurFlame, is the rule and says why each half of it is needed.
+// These two detours are where its two inputs come from.
+
+Detour g_shotUpdate;
+Detour g_startFire;
+
+// True for exactly the length of CShotInfo::Update. Nothing nests: Update is
+// called from one place (CWeapon::UpdateWeapons) and calls nothing that calls
+// it again.
+bool g_inShotUpdate = false;
+
+FlameReportThrottle g_flameThrottle;
+
+bool g_saidFlamePedSent    = false;
+bool g_saidFlameCarSent    = false;
+bool g_saidFlamePedLit     = false;
+bool g_saidFlamePedRefused = false;
+bool g_saidFlamePedNoLight = false;
+
+uint32_t FlameClockMs() { return Global<uint32_t>(CTimer__m_snTimeInMilliseconds); }
+
+// The pedestrian half. A replica is bFireProof, so CShotInfo::Update skips it
+// at 0x0055C1D9 and never gets to StartFire - which is why this runs after
+// Update rather than inside StartFire. Same list, same position, same radius
+// and the same order of tests the engine just used, minus the proof flag.
+//
+// `ours` says which slots were alight and ours going in. A slot whose
+// lifespan ran out this frame is cleared at 0x0055C085 and then processed
+// anyway, so "in use afterwards" would miss its last frame.
+void ReportOurFlameOnReplicaPeds(void *localPed, const bool (&ours)[NUM_SHOT_INFOS]) {
+	uint16_t count = Field<uint16_t>(localPed, PED_NUM_NEAR_PEDS);
+	if (count > PED_NEAR_PEDS_MAX)
+		count = PED_NEAR_PEDS_MAX;
+
+	using InControlFn = bool(__thiscall *)(void *);
+	const uint32_t now = FlameClockMs();
+
+	for (size_t s = 0; s < NUM_SHOT_INFOS; ++s) {
+		if (!ours[s])
+			continue;
+		const uintptr_t slot   = gaShotInfo + s * SIZEOF_SHOTINFO;
+		const float    *pos    = reinterpret_cast<const float *>(slot + SHOT_POS);
+		const float     radius = *reinterpret_cast<const float *>(slot + SHOT_RADIUS);
+
+		for (uint16_t i = 0; i < count; ++i) {
+			void *const ped = Field<void *>(localPed, PED_NEAR_PEDS + i * 4u);
+
+			// Matched on the pointer and then on the pool handle, without
+			// reading the ped - so it also stands in for the engine's own
+			// CPed::IsPointerValid, which a stale entry here would need.
+			uint16_t netId = INVALID_NETID;
+			if (!ped || !AmbientReplicaForPed(ped, netId))
+				continue;
+			if (!Func<InControlFn>(CPed__IsPedInControl)(ped))
+				continue;
+
+			const float *p  = &Field<float>(ped, offs::POSITION);
+			const float  dx = p[0] - pos[0], dy = p[1] - pos[1], dz = p[2] - pos[2];
+			if (!FlameReachesPed(dx * dx + dy * dy + dz * dz, radius))
+				continue;
+			if (!g_flameThrottle.Due(FlameTargetKind::Pedestrian, netId, now))
+				continue;
+
+			RecordLocalPedDamage(netId, WEAPONTYPE_FLAMETHROWER, 0.0f, PEDPIECE_TORSO, 0);
+			if (!g_saidFlamePedSent) {
+				g_saidFlamePedSent = true;
+				Log("combat: our flame reached pedestrian net %u, who belongs to "
+				    "another machine. Sent as C_PedDamage with cause 9: their "
+				    "machine lights him with its own CFireManager::StartFire and "
+				    "its own fire does the burning", netId);
+			}
+		}
+	}
+}
+
+// __cdecl void CShotInfo::Update(). No arguments, plain `ret`.
+using ShotUpdateFn = void(__cdecl *)();
+
+void __cdecl HookedShotInfoUpdate() {
+	void *const localPed = PlayerPed();
+
+	bool ours[NUM_SHOT_INFOS] = {};
+	bool any                  = false;
+	if (localPed) {
+		for (size_t s = 0; s < NUM_SHOT_INFOS; ++s) {
+			const uintptr_t slot = gaShotInfo + s * SIZEOF_SHOTINFO;
+			if (*reinterpret_cast<const uint8_t *>(slot + SHOT_IN_USE) &&
+			    *reinterpret_cast<void *const *>(slot + SHOT_SOURCE) == localPed) {
+				ours[s] = true;
+				any     = true;
+			}
+		}
+	}
+
+	g_inShotUpdate = true;
+	g_shotUpdate.Original<ShotUpdateFn>()();
+	g_inShotUpdate = false;
+
+	if (any)
+		ReportOurFlameOnReplicaPeds(localPed, ours);
+}
+
+// __thiscall CFire *CFireManager::StartFire(CEntity *entityOnFire,
+//     CEntity *fleeFrom, float strength, bool propagation). ret 10h.
+//
+// The bool is taken as the dword the caller pushed (`push 1` at 0x0055C228
+// and 0x004B3F8B), and handed back unchanged.
+using StartFireHookFn = void *(__fastcall *)(void *, void *, void *, void *, float,
+                                             uint32_t);
+
+void *__fastcall HookedStartFire(void *self, void * /*edx*/, void *entity,
+                                 void *fleeFrom, float strength, uint32_t propagation) {
+	// The car half. SetCarsOnFire has no bFireProof to stop it on a replica car
+	// - CoopIII sets only bCollisionProof on one - so the engine gets this far
+	// and this is where it is caught.
+	//
+	// The engine still lights our copy afterwards, on purpose. Nothing tells
+	// this machine that a car another machine owns is burning, so that copy is
+	// the only flame our player sees on the car he is torching. It costs
+	// nothing: its CFire hits CVehicle::InflictDamage every frame with cause 9,
+	// the vehicle detour refuses that on a car we don't own, and cause 9 is
+	// never forwarded as damage - only this ignition is.
+	if (g_inShotUpdate && entity && fleeFrom) {
+		void *const localPed = PlayerPed();
+		if (IsOurFlame(true, localPed != nullptr && fleeFrom == localPed) &&
+		    (Field<uint8_t>(entity, offs::ENTITY_FLAGS) & 7) == ENTITY_TYPE_VEHICLE &&
+		    ReportOurFlameOnCar(entity, g_flameThrottle, FlameClockMs()) &&
+		    !g_saidFlameCarSent) {
+			g_saidFlameCarSent = true;
+			Log("combat: our flame reached a car another machine owns, and the "
+			    "ignition went to that machine. Our copy of the car burns here "
+			    "too, for the look of it - it can't take health off anything");
+		}
+	}
+
+	return g_startFire.Original<StartFireHookFn>()(self, nullptr, entity, fleeFrom,
+	                                               strength, propagation);
+}
+
+// The owner's half: another player's flame reached one of our pedestrians on
+// their screen, so light him here, with the engine's own StartFire and the
+// same 0.8f CShotInfo::Update pushes (0x00603028).
+//
+// StartFire alone rather than the whole of CShotInfo's ped arm. Before its
+// StartFire that arm calls SetFindPathAndFlee(source, 10000) and
+// SetMoveState(SPRINT) for a ped who is not the player (0x0055C1F8,
+// 0x0055C21B), and StartFire's own ped arm makes both calls again (0x00479669,
+// 0x004796B1) before SetMoveAnim and PED_ON_FIRE. The arm's only other writes
+// are a zero into [ped+2BCh] and bit 5 of [ped+157h], which StartFire clears
+// again at 0x004796A7.
+//
+// The culprit is our copy of the shooter, so the flee runs from him and the
+// CFire's m_pSource names him - the same choice ApplyRemotePedDamage makes for
+// a bullet. A burning ped who brushes against our own player sets him alight
+// with that source, and combat.h's RemoteMayDamageLocalPlayer gates that on
+// friendly fire, as it gates everything else the shooter lit.
+void LightHostedPedForFlame(RemotePlayer *attacker, void *ped, uint16_t netId) {
+	const bool fireProof = (Field<uint8_t>(ped, offs::ENTITY_FLAGS_C) &
+	                        offs::ENTITY_FIRE_PROOF) != 0;
+	if (!OwnerLightsFlame(fireProof, /*wrecked=*/false)) {
+		if (!g_saidFlamePedNoLight) {
+			g_saidFlamePedNoLight = true;
+			Log("combat: a flame reached our pedestrian net %u on another screen, "
+			    "and he is bFireProof here, which is the test CShotInfo::Update "
+			    "would have made (0x0055C1D9). Not lit", netId);
+		}
+		return;
+	}
+
+	void *const culprit = attacker ? ResolveRemotePed(*attacker) : nullptr;
+
+	using StartFireFn = void *(__thiscall *)(void *, void *, void *, float, uint32_t);
+	void *const fire  = Func<StartFireFn>(CFireManager__StartFireEntity)(
+        reinterpret_cast<void *>(gFireManager), ped, culprit, FIRE_PED_STRENGTH, 1u);
+
+	if (fire) {
+		if (!g_saidFlamePedLit) {
+			g_saidFlamePedLit = true;
+			Log("combat: lit our pedestrian net %u because %s's flame reached him "
+			    "on their screen. Our fire burns him from here on, and his death, "
+			    "if it comes, goes out as C_PedDeath like any other",
+			    netId, attacker ? attacker->nick.c_str() : "somebody");
+		}
+	} else if (!g_saidFlamePedRefused) {
+		// StartFire's own no: already burning (our copy of their flame
+		// probably got him first), not in control, or no free fire slot.
+		g_saidFlamePedRefused = true;
+		Log("combat: a flame reached our pedestrian net %u on another screen and "
+		    "StartFire declined to light him (state %u, %s). Usually that is our "
+		    "own replay of the same flame having got there first",
+		    netId, Field<uint32_t>(ped, offs::PED_STATE),
+		    Field<void *>(ped, PED_FIRE) ? "already burning" : "not burning");
+	}
 }
 
 // __thiscall bool CPed::InflictDamage(CEntity *damagedBy, eWeaponType method,
@@ -1193,6 +2175,16 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 		return died;
 	}
 
+	// Ours, for the two forwarding branches below. A drive-by round names our
+	// car rather than our ped (driveby.h, HitIsOurs), so the car is only
+	// looked up for that one cause.
+	const bool culpritIsOurCar =
+	    damagedBy && method == WEAPONTYPE_UZI_DRIVEBY &&
+	    damagedBy == Func<void *(__cdecl *)()>(FindPlayerVehicle)();
+	const bool ours = !g_replaying && damagedBy &&
+	                  HitIsOurs(damagedBy == localPed, culpritIsOurCar,
+	                            static_cast<uint8_t>(method));
+
 	uint16_t victimNetId = INVALID_NETID;
 	if (self && RemotePlayerForPed(self, victimNetId)) {
 		// Somebody else's player. Their health is theirs.
@@ -1201,9 +2193,15 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 		// city NPC shooting a remote player is a shot that happened in one
 		// simulation and not in the others (docs/protocol.md §3), and
 		// forwarding it would kill someone with a cop they can't see.
-		const bool ours = !g_replaying && damagedBy && damagedBy == localPed;
 		if (ours && IsForwardableDamage(static_cast<uint8_t>(method))) {
-			RecordLocalDamage(victimNetId, method, damage, piece, direction);
+			// A strike or a swing carries its path, and a swing its amount as
+			// if the engine had known this was a player (melee.h).
+			const MeleeTag melee = LocalMeleeTag(damagedBy, method);
+			if (MeleeKind(melee) == MELEE_SWING)
+				damage = SwingAmountForPlayer(damage, method == WEAPONTYPE_BASEBALLBAT,
+				                              (melee.melee & MELEE_HEAVY) != 0,
+				                              g_melee.adrenaline);
+			RecordLocalDamage(victimNetId, method, damage, piece, direction, melee);
 			if (!g_saidHitSent) {
 				g_saidHitSent = true;
 				Log("combat: our first hit on a remote player, net %u for %.0f with "
@@ -1221,6 +2219,94 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 		// False is "the ped did not die", which is what every caller of this
 		// function already handles for a hit that wasn't fatal.
 		return false;
+	}
+
+	// Somebody else's *pedestrian*, and until this branch existed there was
+	// nothing here at all. That absence is the whole of the bug: a replica is
+	// bullet-, fire-, melee- and explosion-proof on purpose
+	// (population.cpp, SpawnAmbientReplica), so the switch inside this function
+	// threw every shot away, the fall-through below happily called the original
+	// which then did nothing, and no packet went anywhere. Shoot a pedestrian
+	// somebody else hosts and there is no reaction, no blood and no death - on
+	// either screen.
+	//
+	// So it is stated here the same way the player rule above is, positively
+	// and in both halves. Nothing on this machine may damage a pedestrian this
+	// machine does not own, and anything the local player did on purpose
+	// becomes a packet instead.
+	//
+	// The refusal is not redundant with the proof flags, for exactly the reason
+	// the player rule is not: the switch this function makes on the damage
+	// cause has two arms that check no flag at all. WEAPONTYPE_DROWNING is one,
+	// and a replica standing in water on this machine drowned locally and then
+	// stayed a corpse forever, because ApplyAmbientPedState refuses to drive
+	// anything into a dead replica and nothing off the wire ever resets
+	// m_nPedState. The `default:` arm is the other.
+	//
+	// **A blast is not routed through here and must not be.** An explosion is
+	// replayed on every machine at a position everybody agreed on, so the
+	// machine that hosts the pedestrian puts its own copy in its own blast and
+	// its own engine kills it - and that death already travels on C_PedDeath.
+	// Forwarding it as damage as well would apply it twice, which is the same
+	// argument IsForwardableDamage makes for a player (§1.10.1).
+	uint16_t pedNetId = INVALID_NETID;
+	if (self && AmbientReplicaForPed(self, pedNetId)) {
+		// Already a corpse here. The report would be refused by the server
+		// (Session::NotePedDeath has marked the row dead) and refused again by
+		// the owner's own engine at 0x004EA485, so the only thing sending it
+		// would achieve is a reliable packet per round of a burst fired into a
+		// body. Dropped before it costs anything.
+		const uint32_t state  = Field<uint32_t>(self, offs::PED_STATE);
+		const bool     corpse = state == PEDSTATE_DIE || state == PEDSTATE_DEAD;
+
+		// Only what the local player did deliberately, the same test and the
+		// same reason as the player branch: a city NPC shooting a replica is a
+		// shot that happened in one simulation and not in the others, and
+		// forwarding it would have this machine's traffic killing another
+		// machine's pedestrians.
+		if (ours && !corpse &&
+		    IsForwardableDamage(static_cast<uint8_t>(method))) {
+			RecordLocalPedDamage(pedNetId, method, damage, piece, direction,
+			                     LocalMeleeTag(damagedBy, method));
+			if (!g_saidPedHitSent) {
+				g_saidPedHitSent = true;
+				Log("combat: our first hit on a hosted pedestrian, net %u for %.0f "
+				    "with cause %u piece %u, is on its way as C_PedDamage. Their "
+				    "machine applies it through its own CPed::InflictDamage and "
+				    "tells the session what came of it", pedNetId, damage, method,
+				    piece);
+			}
+		} else if (ours && !corpse && !g_saidPedHitNotForwarded) {
+			g_saidPedHitNotForwarded = true;
+			Log("combat: our hit on pedestrian net %u is not forwarded, because "
+			    "cause %u is not one the shooter gets to decide (combat.h, "
+			    "IsForwardableDamage). A blast gets there on its own, because "
+			    "every machine replays it at the same place", pedNetId, method);
+		}
+
+		return false;
+	}
+
+	// One of our own pedestrians, hit by somebody else's replayed round.
+	//
+	// If the session has named it, the shooter has a replica of it, and
+	// whatever their round did to that replica is already on its way here as
+	// C_PedDamage. Letting this one through as well took the health twice. The
+	// flinch, the fall and the blood were drawn before this call and stay.
+	if (g_replaying && self && self != localPed) {
+		bool named = false;
+		const bool hosted = HostedPedFor(self, named);
+		if (!ReplayedShotMayDamage(ClassifyReplayPed(hosted, named),
+		                           static_cast<uint8_t>(method))) {
+			if (!g_saidReplayPedRefused) {
+				g_saidReplayPedRefused = true;
+				Log("combat: a replayed shot reached one of our own pedestrians (cause "
+				    "%u, %.0f) and we did not take the health. The shooter's "
+				    "C_PedDamage for it is the hit that counts",
+				    method, damage);
+			}
+			return false;
+		}
 	}
 
 	// Anything still here is a hit this machine is letting through, and if it
@@ -1277,6 +2363,32 @@ void __fastcall HookedSetDie(void *self, void * /*edx*/, uint32_t animId, float 
 	// corpse.
 	const uint32_t before = self ? Field<uint32_t>(self, offs::PED_STATE) : PEDSTATE_NONE;
 	const bool wasDying   = before == PEDSTATE_DIE || before == PEDSTATE_DEAD;
+
+	// **Somebody else's pedestrian, and this machine is not entitled to kill
+	// him.** The third bullet of docs/population.md §5.6, and the only one of
+	// the three that is a rule being broken rather than a fact going
+	// unreported.
+	//
+	// It is a refusal and not a packet, and the reasoning is all in
+	// population.cpp's RefuseLocalReplicaDeath - short version: the host's
+	// copy of this pedestrian is alive, so the observer has discovered
+	// nothing, and an observer that announced its own divergence would be
+	// asking the session to pick a winner between two machines about a
+	// pedestrian only one of them owns.
+	//
+	// Before the original and before the local player's own arm, because the
+	// original is the thing being refused. The local player is never a
+	// replica, so that test is cheap insurance rather than logic.
+	//
+	// Not for a ped that is already down, and that is not a micro-optimisation:
+	// SetDie returns without doing anything for one, so there is nothing to
+	// refuse - but the refusal puts the health back on its way out, and doing
+	// that to a replica the host correctly reported dead would hand a corpse
+	// a hundred health every time something shot it. The transition test the
+	// rest of this function already makes is the right test here too.
+	uint16_t replicaNetId = INVALID_NETID;
+	if (!localPlayer && !wasDying && RefuseLocalReplicaDeath(self, replicaNetId))
+		return;
 
 	g_setDie.Original<SetDieHookFn>()(self, nullptr, animId, delta, speed);
 
@@ -1379,6 +2491,9 @@ bool InstallCombatHooks() {
 	g_localRay       = LocalRay{};
 	g_replayAim      = ReplayAim{};
 	g_lastLocalDamage = LastLocalDamage{};
+	g_inShotUpdate    = false;
+	g_flameThrottle   = FlameReportThrottle{};
+	g_melee           = MeleeCall{};
 
 	struct Spec {
 		const char *name;
@@ -1403,6 +2518,22 @@ bool InstallCombatHooks() {
 	     reinterpret_cast<void *>(&HookedDoDoomAiming), &g_doomAiming},
 	    {"CBulletTraces::AddTrace", CBulletTraces__AddTrace,
 	     reinterpret_cast<void *>(&HookedAddTrace), &g_addTrace},
+	    {"CShotInfo::Update", CShotInfo__Update,
+	     reinterpret_cast<void *>(&HookedShotInfoUpdate), &g_shotUpdate},
+	    {"CFireManager::StartFire", CFireManager__StartFireEntity,
+	     reinterpret_cast<void *>(&HookedStartFire), &g_startFire},
+	    {"CPed::ReactToAttack", CPed__ReactToAttack,
+	     reinterpret_cast<void *>(&HookedReactToAttack), &g_reactToAttack},
+	    {"CPed::SetFall", CPed__SetFall, reinterpret_cast<void *>(&HookedSetFall),
+	     &g_setFall},
+	    {"CWeapon::FireFromCar", CWeapon__FireFromCar,
+	     reinterpret_cast<void *>(&HookedFireFromCar), &g_fireFromCar},
+	    {"CPed::FightStrike", CPed__FightStrike,
+	     reinterpret_cast<void *>(&HookedFightStrike), &g_fightStrike},
+	    {"CWeapon::FireMelee", CWeapon__FireMelee,
+	     reinterpret_cast<void *>(&HookedFireMelee), &g_fireMelee},
+	    {"CPed::StartFightDefend", CPed__StartFightDefend,
+	     reinterpret_cast<void *>(&HookedStartFightDefend), &g_startFightDefend},
 	};
 
 	bool all = true;
@@ -1444,6 +2575,17 @@ void RemoveCombatHooks() {
 	g_bulletImpact.Remove();
 	g_doomAiming.Remove();
 	g_addTrace.Remove();
+	g_shotUpdate.Remove();
+	g_startFire.Remove();
+	g_reactToAttack.Remove();
+	g_setFall.Remove();
+	g_fireFromCar.Remove();
+	g_fightStrike.Remove();
+	g_fireMelee.Remove();
+	g_startFightDefend.Remove();
+	g_melee        = MeleeCall{};
+	g_inShotUpdate = false;
+	g_flameThrottle = FlameReportThrottle{};
 	g_count = g_head = 0;
 	g_friendlyFire   = false;
 	g_localRay       = LocalRay{};
@@ -1455,7 +2597,11 @@ bool CombatHooksInstalled() {
 	       g_removeProjectile.IsInstalled() && g_inflictDamage.IsInstalled() &&
 	       g_setDie.IsInstalled() && g_lineOfSight.IsInstalled() &&
 	       g_bulletImpact.IsInstalled() && g_doomAiming.IsInstalled() &&
-	       g_addTrace.IsInstalled();
+	       g_addTrace.IsInstalled() && g_shotUpdate.IsInstalled() &&
+	       g_startFire.IsInstalled() && g_reactToAttack.IsInstalled() &&
+	       g_setFall.IsInstalled() && g_fireFromCar.IsInstalled() &&
+	       g_fightStrike.IsInstalled() && g_fireMelee.IsInstalled() &&
+	       g_startFightDefend.IsInstalled();
 }
 
 void SetFriendlyFire(bool enabled) { g_friendlyFire = enabled; }
@@ -1472,7 +2618,24 @@ uint8_t DrainLocalCombat(CombatEvent *out, uint8_t max) {
 
 // ---- replaying somebody else's shot ---------------------------------------
 
+bool ReplayingRemoteShot() { return g_replaying; }
+
+bool LocalPlayerFiring() { return g_localFiring; }
+
+bool IsRemotePlayersProjectile(const void *info) { return TrackedSlotOf(info) >= 0; }
+
 void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
+	// A drive-by round is drawn, not replayed: driveby.h says why.
+	if (shot.weapon == WEAPONTYPE_UZI_DRIVEBY) {
+		void *const ped = ResolveRemotePed(player);
+		if (!ped) {
+			RefuseShot(GATE_NO_PED, "we have no ped for them right now", player, shot.weapon);
+			return;
+		}
+		DrawRemoteDriveBy(player, ped, shot);
+		return;
+	}
+
 	if (!IsReplayableWeapon(shot.weapon)) {
 		RefuseShot(GATE_WEAPON,
 		           "that weapon is not one an observer replays (combat.h, "
@@ -1486,13 +2649,14 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
 		return;
 	}
 
-	// A seated ped's gun is the car's business - drive-bys run through a
-	// different engine path (CWeapon::FireFromCar) that isn't synced. A
-	// dying ped has already stopped: CWeapon::Fire would still go through,
-	// and a muzzle flash out of a corpse looks worse than nothing at all.
+	// A seated ped's gun is the car's business - a drive-by arrives as weapon
+	// 19 and is drawn above, so anything else from a seat is a round fired on
+	// foot that raced the seating here. A dying ped has already stopped:
+	// CWeapon::Fire would still go through, and a muzzle flash out of a
+	// corpse looks worse than nothing at all.
 	if (Field<bool>(ped, offs::PED_IN_VEHICLE)) {
-		RefuseShot(GATE_SEATED, "their ped is in a car and drive-bys are not synced",
-		           player, shot.weapon);
+		RefuseShot(GATE_SEATED, "their ped is in a car here and the round was not a "
+		           "drive-by", player, shot.weapon);
 		return;
 	}
 	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
@@ -1593,8 +2757,12 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
 	if (pointGunAt)
 		Field<void *>(ped, offs::PED_POINT_GUN_AT) = nullptr;
 
+	// The health is refused inside the call (HookedInflictDamage); the
+	// reaction the fire path plays before that is fenced here and in
+	// HookedReactToAttack / HookedSetFall. combat.h, LocalPlayerHitReaction.
 	{
-		ReplayGuard guard;
+		ReplayGuard     guard;
+		ReplayBodyFence fence(localPed);
 		Func<FireThisFn>(CWeapon__Fire)(weapon, ped, source);
 	}
 
@@ -1809,10 +2977,26 @@ void ApplyRemoteDamage(RemotePlayer *attacker, const DamageBody &body) {
 	// the detour's remote-attacker rule refuses. That rule is for hits this
 	// machine invented; this one was decided by the machine entitled to
 	// decide it and has already crossed the network.
+	// The reaction first, as the engine's fire path does it. InflictDamage
+	// plays none for a hit that doesn't kill, and the replay of this round is
+	// no longer allowed to (combat.h, LocalPlayerHitReaction).
+	PlayForwardedHitReaction(ped, culprit, body.weapon, direction);
+
+	// A punch or a bat brings the fight code's half with it (melee.h).
+	const MeleeTag melee = ReadMeleeTag(body.weapon, body.melee, body.hitLevel);
+	MeleeReaction  fight;
+	if (!MeleeBeforeDamage(ped, true, culprit, melee, body.weapon, amount, direction, fight))
+		return;
+
 	{
 		RemoteDamageGuard guard;
 		Func<InflictThisFn>(CPed__InflictDamage)(ped, culprit, body.weapon, amount,
 		                                         body.piece, direction);
+	}
+
+	if (fight.play) {
+		MeleeAfterDamage(ped, true, culprit, melee, body.weapon, direction, fight);
+		SayMeleeApplied(melee, body.weapon, true);
 	}
 
 	if (!g_saidHitApplied) {
@@ -1820,6 +3004,163 @@ void ApplyRemoteDamage(RemotePlayer *attacker, const DamageBody &body) {
 		Log("combat: took our first hit off the wire, %.0f from %s with cause %u",
 		    amount, attacker ? attacker->nick.c_str() : "someone we have no ped for",
 		    body.weapon);
+	}
+}
+
+void ApplyRemotePedDamage(RemotePlayer *attacker, const PedDamageBody &body) {
+	// The one thing this machine is entitled to hurt on somebody else's word:
+	// a pedestrian of its own that the session has named. population.cpp's
+	// filter is the entitlement, and it is the same filter NoteHostedPedDeath
+	// uses in the other direction - a replica fails it, which is what stops a
+	// machine being talked into hurting a pedestrian it is only watching.
+	void *const ped = ResolveHostedPed(body.netId);
+	if (!ped) {
+		// A netId we no longer host. Dropped, not retried, and that is the
+		// decision rather than an omission: a hit only means anything at the
+		// instant it happened, and there is nothing left to land it on.
+		// CPopulation reaps pedestrians constantly and the round trip is
+		// several frames long, so this is the ordinary race and not an error.
+		if (!g_saidPedHitGone) {
+			g_saidPedHitGone = true;
+			Log("combat: a hit arrived for pedestrian net %u and we do not host one "
+			    "under that name any more - our engine reaped him inside the round "
+			    "trip. Dropped, because a hit is only worth anything at the moment "
+			    "it happened", body.netId);
+		}
+		return;
+	}
+
+	// Every bound below is on something that arrived off a socket and is about
+	// to be handed to the engine, and each one is the same bound
+	// ApplyRemoteDamage applies for a player: the weapon steers a switch inside
+	// InflictDamage, the piece steers another one and decides which limb comes
+	// off, the direction indexes two four-entry jump tables, and the amount
+	// reaches CPed::m_fHealth - from where the death path takes it into the
+	// ped's own matrix.
+	//
+	// Cause 9 first, because it is not damage at all: the shooter's flame
+	// reached this pedestrian on their screen (combat.h, IsFlameIgnition).
+	if (IsFlameIgnition(body.weapon)) {
+		LightHostedPedForFlame(attacker, ped, body.netId);
+		return;
+	}
+	if (!IsForwardableDamage(body.weapon))
+		return;
+	if (!IsKnownPedPiece(body.piece))
+		return;
+
+	float amount = 0.0f;
+	if (!FiniteOr(body.amount, 0.0f, amount) || !(amount > 0.0f))
+		return;
+	if (amount > MAX_REMOTE_DAMAGE)
+		amount = MAX_REMOTE_DAMAGE;
+
+	const uint32_t direction =
+	    IsKnownDamageDirection(body.direction) ? body.direction : 0u;
+
+	// Blame, and it is the same choice ApplyRemoteDamage makes for the same
+	// reason: passing the shooter's own ped means the engine's bookkeeping - the
+	// blood, the threat entity, the ped's own reaction - points at the player
+	// who did it rather than at nobody. Null is fine and means what the
+	// script's own damage calls mean by it; the function's `test esi,esi / je`
+	// at 0x004EAACC skips only the car-ramming speed block and the damage still
+	// lands.
+	//
+	// What it does *not* buy is the kill register. At 0x004EAD1A the engine
+	// credits CDarkel only when `damagedBy` is FindPlayerPed() or
+	// FindPlayerVehicle(), and on this machine the shooter is a replica of
+	// somebody else's ped - so the engine registers a co-op kill on an NPC on
+	// neither machine: the shooter cannot either, because its own
+	// InflictDamage returned before reaching that arm. During a rampage that
+	// is put right below, by CreditRemotePedKill (game/darkel.cpp) once the
+	// ped is dead. Outside one, nothing registers it.
+	void *const culprit = attacker ? ResolveRemotePed(*attacker) : nullptr;
+
+	// Read either side of the call, because "the packet arrived" and "the
+	// pedestrian was hurt" are two different claims and the gap between them is
+	// exactly where the last two rounds of this were lost.
+	const float    before      = Field<float>(ped, offs::PED_HEALTH);
+	const uint32_t stateBefore = Field<uint32_t>(ped, offs::PED_STATE);
+
+	// A punch or a bat: the ped reacts, defends, and after the damage falls
+	// and is shoved, here where he lives (melee.h). A pedestrian is never a
+	// player, so nothing spares him.
+	const MeleeTag melee = ReadMeleeTag(body.weapon, body.melee, body.hitLevel);
+	MeleeReaction  fight;
+	MeleeBeforeDamage(ped, false, culprit, melee, body.weapon, amount, direction, fight);
+
+	// Through the real function rather than the trampoline, the same as
+	// ApplyRemoteDamage: the detour passes straight through for a ped that is
+	// neither the local player nor a replica, and a pedestrian this machine
+	// hosts is neither - so this reaches the engine on a build where the hook
+	// failed to install too.
+	//
+	// The remote-damage guard is not needed here and is deliberately not taken.
+	// The rule it exists to get past is the one about the *local player's*
+	// health, and `self` is not the local player; taking the guard anyway would
+	// widen a session-wide flag over a call that does not need it.
+	Func<InflictThisFn>(CPed__InflictDamage)(ped, culprit, body.weapon, amount,
+	                                         body.piece, direction);
+
+	if (fight.play) {
+		MeleeAfterDamage(ped, false, culprit, melee, body.weapon, direction, fight);
+		SayMeleeApplied(melee, body.weapon, false);
+	}
+
+	const float after = Field<float>(ped, offs::PED_HEALTH);
+
+	// The hit killed him, and the kill has just been credited to nobody.
+	//
+	// `culprit` above is the replica of the shooter's ped, which is the right
+	// entity for the blood, the threat and the reaction - and is precisely
+	// what stops the engine crediting the kill, because the test at
+	// 0x004EAD1A only accepts FindPlayerPed() or FindPlayerVehicle(). So the
+	// engine sent this one to RegisterKillNotByPlayer, and the shooter's own
+	// machine could not register it either. It is a rampage kill made by a
+	// player and it is counting for nobody in the session.
+	//
+	// game/darkel.cpp puts it through the engine's own register instead,
+	// which is also what sends it to every other machine. Nothing happens
+	// here when no frenzy is running, which is almost always.
+	const uint32_t stateAfter = Field<uint32_t>(ped, offs::PED_STATE);
+	const bool     wasAlive   = stateBefore != PEDSTATE_DIE && stateBefore != PEDSTATE_DEAD;
+	const bool     nowDead    = stateAfter == PEDSTATE_DIE || stateAfter == PEDSTATE_DEAD;
+	if (wasAlive && nowDead)
+		CreditRemotePedKill(ped, body.weapon, body.piece);
+
+	// A pedestrian in a seat, which is worth its own line because "I shot the
+	// driver and nothing happened" is a true statement about retail GTA III and
+	// the log should say so rather than leave it looking like a sync bug.
+	// InflictDamage's in-vehicle arm sends everything but drowning to
+	// 0x004EADD0, which writes 1.0f into m_fHealth and returns false.
+	if (!g_saidPedHitInCar && Field<bool>(ped, offs::PED_IN_VEHICLE)) {
+		g_saidPedHitInCar = true;
+		Log("combat: the first hit we took off the wire for one of our pedestrians "
+		    "landed on one sitting in a car (net %u, %.0f health before, %.0f "
+		    "after). Retail 1.0 cannot kill a ped in a seat with anything but "
+		    "drowning - CPed::InflictDamage clamps him to exactly 1.0f at "
+		    "0x004EADD0 and answers 'did not die'. So he will not drop, here or "
+		    "on the shooter's screen, and that is the game rather than the wire",
+		    body.netId, before, after);
+	}
+
+	if (after < before) {
+		if (!g_saidPedHitApplied) {
+			g_saidPedHitApplied = true;
+			Log("combat: hurt one of our own pedestrians off the wire - net %u, "
+			    "%.2f health this hit, %.0f left, reported by %s with cause %u. "
+			    "Whatever comes of it goes back out on our own C_PedBodyPart and "
+			    "C_PedDeath", body.netId, before - after, after,
+			    attacker ? attacker->nick.c_str() : "someone we have no ped for",
+			    body.weapon);
+		}
+	} else if (!g_saidPedHitNoMove) {
+		g_saidPedHitNoMove = true;
+		Log("combat: a hit off the wire reached CPed::InflictDamage on our "
+		    "pedestrian net %u and took no health off (%.0f before, %.0f after, "
+		    "%.2f asked for). The authority rule is not what stopped it - look at "
+		    "bUsesCollision, at the ped already dying, or at a seat",
+		    body.netId, before, after, amount);
 	}
 }
 

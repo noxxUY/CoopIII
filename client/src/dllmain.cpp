@@ -12,17 +12,27 @@
 #include "client.h"
 #include "clock.h"
 #include "config.h"
+#include "game/cheats.h"
 #include "game/combat.h"
+#include "game/darkel.h"
 #include "game/frame.h"
 #include "game/garage.h"
+#include "game/heli.h"
+#include "game/heligun.h"
+#include "game/liftbridge.h"
+#include "game/lights.h"
+#include "game/money.h"
 #include "game/nametag.h"
 #include "game/object.h"
 #include "game/pause.h"
 #include "game/ped.h"
 #include "game/pickup.h"
+#include "game/planes.h"
 #include "game/population.h"
 #include "game/radar.h"
 #include "game/seat.h"
+#include "game/sessionclock.h"
+#include "game/trains.h"
 #include "game/vehicle.h"
 #include "game/wanted.h"
 #include "game/verify.h"
@@ -81,6 +91,12 @@ void PreFrame() {
 void PostFrame() {
 	g_client.PostFrame();
 
+	// After CGame::Process, which is exactly where CPhysical::ProcessControl
+	// has just finished deciding whether each loose object is asleep. Walks
+	// the handful of objects this machine knocked over and owes everybody a
+	// resting place for, and is a no-op on every frame nobody hit anything.
+	game::TickUprootedObjects();
+
 	// Last, so the flag agrees with the menu again by the time
 	// cAudioManager::Service and the HUD read it - both run after
 	// CGame::Process returns.
@@ -98,7 +114,7 @@ void PostFrame() {
 
 		// Ped drops, and only once anything has happened. Three numbers
 		// answer the only question worth asking in one glance, the same way
-		// the combat lines do (AGENTS.md, "the damage that never landed"):
+		// the combat lines do:
 		// did our own peds drop anything, did we refuse the ones that are
 		// not ours, and did anything arrive from anybody else. A feature
 		// that does nothing has to say which of the three it stopped at.
@@ -125,6 +141,22 @@ void PostFrame() {
 			    o.breaksSeen, o.reported, o.received, o.receivedUnmatched,
 			    o.receivedNoop, o.skippedExplosion, o.skippedReplica,
 			    o.skippedUnowned);
+
+		// Uprooting, on its own line and on the same rule, because it is the
+		// half that used to be missing and "breaking works and nothing falls
+		// over" has to be readable as such. `came loose` moving while `rest
+		// sent` stays at zero means objects are being knocked over and never
+		// coming to rest here - which would be the watch table leaking or
+		// the pool churning them away before they stop.
+		if (o.uprootsSeen || o.restsReceived)
+			Log("frame: uprooted objects - %u came loose (%u ours to follow, "
+			    "%u somebody else's, %u in a blast), %u rest(s) sent, %u from "
+			    "the wire (%u had nothing here, %u refused); %u lost before "
+			    "they stopped, %u dropped to a full table",
+			    o.uprootsSeen, o.uprootsWatched, o.uprootsNotOurs,
+			    o.uprootsBlast, o.restsSent, o.restsReceived,
+			    o.restsUnmatched, o.restsRefused, o.uprootsLost,
+			    o.uprootsDropped);
 
 		// What the moving-list sweep actually costs, measured on the machine
 		// it runs on rather than asserted in a comment. It is on the game
@@ -228,6 +260,10 @@ DWORD WINAPI Boot(LPVOID) {
 		Log("CoopIII: combat is not fully hooked; firing, explosions and damage "
 		    "may not reach other players");
 
+	// A remote player's arms up or down with their aim. Cosmetic: the shot
+	// itself is aimed off C_Shot's direction whether this installs or not.
+	game::InstallAimPitchHook();
+
 	// Same story for a car blowing up, and the same reason it is a detour
 	// rather than a field: nothing in the engine watches a car's health for
 	// zero, so an observer handed a health of zero gets an undamaged-looking
@@ -244,11 +280,48 @@ DWORD WINAPI Boot(LPVOID) {
 	if (!game::InstallPopulationHooks())
 		Log("CoopIII: ambient pedestrians stay local to each machine");
 
+	// Cheats (game/cheats.h). Not fatal: without the first detour every cheat
+	// runs where it was typed, which is what it always did; without the second
+	// a riot can move a replica here until its owner's stream puts it back.
+	if (!game::InstallCheatHooks())
+		Log("CoopIII: cheats are not fully routed; see the cheats: lines above");
+
+	// Money (game/money.h). Not fatal: without it a wrecked car pays whoever's
+	// game watched it, which is what it always did, whatever the server says.
+	if (!game::InstallMoneyHook())
+		Log("CoopIII: rewards for wrecked cars stay with whoever's game saw them");
+
+	// The El, the subway and the planes on the server's clock. Neither is
+	// fatal: without them each machine runs its own trains and flies its own
+	// planes, which is how it has always been.
+	game::InstallTrainClock();
+	game::InstallPlaneClock();
+	// The traffic lights and the Shoreside lift bridge, the same way and just as
+	// optional: without them each machine keeps its own lights and its own
+	// bridge.
+	game::InstallLightClock();
+	game::InstallLiftBridgeClock();
+
+	// The police helicopter (game/heli.h). Six detours, none fatal: without
+	// them each wanted player's helicopter is his machine's alone, which is
+	// how it has always been. Before MakeWorldBridge's callers below, because
+	// AddHeliToBridge only offers replicas once the ProcessControl detour is
+	// in - a replica without it would fly the real AI at this machine's player.
+	if (!game::InstallHeliHooks())
+		Log("CoopIII: the police helicopter is not fully shared; see the heli: "
+		    "lines above for what that costs");
+	// Its gun. One detour, on the function the helicopter fires through;
+	// without it our own helicopter's rounds are only seen here. Drawing
+	// somebody else's needs nothing hooked.
+	if (!game::InstallHeliGunHook())
+		Log("CoopIII: our police helicopter's gunfire stays on this machine");
+
 	WorldBridge bridge = game::MakeWorldBridge();
 	// Clock and weather are wired here rather than inside MakeWorldBridge
 	// because they share nothing with the ped and vehicle code: different
 	// addresses, different file, no entities involved.
 	game::AddWorldToBridge(bridge);
+	game::AddSessionClockToBridge(bridge);
 	game::AddVehicleBlastToBridge(bridge);
 	game::SetSeatKey(g_config.seatKey);
 	game::AddSeatToBridge(bridge);
@@ -258,6 +331,12 @@ DWORD WINAPI Boot(LPVOID) {
 	// AddPopulationToBridge above has been replicating all along
 	// (docs/wanted.md §4.2).
 	game::InstallWantedBridge(bridge);
+	// Rampages. Four entries and three detours; game/darkel.h is the design.
+	game::InstallRampageBridge(bridge);
+	game::AddHeliToBridge(bridge);
+	game::AddHeliGunToBridge(bridge);
+	game::AddCheatsToBridge(bridge);
+	game::AddMoneyToBridge(bridge);
 
 	// Pickups. One detour, on CPickups::Update, and it is the only way a
 	// pickup can be collected in this build - docs/pickups.md 3 has the
@@ -314,6 +393,38 @@ DWORD WINAPI Boot(LPVOID) {
 		game::SetPickupCallbacks(pickups);
 	}
 
+	// Rampages - docs/roadmap.md §5.10, game/darkel.h.
+	//
+	// Four detours, on CDarkel::StartFrenzy, CDarkel::RegisterKillByPlayer,
+	// CDarkel::RegisterCarBlownUpByPlayer and CDarkel::ReadStatus. Not fatal,
+	// and the failures are different enough that darkel.cpp logs them one at
+	// a time.
+	//
+	// What they buy, in one line: without them a KILLFRENZY pickup starts a
+	// rampage on every machine - the pickup work already does that for free -
+	// but each machine counts only its own player's kills and ends its own
+	// rampage on its own arithmetic, so one player gets the reward while
+	// another is told it failed.
+	if (!game::InstallRampageHooks())
+		Log("CoopIII: rampages are counted per machine, so a rampage can end "
+		    "differently on different screens");
+
+	{
+		game::RampageCallbacks rampage;
+		rampage.Started = [](const RampageStartBody &body) {
+			g_client.RampageStarted(body);
+		};
+		rampage.Kill = [](uint16_t model, uint8_t weapon, bool headshot) {
+			g_client.RampageKilled(model, weapon, headshot);
+		};
+		rampage.CarDestroyed = [](uint16_t model, const UnownedVehicleKey &key) {
+			g_client.RampageCarDestroyed(model, key);
+		};
+		rampage.Ended = [](uint8_t outcome) { g_client.RampageEnded(outcome); };
+		rampage.HaveSession = []() { return g_client.IsConnected(); };
+		game::SetRampageCallbacks(rampage);
+	}
+
 	// What a dead pedestrian leaves on the pavement - docs/pickups.md 10.
 	// Two detours on the only two functions in the game that make a pickup
 	// main.scm did not.
@@ -344,6 +455,14 @@ DWORD WINAPI Boot(LPVOID) {
 		objects.Broken = [](const ObjectBreakBody &body) {
 			return g_client.ReportObjectBroken(body);
 		};
+		objects.Settled = [](const ObjectRestBody &body) {
+			return g_client.ReportObjectSettled(body);
+		};
+		// The one thing object.cpp cannot work out for itself: a bullet
+		// leaves no collision record, so "did our player do this or are we
+		// replaying somebody else's trigger pull" is combat.cpp's answer and
+		// nobody else's. docs/objects.md 5.
+		objects.InReplayedShot = []() { return game::ReplayingRemoteShot(); };
 		objects.IsReplicatedPed = [](int32_t pedRef) {
 			return g_client.IsReplicatedPed(pedRef);
 		};
@@ -411,17 +530,32 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			game::RemoveRadarArrows();
 			g_client.Stop();
 			game::RemovePausePolicy();
+			game::RemoveTrainClock();
+			game::RemovePlaneClock();
+			game::RemoveLightClock();
+			game::RemoveLiftBridgeClock();
 			// Before the frame hook, and before MinHook goes away. Removing
 			// the combat detours ends every projectile CoopIII was animating
 			// for somebody else, and that has to happen while the detour
 			// keeping them from exploding is still installed.
 			game::RemoveCombatHooks();
+			game::RemoveAimPitchHook();
 			// Same reason, and it also puts CVehicleModelInfo::ms_compsToUse
 			// back to { -2, -2 }. Leaving a component override behind would
 			// have the game fit it to the next car it creates by itself, for
 			// the rest of the session, with CoopIII gone and nothing left to
 			// explain it.
 			game::RemoveVehicleHooks();
+			// After Client::Stop, which has already destroyed every helicopter
+			// replica. A replica left behind with the ProcessControl detour
+			// gone would start chasing the local player.
+			game::RemoveHeliHooks();
+			game::RemoveHeliGunHook();
+			// Before the population hooks: the ScanForThreats detour asks the
+			// replica index whether a ped is one of ours.
+			game::RemoveCheatHooks();
+			// After Client::Stop, which has told it the session is over.
+			game::RemoveMoneyHook();
 			// After Client::Stop, which has already destroyed every replica.
 			// The peds this machine hosts are left alone: they are the engine's
 			// own pedestrians and go on being pedestrians without us.

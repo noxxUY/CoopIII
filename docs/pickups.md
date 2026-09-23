@@ -479,12 +479,15 @@ trivial. Accepted for M4. If it ever matters, the fix is a server-side
 multiplier on the kill target - which needs the script intercepted, i.e. M5 -
 and **not** a per-player split.
 
-**One thing is explicitly not in M4:** remote players' kills do not yet count
-toward `CDarkel`. The frenzy starts for everyone and each machine counts only
-its own player's kills, so the target is reached on whichever machine did the
-killing and the others' counters lag. Closing it is small - M3 already carries
-death events (`protocol.md` §1.10) - but it is a `CDarkel` feature, not a
-pickup one, and it is listed in `roadmap.md` M4 as its own line.
+**One thing was explicitly not in M4** and has since been built: remote
+players' kills counting toward `CDarkel`. The frenzy starts for everyone off
+the mechanism above, and that half was right - but the counting was worse than
+"each machine counts its own". `CPed::InflictDamage` only reaches the kill
+register when the damaging entity is `FindPlayerPed()` or
+`FindPlayerVehicle()` (`0x004EAD1A`), and in a session a pedestrian is hosted
+by one machine and shot from another, so the kill counted for **nobody**. It
+is a `CDarkel` feature rather than a pickup one and it lives in
+[rampage.md](rampage.md).
 
 ---
 

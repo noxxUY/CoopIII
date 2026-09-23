@@ -339,6 +339,340 @@ void TestEmptyingStopsTheClock() {
 	Check(out.pos.x > 90.0f, "on the new timeline, with no memory of the old one");
 }
 
+// ---- engine speed ----------------------------------------------------------
+//
+// m_vecMoveSpeed is metres per 1/50 s step; the buffers extrapolate in m/s.
+// interp.h has the addresses.
+
+void TestEngineSpeedUnits() {
+	std::printf("\nengine speed to metres per second\n");
+	Check(ENGINE_STEPS_PER_SECOND == 50.0f, "one engine step is 1/50 s");
+	const Vec3 v = MoveSpeedToMps(Vec3{0.5f, -0.1f, 0.02f});
+	Check(Near(v.x, 25.0f) && Near(v.y, -5.0f) && Near(v.z, 1.0f),
+	      "0.5 a step is 25 m/s, on every axis");
+}
+
+void TestACarCoastsAtItsRealSpeed() {
+	std::printf("\na car coasting on a lost packet\n");
+	VehicleInterpBuffer b;
+	b.Push(1000, Vec3{0.0f, 0.0f, 0.0f}, Yaw(0.0f), MoveSpeedToMps(Vec3{0.5f, 0.0f, 0.0f}));
+
+	VehicleTransform out;
+	b.Sample(1200, out);
+	Check(Near(out.pos.x, 5.0f), "0.5 a step (90 km/h) covers 5 m in 200 ms");
+	b.Sample(5000, out);
+	Check(Near(out.pos.x, 6.25f), "and stops at the 250 ms cap, 6.25 m");
+
+	InterpBuffer p;
+	p.Push(1000, {0.0f, 0.0f, 0.0f}, 0.0f, MoveSpeedToMps(Vec3{0.1f, 0.0f, 0.0f}));
+	Pose pose;
+	p.Sample(1100, pose);
+	Check(Near(pose.pos.x, 0.5f), "a ped running at 0.1 a step covers 0.5 m in 100 ms");
+}
+
+void TestALoneSampleIsHeldNotThrownForward() {
+	std::printf("\nthe first sample of a stream\n");
+	// SampleDelayed starts DELAY_MS behind the only sample there is. That
+	// used to wrap and extrapolate the full 250 ms.
+	const Vec3 fast = MoveSpeedToMps(Vec3{0.5f, 0.0f, 0.0f});
+
+	VehicleInterpBuffer b;
+	b.Push(5000, Vec3{10.0f, 0.0f, 0.0f}, Yaw(0.0f), fast);
+	VehicleTransform out;
+	Check(b.SampleDelayed(20000, out), "samples");
+	Check(Near(out.pos.x, 10.0f), "a car's first frame is where it was sent from");
+	Check(b.Sample(4900, out) && Near(out.pos.x, 10.0f), "and so is any instant before it");
+
+	InterpBuffer p;
+	p.Push(5000, {3.0f, 0.0f, 0.0f}, 0.0f, fast);
+	Pose pose;
+	Check(p.SampleDelayed(20000, pose), "samples");
+	Check(Near(pose.pos.x, 3.0f), "same for a ped");
+}
+
+// Frames at 60 fps and a car at 25 m/s streamed at `intervalMs`, skipping the
+// samples in [dropFrom, dropTo). Returns the smallest and largest distance the
+// car moved in one frame once the playback clock has settled.
+struct Steps {
+	float min = 1e9f;
+	float max = 0.0f;
+};
+
+Steps Drive(uint32_t intervalMs, uint32_t dropFrom, uint32_t dropTo,
+            uint32_t jitterMs = 0) {
+	constexpr float    MPS   = 25.0f;
+	constexpr uint32_t START = 10000;
+	const Vec3 vel = MoveSpeedToMps(Vec3{MPS / ENGINE_STEPS_PER_SECOND, 0.0f, 0.0f});
+
+	VehicleInterpBuffer b;
+	uint32_t nextSend = START;
+	float    lastX    = 0.0f;
+	bool     have     = false;
+	Steps    s;
+	static const uint32_t FRAME[3] = {17, 17, 16};
+	uint32_t now = START;
+	// Each sample lands 0..jitterMs after it was sent, in a fixed shuffle so
+	// the run is the same every time.
+	auto arrives = [&](uint32_t sent) {
+		return sent + (jitterMs ? (sent / intervalMs * 37) % (jitterMs + 1) : 0);
+	};
+	for (int f = 0; now < START + 2000; ++f) {
+		while (arrives(nextSend) <= now) {
+			if (nextSend < dropFrom || nextSend >= dropTo)
+				b.Push(nextSend, Vec3{MPS * (nextSend - START) / 1000.0f, 0.0f, 0.0f},
+				       Yaw(0.0f), vel);
+			nextSend += intervalMs;
+		}
+		VehicleTransform at;
+		if (b.SampleDelayed(now, at)) {
+			if (have && now > START + 300) {
+				const float step = at.pos.x - lastX;
+				s.min = step < s.min ? step : s.min;
+				s.max = step > s.max ? step : s.max;
+			}
+			lastX = at.pos.x;
+			have  = true;
+		}
+		now += FRAME[f % 3];
+	}
+	return s;
+}
+
+void TestLostPacketsDoNotStallACar() {
+	std::printf("\nthree lost packets on a car at 25 m/s\n");
+	// About 0.42 m a frame, a little less while the clock eases back. With
+	// the velocity fifty times too small the frames inside the gap moved
+	// under a centimetre and the first one after it jumped well over a metre.
+	const Steps s = Drive(40, 11000, 11120);
+	std::printf("    per-frame step %.3f .. %.3f m\n", s.min, s.max);
+	Check(s.min > 0.2f, "it keeps moving through the gap");
+	Check(s.max < 0.55f, "and doesn't jump when the stream comes back");
+}
+
+void TestTenHertzTrafficKeepsMoving() {
+	std::printf("\none lost row at 10 Hz, extrapolated\n");
+	// The traffic stream's limiter lands on a 60 fps frame, so rows really
+	// go out about every 117 ms, with some jitter on arrival. One lost row
+	// is a 234 ms gap, and a 100 ms delay doesn't cover it. This is plain
+	// SampleDelayed, which bridges the gap along the last velocity. Traffic
+	// itself no longer reads it that way - see the SampleDelayedHeld tests
+	// below for what it does instead and what that costs.
+	const Steps s = Drive(117, 10930, 10940, 30);
+	std::printf("    per-frame step %.3f .. %.3f m\n", s.min, s.max);
+	Check(s.min > 0.2f, "it keeps moving through the gap");
+	Check(s.max < 0.55f, "and doesn't catch up in a jump");
+}
+
+void TestAStallStaysInsideTheCap() {
+	std::printf("\na stream that stops\n");
+	VehicleInterpBuffer b;
+	const Vec3 vel = MoveSpeedToMps(Vec3{0.5f, 0.0f, 0.0f});
+	for (uint32_t t = 10000; t <= 10400; t += 40)
+		b.Push(t, Vec3{25.0f * (t - 10000) / 1000.0f, 0.0f, 0.0f}, Yaw(0.0f), vel);
+	const float lastX = 25.0f * 0.4f;
+
+	static const uint32_t FRAME[3] = {17, 17, 16};
+	uint32_t now = 10000;
+	VehicleTransform at;
+	float furthest = 0.0f;
+	for (int f = 0; now < 13000; ++f) {
+		b.SampleDelayed(now, at);
+		furthest = at.pos.x > furthest ? at.pos.x : furthest;
+		now += FRAME[f % 3];
+	}
+	std::printf("    held %.2f m past the last sample\n", at.pos.x - lastX);
+	Check(furthest - lastX <= 6.25f + 0.01f, "never further than 250 ms at 25 m/s");
+	Check(at.pos.x - lastX > 5.0f, "and holds most of that, not snapping back");
+}
+
+// ---- traffic: held on the last row, never coasted past it ------------------
+//
+// A traffic car's host streams only the eight nearest its own player, so a
+// car's rows can stop for good while it lives on. SampleDelayedHeld is what
+// Client::CorrectAmbientCars reads, and these pin what it does with a stream
+// that stops and starts.
+
+// One row of a host's car: when it was sent, when it lands here, where the
+// car was and how fast it was going (m/s along x).
+struct Row {
+	uint32_t sent;
+	uint32_t arrives;
+	float    x;
+	float    mps;
+};
+
+// Frames at 60 fps from `start` to `end`, pushing each row once it has
+// arrived and sampling either way. Records every frame's x.
+struct Trace {
+	float    xs[400];
+	uint32_t at[400];
+	int      n = 0;
+};
+
+Trace Play(const Row *rows, int count, uint32_t start, uint32_t end, bool held) {
+	static const uint32_t FRAME[3] = {17, 17, 16};
+	VehicleInterpBuffer b;
+	Trace t;
+	int next = 0;
+	uint32_t now = start;
+	for (int f = 0; now < end && t.n < 400; ++f) {
+		while (next < count && rows[next].arrives <= now) {
+			b.Push(rows[next].sent, Vec3{rows[next].x, 0.0f, 0.0f}, Yaw(0.3f),
+			       Vec3{rows[next].mps, 0.0f, 0.0f});
+			++next;
+		}
+		VehicleTransform out;
+		if (held ? b.SampleDelayedHeld(now, out) : b.SampleDelayed(now, out)) {
+			t.xs[t.n] = out.pos.x;
+			t.at[t.n] = now;
+			++t.n;
+		}
+		now += FRAME[f % 3];
+	}
+	return t;
+}
+
+// A car at 25 m/s whose rows go out every 117 ms from 10000, landing 0..jitter
+// ms late, with the rows sent in [quietFrom, quietTo) never arriving.
+int Cruise(Row *out, int max, uint32_t quietFrom, uint32_t quietTo, uint32_t jitter,
+           uint32_t until) {
+	int n = 0;
+	for (uint32_t s = 10000; s < until && n < max; s += 117) {
+		if (s >= quietFrom && s < quietTo)
+			continue;
+		const uint32_t late = jitter ? (s / 117 * 37) % (jitter + 1) : 0;
+		out[n++] = Row{s, s + late, 25.0f * (s - 10000) / 1000.0f, 25.0f};
+	}
+	return n;
+}
+
+void TestHeldIsSampleDelayedWhileRowsFlow() {
+	std::printf("\ntraffic that is streaming normally\n");
+	// Up to 50 ms of arrival jitter the playback clock never reaches the
+	// newest row, so the clamp never fires. Measured past that it depends on
+	// how the late rows fall, which is the point of the next two tests.
+	bool same = true;
+	for (uint32_t jitter = 0; jitter <= 50; jitter += 10) {
+		Row rows[64];
+		const int n = Cruise(rows, 64, 0, 0, jitter, 13000);
+		const Trace plain = Play(rows, n, 10000, 13000, false);
+		const Trace held  = Play(rows, n, 10000, 13000, true);
+		same = same && plain.n == held.n;
+		for (int i = 0; same && i < plain.n; ++i)
+			same = plain.xs[i] == held.xs[i];
+	}
+	Check(same, "10 Hz with up to 50 ms of jitter: every frame is where SampleDelayed puts it");
+}
+
+void TestHeldStopsOnTheLastRow() {
+	std::printf("\ntraffic that drops out of its host's nearest eight\n");
+	// Rows up to 11053, then nothing: the car is still on its host, it just
+	// isn't one of the eight any more.
+	Row rows[64];
+	const int n = Cruise(rows, 64, 11100, 99999, 0, 14000);
+	const float lastX = rows[n - 1].x;
+
+	const Trace held = Play(rows, n, 10000, 14000, true);
+	float furthest = 0.0f;
+	for (int i = 0; i < held.n; ++i)
+		furthest = held.xs[i] > furthest ? held.xs[i] : furthest;
+	std::printf("    last row at %.2f m, held at %.4f m, furthest %.4f m\n", lastX,
+	            held.xs[held.n - 1], furthest);
+	Check(furthest <= lastX + 1e-4f, "never drawn past the last row its host sent");
+	Check(Near(held.xs[held.n - 1], lastX), "and stands exactly on it");
+
+	const Trace plain = Play(rows, n, 10000, 14000, false);
+	std::printf("    SampleDelayed would have stood it at %.2f m\n",
+	            plain.xs[plain.n - 1]);
+	Check(plain.xs[plain.n - 1] - lastX > 5.0f,
+	      "(where SampleDelayed leaves it: over 5 m on at 25 m/s)");
+
+	VehicleInterpBuffer b;
+	b.Push(1000, Vec3{0.0f, 0.0f, 0.0f}, Yaw(0.0f), Vec3{25.0f, 0.0f, 0.0f});
+	b.Push(1100, Vec3{2.5f, 0.0f, 0.0f}, Yaw(0.7f), Vec3{25.0f, 0.0f, 0.0f});
+	VehicleTransform out;
+	for (uint32_t now = 0; now <= 3000; now += 16)
+		b.SampleDelayedHeld(now, out);
+	Check(Near(out.pos.x, 2.5f) && SameOrientation(out.rot, Yaw(0.7f)),
+	      "position and heading both the newest row's");
+}
+
+void TestHeldTrafficBridgesALostRowWithoutAJump() {
+	std::printf("\none lost row of traffic, held\n");
+	// The cost of not extrapolating: a lost row stops the car for as long as
+	// the row is overdue. What it must not do is jump when the row turns up.
+	Row rows[64];
+	const int n = Cruise(rows, 64, 10936, 10937, 30, 12500);   // loses 10936
+	const Trace t = Play(rows, n, 10000, 12500, true);
+	float maxStep = 0.0f;
+	float minStep = 1e9f;
+	int   stoppedFrames = 0;
+	for (int i = 1; i < t.n; ++i) {
+		if (t.at[i] < 10300)
+			continue;
+		const float step = t.xs[i] - t.xs[i - 1];
+		maxStep = step > maxStep ? step : maxStep;
+		minStep = step < minStep ? step : minStep;
+		if (step < 0.01f)
+			++stoppedFrames;
+	}
+	std::printf("    per-frame step %.3f .. %.3f m, %d frame(s) standing\n", minStep,
+	            maxStep, stoppedFrames);
+	Check(minStep >= 0.0f, "it never goes backwards");
+	// A 17 ms frame at 25 m/s is 0.425 m. It comes out of the stop at about
+	// 1.3 times that for a few frames while the clock eases back, which is
+	// catching up, not a jump; the extrapolated version tops out at 0.525.
+	Check(maxStep < 0.6f, "and doesn't catch up in a jump");
+	Check(stoppedFrames <= 6, "it stands for a handful of frames, not a batch and more");
+}
+
+void TestHeldTrafficComesBackForwards() {
+	std::printf("\ntraffic that comes back into the eight\n");
+	// Braking for a light while nobody is told. The rows stop at 25 m/s; the
+	// host's car pulls up 4 m further on and is standing there when it gets
+	// back into the eight a second and a half later. Extrapolating put the
+	// replica about 5.5 m on, past where the host stopped, so the first row
+	// back dragged it backwards. Held, it waits on the last row and then
+	// moves up.
+	Row rows[64];
+	int n = Cruise(rows, 64, 11100, 99999, 0, 11100);
+	const float lastX = rows[n - 1].x;
+	const float stopX = lastX + 4.0f;
+	for (uint32_t s = 12600; s < 14500; s += 117)
+		rows[n++] = Row{s, s, stopX, 0.0f};
+
+	const Trace held  = Play(rows, n, 10000, 14500, true);
+	const Trace plain = Play(rows, n, 10000, 14500, false);
+	auto backwards = [](const Trace &t) {
+		float worst = 0.0f;
+		for (int i = 1; i < t.n; ++i) {
+			const float step = t.xs[i] - t.xs[i - 1];
+			worst = step < worst ? step : worst;
+		}
+		return worst;
+	};
+	std::printf("    worst backward step: held %.2f m, SampleDelayed %.2f m\n",
+	            backwards(held), backwards(plain));
+	Check(backwards(held) >= 0.0f, "held, it only ever moves forwards");
+	Check(Near(held.xs[held.n - 1], stopX), "and ends where its host's car stopped");
+	Check(backwards(plain) < -1.0f, "(extrapolated, it was pulled back over a metre)");
+
+	// And a gap long enough to leave the clock behind by more than
+	// CLOCK_RESYNC_MS, on a car still driving: it moves up to the stream and
+	// carries on with it, in one step forward and no second copy of anything
+	// - the same buffer, the same samples.
+	Row far[64];
+	int m = Cruise(far, 64, 11100, 12900, 0, 14500);
+	const Trace t = Play(far, m, 10000, 14500, true);
+	Check(backwards(t) >= 0.0f, "a long gap on a moving car: forwards only");
+	const float endX = t.xs[t.n - 1];
+	const float lastSent = far[m - 1].x;
+	std::printf("    back on the stream at %.2f m, newest row %.2f m\n", endX, lastSent);
+	const float endStep = t.xs[t.n - 1] - t.xs[t.n - 2];
+	Check(endX > lastSent - 4.5f && endX <= lastSent && endStep > 0.3f && endStep < 0.55f,
+	      "and runs DELAY_MS behind it at its own speed again, as if it had never left");
+}
+
 int main() {
 	TestEmpty();
 	TestClockAdvancesBetweenSnapshots();
@@ -357,6 +691,16 @@ int main() {
 	TestVehicleBufferInterpolates();
 	TestVehicleSnapDistanceIsNotThePeds();
 	TestVehicleRotationIsHeldNotExtrapolated();
+	TestEngineSpeedUnits();
+	TestACarCoastsAtItsRealSpeed();
+	TestALoneSampleIsHeldNotThrownForward();
+	TestLostPacketsDoNotStallACar();
+	TestTenHertzTrafficKeepsMoving();
+	TestAStallStaysInsideTheCap();
+	TestHeldIsSampleDelayedWhileRowsFlow();
+	TestHeldStopsOnTheLastRow();
+	TestHeldTrafficBridgesALostRowWithoutAJump();
+	TestHeldTrafficComesBackForwards();
 
 	std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL",
 	            g_failures, g_failures == 1 ? "" : "s");

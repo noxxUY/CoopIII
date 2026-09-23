@@ -59,6 +59,113 @@ bool ParseWantedLevel(const std::string &text, WantedLevelRule *out) {
 	return false;
 }
 
+const char *Name(RampageMode rule) {
+	switch (rule) {
+	case RampageMode::Shared: return "shared";
+	case RampageMode::Scaled: return "scaled";
+	case RampageMode::Off:    return "off";
+	}
+	return "shared";
+}
+
+const char *Label(RampageMode rule) {
+	switch (rule) {
+	case RampageMode::Shared: return "Shared";
+	case RampageMode::Scaled: return "Scaled to players";
+	case RampageMode::Off:    return "Off";
+	}
+	return "Shared";
+}
+
+bool ParseRampage(const std::string &text, RampageMode *out) {
+	const std::string t = Trim(text);
+	if (_stricmp(t.c_str(), "shared") == 0) {
+		*out = RampageMode::Shared;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "scaled") == 0 || _stricmp(t.c_str(), "scale") == 0) {
+		*out = RampageMode::Scaled;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "off") == 0 || _stricmp(t.c_str(), "none") == 0 ||
+	    _stricmp(t.c_str(), "perplayer") == 0) {
+		*out = RampageMode::Off;
+		return true;
+	}
+	return false;
+}
+
+const char *Name(CheatMode rule) {
+	switch (rule) {
+	case CheatMode::Shared:   return "shared";
+	case CheatMode::Personal: return "personal";
+	case CheatMode::Off:      return "off";
+	}
+	return "shared";
+}
+
+const char *Label(CheatMode rule) {
+	switch (rule) {
+	case CheatMode::Shared:   return "Shared";
+	case CheatMode::Personal: return "Personal only";
+	case CheatMode::Off:      return "Off";
+	}
+	return "Shared";
+}
+
+bool ParseCheats(const std::string &text, CheatMode *out) {
+	const std::string t = Trim(text);
+	if (_stricmp(t.c_str(), "shared") == 0 || _stricmp(t.c_str(), "on") == 0 ||
+	    _stricmp(t.c_str(), "all") == 0) {
+		*out = CheatMode::Shared;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "personal") == 0 || _stricmp(t.c_str(), "self") == 0) {
+		*out = CheatMode::Personal;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "off") == 0 || _stricmp(t.c_str(), "none") == 0) {
+		*out = CheatMode::Off;
+		return true;
+	}
+	return false;
+}
+
+const char *Name(MoneyMode rule) {
+	switch (rule) {
+	case MoneyMode::Off:    return "off";
+	case MoneyMode::Own:    return "own";
+	case MoneyMode::Shared: return "shared";
+	}
+	return "off";
+}
+
+const char *Label(MoneyMode rule) {
+	switch (rule) {
+	case MoneyMode::Off:    return "Off";
+	case MoneyMode::Own:    return "Own wallets";
+	case MoneyMode::Shared: return "Shared";
+	}
+	return "Off";
+}
+
+bool ParseMoney(const std::string &text, MoneyMode *out) {
+	const std::string t = Trim(text);
+	if (_stricmp(t.c_str(), "off") == 0 || _stricmp(t.c_str(), "none") == 0) {
+		*out = MoneyMode::Off;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "own") == 0 || _stricmp(t.c_str(), "perplayer") == 0) {
+		*out = MoneyMode::Own;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "shared") == 0 || _stricmp(t.c_str(), "pooled") == 0) {
+		*out = MoneyMode::Shared;
+		return true;
+	}
+	return false;
+}
+
 std::string ServerConfig::Path() {
 	char        buf[MAX_PATH] = {0};
 	const DWORD n             = GetModuleFileNameA(nullptr, buf, MAX_PATH);
@@ -103,6 +210,18 @@ bool ServerConfig::Parse(const std::string &text) {
 			missionFailOnDeath = TruthY(value);
 		} else if (_stricmp(key.c_str(), "ammosync") == 0) {
 			ammoSync = TruthY(value);
+		} else if (_stricmp(key.c_str(), "rampages") == 0) {
+			RampageMode rule = rampage;
+			if (ParseRampage(value, &rule))
+				rampage = rule;
+		} else if (_stricmp(key.c_str(), "cheats") == 0) {
+			CheatMode rule = cheats;
+			if (ParseCheats(value, &rule))
+				cheats = rule;
+		} else if (_stricmp(key.c_str(), "money") == 0) {
+			MoneyMode rule = money;
+			if (ParseMoney(value, &rule))
+				money = rule;
 		}
 	}
 	return true;
@@ -123,7 +242,7 @@ bool ServerConfig::Load(const std::string &path) {
 }
 
 std::string ServerConfig::ToIni() const {
-	char out[2048];
+	char out[8192];
 	std::snprintf(
 	    out, sizeof(out),
 	    "; CoopIII server. Sits next to server.exe; both the console server and\n"
@@ -155,9 +274,41 @@ std::string ServerConfig::ToIni() const {
 	    "; default, and with it off a remote player's gun never runs dry on\n"
 	    "; your screen. It does not share weapons - players still carry\n"
 	    "; whatever they picked up, this only makes the counts honest.\n"
-	    "ammoSync = %s\n",
+	    "ammoSync = %s\n"
+	    "\n"
+	    "; What a rampage is worth in a group:\n"
+	    ";   shared   one rampage for the whole session, everybody's kills\n"
+	    ";            count toward it, and the target is the one the game\n"
+	    ";            asks for (the default)\n"
+	    ";   scaled   the same, but the target is multiplied by the number of\n"
+	    ";            players - four of you murder 80 Diablos, not 20\n"
+	    ";   off      nobody's kills are shared; each machine counts only its\n"
+	    ";            own player and can end the rampage differently\n"
+	    "rampages = %s\n"
+	    "\n"
+	    "; What a cheat typed by one player does to everybody else:\n"
+	    ";   shared    every cheat works. The ones about the player who typed\n"
+	    ";             them stay theirs; a weather cheat changes the host's sky,\n"
+	    ";             which is everybody's, and the game speed, MADWEATHER,\n"
+	    ";             ITSALLGOINGMAAAD and WEAPONSFORALL happen for everybody\n"
+	    ";             (the default)\n"
+	    ";   personal  only the cheats about the player who typed them: health,\n"
+	    ";             armour, weapons, money, stars, skins, the tank, the car\n"
+	    ";             handling ones\n"
+	    ";   off       no cheats at all while connected\n"
+	    "cheats = %s\n"
+	    "\n"
+	    "; What happens to the players' cash:\n"
+	    ";   off     every machine pays its own player for what its own game\n"
+	    ";           saw, as it always has (the default)\n"
+	    ";   own     everyone keeps their own money, but the reward for a car\n"
+	    ";           or a police helicopter goes to whoever destroyed it, once\n"
+	    ";   shared  one wallet for everybody: anything anyone earns, spends\n"
+	    ";           or is fined comes out of the same money\n"
+	    "money = %s\n",
 	    port, friendlyFire ? "true" : "false", Name(wantedLevel),
-	    missionFailOnDeath ? "true" : "false", ammoSync ? "true" : "false");
+	    missionFailOnDeath ? "true" : "false", ammoSync ? "true" : "false",
+	    Name(rampage), Name(cheats), Name(money));
 	return out;
 }
 

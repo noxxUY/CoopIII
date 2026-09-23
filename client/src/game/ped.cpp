@@ -1,8 +1,14 @@
 #include "ped.h"
 
 #include "addresses.h"
+#include "boat.h"
+#include "carstatus.h"
+#include "clock.h"
 #include "combat.h"
+#include "driveby.h"
+#include "hook/hook.h"
 #include "log.h"
+#include "pedaim.h"
 #include "pedanim.h"
 #include "vehicle.h"
 
@@ -115,6 +121,62 @@ void ReadDominantAnims(void *clump, AnimSample &base, AnimSample &partial) {
 	});
 }
 
+// ---- aim pitch -------------------------------------------------------------
+//
+// One detour on CPedIK::PointGunInDirection does both halves. For the local
+// player it writes down what the engine asked for, which is what goes out as
+// aimYaw/aimPitch (pedaim.h says why the ped's own fields won't do). For a
+// remote player it replaces the 0.0f AimGun passes every non-player ped with
+// the pitch their owner sent (addresses.h has AimGun's three arms).
+//
+// Why here and not somewhere earlier in the frame: CWorld::Process runs the
+// animation walk over the moving list (UpdateAnimations at 0x004B1B64) and
+// only then the ProcessControl walk (vtable +0x20 at 0x004B1B99), which is
+// where AimGun sits. The animation walk rebuilds every bone's modelling
+// matrix from its key frames, so a bone or a limb angle written from PreFrame
+// is gone before AimGun runs, and m_torsoOrient.pitch written directly gets
+// dragged 7 degrees back toward zero by MoveLimb before RotateTorso uses it.
+// The argument is read inside the ProcessControl walk, after the animation
+// has been applied. Nothing re-poses the clump between there and Idle's
+// render calls, so what RotateTorso leaves is what gets drawn.
+
+Detour            g_pointGunHook;
+ReplicaPitchTable g_replicaPitch;
+LocalAimRecord    g_localAim;
+bool              g_saidPitchApplied = false;
+bool              g_saidPitchSampled = false;
+
+uint32_t FrameNow() { return Global<uint32_t>(CTimer__m_FrameCounter); }
+
+using PointGunHookFn = bool(__fastcall *)(void *, void *, float, float);
+
+bool __fastcall HookedPointGunInDirection(void *ik, void * /*edx*/, float yaw,
+                                          float pitch) {
+	void *const    ped = ik ? Field<void *>(ik, PEDIK_PED) : nullptr;
+	const uint32_t now = FrameNow();
+
+	float wire = 0.0f;
+	if (g_replicaPitch.Find(ped, now, wire)) {
+		if (!g_saidPitchApplied) {
+			g_saidPitchApplied = true;
+			Log("ped: first remote aim pitch handed to the engine's IK: %.1f degrees "
+			    "(AimGun had %.1f). Positive is down",
+			    wire * 57.2957795f, pitch * 57.2957795f);
+		}
+		pitch = wire;
+	} else if (ped && ped == PlayerPed()) {
+		g_localAim = LocalAimRecord{ped, yaw, pitch, now, true};
+		if (!g_saidPitchSampled) {
+			g_saidPitchSampled = true;
+			Log("ped: our own aim is now read off PointGunInDirection: yaw %.2f, "
+			    "pitch %.1f degrees",
+			    yaw, pitch * 57.2957795f);
+		}
+	}
+
+	return g_pointGunHook.Original<PointGunHookFn>()(ik, nullptr, yaw, pitch);
+}
+
 } // namespace
 
 bool LocalPlayerExists() {
@@ -201,6 +263,23 @@ bool SampleLocalPlayer(PlayerStateBody &out) {
 	out.animId2   = partial.id;
 	out.animTime2 = partial.time;
 
+	// In a car, a drive-by is the overlay whatever the blend amounts say.
+	// Held the way DoDriveByShootings tests it (driveby.h, DriveByHeld).
+	if (Field<bool>(ped, offs::PED_IN_VEHICLE)) {
+		AnimSample held;
+		ForEachAnim(ClumpOf(ped), [&](void *assoc) {
+			const int32_t id = Field<int32_t>(assoc, ANIM_ID);
+			if (held.id == ANIM_NONE && id >= 0 && IsDriveByAnim(static_cast<uint16_t>(id)) &&
+			    DriveByHeld(true, Field<float>(assoc, ANIM_BLEND_DELTA)))
+				ReadAnim(assoc, held);
+		});
+		out.animId2 = DriveByOverlayOnWire(out.animId2, true, held.id);
+		if (IsDriveByAnim(held.id)) {
+			out.animTime2   = held.time;
+			partial.running = held.running;
+		}
+	}
+
 	// Weapon. m_currentWeapon doubles as an index into m_weapons and as the
 	// eWeaponType itself, so the slot gets bounds-checked before use. This is
 	// exactly why sampling was held off until the offsets were confirmed.
@@ -250,6 +329,17 @@ bool SampleLocalPlayer(PlayerStateBody &out) {
 	if (Field<void *>(ped, PED_FIRE))
 		out.flags |= PF_ON_FIRE;
 
+	// While aiming, both angles come from what the last AimGun asked
+	// PointGunInDirection for, when the detour above saw it. That is the aim
+	// the engine drew, for a pistol's arm as much as a rifle's torso and for
+	// a lock-on as much as a free aim. The fields below are the fallback for
+	// a session where the detour didn't install, and what goes out when the
+	// player isn't aiming.
+	if (aiming && LocalAimFresh(g_localAim, ped, FrameNow())) {
+		out.aimYaw   = WrapAngle(g_localAim.yaw);
+		out.aimPitch = AimPitchFromWire(g_localAim.pitch);
+		return true;
+	}
 	out.aimYaw = WrapAngle(
 	    aiming ? Field<float>(ped, offs::PED_LOOK_DIRECTION)
 	           : out.heading + Field<float>(ped, offs::PED_IK_TORSO_YAW));
@@ -735,6 +825,8 @@ bool SpawnRemote(RemotePlayer &player) {
 	player.appliedAnimId  = ANIM_NONE;
 	player.appliedAnimId2 = ANIM_NONE;
 	player.appliedWeapon  = 0xFFFF;
+	player.appliedDriveBy = ANIM_NONE;
+	player.driveByArmed   = false;
 	// A brand new ped is not on fire, whatever the old one was doing. The
 	// old ped's fire, if it had one, was put out by ~CPed on the way down
 	// (0x004C51CF: `if (m_pFire) m_pFire->Extinguish()`), so this is
@@ -1541,10 +1633,10 @@ void ApplyFiring(RemotePlayer &player, void *ped) {
 // weapon's flags, so a pistol aims with the arm and a rifle with the torso
 // without CoopIII having to know which is which.
 //
-// Only yaw gets applied. CPed::AimGun passes a hard zero as the pitch for
-// anything that isn't the local CPlayerPed, and CPedIK::MoveLimb drags the
-// torso back toward it at 7 degrees per timestep. Writing the real pitch at
-// 25 Hz against that would look like a twitch, not an aim (§1.8.3).
+// Yaw goes in through SetAimFlag. Pitch can't: CPed::AimGun passes a hard
+// zero for anything that isn't PEDTYPE_PLAYER1..4, so it goes into
+// g_replicaPitch instead and HookedPointGunInDirection swaps it in when
+// AimGun runs later this frame.
 void ApplyAim(RemotePlayer &player, void *ped) {
 	// SetAimFlag reads GetWeapon()->m_eWeaponType and feeds it straight to
 	// GetWeaponInfo, so the ped's current slot has to be in range first.
@@ -1557,6 +1649,7 @@ void ApplyAim(RemotePlayer &player, void *ped) {
 		FiniteOr(player.last.aimYaw, Field<float>(ped, offs::PED_ROT_CUR), yaw);
 		using AimFn = void(__thiscall *)(void *, float);
 		Func<AimFn>(CPed__SetAimFlag)(ped, WrapAngle(yaw));
+		g_replicaPitch.Set(ped, player.last.aimPitch, FrameNow());
 	} else if (Field<uint8_t>(ped, offs::PED_FLAGS_A) & offs::PED_IS_AIMING_GUN) {
 		// Only when it is actually set: ClearAimFlag is what starts the
 		// gun-lowering animation, and re-running it every frame would keep
@@ -1673,12 +1766,7 @@ void *LightRemoteFire(void *ped) {
 // an identity - "the fire at index N that is alight and still points at our
 // ped" is.
 bool FireIsOurs(const RemotePlayer &player, void *ped, void *fire) {
-	if (!fire || player.fireSlot < 0)
-		return false;
-	if (reinterpret_cast<uintptr_t>(fire) != FireSlot(static_cast<size_t>(player.fireSlot)))
-		return false;
-	return Field<uint8_t>(fire, FIRE_ONGOING) != 0 &&
-	       Field<void *>(fire, FIRE_ENTITY) == ped;
+	return WatchedPedFireIsOurs(player.fireSlot, ped, fire);
 }
 
 // Four lines, one each, and between them the log answers the whole chain in
@@ -1826,17 +1914,78 @@ int PassengerSlotOf(void *car, void *ped) {
 // peds cannot both be the driver, and the one the session names wins. The
 // player who lost the seat gets their own exit event a moment later and the
 // two agree from then on.
-bool EvictSeatOccupant(void *car, uint8_t seat, void *incoming) {
-	void *occupant = nullptr;
-	if (seat == 0) {
-		occupant = Field<void *>(car, offs::VEH_DRIVER);
-	} else {
-		const size_t slot = static_cast<size_t>(seat) - 1;
-		if (slot < offs::VEH_MAX_PASSENGERS)
-			occupant = (&Field<void *>(car, offs::VEH_PASSENGERS))[slot];
+//
+// **Never the local player, and that exception is the whole of a bug.** Every
+// sentence above is about replicas. Applied to the person playing the game it
+// says something entirely different: that a statement about where somebody
+// else's ped is sitting may reach into this engine and tear the player out of
+// a car he is driving - RemoveDriver, STATUS_ABANDONED, engine off, both
+// velocities zeroed, bInVehicle false, PED_IDLE - and then put a CCivilianPed
+// in his seat. From that frame on his car is not his: m_pDriver names a
+// replica, so every ownership guard in the vehicle seam reads false, and
+// Client::UpdateRemoteVehicles starts writing the previous driver's throttle,
+// gear and m_vecMoveSpeed onto it before each frame's physics. The car drives
+// off with no key pressed, or refuses to move, depending on what that last
+// snapshot happened to hold. It is also why he cannot get out: the only way
+// out of a car is CPed::SetExitCar, whose first act is CVehicle::CanPedExitCar,
+// which refuses any car whose m_vecMoveSpeed magnitude-squared is over 0.005 -
+// eight times tighter than the gate on the way in (addresses.h).
+//
+// And it needs no exotic trigger. A remote player's replica getting reaped and
+// respawned clears Client's record of where it was sitting, so the next pass
+// re-states the seating; a replicated traffic driver's seat is re-stated on
+// every stream batch by design (docs/population.md §3 step 6). Either one lands
+// on whichever car the local player happens to be driving at the time, if it is
+// the car the session says that ped is in.
+//
+// The seating is refused rather than forced, so the caller reports failure and
+// the ped stays on foot. A remote player standing beside his own car is a
+// cosmetic disagreement for as long as this machine has the local player in it;
+// the local player being thrown out of a car is not.
+//
+// The session *can* take a car off the local player - a carjack is exactly
+// that - but not through here. That goes through the server's arbitration and
+// WorldBridge::SurrenderVehicleSeat, which is one statement about one car
+// rather than a side effect of seating a ped.
+void *SeatOccupant(void *car, uint8_t seat) {
+	if (seat == 0)
+		return Field<void *>(car, offs::VEH_DRIVER);
+	const size_t slot = static_cast<size_t>(seat) - 1;
+	if (slot < offs::VEH_MAX_PASSENGERS)
+		return (&Field<void *>(car, offs::VEH_PASSENGERS))[slot];
+	return nullptr;
+}
+
+// Is the person playing the game in this seat?
+//
+// Checked by both ways of seating a ped rather than only by the eviction,
+// because refusing to *empty* the seat is not enough on its own: both paths end
+// at CVehicle::SetDriver, which is two stores and a RegisterReference and
+// overwrites pDriver without looking at who was there. The whole seating has to
+// be refused, so the answer is a predicate rather than a return code.
+bool SeatHeldByLocalPlayer(void *car, uint8_t seat) {
+	void *const occupant = SeatOccupant(car, seat);
+	if (!occupant || occupant != PlayerPed())
+		return false;
+
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("bridge: refused to seat a replica in seat %u - the local player is "
+		    "in it. The session saying somebody else is sitting there is a "
+		    "statement about a replica and never a reason to empty the player's "
+		    "seat (and this will not be said again)",
+		    seat);
 	}
+	return true;
+}
+
+bool EvictSeatOccupant(void *car, uint8_t seat, void *incoming) {
+	void *const occupant = SeatOccupant(car, seat);
 	if (!occupant || occupant == incoming)
 		return false;
+	if (occupant == PlayerPed())
+		return false;   // SeatHeldByLocalPlayer has already refused the seating
 
 	UnseatPedFromCar(occupant);
 	return true;
@@ -1844,6 +1993,13 @@ bool EvictSeatOccupant(void *car, uint8_t seat, void *incoming) {
 
 bool SeatPedInCar(void *ped, void *car, uint8_t seat) {
 	if (!ped || !car)
+		return false;
+
+	// Never over the top of the local player. EvictSeatOccupant is where the
+	// whole of this is argued; the short version is that WarpPedIntoCar ends at
+	// CVehicle::SetDriver, which would take the wheel off him whether or not
+	// the eviction ran.
+	if (SeatHeldByLocalPlayer(car, seat))
 		return false;
 
 	EvictSeatOccupant(car, seat, ped);
@@ -1862,6 +2018,41 @@ bool SeatPedInCar(void *ped, void *car, uint8_t seat) {
 	using ObjectiveFn = void(__thiscall *)(void *, uint32_t, void *);
 	using WarpFn      = void(__thiscall *)(void *, void *);
 	Func<ObjectiveFn>(CPed__SetObjective)(ped, objective, car);
+
+	// A boat. SetObjective undoes an ENTER_CAR objective on a boat for any ped
+	// that is not the player (0x004D8519, addresses.h "boats"), so the warp
+	// below would read whatever objective came before - OBJECTIVE_NONE for a
+	// replica - and take its no-seat arm. The objective is the only thing the
+	// warp reads; it writes m_pMyVehicle and m_carInObjective itself, with
+	// their references. So it is put back by hand, and only when the engine
+	// took it away.
+	if (SetObjectiveRefusesNonPlayer(Field<int32_t>(car, offs::VEH_TYPE)) &&
+	    Field<uint32_t>(ped, offs::PED_OBJECTIVE) != objective) {
+		Field<uint32_t>(ped, offs::PED_OBJECTIVE) = objective;
+		static bool said = false;
+		if (!said) {
+			said = true;
+			Log("bridge: seating a replica in a boat - CPed::SetObjective "
+			    "refuses that for anybody but the player, so the objective "
+			    "the warp reads was written directly (and this will not be "
+			    "said again)");
+		}
+	}
+
+	// The car's status, read before the warp writes its own over it
+	// (0x004D7E9B: PHYSICS for anybody who isn't a player, in both seat arms,
+	// and in the passenger arm even when every slot was full and nobody got
+	// one). Put back straight after, whether the seating took or not.
+	//
+	// A passenger's warp leaves the car as it was. The one that mattered is
+	// the local player's own car with a remote player getting in beside him:
+	// it went from PLAYER to PHYSICS, the PLAYER arm that reads his pad
+	// stopped running, and the car AI drove it instead - MISSION_NONE's brake
+	// and handbrake, or the cruise of a traffic car he'd taken. game/carstatus.h
+	// has the rest.
+	uint8_t &flags = Field<uint8_t>(car, offs::ENTITY_FLAGS);
+	const uint8_t before = static_cast<uint8_t>(flags >> ENTITY_STATUS_SHIFT);
+
 	Func<WarpFn>(CPed__WarpPedIntoCar)(ped, car);
 
 	// Did it actually take? The warp fails silently and half-applied, so
@@ -1869,6 +2060,11 @@ bool SeatPedInCar(void *ped, void *car, uint8_t seat) {
 	// skipped on failure.
 	const bool seated = seat == 0 ? Field<void *>(car, offs::VEH_DRIVER) == ped
 	                              : PassengerSlotOf(car, ped) >= 0;
+
+	// A seating that didn't take changes nothing about the car either.
+	const uint8_t after = seated ? StatusAfterSeating(before, seat == 0) : before;
+	flags = static_cast<uint8_t>((flags & 0x07u) | (after << ENTITY_STATUS_SHIFT));
+
 	if (!seated) {
 		UnseatPedFromCar(ped);
 		return false;
@@ -1917,10 +2113,13 @@ int UnseatPedFromCar(void *ped) {
 	                      ? Field<void *>(ped, offs::PED_MY_VEHICLE)
 	                      : nullptr;
 
-	// Every vehicle CoopIII creates is a CAutomobile (vehicle.cpp), so this
-	// vtable check is the same net ResolveRemote uses on peds - a slot that
-	// still resolves while no longer holding what we think it does.
-	if (car && Field<uintptr_t>(car, offs::VTABLE) == CAutomobile__vtable) {
+	// Every vehicle CoopIII creates is a CAutomobile or a CBoat (vehicle.cpp,
+	// game/boat.h), so this vtable check is the same net ResolveRemote uses on
+	// peds - a slot that still resolves while no longer holding what we think
+	// it does. Everything written below is CVehicle's or CPhysical's, so it is
+	// valid on both. Leaving the boat out would skip RemoveDriver for a boat,
+	// and destroying it would then leave its pDriver pointing at our ped.
+	if (car && IsBuiltVehicleVtable(Field<uintptr_t>(car, offs::VTABLE))) {
 		if (Field<void *>(car, offs::VEH_DRIVER) == ped) {
 			Func<void(__thiscall *)(void *)>(CVehicle__RemoveDriver)(car);
 
@@ -1940,12 +2139,19 @@ int UnseatPedFromCar(void *ped) {
 			    car, ped);
 		}
 
-		float *const move = &Field<float>(car, offs::MOVE_SPEED);
-		move[0] = 0.0f;
-		move[1] = 0.0f;
-		move[2] = VEH_EXIT_SETTLE_SPEED_Z;
-		float *const turn = &Field<float>(car, offs::TURN_SPEED);
-		turn[0] = turn[1] = turn[2] = 0.0f;
+		// The script's handler stops the car whoever got out of it. Not the
+		// local player's: a remote passenger stepping out of a car he is
+		// driving would otherwise stop it dead under him, at whatever speed
+		// the passenger's own machine let him leave at.
+		void *const local = PlayerPed();
+		if (!local || Field<void *>(car, offs::VEH_DRIVER) != local) {
+			float *const move = &Field<float>(car, offs::MOVE_SPEED);
+			move[0] = 0.0f;
+			move[1] = 0.0f;
+			move[2] = VEH_EXIT_SETTLE_SPEED_Z;
+			float *const turn = &Field<float>(car, offs::TURN_SPEED);
+			turn[0] = turn[1] = turn[2] = 0.0f;
+		}
 	}
 
 	Field<bool>(ped, offs::PED_IN_VEHICLE)     = false;
@@ -2021,6 +2227,8 @@ void UnseatRemotePed(RemotePlayer &player) {
 	player.appliedWeapon  = 0xFFFF;
 	player.appliedAnimId  = ANIM_NONE;
 	player.appliedAnimId2 = ANIM_NONE;
+	player.appliedDriveBy = ANIM_NONE;
+	player.driveByArmed   = false;
 }
 
 // ---- and the same two with the door open ----------------------------------
@@ -2084,9 +2292,21 @@ uint8_t DoorFlag(uint16_t door) {
 // The entry animation lines the ped up against the car's door over several
 // frames, and a car that is going anywhere leaves it behind - the ped ends
 // up being dragged along beside a moving vehicle, which looks far worse than
-// appearing in the seat. Half a metre per second is the width of "parked,
-// settling on its suspension".
-constexpr float ENTER_MAX_CAR_SPEED_SQ = 0.5f * 0.5f;
+// appearing in the seat.
+//
+// This used to be sq(0.5f), chosen as "the width of parked, settling on its
+// suspension", and it was a guess that was looser than the engine's. There
+// are two gates inside the entry and both are 0.2 m/s: CVehicle::CanPedEnterCar
+// tests sq(0.2f) on the move and turn speeds before SeekCar hands over, and
+// the door-opening callback tests the magnitude against 0.2f again at
+// 0x004DE758 - and *that* one does not refuse the entry, it calls
+// QuitEnteringCar and SetFall(1000). A car creeping at 0.3 m/s passed this
+// check, the ped walked up to it, and the engine knocked him into the road.
+// addresses.h, PED_ENTER_MAX_SPEED_SQ, has both disassemblies.
+constexpr float ENTER_MAX_CAR_SPEED_SQ = PED_ENTER_MAX_SPEED_SQ;
+static_assert(ENTER_MAX_CAR_SPEED_SQ == VEH_ENTER_MAX_SPEED_SQ,
+              "the pre-check and CVehicle::CanPedEnterCar must gate on the "
+              "same speed, or the walk starts and the entry is then refused");
 
 // And how far away the ped may be, squared. Beyond this the engine walks
 // them across the street to the handle, which is a second of a remote player
@@ -2134,13 +2354,62 @@ void ClearPedObjective(void *ped) {
 	Field<void *>(ped, offs::PED_CAR_IN_OBJECTIVE) = nullptr;
 }
 
+// Shut a door an abandoned entry left hanging open.
+//
+// QuitEnteringCar makes no call on the car at all - there is no
+// `call [reg+5Ch]` anywhere in 0x004E0E00..0x004E0F96 - so it hands back the
+// door's bit in m_nGettingInFlags and leaves the door itself wherever the
+// animation had swung it to. With nobody in the seat, nothing ever swings it
+// back: only somebody else's get-in or get-out touches that door again, and
+// until then the car sits in the street with a door open and no driver.
+//
+// One call fixes it, and it is the engine's own: ProcessOpenDoor through
+// vtable slot 0x5C with the closing animation and a time past its end, which
+// is exactly what CPed::PedAnimDoorCloseCB does at the end of every real
+// get-in. addresses.h, ANIM_STD_CAR_CLOSE_DOOR_LHS, has the disassembly for
+// the id and for what 1.0f does once it is in there.
+//
+// Called with the car and door read off the ped BEFORE QuitEnteringCar runs,
+// because there is no promise about what it leaves behind on them.
+void ShutDoorAfterAbandonedEntry(void *car, uint16_t door) {
+	if (!car || !door)
+		return;
+	// Only a CAutomobile has doors that swing. CVehicle::ProcessOpenDoor is a
+	// do-nothing in the base class and a boat gets the base one, so this is
+	// about not relying on that rather than about avoiding a crash.
+	if (Field<uintptr_t>(car, offs::VTABLE) != CAutomobile__vtable)
+		return;
+
+	const uintptr_t vt = Field<uintptr_t>(car, offs::VTABLE);
+	using OpenDoorFn   = void(__thiscall *)(void *, uint32_t, uint32_t, float);
+	const auto fn      = *reinterpret_cast<OpenDoorFn *>(vt + VEH_VT_PROCESS_OPEN_DOOR);
+	if (!fn)
+		return;
+	fn(car, door, ANIM_STD_CAR_CLOSE_DOOR_LHS, 1.0f);
+}
+
 int AbandonPedEnterCar(void *ped) {
 	if (!ped)
 		return 0;
 
+	// Read first: the entry is about to be taken off the ped, and the door
+	// has to be shut with the pair the ped was using when it still had them.
+	void *const    car  = Field<void *>(ped, offs::PED_MY_VEHICLE);
+	const uint16_t door = Field<uint16_t>(ped, offs::PED_VEH_DOOR);
+
 	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
-	if (state == PEDSTATE_ENTER_CAR || state == PEDSTATE_CARJACK)
+	const bool     wasEntering =
+	    state == PEDSTATE_ENTER_CAR || state == PEDSTATE_CARJACK;
+	if (wasEntering)
 		Func<void(__thiscall *)(void *)>(CPed__QuitEnteringCar)(ped);
+
+	// And put the door back. Only for an entry that was actually running:
+	// the ped's m_vehDoor is not cleared when one ends, so a ped that was
+	// standing around holding a stale door would otherwise have this reach
+	// into a car it has nothing to do with and slam a door somebody else is
+	// halfway through opening.
+	if (wasEntering)
+		ShutDoorAfterAbandonedEntry(car, door);
 
 	// QuitEnteringCar nils m_pVehicleAnim and restores bUsesCollision, and
 	// leaves the ped idle. It does not clear the objective - the engine's
@@ -2157,14 +2426,39 @@ int AbandonPedEnterCar(void *ped) {
 	return clump ? FadeOutAllPartials(clump) : 0;
 }
 
-bool BeginPedEnterCar(void *ped, void *car, uint8_t seat) {
+bool BeginPedEnterCar(void *ped, void *car, uint8_t seat, uint8_t doorSeat) {
 	if (!ped || !car)
+		return false;
+
+	// Not a replica into a boat. The engine's boat entry is reached through
+	// the ENTER_CAR objective, which SetObjective refuses on a boat for
+	// anybody but the player (addresses.h, "boats"), so the animation would
+	// start with no seat at the end of it. Refused here, the caller warps,
+	// and SeatPedInCar puts the objective back for the warp.
+	//
+	// The local player is let through. seat.cpp's StartCarEntry comes here
+	// for his own passenger entry, and for him the objective holds.
+	if (ped != PlayerPed() &&
+	    !ReplicaMayAnimateEntry(Field<int32_t>(car, offs::VEH_TYPE)))
 		return false;
 
 	// A door of its own, or there is no animation to play. Seats past the
 	// fourth share the rear doors and the engine picks for itself; rather
 	// than guess, those are warped.
-	const uint16_t door = DoorForSeat(seat);
+	if (!DoorForSeat(seat))
+		return false;
+
+	// The door the ped goes in THROUGH, which is not always the seat's own.
+	//
+	// The engine walks a driver to the *nearest* door (CPed::SeekCar ->
+	// CPed::GetNearestDoor, addresses.h) and shuffles him across the front
+	// seats inside the car. So an entry into seat 0 through the front-right
+	// door is an ordinary thing the engine does every time somebody presses
+	// the enter key on the passenger side, and a replica told only the seat
+	// opens the wrong door and gets dragged round the car to it. The caller
+	// says which door; it defaults to the seat's own, which is what every
+	// entry CoopIII starts by itself uses.
+	const uint16_t door = DoorForSeat(doorSeat);
 	const uint8_t  flag = DoorFlag(door);
 	if (!door || !flag)
 		return false;
@@ -2202,6 +2496,13 @@ bool BeginPedEnterCar(void *ped, void *car, uint8_t seat) {
 	if (!(speedSq <= ENTER_MAX_CAR_SPEED_SQ))
 		return false;   // written to catch a NaN as well as a fast car
 	if (DistanceSq(pedPos, carPos) > ENTER_MAX_PED_DIST_SQ)
+		return false;
+
+	// Not into a seat the local player is in. Same rule as the warp's, and the
+	// same reason: this entry ends in PedSetInCarCB calling CVehicle::SetDriver,
+	// so letting it start would take the wheel off him a second from now
+	// instead of immediately. EvictSeatOccupant has the argument.
+	if (SeatHeldByLocalPlayer(car, seat))
 		return false;
 
 	// Make room, the same way the warp does, and for the same reason: two
@@ -2281,14 +2582,15 @@ bool BeginPedExitCar(void *ped) {
 	return Field<uint32_t>(ped, offs::PED_STATE) == PEDSTATE_EXIT_CAR;
 }
 
-bool BeginSeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t seat) {
+bool BeginSeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t seat,
+                        uint8_t doorSeat) {
 	void *const ped = ResolveRemote(player);
 	if (!ped)
 		return false;
 	void *const car = ResolveRemoteVehicle(vehicle);
 	if (!car)
 		return false;
-	return BeginPedEnterCar(ped, car, seat);
+	return BeginPedEnterCar(ped, car, seat, doorSeat);
 }
 
 uint8_t PollSeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t seat) {
@@ -2334,6 +2636,112 @@ bool BeginUnseatRemotePed(RemotePlayer &player) {
 // makes them agree with each other.
 static_assert(WIRE_PEDSTATE_EXIT_CAR == PEDSTATE_EXIT_CAR,
               "client.h's idea of PED_EXIT_CAR and addresses.h's must match");
+static_assert(WIRE_PEDSTATE_DRIVING == PEDSTATE_DRIVING &&
+                  WIRE_PEDSTATE_DRAG_FROM_CAR == PEDSTATE_DRAG_FROM_CAR &&
+                  WIRE_PEDSTATE_ARRESTED == PEDSTATE_ARRESTED,
+              "client.h's copies of PED_DRIVING, PED_DRAG_FROM_CAR and "
+              "PED_ARRESTED must match addresses.h's");
+
+// ---- the drive-by, on a ped in a seat ---------------------------------------
+//
+// DoDriveByShootings is the player's car's (addresses.h, "the drive-by"), so
+// nothing in this machine's engine will ever put a remote driver's arm out of
+// the window. These are its three anim writes, made for the side the wire
+// names, and the uzi it assumes is already in the hand.
+
+// Both sides dropped the way its no-look arm drops them.
+void DropDriveByPose(void *clump) {
+	for (const uint16_t id : {ANIM_STD_CAR_DRIVEBY_LEFT, ANIM_STD_CAR_DRIVEBY_RIGHT})
+		if (void *const assoc = FindAnimById(clump, id))
+			Field<float>(assoc, ANIM_BLEND_DELTA) = DRIVEBY_ANIM_DROP_DELTA;
+}
+
+// The uzi in the hand. The player's own seat keeps it there
+// (RemoveWeaponWhenEnteringVehicle, player arm), but the warp that seats a
+// remote ped takes the model off, so it goes back on here. SetCurrentWeapon
+// removes every weapon atomic before it adds one (0x004CFA94, and
+// RemoveWeaponModel ignores its argument), so this never stacks two.
+void ArmForDriveBy(RemotePlayer &player, void *ped) {
+	if (!GiveWeaponTo(player, ped, WEAPONTYPE_UZI))
+		return;   // streaming; next frame
+	player.driveByArmed = true;
+	if (Field<int32_t>(ped, offs::PED_WEP_MODEL_ID) != -1)
+		return;
+	void *const info = WeaponInfo(WEAPONTYPE_UZI);
+	if (!info)
+		return;
+	const int32_t model = Field<int32_t>(info, WEAPONINFO_MODEL_ID);
+	if (model < 0)
+		return;
+	if (!HasModelLoaded(static_cast<uint32_t>(model))) {
+		RequestModel(static_cast<uint16_t>(model));
+		return;
+	}
+	using SetFn = void(__thiscall *)(void *, uint32_t);
+	Func<SetFn>(CPed__SetCurrentWeapon)(ped, WEAPONTYPE_UZI);
+}
+
+bool g_saidDriveByPosed = false;
+
+void ApplySeatedDriveBy(RemotePlayer &player, void *ped, uint32_t pedState) {
+	void *const clump = ClumpOf(ped);
+	if (!clump)
+		return;
+
+	const bool     driving = pedState == PEDSTATE_DRIVING && Field<bool>(ped, offs::PED_IN_VEHICLE);
+	const uint16_t want    = driving ? DriveByPoseToHold(player.last.animId2,
+	                                                     player.driveByShotAnim,
+	                                                     WallClock::NowMs() - player.driveByShotMs)
+	                                 : ANIM_NONE;
+	if (want == ANIM_NONE) {
+		if (player.appliedDriveBy != ANIM_NONE) {
+			DropDriveByPose(clump);
+			player.appliedDriveBy = ANIM_NONE;
+		}
+		return;
+	}
+
+	ArmForDriveBy(player, ped);
+
+	// 0x005640C2 for the left, 0x00564120 for the right.
+	if (void *const other = FindAnimById(clump, DriveByOtherSide(want)))
+		Field<float>(other, ANIM_BLEND_DELTA) = DRIVEBY_ANIM_DROP_DELTA;
+
+	void *const assoc = FindAnimById(clump, want);
+	if (assoc && DriveByHeld(true, Field<float>(assoc, ANIM_BLEND_DELTA))) {
+		Field<int32_t>(assoc, ANIM_FLAGS) |= ASSOC_RUNNING;
+	} else {
+		if (!MakeAnimRoom(player, clump, Field<void *>(ped, offs::PED_VEHICLE_ANIM)))
+			return;
+		using AddFn = void *(__cdecl *)(void *, int, int);
+		if (!Func<AddFn>(CAnimManager__AddAnimation)(clump, ASSOCGRP_STD, static_cast<int>(want)))
+			return;
+	}
+
+	if (player.appliedDriveBy == ANIM_NONE && !g_saidDriveByPosed) {
+		g_saidDriveByPosed = true;
+		Log("bridge: %s is shooting out of the %s window, and their ped here has the "
+		    "arm out (%s)",
+		    player.nick.c_str(), want == ANIM_STD_CAR_DRIVEBY_LEFT ? "left" : "right",
+		    IsDriveByAnim(player.last.animId2) ? "off the snapshot" : "off a round");
+	}
+	player.appliedDriveBy = want;
+}
+
+// Out of the seat: nothing of the drive-by may follow them onto the street.
+// The uzi was put in the hand by us, so the weapon is forgotten and the pose
+// stream puts back whatever they hold, one atomic, through SetCurrentWeapon.
+void EndSeatedDriveBy(RemotePlayer &player, void *ped) {
+	if (player.appliedDriveBy != ANIM_NONE) {
+		if (void *const clump = ClumpOf(ped))
+			DropDriveByPose(clump);
+		player.appliedDriveBy = ANIM_NONE;
+	}
+	if (player.driveByArmed) {
+		player.driveByArmed  = false;
+		player.appliedWeapon = 0xFFFF;
+	}
+}
 
 void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	void *ped = ResolveRemote(player);
@@ -2393,8 +2801,10 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	if ((player.Seated() || player.Entering()) && engineHasThem) {
 		Field<float>(ped, offs::PED_HEALTH) = player.last.health;
 		Field<float>(ped, offs::PED_ARMOUR) = player.last.armour;
+		ApplySeatedDriveBy(player, ped, pedState);
 		return;
 	}
+	EndSeatedDriveBy(player, ped);
 
 	// Position and facing go through PlaceRemotePed, which also pushes the
 	// matrix into the clump's RenderWare frame and re-files the ped in the
@@ -2452,8 +2862,83 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 
 } // namespace
 
+void *LightWatchedPedFire(void *ped) { return ped ? LightRemoteFire(ped) : nullptr; }
+
+bool WatchedPedFireIsOurs(int8_t fireSlot, void *ped, void *fire) {
+	if (!fire || fireSlot < 0)
+		return false;
+	if (reinterpret_cast<uintptr_t>(fire) != FireSlot(static_cast<size_t>(fireSlot)))
+		return false;
+	return Field<uint8_t>(fire, FIRE_ONGOING) != 0 &&
+	       Field<void *>(fire, FIRE_ENTITY) == ped;
+}
+
+// Is the local player in the middle of getting into a car, and if so, into
+// which seat, through which door?
+//
+// True from the frame CPed::SetEnterCar takes - the align animation, which is
+// the first thing anybody sees - to the frame the ped is in the seat. That is
+// the window the other machines have to be told about, because the claim they
+// already get is sent when this window closes: SampleLocalVehicleIdentity
+// asks CVehicle::m_pDriver, and m_pDriver is written by PedSetInCarCB at the
+// very end of the chain.
+//
+// The door is read off the ped rather than derived from the seat, and that is
+// the whole point of this function. CPed::SeekCar sends a driver's entry
+// through CPed::GetNearestDoor, so pressing the enter key beside the passenger
+// door puts m_vehDoor at the front-right and the engine shuffles across inside
+// the car. addresses.h, CPed__GetNearestDoor.
+bool SampleLocalCarEntry(LocalCarEntry &out) {
+	void *const ped = PlayerPed();
+	if (!ped)
+		return false;
+
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state != PEDSTATE_ENTER_CAR && state != PEDSTATE_CARJACK)
+		return false;
+
+	// SetEnterCar_AllClear is what writes this, so it is set for exactly the
+	// same window as the state above.
+	void *const car = Field<void *>(ped, offs::PED_MY_VEHICLE);
+	if (!car)
+		return false;
+
+	const int32_t handle =
+	    Func<int32_t(__cdecl *)(void *)>(CPools__GetVehicleRef)(car);
+	if (handle < 0)
+		return false;
+
+	// m_vehDoor, a word. The seat-shaped name for it is what goes on the
+	// wire, so that the receiving side can run it back through the one
+	// seat-to-door table this project has (DoorForSeat) instead of carrying a
+	// second copy of the engine's door constants.
+	const uint16_t door = Field<uint16_t>(ped, offs::PED_VEH_DOOR);
+	int32_t        doorSeat = -1;
+	for (uint8_t s = 0; s < 4; ++s)
+		if (DoorForSeat(s) == door)
+			doorSeat = s;
+	if (doorSeat < 0)
+		return false;   // a coach, a train, a van's rear: not ours to animate
+
+	// And where it ends. The objective is what PedSetInCarCB reads to choose
+	// between SetDriver and AddPassenger, so it is the engine's own answer to
+	// "which seat is this", available a second before the seat is.
+	const uint32_t objective = Field<uint32_t>(ped, offs::PED_OBJECTIVE);
+	out.vehicleHandle = handle;
+	out.seat          = objective == OBJECTIVE_ENTER_CAR_AS_DRIVER
+	                        ? 0
+	                        : static_cast<uint8_t>(doorSeat);
+	out.door          = static_cast<uint8_t>(doorSeat);
+	return true;
+}
+
 bool StartCarEntry(void *ped, void *car, uint8_t seat) {
-	return BeginPedEnterCar(ped, car, seat);
+	// The local player's own passenger entry goes in through the seat's own
+	// door: nothing has chosen a different one, and seat.cpp picked the slot
+	// before the walk precisely so the door would be known. The door that
+	// differs from the seat is the driver's, and the driver's entry is the
+	// engine's own key, not this one.
+	return BeginPedEnterCar(ped, car, seat, seat);
 }
 
 uint8_t PollCarEntry(void *ped, void *car, uint8_t seat) {
@@ -2488,6 +2973,29 @@ bool GiveRemoteWeapon(RemotePlayer &player, void *ped, uint8_t weapon) {
 
 bool RemotePlayerForPed(const void *ped, uint16_t &netId) {
 	return LookupRemotePed(ped, netId);
+}
+
+bool InstallAimPitchHook() {
+	g_replicaPitch.Clear();
+	g_localAim = LocalAimRecord{};
+	if (!g_pointGunHook.Install("CPedIK::PointGunInDirection",
+	                            reinterpret_cast<void *>(CPedIK__PointGunInDirection),
+	                            reinterpret_cast<void *>(&HookedPointGunInDirection))) {
+		Log("ped: FAILED to hook CPedIK::PointGunInDirection at 0x%08X; remote "
+		    "players aim level and our own lock-on aim goes out as the old guess",
+		    CPedIK__PointGunInDirection);
+		for (const auto &f : HookFailures())
+			Log("ped:   %s: %s", f.name.c_str(), f.reason.c_str());
+		return false;
+	}
+	Log("ped: hooked CPedIK::PointGunInDirection at 0x%08X", CPedIK__PointGunInDirection);
+	return true;
+}
+
+void RemoveAimPitchHook() {
+	g_pointGunHook.Remove();
+	g_replicaPitch.Clear();
+	g_localAim = LocalAimRecord{};
 }
 
 int32_t StdAnimGroupCount() { return AnimGroupCount(ASSOCGRP_STD); }
@@ -2534,7 +3042,7 @@ void ClampClumpAnimations(void *entity) {
 	// sweep is handed vehicles and objects too, and that offset is a ped
 	// field.
 	void *keepAssoc = nullptr;
-	if ((Field<uint8_t>(entity, offs::ENTITY_FLAGS_A) & 7) == offs::ENTITY_TYPE_PED)
+	if ((Field<uint8_t>(entity, offs::ENTITY_FLAGS) & 7) == offs::ENTITY_TYPE_PED)
 		keepAssoc = Field<void *>(entity, offs::PED_VEHICLE_ANIM);
 
 	const int dropped =
@@ -2652,17 +3160,25 @@ WorldBridge MakeWorldBridge() {
 	b.ApplyRemoteVehicle   = &ApplyRemoteVehicle;
 	b.RestRemoteVehicle    = &RestRemoteVehicle;
 	b.CorrectRemoteVehicle = &CorrectRemoteVehicle;
+	// And the exception to resting and pinning: one machine, named by the
+	// session, finishes what a driverless car was doing instead of holding it
+	// in the pose its last driver left it in. protocol.h, S_VehicleCustody.
+	b.SampleObservedVehicle = &SampleObservedVehicle;
+	b.VehicleAtRest         = &VehicleAtRest;
+	b.VehicleBurning        = &VehicleBurning;
 	// What shape a car is in (docs/cardamage.md). Beside the state pair
 	// because they are the same seam, and separate from it because damage is
 	// an event on the reliable channel and state is a 25 Hz sample.
-	b.SampleLocalVehicleDamage = &SampleLocalVehicleDamage;
-	b.ApplyRemoteVehicleDamage = &ApplyRemoteVehicleDamage;
+	b.SampleLocalVehicleDamage    = &SampleLocalVehicleDamage;
+	b.SampleObservedVehicleDamage = &SampleObservedVehicleDamage;
+	b.ApplyRemoteVehicleDamage    = &ApplyRemoteVehicleDamage;
 	b.SeatRemotePed        = &SeatRemotePed;
 	b.UnseatRemotePed      = &UnseatRemotePed;
 	b.BeginSeatRemotePed   = &BeginSeatRemotePed;
 	b.PollSeatRemotePed    = &PollSeatRemotePed;
 	b.AbandonSeatRemotePed = &AbandonSeatRemotePed;
 	b.BeginUnseatRemotePed = &BeginUnseatRemotePed;
+	b.SampleLocalCarEntry  = &SampleLocalCarEntry;
 
 	// Combat. These three live in game/combat.cpp because they're driven by
 	// detours rather than the frame pump, and because every address they use
@@ -2673,6 +3189,14 @@ WorldBridge MakeWorldBridge() {
 	b.PlayRemoteExplosion = &PlayRemoteExplosion;
 	b.ApplyRemoteDamage   = &ApplyRemoteDamage;
 	b.KillRemotePed       = &KillRemotePed;
+	// The pedestrian half of ApplyRemoteDamage, and it is wired here rather
+	// than in AddPopulationToBridge beside the other ambient entries because it
+	// is combat.cpp's function: the bounds it applies and the call it makes are
+	// the ones directly above, and the only thing it borrows from
+	// population.cpp is the netId lookup. Not gated on the population hooks
+	// either - with them missing this machine hosts no named pedestrians, so
+	// nothing ever resolves and the function is simply never useful.
+	b.ApplyRemotePedDamage = &ApplyRemotePedDamage;
 	b.SetFriendlyFire     = &SetFriendlyFire;
 	b.SetAmmoSync         = &SetAmmoSync;
 
@@ -2682,6 +3206,11 @@ WorldBridge MakeWorldBridge() {
 	// one place a claim in flight can leave a car frozen under its own
 	// driver. WorldBridge::LocalDrivesVehicle says the rest.
 	b.LocalDrivesVehicle = &LocalDrivesVehicle;
+
+	// And the one case where that question's answer is stale rather than
+	// wrong: the session has given a car we are sitting at the wheel of to the
+	// player who jacked us. WorldBridge::SurrenderVehicleSeat.
+	b.SurrenderVehicleSeat = &SurrenderVehicleSeat;
 
 	// Every address in the spawn path comes from the game's own
 	// COMMAND_CREATE_CHAR / COMMAND_DELETE_CHAR handlers (addresses.h records

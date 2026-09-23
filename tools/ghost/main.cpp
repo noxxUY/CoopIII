@@ -23,7 +23,10 @@
 //        CWeapon::FireInstantHit copies target.z from source.z for every ped
 //        that is not the local player, so a replayed shot is flat unless the
 //        wire's direction is really being applied. Trails that stay level
-//        under -pitch mean it is not.
+//        under -pitch mean it is not. The snapshot's aimPitch follows the
+//        same sweep, so the ghost's gun arm should rise and fall with its
+//        trails; an arm that stays level means CoopIII.log never said it
+//        hooked CPedIK::PointGunInDirection.
 // -throw holds a molotov and lobs one every three seconds, sends the
 //        explosion a beat later. The two halves are kept separate: the throw
 //        makes a bottle appear and fly, the explosion proves the observer's
@@ -135,6 +138,7 @@
 // second machine and a second person.
 
 #include "clock.h"
+#include "interp.h"
 
 #include <coopiii/net.h>
 #include <coopiii/protocol.h>
@@ -158,6 +162,15 @@ constexpr float ORBIT_PERIOD_S = 12.0f;
 // street; 6 seconds because the whole point is to watch it move.
 constexpr float    SHOT_PITCH_DEG    = 40.0f;
 constexpr uint32_t SHOT_PITCH_PERIOD = 6000;
+
+// Where -pitch's sweep is at a given moment, in radians, positive up. The
+// shot and the snapshot's aimPitch both read it, so the arms and the trail
+// move together.
+float ShotPitchAt(uint32_t nowMs) {
+	const float phase = static_cast<float>(nowMs % SHOT_PITCH_PERIOD) /
+	                    static_cast<float>(SHOT_PITCH_PERIOD);
+	return SHOT_PITCH_DEG * 0.0174532925f * std::sin(phase * 6.2831853f);
+}
 
 // -far. The radar reaches 120 m on foot (addresses.h, RADAR_RANGE_ON_FOOT_M),
 // so 20 to 200 m crosses the rim well inside it and well outside it. The
@@ -625,10 +638,12 @@ int main(int argc, char **argv) {
 			pkt.body.heading = angle + 1.5707963f;
 
 			// Tangential only. The radial part of -far's sweep is slow enough
-			// next to this that leaving it out costs nothing, and moveSpeed
-			// is what the receiver picks a walk or a run from rather than
-			// anything it positions with.
-			const float speed      = 6.2831853f * radius / period;
+			// next to this that leaving it out costs nothing. moveSpeed is
+			// in the engine's unit, metres per 1/50 s step, like a real
+			// client's (interp.h): the receiver writes it into the ped and
+			// extrapolates along it once converted, so a ghost sending m/s
+			// here would coast 50 times too far on a lost packet.
+			const float speed = 6.2831853f * radius / period / ENGINE_STEPS_PER_SECOND;
 			pkt.body.moveSpeed.x   = -speed * std::sin(angle);
 			pkt.body.moveSpeed.y   = speed * std::cos(angle);
 			pkt.body.moveSpeed.z   = 0.0f;
@@ -654,7 +669,9 @@ int main(int argc, char **argv) {
 			pkt.body.animId2   = ANIM_NONE;
 			pkt.body.animTime2 = 0.0f;
 			pkt.body.weapon    = heldWeapon;
-			pkt.body.aimPitch  = 0.0f;
+			// -pitch tilts the arms along with the shots. aimPitch is the
+			// engine's IK argument, where positive is down, hence the sign.
+			pkt.body.aimPitch  = pitchFlag ? -ShotPitchAt(WallClock::NowMs()) : 0.0f;
 
 			// Aim at the player rather than along the orbit when armed. A
 			// remote player firing off into the distance looks the same
@@ -738,14 +755,7 @@ int main(int argc, char **argv) {
 				// tilt is the only thing in a ghost's shot that an observer
 				// could not have invented for itself, so it is the only thing
 				// that proves the direction crossed the wire.
-				float pitch = 0.0f;
-				if (pitchFlag) {
-					const float phase =
-					    static_cast<float>(nowMs % SHOT_PITCH_PERIOD) /
-					    static_cast<float>(SHOT_PITCH_PERIOD);
-					pitch = SHOT_PITCH_DEG * 0.0174532925f *
-					        std::sin(phase * 6.2831853f);
-				}
+				const float pitch = pitchFlag ? ShotPitchAt(nowMs) : 0.0f;
 				const float flat = std::cos(pitch);
 				shot.body.dir    = Vec3{-std::sin(pkt.body.aimYaw) * flat,
 				                        std::cos(pkt.body.aimYaw) * flat,
@@ -905,8 +915,12 @@ int main(int argc, char **argv) {
 					v.body.rot = Quat{0.0f, 0.0f, std::sin(yaw * 0.5f),
 					                  std::cos(yaw * 0.5f)};
 
-					v.body.moveSpeed.x = -fy * std::cos(angle * 0.5f);
-					v.body.moveSpeed.y = fx * std::cos(angle * 0.5f);
+					// d(sway)/dt, in metres per engine step like a real
+					// client's (interp.h).
+					const float swaySpeed = std::cos(angle * 0.5f) * 6.2831853f /
+					                        period / ENGINE_STEPS_PER_SECOND;
+					v.body.moveSpeed.x = -fy * swaySpeed;
+					v.body.moveSpeed.y = fx * swaySpeed;
 
 					v.body.health = 1000.0f;
 					v.body.gear   = 2;

@@ -65,6 +65,26 @@ void WriteRemoteSlotAmmo(void *ped, uint8_t slot, uint16_t clip, uint32_t total)
 // reference rather than by comparing pointers, so a recycled slot says no.
 bool RemotePlayerForPed(const void *ped, uint16_t &netId);
 
+// The fire a burning player gets on every screen but their own (ped.cpp,
+// LightRemoteFire): the tail of CFireManager::StartFire with the AI arm left
+// out, so it moves nothing and, on a bFireProof ped, costs nothing. For
+// population.cpp, which puts the same fire on a burning pedestrian's replica.
+// Returns the CFire, or nil when all 40 slots are taken.
+void *LightWatchedPedFire(void *ped);
+
+// Is `fire` the one this machine lit in slot `fireSlot`, still alight and
+// still on `ped`? A slot is re-let the moment its fire goes out, so the index
+// alone is not an identity.
+bool WatchedPedFireIsOurs(int8_t fireSlot, void *ped, void *fire);
+
+// ---- for dllmain.cpp ------------------------------------------------------
+
+// The detour on CPedIK::PointGunInDirection that bends a remote player's arms
+// to their owner's pitch and reads our own aim for the snapshot. Not fatal if
+// it fails: remote players aim level, as they did before it existed.
+bool InstallAimPitchHook();
+void RemoveAimPitchHook();
+
 // How many animations ASSOCGRP_STD actually holds in this build, or 0 before
 // the anim files have loaded. The bound every id off the wire gets measured
 // against, read from the engine rather than taken from re3 - the retail 1.0
@@ -128,6 +148,11 @@ void UnseatReplicaPed(void *ped);
 // no, belong to whoever is driving them.
 bool    StartCarEntry(void *ped, void *car, uint8_t seat);
 uint8_t PollCarEntry(void *ped, void *car, uint8_t seat);
+
+// What the local player's engine is doing about a car right now, so the other
+// machines can play the same entry at the same time instead of being told
+// about it once it is over. WorldBridge::SampleLocalCarEntry.
+bool    SampleLocalCarEntry(LocalCarEntry &out);
 
 // Take an unfinished entry off a ped and fade what it blended. Returns how
 // many partial animations went, for the caller to report.

@@ -84,8 +84,8 @@ struct Player {
 	// A Player is born at the origin because a struct has to start somewhere,
 	// and the origin in Liberty City is the water off Portland. Announcing
 	// that as a position would have every joiner create a ped there and watch
-	// it drown, which is a bug this project has already had once and paid for
-	// (AGENTS.md, "the ped was born in water"). So the session says whether
+	// it drown, which is a bug this project has already had once and paid
+	// for. So the session says whether
 	// it knows, and the packet carries a bit for it.
 	bool        havePos = false;
 
@@ -113,6 +113,10 @@ struct Player {
 	float       health = 100.0f;
 	float       armour = 0.0f;
 	uint8_t     weapon = 0;      // eWeaponType
+
+	// The last C_MoneyChange of theirs the pool holds. Handed back in their
+	// own S_Money so their machine knows which of its changes are counted.
+	uint32_t    moneySeq = 0;
 };
 
 // A vehicle the session knows about, meaning one a player has actually been
@@ -122,6 +126,10 @@ struct Player {
 // the last transform it heard (so they spawn it where it is now, not where
 // it got claimed). No simulation happens here; the driver is authoritative
 // and a car with nobody in it just sits there.
+//
+// Until nobody needs it any more, that is. See ReleaseIdleVehicles: a row is
+// freed once the car has been empty and had no player near it for
+// VEHICLE_RELEASE_MS, and every machine is told with S_VehicleDespawn.
 struct Vehicle {
 	bool     active  = false;
 	uint16_t netId   = INVALID_NETID;
@@ -138,6 +146,24 @@ struct Vehicle {
 	Vec3     pos = {};
 	Quat     rot = {0.0f, 0.0f, 0.0f, 1.0f};
 	uint8_t  driverPlayerId = INVALID_PLAYER;
+
+	// The one machine allowed to simulate this car while nobody is driving
+	// it, or INVALID_PLAYER for the ordinary case: nobody simulates it and
+	// every machine pins it where it stands. protocol.h, S_VehicleCustody.
+	//
+	// Granted to the player who has just got out, short-lived, and cleared by
+	// a new driver, by the car's destruction, by the custodian's own
+	// C_VehicleSettled and by the custodian disconnecting. It exists because
+	// pinning is the right answer for a parked car and the wrong one for a
+	// car that was still rolling when the session stopped having a driver for
+	// it - held in that pose, CVehicle::CanPedEnterCar refuses it for the
+	// rest of the session and CPed::SeekCar answers the refusal by walking
+	// the player at the door with no timeout.
+	//
+	// Never set at the same time as a driverPlayerId. MayReportVehicle reads
+	// the pair as a precedence rather than a union so that even a record that
+	// somehow held both would still name exactly one reporter.
+	uint8_t  custodianPlayerId = INVALID_PLAYER;
 
 	// ---- condition ---------------------------------------------------------
 	//
@@ -169,7 +195,44 @@ struct Vehicle {
 	// A destroyed car is left out of the backfill entirely. That is a
 	// decision and it is reversible in one branch - see BuildBackfill.
 	bool     destroyed = false;
+
+	// The last time the session had a reason to keep this car: somebody in a
+	// seat, somebody settling it, or a player within VEHICLE_KEEP_RADIUS_M.
+	// `neededKnown` is false until the first sweep has looked at the row, so
+	// AddVehicle and PromoteCar don't need a clock.
+	bool     neededKnown = false;
+	uint32_t neededAtMs  = 0;
 };
+
+// How many session cars can exist at once. Rows are freed by
+// ReleaseIdleVehicles and reused, so this caps cars that are alive at the same
+// time, not cars claimed over the whole session. It is also the client's
+// roster size (Client::MAX_REMOTE_VEHICLES) and the observed-vehicle table's,
+// so raising it means raising those too.
+constexpr size_t MAX_SESSION_VEHICLES = 64;
+
+// When a session car stops being one.
+//
+// The session decides, because a copy isn't any one observer's to delete:
+// every machine has one, and only the server sees where all the players are.
+// A car is kept while anybody sits in it, while somebody is settling it
+// (S_VehicleCustody), or while any player is within the keep radius of where
+// it was last reported. Once none of that has been true for
+// VEHICLE_RELEASE_MS in a row, the row goes and S_VehicleDespawn goes out.
+//
+// The radius comes from the engine's own rule for its own cars,
+// CCarCtrl::PossiblyRemoveVehicle (0x00418430): a car is removed past 50 m
+// when it's off screen, and past 130 m * GenerationDistMultiplier when it's
+// on screen or parked, times 1.5 for bExtendedRange (constants at 0x005EC92C,
+// 0x005EC920 and 0x005EC970). The session can't know what anybody's camera
+// sees, so it keeps everything inside the widest of those, 195 m at the
+// normal multiplier, rounded up. A player who parks and walks 50 m away is
+// always inside it, so his car can't go while he walks back to it.
+//
+// Who claimed the car doesn't matter. Somebody else may be using it by the
+// time the claimer leaves, and a car nobody is near goes anyway.
+constexpr float    VEHICLE_KEEP_RADIUS_M = 200.0f;
+constexpr uint32_t VEHICLE_RELEASE_MS    = 60000;
 
 // A pedestrian one player's engine made, that the whole session now shares.
 //
@@ -341,6 +404,10 @@ struct Backfill {
 	// sync on, and it never covers the weapon a player is holding - that one
 	// is in their next snapshot, 40 ms away.
 	std::vector<S_PlayerAmmo>    ammo;
+	// The cheats every machine runs - the riot, the armed crowd, the clock's
+	// speed - at the state the last one to type each left it. Last, because
+	// nothing else in here depends on them and they depend on nothing.
+	std::vector<S_Cheat>         cheats;
 };
 
 // A pickup somebody has, and until when.
@@ -453,6 +520,134 @@ public:
 	bool AmmoSync() const { return m_ammoSync; }
 	void SetAmmoSync(bool on) { m_ammoSync = on; }
 
+	// ---- the session's rampage (docs/roadmap.md 5.10) ----------------------
+	//
+	// One record, because the engine allows exactly one: CDarkel is a
+	// singleton with one kill count, one clock and one HUD, and retail's own
+	// CanBePickedUp already refuses a second KILLFRENZY pickup while one is
+	// running (CDarkel::FrenzyOnGoing, 0x00420E60).
+	//
+	// **The server holds three things and decides two.** It holds the kill
+	// count, the deadline and the verdict; it decides the target - which is
+	// the only place the player count can be applied consistently - and it
+	// decides which of several endings the session gets. It does not hold the
+	// weapon, the models, the message or the HUD, because every machine's own
+	// rampage.sc put those in its own CDarkel already and they are identical.
+	// How many named cars one frenzy remembers. Rampage 02 wants 13, and only
+	// parked cars and abandoned session cars carry a name at all; once it's
+	// full the oldest name goes first.
+	static constexpr uint8_t RAMPAGE_CAR_KEYS = 64;
+
+	struct Rampage {
+		bool     open       = false;
+		uint16_t id         = 0;
+		uint16_t target     = 0;              // after the rule's multiplier
+		uint16_t kills      = 0;              // pedestrians and cars together
+		int32_t  limitMs    = 0;              // <0 means the script set no limit
+		uint32_t openedAtMs = 0;
+		uint8_t  openedBy   = INVALID_PLAYER; // for the log, nothing else
+		// Named cars already counted in this frenzy. See NoteRampageCar.
+		UnownedVehicleKey carKeys[RAMPAGE_CAR_KEYS] = {};
+		uint8_t           carKeyCount = 0;
+		uint8_t           carKeyNext  = 0;
+	};
+
+	uint8_t RampageRuleValue() const { return m_rampageRule; }
+	void    SetRampageRule(uint8_t rule) {
+	    m_rampageRule = rule > RAMPAGE_RULE_OFF ? uint8_t(RAMPAGE_RULE_SHARED) : rule;
+	}
+
+	// ---- cheats (docs/cheats.md) -------------------------------------------
+
+	uint8_t CheatRuleValue() const { return m_cheatRule; }
+	void    SetCheatRule(uint8_t rule) {
+	    m_cheatRule = rule > CHEAT_RULE_OFF ? uint8_t(CHEAT_RULE_SHARED) : rule;
+	}
+
+	// What to do with a cheat player `from` typed: CheatRelayFor, with this
+	// session's rule and host. One every machine runs is also written down,
+	// so BuildBackfill can bring a joiner to it; a dropped one is not.
+	uint8_t NoteCheat(uint8_t from, const CheatBody &body);
+
+	// ---- money (protocol.h, MoneyRule) -------------------------------------
+
+	uint8_t MoneyRuleValue() const { return m_moneyRule; }
+	// A change of rule empties the pool; the same rule again does nothing,
+	// which is what the options dialog's save does to it.
+	void    SetMoneyRule(uint8_t rule);
+	bool    MoneyPoolSeeded() const { return m_moneySeeded; }
+	int32_t MoneyPool() const { return m_moneyPool; }
+
+	// A change to player `from`'s cash. False when there is nothing to tell
+	// anybody: the session isn't pooling, the player isn't here, or it is a
+	// change the pool already holds. The first one into an empty pool seeds
+	// it with what that player has.
+	bool NoteMoneyChange(uint8_t from, const MoneyChangeBody &body);
+
+	// What S_Money says to player `to`: the rule, the pool and the last of
+	// their own changes it holds. `from` and `delta` say what caused it.
+	S_Money MoneyFor(uint8_t to, uint8_t from, int32_t delta, uint32_t sendTimeMs) const;
+
+	// May this award be delivered? Not with the rule off, not to somebody
+	// who isn't here, not for a nonsense amount, and not for a car that has
+	// already been paid for inside MONEY_AWARD_KEY_MS - every machine that
+	// decides a parked car sends one, and the first is the one that counts.
+	bool TakeMoneyAward(uint8_t from, const MoneyAwardBody &body, uint32_t nowMs);
+	const Rampage &CurrentRampage() const { return m_rampage; }
+
+	// A machine says its script started a frenzy.
+	//
+	// Every machine says so - each one's rampage.sc starts the same frenzy
+	// off its own aPickUpsCollected - and the server keeps the first. The
+	// later ones are not refused, though: they are answered with the frenzy
+	// that is already open and how far into it the session is, which is also
+	// the whole of the late-join answer. A player backfilled with the
+	// KILLFRENZY collection starts a fresh 120-second rampage on his own
+	// machine, and this is what puts him into the session's one instead.
+	//
+	// False only with the rule off, where there is no session-wide rampage to
+	// be in.
+	bool NoteRampageStart(uint8_t byPlayer, const RampageStartBody &in, uint32_t nowMs,
+	                      RampageOpenBody &out);
+
+	// One qualifying kill, judged on the machine that made it by that
+	// machine's own CDarkel. The server counts it and nothing else: it has no
+	// idea what models this rampage wants and does not need one.
+	//
+	// False for a kill that names a frenzy which is not the open one, which
+	// is the straggler arriving after an ending - rampage.sc puts a failed
+	// rampage's pickup back within a frame or two, so that is a real race.
+	bool NoteRampageKill(const RampageKillBody &in);
+
+	// One car wreck that counted on the machine that decided it. Same rules
+	// as a kill, plus one: a car that carries a key (a parked car, or a
+	// session car nobody was driving) can be wrecked independently on several
+	// machines, each by its own copy of the same blast, and each of them
+	// reports it. The first report for a key is counted and relayed, the rest
+	// are dropped. An unkeyed car has one machine that can decide it, so it's
+	// always counted.
+	bool NoteRampageCar(const RampageCarBody &in);
+
+	// A machine reports the ending its own CDarkel reached. First one wins;
+	// everything after it is dropped, which is ClaimPickup's rule applied to
+	// an outcome instead of an object.
+	bool NoteRampageEnd(const RampageEndBody &in, RampageEndBody &out);
+
+	// The backstop, and the answer to "whose clock is it".
+	//
+	// Normally a client reports the timeout first - its own CDarkel::Update
+	// fails the frenzy off CTimer and the report arrives a round trip later.
+	// This is what happens when no client can: the one who started it has
+	// disconnected, or every remaining player is sitting in the pause menu,
+	// where CTimer stops and the rampage would otherwise stay open for the
+	// rest of the session with $ONMISSION set on every machine.
+	//
+	// The grace is why this does not race the clients: the session's own
+	// deadline has to be a second past before the server will call it, so an
+	// honest last-second kill always wins.
+	static constexpr uint32_t RAMPAGE_GRACE_MS = 1000;
+	bool ExpireRampage(uint32_t nowMs, RampageEndBody &out);
+
 	// Record what a player says is in one of their weapon slots. Returns
 	// false when the slot is out of range or nothing changed, which is what
 	// stops the server relaying a restatement.
@@ -522,18 +717,29 @@ public:
 	// ---- vehicles ---------------------------------------------------------
 	//
 	// A vehicle joins the session the first time a player gets into it, and
-	// stays for the rest of the session. Park it and it's still there when
-	// you walk back. Getting out doesn't remove it. See EnterVehicleBody in
+	// stays while anybody needs it. Park it and it's still there when you
+	// walk back. Getting out doesn't remove it; being left alone for a minute
+	// with nobody near does (ReleaseIdleVehicles). See EnterVehicleBody in
 	// protocol.h for why the rest of the world's cars aren't synced at all.
 	Vehicle       *FindVehicle(uint16_t netId);
 	const Vehicle *FindVehicle(uint16_t netId) const;
 
 	// Registers a newly claimed vehicle, returns it, or null if the session
-	// already has as many as it'll track.
+	// already has MAX_SESSION_VEHICLES alive. A freed row is reused first.
 	Vehicle *AddVehicle(uint16_t modelId, uint8_t colour1, uint8_t colour2,
 	                    const Vec3 &pos, const Quat &rot);
 
 	const std::vector<Vehicle> &Vehicles() const { return m_vehicles; }
+	size_t LiveVehicleCount() const;
+
+	// Somebody is in it, settling it, or near it. See VEHICLE_KEEP_RADIUS_M.
+	bool VehicleNeeded(const Vehicle &v) const;
+
+	// Frees every row nobody has needed for VEHICLE_RELEASE_MS and returns the
+	// netIds, for the caller to send S_VehicleDespawn for. Run from the
+	// server's tick. AllocNetId has already moved past a released netId, so a
+	// late snapshot or claim naming it is refused like any unknown number.
+	std::vector<uint16_t> ReleaseIdleVehicles(uint32_t nowMs);
 
 	// ---- ambient peds ------------------------------------------------------
 	//
@@ -582,6 +788,36 @@ public:
 	// CPed::SetDie a second time over a state that is already the death's.
 	bool NotePedDeath(const PedDeathBody &death, uint8_t byPlayerId);
 
+	// Who a hit on an ambient pedestrian goes to, or null for nobody.
+	//
+	// The one ambient claim that travels *towards* an owner, so every ownership
+	// test in here is the inverse of the three above: those refuse anyone but
+	// the owner, and this refuses the owner. A machine reporting a hit on its
+	// own pedestrian is reporting one its own engine already applied, and
+	// relaying it back would apply it twice.
+	//
+	// The decision lives here rather than inline in the relay for the reason
+	// NotePedDeath's does: it is the whole of what the server decides about this
+	// packet, and tools/sessiontest can walk it without a socket. The relay
+	// does not second-guess any of it.
+	//
+	// Null for a pedestrian the session has never had or has already dropped,
+	// for a sender claiming a hit on its own ped, for a pedestrian already
+	// reported dead - the owner's own CPed::InflictDamage refuses a corpse at
+	// 0x004EA485, so this only saves the trip, exactly as the same test does in
+	// OnDamage - and for an owner who is no longer connected.
+	//
+	// **Friendly fire is deliberately not consulted.** docs/roadmap.md §5.2 is
+	// a rule about players hurting *each other*; a pedestrian is not a player,
+	// and a session with friendly fire off still lets everybody shoot NPCs.
+	// Asking here would make the default session one where NPCs are
+	// bulletproof, which is the bug rather than the fix.
+	//
+	// Nothing is recorded. Unlike a death, a hit is not a state a joiner has to
+	// be handed: the health it produced lives on the owner's machine, and no
+	// packet has ever carried an ambient ped's health.
+	Player *PedDamageRecipient(uint16_t pedNetId, uint8_t byPlayerId);
+
 	const std::vector<AmbientPed> &Peds() const { return m_peds; }
 
 	// ---- ambient traffic ---------------------------------------------------
@@ -608,7 +844,58 @@ public:
 	// about somebody else's car is a statement about the sender, not the car.
 	bool NoteCarState(const AmbientCarState &state, uint8_t byPlayerId);
 
+	// Who should be told that `byPlayerId` shot traffic car `netId`, or null.
+	//
+	// The car's host, which is the machine NoteCarState takes the stream from,
+	// and never the host itself: its own engine already applied the hit. So
+	// for a live car and a connected player, exactly one of "may stream it"
+	// and "gets told about hits on it" is true. A wrecked car is refused, the
+	// same as VehicleHitRecipient does, because the host's InflictDamage
+	// would leave at zero health anyway.
+	//
+	// A netId that has been promoted to a session car is no longer in this
+	// table, so a hit that was in flight across the promotion is dropped
+	// rather than rerouted. docs/protocol.md §1.23.
+	Player *CarHitRecipient(uint16_t netId, uint8_t byPlayerId);
+
 	const std::vector<AmbientCar> &Cars() const { return m_cars; }
+
+	// ---- police helicopters ------------------------------------------------
+	//
+	// protocol.h, entry 32. The owner's machine is the only one
+	// that can run a helicopter, so the session remembers very little: which
+	// serial is live in each of an owner's two police slots, so a hit can be
+	// routed and a late one dropped, and the last few serials each owner has
+	// said are gone, so an unreliable state that overtook its own C_HeliGone
+	// isn't relayed and doesn't bring the helicopter back on anybody's screen.
+
+	// A state from `owner`. False when it shouldn't be relayed: a slot that
+	// isn't a police slot, a status the engine doesn't have, or a serial the
+	// owner has already said is gone.
+	bool NoteHeliState(uint8_t owner, const HeliStateBody &body);
+
+	// A helicopter `owner` says is finished. False for a slot that isn't a
+	// police slot and for a serial already reported, which is the caller's
+	// cue to relay nothing.
+	bool NoteHeliGone(uint8_t owner, const HeliGoneBody &body);
+
+	// Whether `credit` can be named as the shooter of `owner`'s helicopter:
+	// somebody in the session who isn't the owner. Otherwise the relay says
+	// nobody.
+	bool MayCreditHeli(uint8_t owner, uint8_t credit);
+
+	// Who should be told that `byPlayerId` hit a helicopter, or null. The
+	// owner, when the helicopter is live under that serial, the hit is one
+	// the owner's rule can read, and the shooter isn't the owner himself.
+	Player *HeliHitRecipient(const HeliHitBody &body, uint8_t byPlayerId);
+
+	// Is this serial live in this owner's slot? For the tests.
+	bool HeliLive(uint8_t owner, uint8_t slot, uint16_t serial) const;
+
+	// A round `owner`'s helicopter fired. True when it should be relayed:
+	// a helicopter of his that is live, and a shot that is a shot. Nothing is
+	// remembered; a round changes nothing on the server.
+	bool MayRelayHeliShot(uint8_t owner, const HeliShotBody &body) const;
 
 	// ---- keeping the session's copy current --------------------------------
 	//
@@ -650,12 +937,124 @@ public:
 	// believed because of who sent it, not because nothing contradicts it.
 	bool MayReportVehicle(uint8_t playerId, uint16_t netId) const;
 
+	// Who should be told that `byPlayerId` just shot `netId`, or null if
+	// nobody should.
+	//
+	// **The exact inverse of MayReportVehicle**, and that inversion is the
+	// whole reason this is its own function rather than a flag on one. Every
+	// other packet about a car is a statement about the sender's own world -
+	// where mine is, what shape mine is in, mine blew up - and MayReportVehicle
+	// is the one rule that checks all of them: is the sender its driver. This
+	// one is refused *to* the driver, because a machine reporting a hit on the
+	// car it is driving is reporting one its own engine has already applied,
+	// and relaying it back would apply it twice.
+	//
+	// The recipient is the recorded driver, or with no driver the custodian
+	// settling the car (S_VehicleCustody) - MayReportVehicle's precedence,
+	// and for its reason: that is the machine whose engine is simulating the
+	// car and reporting its health. A car with neither is refused here rather
+	// than routed to a bystander, who would be taking health off a car it does
+	// not own either. Server::OnVehicleHit asks CustodyForHit first, which
+	// makes the shooter the custodian of a session car nobody holds.
+	//
+	// A destroyed car is refused too. The owner's own CVehicle::InflictDamage
+	// would refuse it at 0x00551A10 - health <= 0 leaves before the arithmetic
+	// - so this only saves the trip, exactly as the `alive` test does in
+	// PedDamageRecipient. A burst that was in flight when the car exploded is
+	// the ordinary case, not a rare one.
+	//
+	// **Friendly fire is deliberately not consulted**, the same as for a
+	// pedestrian. docs/roadmap.md §5.2 is a rule about players hurting each
+	// other; a car is not a player, and a session with friendly fire off still
+	// lets everybody shoot cars. It is also not the lever anyone would want:
+	// with it off you could still ram the same car off a bridge.
+	//
+	// Nothing is recorded. The health this produces lives on the owner's
+	// machine and reaches the session on the snapshot that has always carried
+	// it (Session::NoteVehicleState), so there is nothing here for a joiner to
+	// be told that the existing backfill does not already say.
+	Player *VehicleHitRecipient(uint16_t netId, uint8_t byPlayerId);
+
 	// A player got into a car, in a seat, or got out of one. The only place
 	// the session writes down who is sitting where, so the backfill and the
 	// live fan-out cannot disagree about it. NoteExitVehicle is safe to call
 	// for a car they were never in.
-	void NoteEnterVehicle(Player &p, Vehicle &v, uint8_t seat);
+	//
+	// NoteEnterVehicle returns the player it took OUT of the driver's seat to
+	// put this one in, or INVALID_PLAYER when nobody was there. That is the
+	// carjack, and it is the one thing in this whole area only the server can
+	// decide.
+	//
+	// Both machines involved in a jack believe they own the car and neither is
+	// wrong from where it is standing: the jacker's engine has the local
+	// player behind the wheel, and the victim's engine still has *its* local
+	// player behind the wheel, because a carjack only ever happens in the
+	// jacker's process. Nothing either client can look at breaks that tie.
+	// The session's record does, and this is it: a car has one driver, the
+	// latest claim on the driver's seat wins, and the loser is recorded out of
+	// the car here so the fan-out can tell them - which is the only way they
+	// ever find out. Server::OnEnterVehicle sends that S_ExitVehicle.
+	//
+	// Passengers are left where they are. A jacked car keeps the people
+	// sitting in the back, exactly as the engine's own jack does.
+	uint8_t NoteEnterVehicle(Player &p, Vehicle &v, uint8_t seat);
 	void NoteExitVehicle(Player &p, uint16_t netId);
+
+	// ---- who simulates a car nobody is driving ----------------------------
+	//
+	// protocol.h, S_VehicleCustody, has the design. The server's whole half
+	// of it is these three and the precedence inside MayReportVehicle: a
+	// custody is granted by NoteExitVehicle, read here so the fan-out can
+	// announce it, and ended either by the custodian saying it is finished or
+	// by one of the three things that end it silently (a new driver, the
+	// car's destruction, the custodian leaving).
+
+	// Who, or INVALID_PLAYER for nobody - which is the ordinary state of
+	// every parked car in the session and not a gap in the record.
+	uint8_t CustodianOf(uint16_t netId) const;
+
+	// The custodian's own "it has come to rest". False for anybody else's,
+	// which is the arbitration: a client may end its own ownership and never
+	// somebody else's.
+	bool EndCustody(uint16_t netId, uint8_t byPlayerId);
+
+	// A hit on a session car with no driver, from the machine that fired it.
+	//
+	// The one other way a custody starts. Every machine holds a parked car's
+	// health at the last report, so a hit taken locally was undone the next
+	// frame and a car nobody holds could not be shot into a fire. So the
+	// shooter becomes its custodian - it is looking at the car, which is the
+	// argument NoteExitVehicle makes for the ex-driver - and takes its own hit
+	// back; its health goes out on the snapshot, and its fire timer is the
+	// only one running.
+	//
+	//   Granted        nobody held it; `byPlayerId` does now. Announce it.
+	//   AlreadyTheirs  they were already its custodian and fired before they
+	//                  heard. Send it back to them, nothing to announce.
+	//   NotTheirs      a driver, somebody else's custody, a wreck, no such car
+	//                  or no such player: VehicleHitRecipient's business.
+	enum class HitCustody : uint8_t { NotTheirs, Granted, AlreadyTheirs };
+	HitCustody CustodyForHit(uint16_t netId, uint8_t byPlayerId);
+
+	// ---- a traffic car that has stopped being traffic ---------------------
+	//
+	// A player has taken the wheel of a car another machine's engine made.
+	// The ambient roster has an owner and no seats, so it cannot describe
+	// that at all - every observer would go on drawing the driver's ped in
+	// the road beside a car its original host is still steering.
+	//
+	// So the AmbientCar row becomes a Vehicle row **under the same netId**,
+	// which is what lets every machine keep the CVehicle it already has:
+	// nothing is spawned and nothing is destroyed, including on the machine
+	// whose own engine built it. netIds are one space (AllocNetId), so a
+	// number can never name both kinds at once and a C_EnterVehicle naming
+	// one is unambiguous - which is why this needed no new claim packet.
+	//
+	// Returns the new row, or null when the number names no traffic car or
+	// the vehicle table is full. `wasOwner` comes back as the machine that
+	// was hosting it, for the S_CarPromoted that tells everyone.
+	Vehicle *PromoteCar(uint16_t netId, uint8_t driverPlayerId,
+	                    uint8_t &wasOwner, AmbientCarBody &body);
 
 	// "That car is finished." The one way a vehicle becomes destroyed, so
 	// there is one place to look and one place for the vehicle seam's own
@@ -781,9 +1180,53 @@ private:
 	uint16_t             m_nextNetId  = 1;   // 0 is INVALID_NETID
 	bool                 m_friendlyFire = false;   // docs/roadmap.md §5.2
 	bool                 m_ammoSync     = false;   // docs/protocol.md 1.9.6
+	uint8_t              m_rampageRule  = RAMPAGE_RULE_SHARED;  // roadmap.md 5.10
+	uint8_t              m_cheatRule    = CHEAT_RULE_SHARED;    // roadmap.md 5.14
+	// The last state of each cheat every machine runs, by CheatId, with the
+	// two time cheats filed under CHEAT_FAST_TIME. See NoteCheat.
+	struct WorldCheat {
+		bool      set  = false;
+		CheatBody body = {};
+	};
+	WorldCheat           m_worldCheats[CHEAT_COUNT];
+	uint8_t              m_moneyRule    = MONEY_RULE_OFF;
+	// The session's wallet under `shared`. Empty until the first player in
+	// says what he has, and empty again once the last one leaves.
+	bool                 m_moneySeeded  = false;
+	int32_t              m_moneyPool    = 0;
+	// Cars somebody has been paid for lately, so the other machines that
+	// decided the same car are not.
+	struct PaidCar {
+		UnownedVehicleKey key    = {};
+		uint32_t          paidMs = 0;
+		bool              used   = false;
+	};
+	static constexpr size_t PAID_CARS = 32;
+	PaidCar              m_paidCars[PAID_CARS];
+	size_t               m_paidCarNext  = 0;
+	void ClearMoney();
+	Rampage              m_rampage;
+	// Never reused inside a session, and it starts at 1 so that a zero read
+	// out of an uninitialised field is never a valid frenzy.
+	uint16_t             m_nextFrenzyId = 1;
 	uint8_t              m_wantedRule   = WANTED_RULE_PERPLAYER;  // §5.1
 	std::vector<TakenPickup> m_pickups;
 	std::vector<WreckedUnownedCar> m_unownedWrecks;
+
+	// The police helicopters, per owner. See NoteHeliState.
+	struct HeliSlot {
+		bool     live   = false;
+		uint16_t serial = 0;
+	};
+	static constexpr uint8_t HELI_GONE_MEMORY = 8;
+	struct OwnerHelis {
+		HeliSlot slots[HELI_POLICE_SLOTS];
+		uint16_t gone[HELI_GONE_MEMORY] = {};
+		uint8_t  goneCount = 0;
+		uint8_t  goneNext  = 0;
+	};
+	OwnerHelis m_helis[MAX_PLAYERS];
+	bool HeliGoneAlready(uint8_t owner, uint16_t serial) const;
 
 	// Found by ident, or null. Non-const so ClaimPickup can overwrite a
 	// record whose window has passed instead of growing the vector forever.

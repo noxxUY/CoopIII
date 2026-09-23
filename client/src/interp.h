@@ -17,6 +17,36 @@ struct Pose {
 	float heading = 0.0f;
 };
 
+// Both buffers below extrapolate as pos + velocity * seconds, so the velocity
+// they take is metres per second. CPhysical::m_vecMoveSpeed isn't. It's
+// metres per engine step, and a step is 1/50 s:
+//
+//   0x00495B10  CPhysical::ApplyMoveSpeed
+//               pos (+0x34..+0x3C) += m_vecMoveSpeed (+0x78..+0x80) * [0x008E2CB4]
+//   0x004AD106  CTimer::Update, QueryPerformanceCounter arm
+//               ms_fTimeStep = frameMs * 0.05     (double at 0x005F76A8)
+//   0x004AD223  the timeGetTime arm, same thing in two multiplies
+//               ms_fTimeStep = frameMs * 0.001 * 50.0   (0x005F76B0, 0x005F76B4)
+//
+// So ms_fTimeStep is 1.0 at 20 ms a frame, 0.83 at 60 fps, and a move speed of
+// 1.0 covers 50 m in a second whatever the frame rate. The handling loader
+// agrees from the other side: ConvertDataToGameUnits (0x00546BB0) turns km/h
+// into this unit with * 0.0055556 (0x0060170C, 1000 / 3600 / 50) and
+// accelerations with * 0.0004 (0x00601708, 1 / 50^2).
+//
+// Everything on the wire that's named after m_vecMoveSpeed carries it raw,
+// because the receivers also write it back into the engine
+// (ApplyRemoteVehicle, the remote ped's velocity). The conversion happens
+// here, at the push, and only there. HeliStateBody::velocity is already m/s
+// on the wire (game/heli.cpp converts on both ends), so helisync pushes it
+// as is.
+constexpr float ENGINE_STEPS_PER_SECOND = 50.0f;
+
+inline Vec3 MoveSpeedToMps(const Vec3 &moveSpeed) {
+	return {moveSpeed.x * ENGINE_STEPS_PER_SECOND, moveSpeed.y * ENGINE_STEPS_PER_SECOND,
+	        moveSpeed.z * ENGINE_STEPS_PER_SECOND};
+}
+
 // Shortest-path angle lerp. Ped headings are a scalar yaw in radians
 // (CPed::m_fRotationCur, re3 src/peds/Ped.h:444) and wrap at ±pi, so a plain
 // lerp spins the long way round whenever it crosses that seam.
@@ -62,6 +92,13 @@ public:
 	// toward a number that no longer means anything.
 	void Stop() { m_running = false; }
 	bool Running() const { return m_running; }
+
+	// Pulls the render instant back to `maxMs` if it has run past it, and
+	// returns it. For a stream whose receiver wants to stop at the newest
+	// sample instead of extrapolating past it. The clock itself is what gets
+	// held, not just the pose, so a late sample picks up from where the
+	// entity stands rather than from where the clock had wandered off to.
+	uint32_t Clamp(uint32_t maxMs);
 
 private:
 	uint32_t m_renderTimeMs = 0;
@@ -153,6 +190,10 @@ Quat Slerp(const Quat &a, const Quat &b, float t);
 class VehicleInterpBuffer {
 public:
 	static constexpr uint32_t DELAY_MS           = 100;
+	// With the velocity in m/s, that's 6.25 m for a car at 25 m/s and 12.5 m
+	// at a move speed of 1.0 (180 km/h). In practice it's a bit less: during
+	// a stall the playback clock settles about 220 ms past the newest sample
+	// at 60 fps, because CLOCK_EASE keeps pulling it back toward the target.
 	static constexpr uint32_t MAX_EXTRAPOLATE_MS = 250;
 
 	// 20m, not the ped's 5. A car at 100 km/h covers about 1.1m between
@@ -175,6 +216,23 @@ public:
 	// its wheels are turning at 60.
 	bool SampleDelayed(uint32_t localNowMs, VehicleTransform &out);
 
+	// SampleDelayed that never goes past the newest sample: when the stream
+	// goes quiet the car stops on the last transform its sender gave and
+	// stays there, instead of coasting MAX_EXTRAPOLATE_MS further along its
+	// last velocity first.
+	//
+	// This is for traffic (Client::CorrectAmbientCars). A traffic car's host
+	// only streams the eight nearest its own player, so one can go quiet for
+	// good while its host still has it, and whatever pose it is held at is
+	// where it stands on this screen until it comes back or is despawned.
+	// That has to be a pose the host said, not a guess this end made.
+	//
+	// While the stream is flowing it is SampleDelayed exactly: the playback
+	// clock sits DELAY_MS behind the newest sample and never reaches it. At
+	// traffic's 10 Hz it swings between about 150 and 50 ms behind, so the
+	// two only differ once a row is some 50 ms late or missing.
+	bool SampleDelayedHeld(uint32_t localNowMs, VehicleTransform &out);
+
 	uint32_t NewestTimeMs() const {
 		return m_samples.empty() ? 0 : m_samples.back().timeMs;
 	}
@@ -186,6 +244,8 @@ private:
 		Quat     rot;
 		Vec3     velocity;
 	};
+
+	bool SampleOnClock(uint32_t localNowMs, bool holdAtNewest, VehicleTransform &out);
 
 	std::deque<Snapshot> m_samples;
 	PlaybackClock        m_clock;

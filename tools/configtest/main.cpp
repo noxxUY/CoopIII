@@ -30,6 +30,91 @@ void TestDefaults() {
 	Check(c.wantedLevel == WantedLevelRule::PerPlayer, "wanted level is per player (5.1)");
 	Check(c.missionFailOnDeath == true, "a mission fails on death (5.4)");
 	Check(c.ammoSync == false, "ammo sync is off (protocol 1.9.6)");
+	// roadmap.md 5.10 decided shared, so shared is the default. The other two
+	// values are a group disagreeing about difficulty, not about the rule.
+	Check(c.rampage == RampageMode::Shared, "rampages are shared (5.10)");
+	// Every cheat works in single player, so every cheat works by default
+	// (5.5, 5.14); the other two values are a group choosing otherwise.
+	Check(c.cheats == CheatMode::Shared, "cheats are shared (5.14)");
+	// Every build before the setting existed paid each machine's own player
+	// for what its own engine saw, so that is what off is and off is the
+	// default.
+	Check(c.money == MoneyMode::Off, "money is off");
+}
+
+void TestMoney() {
+	std::printf("money\n");
+
+	ServerConfig c;
+	Check(c.Parse("money = own\n") && c.money == MoneyMode::Own, "\"own\" parses");
+	Check(c.Parse("MONEY = Shared\n") && c.money == MoneyMode::Shared,
+	      "\"Shared\" parses, key and value both without case");
+	Check(c.Parse("money = off\n") && c.money == MoneyMode::Off, "\"off\" parses");
+	Check(c.Parse("money = pooled\n") && c.money == MoneyMode::Shared,
+	      "\"pooled\" is another word for shared");
+	c.Parse("money = everybody's\n");
+	Check(c.money == MoneyMode::Shared, "an unknown value leaves it where it was");
+
+	MoneyMode m = MoneyMode::Off;
+	Check(ParseMoney("  own ", &m) && m == MoneyMode::Own, "the value is trimmed, as on the command line");
+	Check(!ParseMoney("", &m) && m == MoneyMode::Own, "an empty value is refused and changes nothing");
+
+	Check(std::string(Name(MoneyMode::Off)) == "off" &&
+	          std::string(Name(MoneyMode::Own)) == "own" &&
+	          std::string(Name(MoneyMode::Shared)) == "shared",
+	      "the three names are the three values the file takes");
+	Check(WireValue(MoneyMode::Off) == MONEY_RULE_OFF &&
+	          WireValue(MoneyMode::Own) == MONEY_RULE_OWN &&
+	          WireValue(MoneyMode::Shared) == MONEY_RULE_SHARED,
+	      "and each one is the rule S_Money carries");
+
+	ServerConfig written;
+	written.money = MoneyMode::Shared;
+	const std::string ini = written.ToIni();
+	Check(ini.find("money = shared") != std::string::npos, "the file says money = shared");
+	Check(ini.find("cheats = shared") != std::string::npos,
+	      "and still has the key written before it, whole");
+	ServerConfig read;
+	read.Parse(ini);
+	Check(read == written, "and reads back the same");
+	ServerConfig other = written;
+	other.money = MoneyMode::Own;
+	Check(other != written, "and a different money rule is a different config");
+}
+
+void TestCheats() {
+	std::printf("cheats (5.14)\n");
+
+	ServerConfig c;
+	Check(c.Parse("cheats = personal\n") && c.cheats == CheatMode::Personal,
+	      "\"personal\" parses");
+	Check(c.Parse("CHEATS = OFF\n") && c.cheats == CheatMode::Off,
+	      "\"OFF\" parses, key and value both without case");
+	Check(c.Parse("cheats = shared\n") && c.cheats == CheatMode::Shared,
+	      "\"shared\" parses");
+	c.cheats = CheatMode::Personal;
+	c.Parse("cheats = sometimes\n");
+	Check(c.cheats == CheatMode::Personal, "an unknown value leaves it where it was");
+
+	Check(std::string(Name(CheatMode::Shared)) == "shared" &&
+	          std::string(Name(CheatMode::Personal)) == "personal" &&
+	          std::string(Name(CheatMode::Off)) == "off",
+	      "the three names are the three values the file takes");
+	Check(WireValue(CheatMode::Shared) == CHEAT_RULE_SHARED &&
+	          WireValue(CheatMode::Personal) == CHEAT_RULE_PERSONAL &&
+	          WireValue(CheatMode::Off) == CHEAT_RULE_OFF,
+	      "and each one is the rule the welcome carries");
+
+	ServerConfig written;
+	written.cheats = CheatMode::Off;
+	const std::string ini = written.ToIni();
+	Check(ini.find("cheats = off") != std::string::npos,
+	      "the file says cheats = off");
+	Check(ini.find("rampages = shared") != std::string::npos,
+	      "and still has the key written before it, whole");
+	ServerConfig read;
+	read.Parse(ini);
+	Check(read == written, "and reads back the same");
 }
 
 void TestParse() {
@@ -37,13 +122,14 @@ void TestParse() {
 
 	ServerConfig c;
 	Check(c.Parse("[CoopIII]\nport = 2010\nfriendlyFire = true\nwantedLevel = shared\n"
-	              "missionFailOnDeath = false\nammoSync = true\n"),
+	              "missionFailOnDeath = false\nammoSync = true\nrampages = scaled\n"),
 	      "a full file parses");
 	Check(c.port == 2010, "port");
 	Check(c.friendlyFire, "friendly fire");
 	Check(c.wantedLevel == WantedLevelRule::Shared, "wanted level");
 	Check(!c.missionFailOnDeath, "mission fails on death");
 	Check(c.ammoSync, "ammo sync");
+	Check(c.rampage == RampageMode::Scaled, "the rampage rule");
 
 	// Keys are matched without case, values too, and yes/on/1 all mean true -
 	// a config file is edited by hand and should not be fussy.
@@ -83,6 +169,8 @@ void TestRoundTrip() {
 	written.wantedLevel        = WantedLevelRule::Off;
 	written.missionFailOnDeath = false;
 	written.ammoSync           = true;
+	written.rampage            = RampageMode::Scaled;
+	written.money              = MoneyMode::Own;
 
 	const std::string ini = written.ToIni();
 	Check(ini.find("[CoopIII]") != std::string::npos, "the file has its section header");
@@ -123,6 +211,8 @@ int main() {
 	TestParse();
 	TestRoundTrip();
 	TestNames();
+	TestCheats();
+	TestMoney();
 
 	std::printf("\n%s\n", g_failures == 0 ? "all server config checks passed"
 	                                      : "server config checks FAILED");

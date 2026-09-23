@@ -4,6 +4,7 @@
 #include "ped.h"
 #include "pedanim.h"
 #include "vehicle.h"
+#include "wreckqueue.h"
 #include "../hook/hook.h"
 #include "../clock.h"
 #include "../log.h"
@@ -52,6 +53,83 @@ uint32_t g_replicas = 0;
 // never had to fire.
 uint32_t g_replicaHandleLost = 0;
 uint32_t g_replicaSlotStolen = 0;
+
+// How often this machine's own engine has tried to kill a replica, and how
+// often it managed it before anything could stop it.
+//
+// Two numbers rather than one, because they mean opposite things. The first
+// is the guard working: a death refused at CPed::SetDie costs nothing and
+// nobody sees it. The second is the backstop working: a replica that reached
+// PED_DIE or PED_DEAD with nothing in the session having asked, which today
+// has exactly one known route (CAutomobile::BlowUpCar's PED_DRIVING arm goes
+// through CPed::SetDead, a different address) and is rebuilt from the host's
+// stream. A session that reports a large second number against a small first
+// one is one where this file is guarding the wrong door.
+uint32_t g_replicaDeathRefused  = 0;
+uint32_t g_replicaDeathRecovered = 0;
+
+// True while KillAmbientReplica is carrying out a death the host reported.
+// population.h, HostDeathScope, has the reason; a plain bool for the same
+// reason g_creatingReplica is one.
+bool g_applyingHostDeath = false;
+
+// ---- which CPed is a replica of whose pedestrian ----------------------------
+//
+// The reverse index population.h promises, and it lives here rather than in
+// client.cpp because this file owns every transition of
+// `RemoteAmbientPed::poolHandle` - SpawnAmbientReplica sets it,
+// DespawnAmbientReplica clears it, AmbientReplicaIsAlive clears it when the
+// engine has taken the object away - and a table maintained anywhere else
+// would be a second thing to keep in step with three writers.
+//
+// Shaped after `HostedPed` rather than after ped.cpp's `g_remotePeds`, and the
+// difference is deliberate. `g_remotePeds` is eight entries, so it can afford a
+// CPools::GetPed per entry per lookup. This is 256, and the caller is inside
+// CPed::InflictDamage. So the scan is 256 pointer compares and the pool lookup
+// happens once, on the one entry that matched - which is where it is
+// load-bearing anyway, because a pool slot is reused immediately and "the
+// pointer still matches" is not "our replica is still alive".
+//
+// Matched to Client::MAX_REMOTE_PEDS, which is matched to the server's
+// MAX_AMBIENT_PEDS. A roster this table could not hold would silently stop
+// answering for whichever replicas fell off the end, and the symptom would be
+// a pedestrian that cannot be shot - which is the bug this whole file's newest
+// half exists to end.
+constexpr size_t MAX_REPLICA_INDEX = 256;
+
+struct ReplicaIdentity {
+	void    *ped        = nullptr;
+	int32_t  poolHandle = -1;
+	uint16_t netId      = INVALID_NETID;
+};
+
+ReplicaIdentity g_replicaIndex[MAX_REPLICA_INDEX];
+
+// Said once. Past the table a replica still exists and still walks around; it
+// simply cannot be shot, which is a visible thing and has to be said rather
+// than discovered.
+bool g_warnedReplicaIndexFull = false;
+
+void RememberReplica(void *ped, int32_t poolHandle, uint16_t netId) {
+	for (ReplicaIdentity &id : g_replicaIndex) {
+		if (id.ped != nullptr)
+			continue;
+		id = ReplicaIdentity{ped, poolHandle, netId};
+		return;
+	}
+	if (!g_warnedReplicaIndexFull) {
+		g_warnedReplicaIndexFull = true;
+		Log("population: the replica index is full at %zu; pedestrians past it "
+		    "cannot be shot on this machine (and this will not be said again)",
+		    MAX_REPLICA_INDEX);
+	}
+}
+
+void ForgetReplica(uint16_t netId) {
+	for (ReplicaIdentity &id : g_replicaIndex)
+		if (id.ped != nullptr && id.netId == netId)
+			id = ReplicaIdentity{};
+}
 
 // ---- the duplicate-pedestrian instrument -----------------------------------
 //
@@ -169,6 +247,15 @@ void ReportCrowd(uint32_t peds, uint32_t pedReplicas, uint32_t cars,
 		Log("population: %u ped replica(s) have stopped resolving and %u have "
 		    "had their pool slot taken since the session started",
 		    g_replicaHandleLost, g_replicaSlotStolen);
+
+	// Same rule: said only when it is not zero, because zero is what the
+	// prevention is for. The first number is deaths this machine's engine
+	// asked for and was refused; the second is replicas it killed by a route
+	// that never reaches CPed::SetDie and that had to be rebuilt.
+	if (g_replicaDeathRefused != 0 || g_replicaDeathRecovered != 0)
+		Log("population: refused %u local death(s) of somebody else's "
+		    "pedestrian and rebuilt %u replica(s) this machine killed anyway",
+		    g_replicaDeathRefused, g_replicaDeathRecovered);
 
 	// The second line, added with the ped stream (docs/population.md §3
 	// step 6). The first line says whether the crowd is shared rather than
@@ -431,14 +518,11 @@ bool g_warnedLostCarsFull   = false;
 //     replica's autopilot is zeroed and its transform is written from the
 //     wire. The replica is not simulating the crash that killed the original
 //     and never will.
-//   - Health. AmbientCarState carries position, rotation and velocity and no
-//     condition at all, so the original and its replicas have independent
-//     healths from the frame they are created: the original is driven into
-//     things by the traffic AI, the replica is bumped by whatever this
-//     machine's own world does to it. The same 1100 x mult that finishes one
-//     leaves the other running. A parked car did not have this - it sits at
-//     full health on every machine, which is exactly why the parked half
-//     could lean on the explosion replay harder than this one can.
+//   - Health. This used to be the big one: the original and its replicas
+//     had independent healths, so the same blast finished one and left the
+//     other running. Since docs/protocol.md §1.23 a replica takes no damage
+//     of its own and holds the health the host streams, so the replica never
+//     gets there first - it waits for this report.
 //   - Distance. Only the eight cars nearest the host's own player are
 //     streamed (protocol.h, MAX_CAR_STATES); the ninth is held wherever it
 //     was last heard. A replica several streets from its original is not in
@@ -449,10 +533,14 @@ bool g_warnedLostCarsFull   = false;
 // died. A replica's own wreck is this machine's local opinion about somebody
 // else's property - see IsAmbientCarWeShouldHost for where that refusal
 // lives and why it is a property of the object rather than a moment in time.
-constexpr uint8_t MAX_PENDING_AMBIENT_WRECKS = 8;
-UnownedBlast      g_ambientWrecks[MAX_PENDING_AMBIENT_WRECKS];
-uint8_t           g_ambientWreckHead  = 0;
-uint8_t           g_ambientWreckCount = 0;
+//
+// It holds every car this machine can host. It used to hold eight, and the
+// sweep below marks a car reported before it queues it, so the ninth wreck of
+// one frame - which BANGBANGBANG makes routine - was dropped and never tried
+// again (game/wreckqueue.h).
+WreckQueue<MAX_HOSTED_CARS> g_ambientWrecks;
+static_assert(WreckQueue<MAX_HOSTED_CARS>::kCapacity >= MAX_HOSTED_CARS,
+              "every hosted car can wreck in the same frame");
 
 bool g_saidAmbientWreckSent    = false;
 bool g_saidAmbientWreckApplied = false;
@@ -478,20 +566,8 @@ void PushAmbientWreck(uint16_t netId, void *vehicle) {
 	blast.key.id   = netId;
 	ReadCarBlastTransform(vehicle, blast.where);
 
-	for (uint8_t i = 0; i < g_ambientWreckCount; ++i) {
-		const UnownedBlast &k =
-		    g_ambientWrecks[(g_ambientWreckHead + i) % MAX_PENDING_AMBIENT_WRECKS];
-		if (k.key.id == blast.key.id)
-			return;   // already queued; one car, one report
-	}
-	if (g_ambientWreckCount == MAX_PENDING_AMBIENT_WRECKS) {
-		g_ambientWreckHead = static_cast<uint8_t>((g_ambientWreckHead + 1) %
-		                                          MAX_PENDING_AMBIENT_WRECKS);
-		--g_ambientWreckCount;
-	}
-	g_ambientWrecks[(g_ambientWreckHead + g_ambientWreckCount) %
-	                MAX_PENDING_AMBIENT_WRECKS] = blast;
-	++g_ambientWreckCount;
+	// Already queued: one car, one report. The queue refuses the second.
+	g_ambientWrecks.Push(blast);
 }
 
 HostedCar *FindHostedCar(const void *vehicle) {
@@ -719,13 +795,7 @@ uint32_t DrainLostAmbientCars(uint16_t *out, uint32_t max) {
 }
 
 uint8_t DrainAmbientWrecks(UnownedBlast *out, uint8_t max) {
-	uint8_t n = 0;
-	while (n < max && g_ambientWreckCount > 0) {
-		out[n++] = g_ambientWrecks[g_ambientWreckHead];
-		g_ambientWreckHead =
-		    static_cast<uint8_t>((g_ambientWreckHead + 1) % MAX_PENDING_AMBIENT_WRECKS);
-		--g_ambientWreckCount;
-	}
+	const uint8_t n = g_ambientWrecks.Drain(out, max);
 
 	// Once, the first time it works, and this project has paid for that rule
 	// twice: a seam that only ever logs its failures looks identical to a
@@ -776,12 +846,7 @@ UnownedWreckOutcome WreckAmbientCarReplica(RemoteAmbientCar &car,
 	if (IsWreckedCar(v))
 		return UnownedWreckOutcome::Already;
 
-	using BlowUpSlotFn = void(__thiscall *)(void *, void *);
-	void *const vtable = Field<void *>(v, 0);
-	if (!vtable)
-		return UnownedWreckOutcome::NotHere;
-	const uintptr_t slot = reinterpret_cast<uintptr_t *>(vtable)[VTABLE_BLOW_UP_CAR];
-	if (!slot)
+	if (!Field<void *>(v, 0))
 		return UnownedWreckOutcome::NotHere;
 
 	// Placed first, then blown up. Everything BlowUpCar decides - where the
@@ -790,10 +855,11 @@ UnownedWreckOutcome WreckAmbientCarReplica(RemoteAmbientCar &car,
 	// call and not after it.
 	PlaceCarForBlast(v, where);
 
+	// Through game/vehicle.cpp, because its BlowUpCar detour refuses a replica
+	// unless the call says it comes from the host (docs/protocol.md §1.23).
 	// Null culprit, the same thing the script's own BLOW_UP_CAR passes.
-	// Crediting the local player would pay them for a kill on another
-	// machine, and CDarkel would register every ped in the car as theirs.
-	reinterpret_cast<BlowUpSlotFn>(slot)(v, nullptr);
+	if (!BlowUpCarAsOwnerSaid(v))
+		return UnownedWreckOutcome::NotHere;
 
 	// BlowUpCar returns having done nothing when bCanBeDamaged is clear,
 	// which the campaign uses during cutscenes. Saying "wrecked" then would
@@ -845,7 +911,10 @@ bool NameLocalAmbientCar(uint32_t tempId, uint16_t netId) {
 // nearly the same eight; two players on opposite islands do not, and the far
 // one's view of this machine's traffic is a set of parked cars. Fixing that
 // means the server choosing per-observer, which is step 5's business.
-uint32_t SampleHostedCars(AmbientCarState *out, uint32_t max) {
+uint32_t SampleHostedCars(AmbientCarState *out, uint32_t max, uint8_t &hornMask,
+                          uint8_t &sirenMask) {
+	hornMask  = 0;
+	sirenMask = 0;
 	if (max == 0)
 		return 0;
 
@@ -905,6 +974,10 @@ uint32_t SampleHostedCars(AmbientCarState *out, uint32_t max) {
 		if (!SampleHostedCar(best[i].car->poolHandle, state))
 			continue;
 		state.netId    = best[i].car->netId;
+		if (HostedCarHonking(best[i].car->poolHandle))
+			hornMask |= CarStateHornBit(static_cast<uint8_t>(written));
+		if (HostedCarSirenOn(best[i].car->poolHandle))
+			sirenMask |= CarStateSirenBit(static_cast<uint8_t>(written));
 		out[written++] = state;
 	}
 
@@ -1258,7 +1331,154 @@ void NoteHostedPedDeath(void *ped, uint16_t animId) {
 	out.animId = animId;
 }
 
+HostDeathScope::HostDeathScope() { g_applyingHostDeath = true; }
+HostDeathScope::~HostDeathScope() { g_applyingHostDeath = false; }
+
+// Called from game/combat.cpp's CPed::SetDie detour, before the original, for
+// every ped that is not the local player.
+//
+// **Why this is a refusal and not a report**, which is the decision the whole
+// change turns on. CoopIII is host-authoritative: an entity's own machine
+// decides what happens to it and everybody else is written to. A replica
+// reaching CPed::SetDie on an observer is that rule being broken, not a fact
+// the observer has discovered - the host's copy of that pedestrian is alive
+// and walking, and it is the observer that is wrong. Telling the session
+// would be one machine announcing its own mistake as news, and the session
+// would then have to pick a winner between two machines for a pedestrian
+// neither of them is authoritative about together. So nothing goes on the
+// wire; the call simply does not happen.
+//
+// **Why it is stated on the object and not on the cause.** `SpawnAmbientReplica`
+// already sets the four CEntity proof flags plus bExplosionProof, and they
+// are not a mechanism: population.h's PedProofForDamageCause has the jump
+// table out of the retail image, and six of CPed::InflictDamage's causes read
+// no flag at all. A guard that has to enumerate causes is a guard that will
+// be wrong again the next time somebody finds a seventh.
+//
+// **Why here and not at CPed::InflictDamage**, which already refuses damage
+// to a replica since protocol 23. Because most of what can still kill one
+// does not go through InflictDamage: `CPed::ProcessControl`'s
+// `m_fHealth <= 1.0f` arm at 0x004C8DDA, `CPed::SetGetUp`'s crush at
+// 0x004D0F95 and `CAutomobile::BlowUpCar`'s on-foot arm at 0x0053BDFE all
+// call SetDie directly. Guarding the damage was the right thing to do and it
+// was never going to be enough.
+bool RefuseLocalReplicaDeath(void *ped, uint16_t &netId) {
+	if (!ped)
+		return false;
+	// The session's own kill, through KillAmbientReplica. It goes through the
+	// engine's address and therefore through the same detour.
+	if (g_applyingHostDeath)
+		return false;
+	if (!AmbientReplicaForPed(ped, netId))
+		return false;
+	if (PlanReplicaSetDie(/*isReplica=*/true, /*sessionAsked=*/false) !=
+	    SetDieVerdict::RefuseAndHeal)
+		return false;
+
+	// The health goes back before the refusal is reported, because two of the
+	// callers zeroed it on the way in and a replica left on zero health is one
+	// CPed::ProcessControl will bring straight back here on the next frame,
+	// sixty times a second, for the rest of the session. 100.0f is what
+	// CPed::CPed gives a new one (0x004C4225).
+	Field<float>(ped, offs::PED_HEALTH) = REPLICA_FULL_HEALTH;
+
+	++g_replicaDeathRefused;
+	if (PopTrace())
+		Log("population/trace: refused a local death of replica net %u", netId);
+
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("population: our own engine tried to kill ambient ped replica %u "
+		    "and was refused - only the machine hosting a pedestrian decides "
+		    "that he is dead, and it tells us on C_PedDeath. His health has "
+		    "been put back (and this will not be said again)", netId);
+	}
+	return true;
+}
+
+bool AmbientReplicaForPed(const void *ped, uint16_t &netId) {
+	if (!ped)
+		return false;
+	for (const ReplicaIdentity &id : g_replicaIndex) {
+		if (id.ped != ped)
+			continue;
+		// Matched on the pointer; now the half that makes it safe. A pool slot
+		// is reused the instant it frees up, so a row whose replica the engine
+		// has already deleted would otherwise go on matching whatever moved in
+		// - and the next civilian to take that slot would have its wounds
+		// reported to the session under somebody else's pedestrian's name.
+		// AmbientReplicaIsAlive clears the entry on the next frame; until it
+		// runs, this is what says no.
+		if (id.poolHandle < 0 ||
+		    Func<GetPedFn>(CPools__GetPed)(id.poolHandle) != ped)
+			return false;
+		netId = id.netId;
+		return true;
+	}
+	return false;
+}
+
+void *ResolveHostedCar(uint16_t netId) {
+	if (netId == INVALID_NETID)
+		return nullptr;
+	for (const HostedCar &c : g_hostedCars) {
+		if (!c.active || !c.named || c.netId != netId)
+			continue;
+		void *const now = c.poolHandle >= 0 ? AmbientCarFromRef(c.poolHandle) : nullptr;
+		return now == c.vehicle ? now : nullptr;
+	}
+	return nullptr;
+}
+
+bool HostedPedFor(const void *ped, bool &named) {
+	named = false;
+	const HostedPed *h = ped ? FindHostedByPed(ped) : nullptr;
+	if (!h || h->poolHandle < 0 ||
+	    Func<GetPedFn>(CPools__GetPed)(h->poolHandle) != ped)
+		return false;
+	named = h->named && h->netId != INVALID_NETID;
+	return true;
+}
+
+bool HostedCarFor(const void *vehicle, bool &named) {
+	named = false;
+	const HostedCar *c = vehicle ? FindHostedCar(vehicle) : nullptr;
+	if (!c || c->poolHandle < 0 || AmbientCarFromRef(c->poolHandle) != vehicle)
+		return false;
+	named = c->named && c->netId != INVALID_NETID;
+	return true;
+}
+
+void *ResolveHostedPed(uint16_t netId) {
+	if (netId == INVALID_NETID)
+		return nullptr;
+	for (const HostedPed &h : g_hosted) {
+		// `named` is the entitlement half. A ped this machine has not yet had a
+		// netId for cannot be the one anybody asked about, and a row that is
+		// merely active is not one the session has a name for.
+		if (!h.active || !h.named || h.netId != netId)
+			continue;
+		// And the liveness half, exactly as the sweep does it: the handle has to
+		// still resolve, and it has to still resolve to the same object. The
+		// sweep runs once a frame and this row could have been stale for most of
+		// this one, which is the same race NameLocalAmbientPed re-checks for.
+		void *const now = h.poolHandle >= 0
+		                      ? Func<GetPedFn>(CPools__GetPed)(h.poolHandle)
+		                      : nullptr;
+		return now == h.ped ? now : nullptr;
+	}
+	return nullptr;
+}
+
 namespace {
+
+// Defined at the bottom of this file, next to the spawn it undoes. Needed up
+// here because AmbientReplicaIsAlive has to be able to take away a replica the
+// local engine killed, and a corpse it only dropped the handle to would be a
+// locked MISSION_CHAR body lying in the street for the rest of the session -
+// CanBeDeleted refuses it, so nothing would ever come for it.
+void DespawnAmbientReplica(RemoteAmbientPed &ped);
 
 uint32_t DrainAmbientPedDeaths(PedDeathBody *out, uint32_t max) {
 	const uint32_t n = g_deathCount < max ? g_deathCount : max;
@@ -1331,7 +1551,13 @@ bool KillAmbientReplica(RemoteAmbientPed &ped, uint16_t animId) {
 	// checks it.
 	using SetDieThisFn = void(__thiscall *)(void *, uint32_t, float, float);
 	const uint16_t anim = PlanDeathAnim(animId, StdAnimGroupCount());
-	Func<SetDieThisFn>(CPed__SetDie)(mem, anim, PED_DIE_DELTA, PED_DIE_SPEED);
+	{
+		// Through the engine's own address, so through game/combat.cpp's own
+		// CPed::SetDie detour - which now refuses that call for a replica.
+		// This is the one caller entitled to make it, so it says so.
+		HostDeathScope scope;
+		Func<SetDieThisFn>(CPed__SetDie)(mem, anim, PED_DIE_DELTA, PED_DIE_SPEED);
+	}
 
 	// Whatever was driven into this ped went with the death. ClearAll and the
 	// die animation replaced it, so leaving this set would have
@@ -1540,7 +1766,10 @@ uint32_t SampleHostedPeds(AmbientPedState *out, uint32_t max) {
 		s.animId       = ReadPedBaseAnim(c.ped);
 		s.vehicleNetId = c.vehicleNetId;
 		s.seat         = c.seat;
-		s.pad          = 0;
+		// Alight, as the host's own engine has it. m_pFire is set by
+		// StartFire and nilled by Extinguish, so there is no second copy of
+		// the answer to go stale (the same read PF_ON_FIRE makes).
+		s.flags        = Field<void *>(c.ped, PED_FIRE) ? AMBIENT_PED_ON_FIRE : 0;
 		s.pos          = ReadVec3(c.ped, offs::POSITION);
 		s.heading      = Field<float>(c.ped, offs::PED_ROT_CUR);
 	};
@@ -1604,8 +1833,8 @@ uint32_t SampleHostedPeds(AmbientPedState *out, uint32_t max) {
 //
 //   - `CPools::GetPed` returns null. `CPool::GetAt` compares the whole pool
 //     flags byte, whose top bit is the slot's free flag, so a handle stops
-//     resolving the moment the ped is deleted - reused slot or not
-//     (AGENTS.md, Area B). There is no transient null for a live object.
+//     resolving the moment the ped is deleted - reused slot or not.
+//     There is no transient null for a live object.
 //   - the vtable is not `CCivilianPed`'s. Belt and braces on top of the
 //     above, and the same test `DespawnAmbientReplica` already trusts to
 //     decide whether it may run a destructor.
@@ -1618,8 +1847,63 @@ bool AmbientReplicaIsAlive(RemoteAmbientPed &ped) {
 
 	void *const mem = Func<GetPedFn>(CPools__GetPed)(ped.poolHandle);
 	if (mem != nullptr &&
-	    Field<uintptr_t>(mem, offs::VTABLE) == CCivilianPed__vtable)
-		return true;
+	    Field<uintptr_t>(mem, offs::VTABLE) == CCivilianPed__vtable) {
+		// **The third condition, and it is a different kind of gone.**
+		//
+		// The two below are the object disappearing. This one is the object
+		// still being there and being a corpse nobody asked for: the local
+		// engine has killed a pedestrian it does not host, which is an
+		// observer deciding something only the host may decide
+		// (docs/population.md §5.6).
+		//
+		// game/combat.cpp's CPed::SetDie detour refuses almost every route to
+		// this, and this is the backstop for the rest. It is deliberately a
+		// test on the *state* rather than on the route, which is what makes
+		// it complete: `CAutomobile::BlowUpCar`'s PED_DRIVING arm kills its
+		// occupants through `CPed::SetDead` (0x004D3970) and never touches
+		// CPed::SetDie at all, so no amount of guarding that one address
+		// would catch it - and anything else nobody has found yet lands here
+		// too.
+		//
+		// The recovery is the one this function already performs, which is
+		// why it lives here rather than in a pass of its own: put the replica
+		// down, re-arm the spawn, and let the host's stream build him again
+		// on his feet where the host says he is. `Client::UpdateRemoteAmbientPeds`
+		// runs this before the spawn pass, the death pass and the seat pass,
+		// so the rebuild, the `deathApplied` reset and the re-seating all
+		// happen on the same frame.
+		//
+		// `ped.dead` is what stops it being a resurrection machine: a corpse
+		// the session reported is a corpse that stays down.
+		if (!ReplicaDiedUnasked(Field<uint32_t>(mem, offs::PED_STATE), ped.dead))
+			return true;
+
+		++g_replicaDeathRecovered;
+		if (PopTrace())
+			Log("population/trace: replica net %u handle %d is dead and nobody "
+			    "asked - taking it away and re-arming the spawn", ped.netId,
+			    ped.poolHandle);
+
+		static bool saidKilled = false;
+		if (!saidKilled) {
+			saidKilled = true;
+			Log("population: our own engine killed ambient ped replica %u and "
+			    "nothing in the session asked it to. Taking the body away and "
+			    "rebuilding him from his host's stream - an observer does not "
+			    "get to decide that somebody else's pedestrian is dead (and "
+			    "this will not be said again)", ped.netId);
+		}
+
+		// The full teardown, not a dropped handle. This ped is CREATED_BY
+		// MISSION and bIsLocked-equivalent for the pool: `CanBeDeleted`
+		// refuses it, so nothing in the engine would ever come and collect
+		// the corpse.
+		DespawnAmbientReplica(ped);
+		ped.spawnPending       = true;
+		ped.seatedVehicleNetId = INVALID_NETID;
+		ped.appliedAnimId      = ANIM_NONE;
+		return false;
+	}
 
 	if (mem == nullptr)
 		++g_replicaHandleLost;
@@ -1643,6 +1927,10 @@ bool AmbientReplicaIsAlive(RemoteAmbientPed &ped) {
 	// exists, and the identity, the owner and the interpolation buffer are
 	// all still good. Only the object is gone.
 	ped.poolHandle   = -1;
+	// And so is the index entry that named it. The spawn pass will put a new
+	// one back when it rebuilds the replica; leaving this would have the index
+	// pointing at a freed pool slot until then.
+	ForgetReplica(ped.netId);
 	ped.spawnPending = true;
 	// Nothing is sitting in a car any more, whatever this row thought. The
 	// seat pass reconciles that from `poolHandle < 0` on the same frame; this
@@ -1725,6 +2013,77 @@ void ApplyAmbientPedState(RemoteAmbientPed &ped, const Pose &at) {
 	// leave the ped permanently half-way into its own walk.
 	if (ped.animId != ped.appliedAnimId && BlendReplicaAnim(mem, ped.animId))
 		ped.appliedAnimId = ped.animId;
+}
+
+// A pedestrian on fire, on a screen that isn't his host's.
+//
+// The host's engine burns him - CFire, flee, PED_ON_FIRE, the damage and the
+// death - and none of it reaches a replica on its own: the replica is
+// bFireProof, so nothing here can light it, and entity fires never travel
+// (addresses.h, the fire section). So the host says one bit
+// (AMBIENT_PED_ON_FIRE) and this puts the same visual-only fire a burning
+// player gets on the replica. It decides nothing: no AI, the ped's health is
+// untouched because the cause-9 arm of InflictDamage stops at bFireProof and
+// combat.cpp refuses anything aimed at a replica anyway.
+//
+// The decision is ped.cpp's PlanRemoteFire, unchanged.
+bool g_saidReplicaFireLit    = false;
+bool g_saidReplicaFireNoSlot = false;
+
+void ApplyAmbientPedFire(RemoteAmbientPed &ped) {
+	if (ped.poolHandle < 0)
+		return;
+	void *const mem = Func<GetPedFn>(CPools__GetPed)(ped.poolHandle);
+	if (!mem || Field<uintptr_t>(mem, offs::VTABLE) != CCivilianPed__vtable)
+		return;
+
+	void *const fire = Field<void *>(mem, PED_FIRE);
+	const bool  want =
+	    AmbientPedShouldBurn(ped.fireSaid, ped.fireSaidMs, WallClock::NowMs());
+	const bool ours = WatchedPedFireIsOurs(ped.fireSlot, mem, fire);
+
+	using InControlFn   = bool(__thiscall *)(void *);
+	const bool inControl = Func<InControlFn>(CPed__IsPedInControl)(mem);
+
+	switch (PlanRemoteFire(want, fire != nullptr, ours, inControl)) {
+	case FireAction::NOTHING:
+		return;
+
+	case FireAction::LIGHT: {
+		void *const lit = LightWatchedPedFire(mem);
+		if (!lit) {
+			ped.fireSlot = -1;
+			if (!g_saidReplicaFireNoSlot) {
+				g_saidReplicaFireNoSlot = true;
+				Log("population: pedestrian %u is burning on his host's screen and "
+				    "all %u fire slots are taken here, so he doesn't burn on this one",
+				    ped.netId, static_cast<unsigned>(NUM_FIRES));
+			}
+			return;
+		}
+		ped.fireSlot = static_cast<int8_t>(FireSlotIndex(lit));
+		if (!g_saidReplicaFireLit) {
+			g_saidReplicaFireLit = true;
+			Log("population: pedestrian %u is burning on his host's screen; lit our "
+			    "own copy on the replica in slot %d. It can't hurt him or move him - "
+			    "his host's fire is the one doing that",
+			    ped.netId, static_cast<int>(ped.fireSlot));
+		}
+		return;
+	}
+
+	case FireAction::KEEP:
+		Field<uint32_t>(fire, FIRE_EXTINGUISH) =
+		    Global<uint32_t>(CTimer__m_snTimeInMilliseconds) + REMOTE_FIRE_MS;
+		return;
+
+	case FireAction::EXTINGUISH: {
+		using ExtinguishFn = void(__thiscall *)(void *);
+		Func<ExtinguishFn>(CFire__Extinguish)(fire);
+		ped.fireSlot = -1;
+		return;
+	}
+	}
 }
 
 // Seat a replica in a replica. The engine work is game/ped.cpp's - the
@@ -1898,6 +2257,10 @@ bool SpawnAmbientReplica(RemoteAmbientPed &ped) {
 	++Global<uint32_t>(CPopulation__ms_nTotalMissionPeds);
 
 	ped.poolHandle = Func<RefFn>(CPools__GetPedRef)(mem);
+	// And the reverse index, so game/combat.cpp can recognise this object when
+	// the engine hands it back as the thing a bullet just hit. One of the three
+	// places `poolHandle` changes; the other two forget.
+	RememberReplica(mem, ped.poolHandle, ped.netId);
 	++g_replicas;
 	if (PopTrace())
 		Log("population/trace: replica spawn net %u model %u owner %u ped %p "
@@ -1918,6 +2281,11 @@ void DespawnAmbientReplica(RemoteAmbientPed &ped) {
 		    "resolves %d", ped.netId, ped.body.modelId, mem, ped.poolHandle,
 		    mem != nullptr ? 1 : 0);
 	ped.poolHandle  = -1;
+	// Forgotten here and not after the destructor, so there is no window in
+	// which the index names an object this function is in the middle of
+	// dismantling. Nothing in the teardown below can reach InflictDamage, but
+	// the ordering costs nothing and removes the question.
+	ForgetReplica(ped.netId);
 	if (!mem)
 		return;   // the engine already took it; nothing left to do
 
@@ -1996,6 +2364,13 @@ void RemovePopulationHooks() {
 	g_bodyPartDetour.Remove();
 	g_limbCount  = 0;
 	g_deathCount = 0;
+	// The replicas themselves are taken away by Client::ClearAmbientPeds, which
+	// goes through DespawnAmbientReplica and therefore forgets each one. This is
+	// the backstop for a teardown that did not: an index entry naming a freed
+	// pool slot would answer yes to the first civilian to inherit it.
+	for (ReplicaIdentity &id : g_replicaIndex)
+		id = ReplicaIdentity{};
+	g_warnedReplicaIndexFull = false;
 	for (HostedPed &h : g_hosted)
 		h = HostedPed{};
 	g_bornCount = 0;
@@ -2004,6 +2379,40 @@ void RemovePopulationHooks() {
 		c = HostedCar{};
 	g_bornCarCount = 0;
 	g_lostCarCount = 0;
+}
+
+// A traffic car has become a session car (protocol.h, S_CarPromoted), and this
+// is the half of it that belongs to this file.
+//
+// The machine that was hosting the car has to stop hosting it, and it must not
+// do that through QueueLostCar. That one queues a C_CarDespawn, which is the
+// right statement for a car the engine has taken away - "it stopped existing,
+// drop your replicas". A promoted car is the opposite statement: the netId
+// lives on and every machine keeps the object under it. Sending a despawn here
+// would have every observer destroy the replica the promotion just told them
+// to keep, and the driver would be left in a car nobody else can see.
+//
+// So the row is simply forgotten. Nothing goes on the wire, this machine stops
+// streaming it in SampleHostedCars, and the wreck poll in SweepHostedCars stops
+// watching it - which is correct, because the car has a driver now and a driven
+// car's destruction travels on the vehicle blast path instead.
+//
+// Written against the pool handle rather than the pointer, the same discipline
+// the rest of this file keeps: a stale pointer starts matching an unrelated
+// taxi the moment the slot is reused.
+void AdoptPromotedCarHere(RemoteVehicle &vehicle, bool weHostedIt) {
+	if (weHostedIt) {
+		for (HostedCar &c : g_hostedCars) {
+			if (!c.active || c.netId != vehicle.netId)
+				continue;
+			Log("population: the session has given traffic car %u a driver, so "
+			    "this machine stops hosting it - the car stays exactly where "
+			    "it is and only the bookkeeping moves", c.netId);
+			c = HostedCar{};
+			break;
+		}
+	}
+	AdoptPromotedCar(vehicle, weHostedIt);
 }
 
 void AddPopulationToBridge(WorldBridge &bridge) {
@@ -2054,6 +2463,10 @@ void AddPopulationToBridge(WorldBridge &bridge) {
 	bridge.DrainAmbientPedDeaths = &DrainAmbientPedDeaths;
 	bridge.KillAmbientReplica    = &KillAmbientReplica;
 
+	// A burning pedestrian. Only the receiving half needs an entry here; the
+	// host's half is the bit SampleHostedPeds already writes.
+	bridge.ApplyAmbientPedFire = &ApplyAmbientPedFire;
+
 	// And the traffic half. Same door, same handshake, same all-or-nothing
 	// rule about installing it: a machine that replicated other people's
 	// traffic without announcing its own would hold everybody's cars and
@@ -2065,6 +2478,13 @@ void AddPopulationToBridge(WorldBridge &bridge) {
 	bridge.DespawnAmbientCarReplica = &DespawnAmbientCarReplicaCounted;
 	bridge.SampleHostedCars         = &SampleHostedCars;
 	bridge.CorrectAmbientCarReplica = &CorrectAmbientCarReplica;
+	// Getting into somebody else's traffic is an ownership change now, not
+	// just a reason to stop correcting it (protocol.h, S_CarPromoted). Wired
+	// here with the rest of the ambient seam although both live in
+	// game/vehicle.cpp, because the roster half of the promotion is the
+	// ambient roster and this is where that roster's seam is installed.
+	bridge.LocalDrivesAmbientCar    = &LocalDrivesAmbientCar;
+	bridge.AdoptPromotedCar         = &AdoptPromotedCarHere;
 
 	// And the wreck pair (docs/roadmap.md 5.8, the ambient half). Both or
 	// neither, like everything else here: a machine that applied other

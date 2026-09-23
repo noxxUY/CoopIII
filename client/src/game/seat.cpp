@@ -1,6 +1,7 @@
 #include "seat.h"
 
 #include "addresses.h"
+#include "carstatus.h"
 #include "ped.h"
 #include "pedanim.h"
 #include "vehicle.h"
@@ -113,7 +114,19 @@ int32_t WarpIntoSeat(void *ped, void *vehicle) {
 	using ObjFn  = void(__thiscall *)(void *, uint32_t, void *);
 	using WarpFn = void(__thiscall *)(void *, void *);
 	Func<ObjFn>(CPed__SetObjective)(ped, OBJECTIVE_ENTER_CAR_AS_PASSENGER, vehicle);
+
+	// The warp makes the car STATUS_PLAYER for the player whichever seat he
+	// takes (0x004D7E83), and this is nearly always somebody else's car. In
+	// that status ProcessControl reads this machine's horn key into it
+	// (0x00534191) and runs DoDriveByShootings with its driver's weapon. The
+	// door entry leaves a passenger's car alone, so the warp is made to as
+	// well: whatever it was before, it is again (game/carstatus.h).
+	uint8_t      &flags  = Field<uint8_t>(vehicle, offs::ENTITY_FLAGS);
+	const uint8_t before = static_cast<uint8_t>(flags >> ENTITY_STATUS_SHIFT);
 	Func<WarpFn>(CPed__WarpPedIntoCar)(ped, vehicle);
+	flags = static_cast<uint8_t>(
+	    (flags & 0x07u) |
+	    (StatusAfterSeating(before, /*driverSeat=*/false) << ENTITY_STATUS_SHIFT));
 
 	// Which seat it actually gave us. Read back rather than assumed, because
 	// the engine chose it and the number is what the session has to be told.
@@ -198,7 +211,7 @@ bool LocalIsPassenger() {
 	return Field<void *>(car, offs::VEH_DRIVER) != ped;
 }
 
-int32_t SeatLocalPlayerIn(int32_t vehicleHandle) {
+int32_t SeatLocalPlayerIn(int32_t vehicleHandle, uint8_t *seatAsked) {
 	void *const ped = PlayerPed();
 	if (!ped)
 		return -1;
@@ -267,11 +280,13 @@ int32_t SeatLocalPlayerIn(int32_t vehicleHandle) {
 		g_entryCarHandle = vehicleHandle;
 		g_entrySeat      = static_cast<uint8_t>(want);
 		g_entryDeadline  = GetTickCount() + SEAT_ANIM_TIMEOUT_MS;
+		if (seatAsked)
+			*seatAsked = static_cast<uint8_t>(want);
 		if (!g_saidWalking) {
 			g_saidWalking = true;
 			Log("seat: walking to the door to get in as a passenger, seat %d. "
-			    "The session is told which seat only once the engine has "
-			    "actually given it",
+			    "The session is told now rather than at the end, so the other "
+			    "machines open the same door at the same time",
 			    want);
 		}
 		return SEAT_LOCAL_WALKING;
@@ -304,8 +319,9 @@ int32_t PollLocalSeatEntry() {
 	if (progress == SEAT_DONE) {
 		g_entryCarHandle = -1;
 		// Read the seat back instead of trusting the one that was asked for.
-		// The engine is what assigned it, and that number is what the session
-		// is about to be told.
+		// The engine is what assigned it, and the session has already been
+		// told the slot we asked for - so this number is what decides whether
+		// that has to be corrected.
 		const int32_t seat = PassengerSeatOf(vehicle, ped);
 		if (seat < 0)
 			return SEAT_LOCAL_REFUSED;

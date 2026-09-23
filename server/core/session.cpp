@@ -80,6 +80,30 @@ uint8_t Session::RemovePeer(uint32_t peer) {
 		if (v.active && v.driverPlayerId == id)
 			v.driverPlayerId = INVALID_PLAYER;
 
+	// And any car they were settling for the session (protocol.h,
+	// S_VehicleCustody). Cleared rather than handed on, and that is a
+	// decision: the only machine worth giving a driverless car to is one that
+	// has it streamed in with the collision loaded around it, which is why
+	// custody goes to the player who was just driving it in the first place.
+	// Nobody else is known to be anywhere near it, and a custodian that
+	// cannot see the car simulates it falling through an unloaded world and
+	// reports the fall.
+	//
+	// So it goes back to the state this whole feature is the exception to:
+	// nobody simulates it and every machine holds it where it stands. If it
+	// was mid-fall when its custodian's socket closed it stays mid-fall,
+	// which is exactly what happened before any of this existed and is no
+	// worse for having been briefly better.
+	for (Vehicle &v : m_vehicles)
+		if (v.active && v.custodianPlayerId == id)
+			v.custodianPlayerId = INVALID_PLAYER;
+
+	// Their helicopters went with their engine. The observers find out from
+	// the S_PlayerLeave the server sends anyway, and the slot is about to be
+	// handed to somebody whose serials start again from 1.
+	if (id < MAX_PLAYERS)
+		m_helis[id] = OwnerHelis{};
+
 	*p    = Player{};
 	p->id = id;
 	PickHost();
@@ -130,7 +154,7 @@ void Session::NotePlayerRespawned(Player &p, const Vec3 &pos, float heading) {
 
 // ---- who is sitting where --------------------------------------------------
 
-void Session::NoteEnterVehicle(Player &p, Vehicle &v, uint8_t seat) {
+uint8_t Session::NoteEnterVehicle(Player &p, Vehicle &v, uint8_t seat) {
 	// Out of whatever they were in first, so nobody is ever recorded in two
 	// cars at once. Stepping straight from one car into another is a single
 	// C_EnterVehicle with no exit in front of it, and a client that sends the
@@ -139,22 +163,91 @@ void Session::NoteEnterVehicle(Player &p, Vehicle &v, uint8_t seat) {
 	if (p.vehicleNetId != INVALID_NETID && p.vehicleNetId != v.netId)
 		NoteExitVehicle(p, p.vehicleNetId);
 
+	// Somebody else was already recorded at the wheel. That is a carjack, and
+	// until now the session simply overwrote the name: the car changed owner
+	// and the player it was taken from was never told, so their machine went
+	// on believing it owned the car for the rest of the session. From there
+	// the two ends disagree in both directions at once - the loser's client
+	// refuses every snapshot the new owner sends, because a car it thinks is
+	// its own is not a car it observes, so the car stands still on that screen
+	// while it is driven away on the other; and the loser's own snapshots are
+	// dropped by MayReportVehicle, so nothing it does with the car reaches
+	// anybody. The record also ended up with two players in one seat, which
+	// the backfill would then hand to the next joiner.
+	//
+	// Taken out here rather than in the fan-out so that the session is never,
+	// even briefly, in that state, and so that sessiontest can hold it to it
+	// without a socket.
+	uint8_t displaced = INVALID_PLAYER;
+	if (seat == 0 && v.driverPlayerId != INVALID_PLAYER &&
+	    v.driverPlayerId != p.id) {
+		if (Player *loser = FindById(v.driverPlayerId)) {
+			displaced = loser->id;
+			NoteExitVehicle(*loser, v.netId);
+			// Their old complaint is about a car they no longer own, and the
+			// next snapshot they send for it is the ordinary one-in-flight
+			// race rather than a client lying. Let them earn a new warning.
+			loser->warnedVehicleAuthority = false;
+		} else {
+			// A slot that has been freed since. RemovePeer already clears the
+			// driver of every car a leaver was in, so this is belt and braces
+			// against a stale id rather than a case that is reached.
+			v.driverPlayerId = INVALID_PLAYER;
+		}
+	}
+
 	p.vehicleNetId = v.netId;
 	p.seat         = seat;
 
 	// Only the driver's seat carries ownership. A passenger is recorded so a
 	// joiner can be told where they are sitting, and gets no say over the
 	// car's position or condition - see MayReportVehicle.
-	if (seat == 0)
+	if (seat == 0) {
 		v.driverPlayerId = p.id;
+		// A driver ends a custody (protocol.h, S_VehicleCustody). No packet
+		// is spent saying so and none is needed: "the driver, or the
+		// custodian when there is no driver" is one rule with a precedence in
+		// it, so the S_EnterVehicle that names the driver already says this
+		// as well. What must not happen is the record keeping both - a car
+		// with a driver and a custodian is two machines entitled to report
+		// it, which is the state protocol 22 exists to make impossible.
+		v.custodianPlayerId = INVALID_PLAYER;
+	}
+
+	return displaced;
 }
 
 void Session::NoteExitVehicle(Player &p, uint16_t netId) {
 	// The car stays in the session either way. Somebody parked it; it did not
 	// stop existing.
 	if (Vehicle *v = FindVehicle(netId))
-		if (v->driverPlayerId == p.id)
+		if (v->driverPlayerId == p.id) {
 			v->driverPlayerId = INVALID_PLAYER;
+
+			// And the machine that was driving it a moment ago is handed the
+			// job of finishing whatever it was doing (protocol.h,
+			// S_VehicleCustody).
+			//
+			// **The player who was driving, not the session host.**
+			// roadmap.md §5.8 is right that an ownerless world entity is the
+			// host's, and that is the right rule for a *fact* about a car
+			// nobody owns - the host is one machine and it is always there.
+			// It is the wrong machine to run a car's physics on: GTA III
+			// streams around one player (roadmap §2.1) and keeps one island's
+			// collision in memory (§2.2), so a host across the river would be
+			// simulating a car with no ground under it and reporting the
+			// fall. The player who has just stepped out is standing next to
+			// it. That is the entire argument, and it is also why custody is
+			// short: two seconds on the custodian's own clock, after which
+			// the car goes back to being pinned by everybody.
+			//
+			// Not granted to a wreck. Its shape came from
+			// FuckCarCompletely and is the same on every machine, and a
+			// custodian would be asked to settle a car that has already
+			// finished doing everything it is ever going to do.
+			if (!v->destroyed)
+				v->custodianPlayerId = p.id;
+		}
 
 	if (p.vehicleNetId == netId || netId == INVALID_NETID) {
 		p.vehicleNetId = INVALID_NETID;
@@ -162,9 +255,90 @@ void Session::NoteExitVehicle(Player &p, uint16_t netId) {
 	}
 }
 
+uint8_t Session::CustodianOf(uint16_t netId) const {
+	const Vehicle *v = FindVehicle(netId);
+	return v && v->active ? v->custodianPlayerId : INVALID_PLAYER;
+}
+
+// The custodian saying it is finished (protocol.h, C_VehicleSettled).
+//
+// Only the custodian may end its own custody, for the same reason only the
+// driver may report a car's state: a message that any client could send would
+// be a client deciding somebody else's ownership, which is the class of bug
+// the whole of protocol 22 was about.
+bool Session::EndCustody(uint16_t netId, uint8_t byPlayerId) {
+	Vehicle *v = FindVehicle(netId);
+	if (!v || !v->active)
+		return false;
+	if (v->custodianPlayerId == INVALID_PLAYER ||
+	    v->custodianPlayerId != byPlayerId)
+		return false;
+	v->custodianPlayerId = INVALID_PLAYER;
+	return true;
+}
+
+Session::HitCustody Session::CustodyForHit(uint16_t netId, uint8_t byPlayerId) {
+	Vehicle *v = FindVehicle(netId);
+	if (!v || !v->active || v->destroyed)
+		return HitCustody::NotTheirs;
+	if (v->driverPlayerId != INVALID_PLAYER)
+		return HitCustody::NotTheirs;
+	if (!FindById(byPlayerId))
+		return HitCustody::NotTheirs;
+	if (v->custodianPlayerId == byPlayerId)
+		return HitCustody::AlreadyTheirs;
+	if (v->custodianPlayerId != INVALID_PLAYER)
+		return HitCustody::NotTheirs;
+	v->custodianPlayerId = byPlayerId;
+	return HitCustody::Granted;
+}
+
+// Who may report this car's position and condition.
+//
+// The driver, and - only when there is no driver at all - the one machine the
+// session has asked to settle it. Written as a precedence rather than as two
+// independent tests so that a record which somehow held both would still have
+// exactly one answer: a car with a driver is a car whose custody is over,
+// whatever a stale field says.
 bool Session::MayReportVehicle(uint8_t playerId, uint16_t netId) const {
 	const Vehicle *v = FindVehicle(netId);
-	return v && v->active && v->driverPlayerId == playerId;
+	if (!v || !v->active)
+		return false;
+	if (v->driverPlayerId != INVALID_PLAYER)
+		return v->driverPlayerId == playerId;
+	return v->custodianPlayerId != INVALID_PLAYER &&
+	       v->custodianPlayerId == playerId;
+}
+
+Player *Session::VehicleHitRecipient(uint16_t netId, uint8_t byPlayerId) {
+	Vehicle *v = FindVehicle(netId);
+	if (!v || !v->active)
+		return nullptr;
+	// Whose it is: MayReportVehicle's precedence, driver and then custodian.
+	// The custodian's engine is the one simulating the car while it settles
+	// and the one streaming its health, so it is the one to take the hit -
+	// the same reason the driver is.
+	const uint8_t owner = v->driverPlayerId != INVALID_PLAYER
+	                          ? v->driverPlayerId
+	                          : v->custodianPlayerId;
+	// The inversion, and it is this function's whole reason for existing
+	// separately from MayReportVehicle above. Only a machine that does *not*
+	// own the car may say this.
+	if (owner == byPlayerId)
+		return nullptr;
+	// A car nobody is driving or settling has nobody entitled to decide its
+	// condition. Refused rather than routed: roadmap.md §5.8 is what carries
+	// what happens to those, and it runs after the fact rather than before
+	// it. That includes a hit that was fired during a settle and lands after
+	// it ended - the car is nobody's by then and there is nobody to give it to.
+	if (owner == INVALID_PLAYER)
+		return nullptr;
+	if (v->destroyed)
+		return nullptr;
+	// And somebody has to be there to be told. A driver or custodian who left
+	// had the claim cleared with them, so this is belt and braces rather than
+	// a race anyone has seen.
+	return FindById(owner);
 }
 
 void Session::NoteVehicleState(const VehicleStateBody &body) {
@@ -268,6 +442,14 @@ void Session::DestroyVehicle(uint16_t netId) {
 		if (p.active && p.vehicleNetId == netId)
 			NoteExitVehicle(p, netId);
 	v->driverPlayerId = INVALID_PLAYER;
+
+	// And nobody is settling one either. `v->destroyed` was set above, so the
+	// NoteExitVehicle calls that just ran already declined to grant it; this
+	// is the case where the car was *already* being settled and then blew up
+	// underneath its custodian. Nothing is left to finish, and a custodian
+	// still holding it would go on being the one machine entitled to report a
+	// wreck's position.
+	v->custodianPlayerId = INVALID_PLAYER;
 }
 
 // ---- what a joiner is told -------------------------------------------------
@@ -343,6 +525,21 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 				out.ammo.push_back(ammo);
 			}
 		}
+	}
+
+	// The cheats every machine runs, at the state the last one left them. A
+	// riot typed an hour ago is still a riot on every screen but the joiner's
+	// otherwise. From nobody in particular: the typist may have left, and a
+	// slot id could by now be the joiner's own, which its client would take
+	// for its own cheat coming back and drop.
+	for (const WorldCheat &c : m_worldCheats) {
+		if (!c.set || !CheatAllowed(m_cheatRule, c.body.cheat))
+			continue;
+		S_Cheat cheat;
+		InitHeader(cheat, sendTimeMs);
+		cheat.playerId = INVALID_PLAYER;
+		cheat.body     = c.body;
+		out.cheats.push_back(cheat);
 	}
 
 	for (const Vehicle &v : m_vehicles) {
@@ -549,6 +746,13 @@ bool Session::NoteUnownedBlowUp(const UnownedVehicleKey &key, uint8_t byPlayerId
 		// standing next to it may report it.
 		if (v->driverPlayerId != INVALID_PLAYER)
 			return false;
+		// Unless somebody is settling it. Then the custodian's engine is the
+		// only one simulating it, every other client refuses to blow it up,
+		// and a report from one of them is a copy that went its own way.
+		// The custodian says it with this packet, since it isn't driving.
+		if (v->custodianPlayerId != INVALID_PLAYER &&
+		    v->custodianPlayerId != byPlayerId)
+			return false;
 		DestroyVehicle(key.id);
 		return true;
 	}
@@ -724,6 +928,120 @@ void Session::ExpirePickups(uint32_t nowMs) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// The session's rampage - docs/roadmap.md 5.10
+// ---------------------------------------------------------------------------
+
+bool Session::NoteRampageStart(uint8_t byPlayer, const RampageStartBody &in,
+                               uint32_t nowMs, RampageOpenBody &out) {
+	if (m_rampageRule == RAMPAGE_RULE_OFF)
+		return false;
+
+	if (!m_rampage.open) {
+		m_rampage            = Rampage{};
+		m_rampage.open       = true;
+		m_rampage.id         = m_nextFrenzyId++;
+		// Never zero, because a frenzy id of zero would be indistinguishable
+		// from an uninitialised field on the client.
+		if (m_nextFrenzyId == 0)
+			m_nextFrenzyId = 1;
+		m_rampage.limitMs    = in.limitMs;
+		m_rampage.openedAtMs = nowMs;
+		m_rampage.openedBy   = byPlayer;
+		// The one decision the server makes here, and the only place it can
+		// be made: nothing on a client knows how many players there are at
+		// the instant the script asks, and two clients that worked it out for
+		// themselves would disagree the moment somebody was mid-join.
+		//
+		// Count(), not m_players.size(): the vector is pre-sized to the
+		// session's slots and every one of them is a Player whether anybody
+		// is in it or not, so size() is 8 in an empty session and a
+		// two-player rampage would be asked for eight times the kills.
+		m_rampage.target = ScaledRampageTarget(in.target, m_rampageRule, Count());
+	}
+
+	out.frenzyId = m_rampage.id;
+	// What is still wanted, not what was asked for. For the machine that
+	// opened it those are the same number; for a machine that has just walked
+	// into a rampage the group is halfway through, they are not.
+	out.killsNeeded = m_rampage.kills >= m_rampage.target
+	                      ? uint16_t(0)
+	                      : static_cast<uint16_t>(m_rampage.target - m_rampage.kills);
+	out.elapsedMs   = nowMs - m_rampage.openedAtMs;
+	return true;
+}
+
+bool Session::NoteRampageKill(const RampageKillBody &in) {
+	if (!m_rampage.open || in.frenzyId != m_rampage.id)
+		return false;
+	// Counted but never used to end anything. The server does not decide that
+	// a rampage has been passed: the clients' own CDarkel::Update does, off a
+	// counter every one of them is now driving with the same events, and one
+	// of them then reports it. All this number is for is telling a joiner how
+	// many are left.
+	if (m_rampage.kills < 0xFFFF)
+		++m_rampage.kills;
+	return true;
+}
+
+bool Session::NoteRampageCar(const RampageCarBody &in) {
+	if (!m_rampage.open || in.frenzyId != m_rampage.id)
+		return false;
+
+	if (RampageCarKeyed(in.key)) {
+		for (uint8_t i = 0; i < m_rampage.carKeyCount; ++i)
+			if (SameUnownedKey(m_rampage.carKeys[i], in.key))
+				return false;   // somebody else's copy of it already counted
+		m_rampage.carKeys[m_rampage.carKeyNext] = in.key;
+		m_rampage.carKeyNext =
+		    static_cast<uint8_t>((m_rampage.carKeyNext + 1) % RAMPAGE_CAR_KEYS);
+		if (m_rampage.carKeyCount < RAMPAGE_CAR_KEYS)
+			++m_rampage.carKeyCount;
+	}
+
+	// Same counter as the kills. A vehicle rampage only ever gets cars and a
+	// pedestrian one only ever gets people, because each machine's engine
+	// judged it before sending, so one number is enough for a joiner.
+	if (m_rampage.kills < 0xFFFF)
+		++m_rampage.kills;
+	return true;
+}
+
+bool Session::NoteRampageEnd(const RampageEndBody &in, RampageEndBody &out) {
+	if (!m_rampage.open || in.frenzyId != m_rampage.id)
+		return false;
+	if (!IsRampageOutcome(in.outcome))
+		return false;
+
+	// First report wins. The others are the rest of the session reaching the
+	// same conclusion a few milliseconds later - or, in the one case this
+	// exists for, reaching the opposite one: a machine whose clock ran out
+	// while the winning kill was still on the wire.
+	m_rampage.open = false;
+	out.frenzyId   = in.frenzyId;
+	out.outcome    = in.outcome;
+	return true;
+}
+
+bool Session::ExpireRampage(uint32_t nowMs, RampageEndBody &out) {
+	if (!m_rampage.open)
+		return false;
+	// A rampage the script gave no time limit never times out, here or in the
+	// engine (`cmp dword [00885BACh],0 / jl` at 0x00420696).
+	if (m_rampage.limitMs < 0)
+		return false;
+
+	const uint32_t deadline =
+	    static_cast<uint32_t>(m_rampage.limitMs) + RAMPAGE_GRACE_MS;
+	if (nowMs - m_rampage.openedAtMs < deadline)
+		return false;
+
+	m_rampage.open = false;
+	out.frenzyId   = m_rampage.id;
+	out.outcome    = RAMPAGE_FAILED;
+	return true;
+}
+
 
 // The host keeps the job until they leave, and then the lowest active slot
 // takes it.
@@ -744,6 +1062,108 @@ void Session::PickHost() {
 			m_hostId = p.id;
 			return;
 		}
+
+	// Nobody left. Whatever the cheats did lives on in engines that are no
+	// longer here, and the next player to arrive has not had any of it.
+	for (WorldCheat &c : m_worldCheats)
+		c = WorldCheat{};
+	// The wallet too. Whoever comes back first brings it with him - he
+	// adopted it - and a stranger's save isn't told to spend it.
+	ClearMoney();
+}
+
+// ---- money -------------------------------------------------------------------
+
+void Session::ClearMoney() {
+	m_moneySeeded = false;
+	m_moneyPool   = 0;
+	for (PaidCar &c : m_paidCars)
+		c = PaidCar{};
+	m_paidCarNext = 0;
+}
+
+void Session::SetMoneyRule(uint8_t rule) {
+	rule = SaneMoneyRule(rule);
+	if (rule == m_moneyRule)
+		return;
+	m_moneyRule = rule;
+	ClearMoney();
+}
+
+bool Session::NoteMoneyChange(uint8_t from, const MoneyChangeBody &body) {
+	if (m_moneyRule != MONEY_RULE_SHARED)
+		return false;
+	Player *p = FindById(from);
+	if (!p)
+		return false;
+	// CH_EVENT is ordered, so this is only ever a client repeating itself.
+	if (body.seq == 0 || body.seq <= p->moneySeq)
+		return false;
+	p->moneySeq = body.seq;
+
+	if (!m_moneySeeded) {
+		m_moneySeeded = true;
+		m_moneyPool   = AddToMoneyPool(0, body.have);
+		return true;
+	}
+	// Even a zero goes out: it is a joiner who tried to seed a pool somebody
+	// else had seeded first, and he needs the total to adopt.
+	m_moneyPool = AddToMoneyPool(m_moneyPool, body.delta);
+	return true;
+}
+
+S_Money Session::MoneyFor(uint8_t to, uint8_t from, int32_t delta,
+                          uint32_t sendTimeMs) const {
+	S_Money out;
+	InitHeader(out, sendTimeMs);
+	const bool pooled = m_moneyRule == MONEY_RULE_SHARED && m_moneySeeded;
+	out.rule         = m_moneyRule;
+	out.flags        = pooled ? uint8_t(MONEY_POOL_SEEDED) : uint8_t(0);
+	out.fromPlayerId = from;
+	out.pad          = 0;
+	out.total        = pooled ? m_moneyPool : 0;
+	out.ackSeq       = 0;
+	for (const Player &p : m_players)
+		if (p.active && p.id == to)
+			out.ackSeq = p.moneySeq;
+	out.delta = delta;
+	return out;
+}
+
+bool Session::TakeMoneyAward(uint8_t from, const MoneyAwardBody &body, uint32_t nowMs) {
+	if (m_moneyRule == MONEY_RULE_OFF)
+		return false;
+	if (!FindById(from) || !FindById(body.toPlayerId))
+		return false;
+	if (!IsSaneMoneyAward(body.unit) || body.kind > MONEY_AWARD_BOMB)
+		return false;
+	if (!MoneyAwardKeyed(body.key))
+		return true;
+
+	for (const PaidCar &c : m_paidCars)
+		if (c.used && SameUnownedKey(c.key, body.key) &&
+		    nowMs - c.paidMs < MONEY_AWARD_KEY_MS)
+			return false;
+	PaidCar &slot = m_paidCars[m_paidCarNext];
+	slot.key      = body.key;
+	slot.paidMs   = nowMs;
+	slot.used     = true;
+	m_paidCarNext = (m_paidCarNext + 1) % PAID_CARS;
+	return true;
+}
+
+uint8_t Session::NoteCheat(uint8_t from, const CheatBody &body) {
+	const uint8_t relay = CheatRelayFor(m_cheatRule, body.cheat, body.state,
+	                                    from == m_hostId, m_hostId != INVALID_PLAYER);
+	if (relay == CHEAT_RELAY_OTHERS) {
+		// TIMEFLIES and BOOOOORING are one setting reached from two ends, so
+		// they share a record and the later one wins.
+		const uint8_t slot = body.cheat == CHEAT_SLOW_TIME ? uint8_t(CHEAT_FAST_TIME)
+		                                                    : body.cheat;
+		m_worldCheats[slot].set  = true;
+		m_worldCheats[slot].body = body;
+	}
+	return relay;
 }
 
 bool Session::SetWeather(uint8_t weather, uint8_t weatherOld) {
@@ -802,38 +1222,161 @@ const Vehicle *Session::FindVehicle(uint16_t netId) const {
 Vehicle *Session::AddVehicle(uint16_t modelId, uint8_t colour1, uint8_t colour2,
                              const Vec3 &pos, const Quat &rot) {
 	// Capped because this whole list gets replayed to every joining player,
-	// and an hours-long session would otherwise hand a latecomer a thousand
-	// cars to spawn. Way more than 8 players could ever sit in.
-	constexpr size_t MAX_VEHICLES = 64;
-	if (m_vehicles.size() >= MAX_VEHICLES) {
-		bool reused = false;
-		for (Vehicle &v : m_vehicles)
-			if (!v.active) {
-				v       = Vehicle{};
-				reused  = true;
-				v.active = true;
-				v.netId  = AllocNetId();
-				v.modelId = modelId;
-				v.colour1 = colour1;
-				v.colour2 = colour2;
-				v.pos     = pos;
-				v.rot     = rot;
-				return &v;
-			}
-		if (!reused)
+	// and because every client holds the same number of rows. It counts cars
+	// alive right now: ReleaseIdleVehicles frees the rows nobody needs, and a
+	// freed row is reused here before the vector grows. It used to be reused
+	// only once the vector was full, which never happened because nothing
+	// ever freed one, so the 65th claim of a session was refused.
+	Vehicle *slot = nullptr;
+	for (Vehicle &v : m_vehicles)
+		if (!v.active) {
+			slot = &v;
+			break;
+		}
+	if (!slot) {
+		if (m_vehicles.size() >= MAX_SESSION_VEHICLES)
 			return nullptr;
+		m_vehicles.push_back(Vehicle{});
+		slot = &m_vehicles.back();
 	}
 
-	Vehicle v;
-	v.active  = true;
-	v.netId   = AllocNetId();
-	v.modelId = modelId;
-	v.colour1 = colour1;
-	v.colour2 = colour2;
-	v.pos     = pos;
-	v.rot     = rot;
-	m_vehicles.push_back(v);
-	return &m_vehicles.back();
+	*slot         = Vehicle{};
+	slot->active  = true;
+	slot->netId   = AllocNetId();
+	slot->modelId = modelId;
+	slot->colour1 = colour1;
+	slot->colour2 = colour2;
+	slot->pos     = pos;
+	slot->rot     = rot;
+	return slot;
+}
+
+size_t Session::LiveVehicleCount() const {
+	return static_cast<size_t>(
+	    std::count_if(m_vehicles.begin(), m_vehicles.end(),
+	                  [](const Vehicle &v) { return v.active; }));
+}
+
+bool Session::VehicleNeeded(const Vehicle &v) const {
+	if (!v.active)
+		return false;
+	if (v.driverPlayerId != INVALID_PLAYER || v.custodianPlayerId != INVALID_PLAYER)
+		return true;
+	constexpr float r2 = VEHICLE_KEEP_RADIUS_M * VEHICLE_KEEP_RADIUS_M;
+	for (const Player &p : m_players) {
+		if (!p.active)
+			continue;
+		// Any seat. A passenger has no say over the car but he is sitting in
+		// it, and releasing it would destroy it around him on every machine.
+		if (p.vehicleNetId == v.netId)
+			return true;
+		// 2D, like PossiblyRemoveVehicle's own distance. A player we have no
+		// position for yet can't be near anything.
+		if (!p.havePos)
+			continue;
+		const float dx = p.pos.x - v.pos.x;
+		const float dy = p.pos.y - v.pos.y;
+		if (dx * dx + dy * dy <= r2)
+			return true;
+	}
+	return false;
+}
+
+std::vector<uint16_t> Session::ReleaseIdleVehicles(uint32_t nowMs) {
+	std::vector<uint16_t> released;
+	for (Vehicle &v : m_vehicles) {
+		if (!v.active)
+			continue;
+		if (!v.neededKnown || VehicleNeeded(v)) {
+			v.neededKnown = true;
+			v.neededAtMs  = nowMs;
+			continue;
+		}
+		// Unsigned, so a clock that wraps still measures forwards.
+		if (nowMs - v.neededAtMs < VEHICLE_RELEASE_MS)
+			continue;
+		// A wreck goes the same way. A copy is locked, so PossiblyRemoveVehicle
+		// skips its distance removal (the bIsLocked test at 0x00418448); this
+		// is what takes it off every machine, and nobody is near to see it go.
+		released.push_back(v.netId);
+		v = Vehicle{};
+	}
+	return released;
+}
+
+// A traffic car becomes a session car, keeping its number. protocol.h,
+// S_CarPromoted.
+//
+// Deliberately not AddVehicle plus RemoveCar. AddVehicle allocates a netId,
+// and a new number is exactly what must not happen here: it is the number
+// every machine already has this CVehicle filed under, and keeping it is what
+// lets them all move their bookkeeping instead of destroying and rebuilding
+// the object. Allocating a second one would put the session back in the state
+// roadmap §5.8.1 case 2 describes - two netIds for one car, one following the
+// driver and one frozen.
+//
+// The ambient row goes away here rather than being left to the host's own
+// despawn. Its owner has been told to stop hosting the car, so no C_CarDespawn
+// is coming for it, and a row left behind would keep answering NoteCarState
+// for a netId that now belongs to something else.
+Vehicle *Session::PromoteCar(uint16_t netId, uint8_t driverPlayerId,
+                             uint8_t &wasOwner, AmbientCarBody &body) {
+	wasOwner = INVALID_PLAYER;
+
+	AmbientCar *car = FindCar(netId);
+	if (!car || !car->active)
+		return nullptr;
+	// A burnt shell is not a car anybody is driving away. Its host has
+	// already reported it destroyed and the roster is holding the row only so
+	// the number stays spoken for.
+	if (car->destroyed)
+		return nullptr;
+	// And the number must not already name a session car. It cannot, because
+	// AllocNetId hands each number out once - this is the assertion that says
+	// so rather than a case that is reached.
+	if (FindVehicle(netId))
+		return nullptr;
+
+	wasOwner = car->ownerPlayerId;
+	body     = car->body;
+
+	Vehicle promoted;
+	promoted.active  = true;
+	promoted.netId   = netId;
+	promoted.modelId = body.modelId;
+	promoted.colour1 = body.colour1;
+	promoted.colour2 = body.colour2;
+	promoted.extra1  = body.extra1;
+	promoted.extra2  = body.extra2;
+	promoted.pos     = body.pos;
+	promoted.rot     = body.rot;
+	// Straight into the driver's seat. The claim that got here is a
+	// C_EnterVehicle for seat 0 and the caller records the seat through
+	// NoteEnterVehicle immediately afterwards; this is only the row existing
+	// in time for it to be recorded against.
+
+	// Somewhere to put it first, and only then take the ambient row away. The
+	// other order loses the car outright on a full vehicle table: the traffic
+	// roster would have forgotten it, the vehicle roster would never have had
+	// it, and its host has no reason to announce it a second time.
+	Vehicle *slot = nullptr;
+	for (Vehicle &v : m_vehicles)
+		if (!v.active) {
+			slot = &v;
+			break;
+		}
+	if (!slot) {
+		if (m_vehicles.size() >= MAX_SESSION_VEHICLES) {
+			wasOwner = INVALID_PLAYER;
+			return nullptr;
+		}
+		m_vehicles.push_back(Vehicle{});
+		slot = &m_vehicles.back();
+	}
+
+	*slot = promoted;
+	*car  = AmbientCar{};
+	return slot;
 }
 
 // ---- ambient peds ----------------------------------------------------------
@@ -923,6 +1466,23 @@ bool Session::NotePedDeath(const PedDeathBody &death, uint8_t byPlayerId) {
 	return true;
 }
 
+Player *Session::PedDamageRecipient(uint16_t pedNetId, uint8_t byPlayerId) {
+	const AmbientPed *ped = FindPed(pedNetId);
+	if (!ped)
+		return nullptr;
+	// The inversion, and it is the whole of this function's reason for existing
+	// separately from the three above. Only a machine that is *not* the owner
+	// may say this.
+	if (ped->ownerPlayerId == byPlayerId)
+		return nullptr;
+	if (!ped->alive)
+		return nullptr;
+	// And somebody has to be there to be told. An owner who left took their
+	// pedestrians with them (Server::DropPedsOf), so this is belt and braces
+	// rather than a race anyone has seen.
+	return FindById(ped->ownerPlayerId);
+}
+
 std::vector<uint16_t> Session::PedsOwnedBy(uint8_t playerId) const {
 	std::vector<uint16_t> out;
 	if (playerId == INVALID_PLAYER)
@@ -1008,6 +1568,90 @@ bool Session::NoteCarState(const AmbientCarState &state, uint8_t byPlayerId) {
 	car->body.pos = state.pos;
 	car->body.rot = state.rot;
 	return true;
+}
+
+Player *Session::CarHitRecipient(uint16_t netId, uint8_t byPlayerId) {
+	const AmbientCar *car = FindCar(netId);
+	if (!car || car->destroyed)
+		return nullptr;
+	if (car->ownerPlayerId == byPlayerId)
+		return nullptr;
+	return FindById(car->ownerPlayerId);
+}
+
+// ---- police helicopters ------------------------------------------------------
+
+bool Session::HeliGoneAlready(uint8_t owner, uint16_t serial) const {
+	const OwnerHelis &o = m_helis[owner];
+	for (uint8_t i = 0; i < o.goneCount; ++i)
+		if (o.gone[i] == serial)
+			return true;
+	return false;
+}
+
+bool Session::NoteHeliState(uint8_t owner, const HeliStateBody &body) {
+	if (owner >= MAX_PLAYERS || !IsPoliceHeliSlot(body.slot) ||
+	    !IsKnownHeliStatus(body.status))
+		return false;
+	if (HeliGoneAlready(owner, body.serial))
+		return false;
+	// Overwrites whatever serial the slot held. The engine only fills a slot
+	// that is empty, so an older serial here is one whose C_HeliGone is
+	// still on its way, and the ring above catches it when it lands.
+	HeliSlot &s = m_helis[owner].slots[body.slot];
+	s.live      = true;
+	s.serial    = body.serial;
+	return true;
+}
+
+bool Session::NoteHeliGone(uint8_t owner, const HeliGoneBody &body) {
+	if (owner >= MAX_PLAYERS || !IsPoliceHeliSlot(body.slot) ||
+	    !IsKnownHeliGoneReason(body.reason))
+		return false;
+	if (HeliGoneAlready(owner, body.serial))
+		return false;
+
+	OwnerHelis &o = m_helis[owner];
+	o.gone[o.goneNext] = body.serial;
+	o.goneNext         = static_cast<uint8_t>((o.goneNext + 1) % HELI_GONE_MEMORY);
+	if (o.goneCount < HELI_GONE_MEMORY)
+		++o.goneCount;
+
+	HeliSlot &s = o.slots[body.slot];
+	if (s.live && s.serial == body.serial)
+		s = HeliSlot{};
+	return true;
+}
+
+bool Session::MayCreditHeli(uint8_t owner, uint8_t credit) {
+	return credit != owner && FindById(credit) != nullptr;
+}
+
+Player *Session::HeliHitRecipient(const HeliHitBody &body, uint8_t byPlayerId) {
+	if (!IsSaneHeliHit(body) || body.ownerPlayerId >= MAX_PLAYERS)
+		return nullptr;
+	if (body.ownerPlayerId == byPlayerId)
+		return nullptr;   // the owner's engine already took its own hit
+	const HeliSlot &s = m_helis[body.ownerPlayerId].slots[body.slot];
+	if (!s.live || s.serial != body.serial)
+		return nullptr;
+	return FindById(body.ownerPlayerId);
+}
+
+bool Session::HeliLive(uint8_t owner, uint8_t slot, uint16_t serial) const {
+	if (owner >= MAX_PLAYERS || !IsPoliceHeliSlot(slot))
+		return false;
+	const HeliSlot &s = m_helis[owner].slots[slot];
+	return s.live && s.serial == serial;
+}
+
+bool Session::MayRelayHeliShot(uint8_t owner, const HeliShotBody &body) const {
+	if (!IsSaneHeliShot(body))
+		return false;
+	// Only a helicopter the owner is streaming. A round that overtook its
+	// helicopter's C_HeliGone, or came before its first state, has no replica
+	// anywhere to be drawn from.
+	return HeliLive(owner, body.slot, body.serial);
 }
 
 std::string SanitizeText(const char *src, size_t capacity) {

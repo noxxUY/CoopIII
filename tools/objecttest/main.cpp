@@ -136,6 +136,103 @@ void TestWireLayout() {
 	Check(sizeof(S_ObjectBroken) == 30, "S_ObjectBroken is a byte more, for the reporter");
 	Check(C_ObjectBroken::OPCODE == 0xC0 && S_ObjectBroken::OPCODE == 0xC1,
 	      "the opcodes are the reserved 0xC0 pair");
+
+	Check(sizeof(ObjectRestBody) == 64, "ObjectRestBody is 64 bytes");
+	Check(offsetof(ObjectRestBody, right) == 16, "the matrix follows the ident");
+	Check(offsetof(ObjectRestBody, forward) == 28 &&
+	          offsetof(ObjectRestBody, up) == 40 &&
+	          offsetof(ObjectRestBody, pos) == 52,
+	      "right, forward, up, position - CMatrix's own order");
+	Check(sizeof(C_ObjectSettled) == 69, "C_ObjectSettled is 69 bytes");
+	Check(sizeof(S_ObjectSettled) == 70, "S_ObjectSettled is a byte more, for the reporter");
+	Check(C_ObjectSettled::OPCODE == 0xC2 && S_ObjectSettled::OPCODE == 0xC3,
+	      "and the resting place uses the next reserved pair");
+
+	// The three bits of the state byte are distinct and the top five are
+	// still free. Worth pinning because the uproot bit was added to a byte
+	// that already had two meanings and a collision between them would look
+	// like "sometimes the crate does not burst".
+	Check(OBJ_BREAK_RENDER_DAMAGED == 1 && OBJ_BREAK_SMASHED == 2 &&
+	          OBJ_BREAK_UPROOTED == 4,
+	      "the three state bits do not overlap");
+}
+
+// ---------------------------------------------------------------------------
+// What object.dat says, as a regression test rather than as a paragraph
+// ---------------------------------------------------------------------------
+//
+// The brief this work started from said a lamp post that is *shot* falls over
+// on the shooter's screen only. It does not fall over on anybody's screen,
+// and the reason is one column of a text file that ships with the game.
+//
+// CWeapon::DoBulletImpact, CWeapon::FireShotgun and CWeapon::FireMelee share
+// one object arm, and its uproot gate is `GetIsStatic() && m_fUprootLimit <=
+// 0.0f` - verified against the retail image, including that the three
+// constants compared against (0x00603060, 0x00603060, 0x00602C88) all read
+// 00000000, so it really is `<= 0` and not a threshold. The move force that
+// follows is behind `!GetIsStatic()`, so a static object gets neither.
+//
+// Column G of data/object.dat is the number that gate reads, and for every
+// piece of street furniture worth shooting it is well above zero.
+void TestABulletCannotUprootALampPost() {
+	std::printf("what a bullet can and cannot knock over\n");
+
+	// data/object.dat, column G, for the breakable models that appear in the
+	// map in any number. These are data, not measurements - the file ships
+	// with the game and is identical on every install, which is the same
+	// property the whole identity scheme rests on.
+	struct Furniture { const char *model; float uprootLimit; int instances; };
+	constexpr Furniture kBreakables[] = {
+	    {"doublestreetlght1", 400.0f, 392},
+	    {"trafficlight1",     500.0f, 333},
+	    {"lamppost3",         400.0f, 184},
+	    {"lamppost1",         400.0f, 119},
+	    {"bar_barrier10",     350.0f, 107},
+	    {"parkbench1",          5.0f,  70},
+	    {"lamppost2",         400.0f,  67},
+	    {"trafficcone",        10.0f,  39},
+	    {"parkingmeter",      100.0f,   0},
+	    {"bin1",              100.0f,   0},
+	    {"postbox1",          100.0f,   0},
+	    {"fire_hydrant",      100.0f,   0},
+	    {"smashbar",         1000.0f,   0},
+	};
+
+	bool anyUprootable = false;
+	for (const Furniture &f : kBreakables)
+		if (f.uprootLimit <= 0.0f)
+			anyUprootable = true;
+	Check(!anyUprootable,
+	      "no lamp post, traffic light, meter, bin, bench, cone or barrier has "
+	      "an uproot limit a bullet can beat");
+
+	// The ones it can, and they are all boxes. This half matters as much as
+	// the other: a player shooting a stack of crates really does knock them
+	// loose, on every machine, because docs/protocol.md 1.9.2 replays the
+	// shot through the engine and every observer's own DoBulletImpact runs
+	// the same arm.
+	constexpr Furniture kLoose[] = {
+	    {"cardboardbox4", 0.0f, 95},
+	    {"woodenbox",     0.0f, 64},
+	    {"cardboardbox2", 0.0f, 25},
+	    {"papermachn01",  0.0f, 20},
+	    {"wastebin",      0.0f,  0},
+	    {"palette",       0.0f,  0},
+	};
+	bool allLoose = true;
+	for (const Furniture &f : kLoose)
+		if (f.uprootLimit > 0.0f)
+			allLoose = false;
+	Check(allLoose, "the boxes and bins a bullet does move are the zero-limit ones");
+
+	// And the threshold a break goes through is a different number from the
+	// one an uproot goes through, which is why they are two decisions and not
+	// one. A lamp post bends at 150 impulse and comes down at 400.
+	Check(obj::OBJECT_DAMAGE_THRESHOLD == 150.0f,
+	      "a break is amount * multiplier > 150");
+	Check(obj::OBJECT_DAMAGE_THRESHOLD < 400.0f,
+	      "and a lamp post's uproot limit is above it, so it can bend without "
+	      "coming down");
 }
 
 void TestSameObject() {
@@ -191,6 +288,24 @@ void TestBreakState() {
 	      "invisible on its own is not broken");
 	Check(BreakStateFromFlags(0, kIsVisible) == 0,
 	      "no collision on its own is not broken");
+
+	// bIsStatic is byte A bit 2, and clearing it is the whole of "uprooted".
+	// It is deliberately not part of BreakStateFromFlags: a smash *sets*
+	// bIsStatic, so folding the two together would make finishing an object
+	// off look like standing it back up.
+	constexpr uint8_t kIsStatic = 0x04;
+	Check(!ObjectIsLoose(kIsStatic), "a static object is standing");
+	Check(ObjectIsLoose(kUsesCollision), "one with bIsStatic clear has come loose");
+
+	Check(BreakStateWithUproot(kUsesCollision | kIsStatic, kIsVisible) == 0,
+	      "a pristine standing post is neither broken nor loose");
+	Check(BreakStateWithUproot(kUsesCollision, kIsVisible) == OBJ_BREAK_UPROOTED,
+	      "a pristine post that came loose says only that");
+	Check(BreakStateWithUproot(kUsesCollision, kIsVisible | kRenderDamaged) ==
+	          (OBJ_BREAK_RENDER_DAMAGED | OBJ_BREAK_UPROOTED),
+	      "and the car that bends a lamp post usually knocks it down too");
+	Check(BreakStateWithUproot(kIsStatic, 0) == OBJ_BREAK_SMASHED,
+	      "a smash re-statics the object, so a smashed crate is not 'loose'");
 }
 
 void TestReplayCount() {
@@ -209,6 +324,92 @@ void TestReplayCount() {
 	      "a copy that is already smashed is never walked backwards");
 	Check(BreakReplaysNeeded(OBJ_BREAK_SMASHED, 0) == 0,
 	      "and a late packet about a pristine object does not undo it");
+
+	// The uproot bit is not a break and must not change the count. Nothing
+	// ObjectDamage does can produce it, so a replay aimed at it would run
+	// forever - or, worse, once too often on a change-then-smash object.
+	Check(BreakReplaysNeeded(0, OBJ_BREAK_UPROOTED) == 0,
+	      "a post that only came loose needs no ObjectDamage at all");
+	Check(BreakReplaysNeeded(0, OBJ_BREAK_RENDER_DAMAGED | OBJ_BREAK_UPROOTED) == 1,
+	      "bent and loose is still one hit");
+	Check(BreakReplaysNeeded(OBJ_BREAK_UPROOTED,
+	                         OBJ_BREAK_SMASHED | OBJ_BREAK_UPROOTED) == 2,
+	      "and a loose local copy is not treated as already half broken");
+}
+
+void TestWhoSaysWhereItLanded() {
+	std::printf("who follows an object that came loose\n");
+
+	// A collision wrote m_fDamageImpulse and m_pDamageEntity this frame, so
+	// the ordinary ownership answer stands unchanged.
+	Check(UprootCause(/*hadImpulse*/ true, BreakCause::OURS, false) ==
+	          BreakCause::OURS,
+	      "our own car knocking a post down is ours to follow");
+	Check(UprootCause(true, BreakCause::REPLICA, false) == BreakCause::REPLICA,
+	      "a replica's collision is its owner's");
+	Check(UprootCause(true, BreakCause::NOBODY, false) == BreakCause::NOBODY,
+	      "and an ownerless collision stays ownerless");
+
+	// No impulse means nothing collided with it, and the only other thing in
+	// the image that clears bIsStatic on a breakable map object is the object
+	// arm shared by DoBulletImpact, FireShotgun and FireMelee - which only
+	// ever runs inside somebody's CWeapon::Fire. So the shooter knows it was
+	// theirs because the engine is still inside their own trigger pull.
+	Check(UprootCause(false, BreakCause::NOBODY, /*replaying*/ false) ==
+	          BreakCause::OURS,
+	      "a bullet with nobody replaying a shot is our own trigger pull");
+	Check(UprootCause(false, BreakCause::NOBODY, /*replaying*/ true) ==
+	          BreakCause::REPLICA,
+	      "and one fired inside a replay is the shooter's to follow, not ours");
+
+	// The whole point of the arm above: a non-host shooting a crate reports
+	// it. Under the old rule this was NOBODY, which MayReportBreak hands to
+	// the host - the one machine in the session that might be 80 m away and
+	// hold no CObject at all.
+	Check(MayReportBreak(obj::GAME_OBJECT, false, true, false,
+	                     UprootCause(false, BreakCause::NOBODY, false),
+	                     /*isHost*/ false),
+	      "a non-host who shoots a crate loose is the one who reports it");
+	Check(!MayReportBreak(obj::GAME_OBJECT, false, true, false,
+	                      UprootCause(false, BreakCause::NOBODY, true),
+	                      /*isHost*/ true),
+	      "and the host stays quiet about somebody else's replayed shot");
+}
+
+void TestARestingPlaceOffTheWire() {
+	std::printf("a matrix we are willing to write into an entity\n");
+
+	ObjectRestBody good{};
+	good.ident   = Ident(100.0f, -200.0f, 15.0f, 1393);
+	good.right   = {1.0f, 0.0f, 0.0f};
+	good.forward = {0.0f, 1.0f, 0.0f};
+	good.up      = {0.0f, 0.0f, 1.0f};
+	good.pos     = {100.0f, -200.0f, 14.5f};
+	Check(SaneRotation(good), "an identity rotation is fine");
+
+	// A post lying down is the case this whole packet exists for, and its
+	// rows are still unit length - they are just pointing somewhere else.
+	ObjectRestBody fallen = good;
+	fallen.forward = {0.0f, 0.0f, -1.0f};
+	fallen.up      = {0.0f, 1.0f, 0.0f};
+	Check(SaneRotation(fallen), "and so is a post lying on its side");
+
+	ObjectRestBody zeroed{};
+	Check(!SaneRotation(zeroed),
+	      "an all-zero body is refused - that is a truncated or forged packet, "
+	      "and writing it would collapse the object's collision to a point");
+
+	ObjectRestBody nan = good;
+	nan.up.z = std::nanf("");
+	Check(!SaneRotation(nan), "a NaN in the matrix is refused before it propagates");
+
+	ObjectRestBody huge = good;
+	huge.pos.x = 1.0e30f;
+	Check(!SaneRotation(huge), "and so is a position no sector index could hold");
+
+	ObjectRestBody stretched = good;
+	stretched.right = {10.0f, 0.0f, 0.0f};
+	Check(!SaneRotation(stretched), "a row ten times unit length is not a rotation");
 }
 
 void TestWhoReports() {
@@ -352,10 +553,13 @@ void TestStrideIsNotSizeof() {
 int main() {
 	std::printf("objecttest: breakable street objects\n\n");
 	TestWireLayout();
+	TestABulletCannotUprootALampPost();
 	TestSameObject();
 	TestBreakState();
 	TestReplayCount();
 	TestWhoReports();
+	TestWhoSaysWhereItLanded();
+	TestARestingPlaceOffTheWire();
 	TestLookup();
 	TestStrideIsNotSizeof();
 
