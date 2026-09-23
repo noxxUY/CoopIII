@@ -1,6 +1,7 @@
 #include "seat.h"
 
 #include "addresses.h"
+#include "ped.h"
 #include "pedanim.h"
 #include "vehicle.h"
 #include "../client.h"
@@ -71,6 +72,80 @@ bool HasFreePassengerSeat(void *vehicle) {
 			return true;
 	}
 	return false;
+}
+
+// The lowest free passenger slot, as a wire seat number, or -1.
+//
+// WarpPedIntoCar picked this itself and never said which. The engine's
+// animated entry cannot: SetEnterCar switches on the door it is given, so the
+// seat has to be chosen before the walk starts rather than read back after.
+int32_t FirstFreePassengerSeat(void *vehicle) {
+	const uint8_t maxPassengers = Field<uint8_t>(vehicle, offs::VEH_NUM_MAX_PASSENGERS);
+	const size_t  seats =
+	    maxPassengers < offs::VEH_MAX_PASSENGERS ? maxPassengers : offs::VEH_MAX_PASSENGERS;
+	for (size_t i = 0; i < seats; ++i) {
+		const size_t at = offs::VEH_PASSENGERS + i * sizeof(void *);
+		if (Field<void *>(vehicle, at) == nullptr)
+			return static_cast<int32_t>(i) + 1;
+	}
+	return -1;
+}
+
+// An entry the engine is walking. The car is held as a pool handle and not as
+// a pointer: an entry takes a couple of seconds, and a car can be destroyed
+// inside one.
+int32_t  g_entryCarHandle = -1;
+uint8_t  g_entrySeat      = 0;
+uint32_t g_entryDeadline  = 0;
+
+bool g_saidWalking  = false;
+bool g_saidGaveUp   = false;
+bool g_saidNoSlot   = false;
+
+// The old way in, kept as the fallback for every case where the engine
+// refuses to animate: a car on its roof, a car moving, a door that will not
+// open. Getting in instantly is worse than getting in with the door open, and
+// both are better than the seat key doing nothing.
+int32_t WarpIntoSeat(void *ped, void *vehicle) {
+	// The objective first, and it is not ceremony: WarpPedIntoCar reads it to
+	// decide which seat to give. Anything that is not the driver's objective
+	// takes the passenger arm, which walks to the first free slot itself.
+	using ObjFn  = void(__thiscall *)(void *, uint32_t, void *);
+	using WarpFn = void(__thiscall *)(void *, void *);
+	Func<ObjFn>(CPed__SetObjective)(ped, OBJECTIVE_ENTER_CAR_AS_PASSENGER, vehicle);
+	Func<WarpFn>(CPed__WarpPedIntoCar)(ped, vehicle);
+
+	// Which seat it actually gave us. Read back rather than assumed, because
+	// the engine chose it and the number is what the session has to be told.
+	const int32_t seat = PassengerSeatOf(vehicle, ped);
+	if (seat < 0) {
+		// It said yes and then seated nobody. Undo what the warp set so the
+		// player is not left believing they are in a car with no seat.
+		Field<bool>(ped, offs::PED_IN_VEHICLE)   = false;
+		Field<void *>(ped, offs::PED_MY_VEHICLE) = nullptr;
+		Field<uint32_t>(ped, offs::PED_OBJECTIVE)      = OBJECTIVE_NONE;
+		Field<uint32_t>(ped, offs::PED_PREV_OBJECTIVE) = OBJECTIVE_NONE;
+		Field<void *>(ped, offs::PED_CAR_IN_OBJECTIVE) = nullptr;
+		Log("seat: CPed::WarpPedIntoCar took the passenger arm and left us in no "
+		    "slot at all; put the player back on the pavement");
+		return SEAT_LOCAL_REFUSED;
+	}
+
+	// The objective goes once the seat is taken, for the same reason
+	// UnseatRemotePed clears it: a ped left holding ENTER_CAR_AS_PASSENGER
+	// and a car pointer keeps trying to carry the objective out.
+	Field<uint32_t>(ped, offs::PED_OBJECTIVE)      = OBJECTIVE_NONE;
+	Field<uint32_t>(ped, offs::PED_PREV_OBJECTIVE) = OBJECTIVE_NONE;
+	Field<void *>(ped, offs::PED_CAR_IN_OBJECTIVE) = nullptr;
+
+	if (!g_saidSeated) {
+		g_saidSeated = true;
+		Log("seat: got into somebody else's car as a passenger, seat %d. The "
+		    "driver owns the physics, so nothing about this car goes on the "
+		    "wire from here",
+		    seat);
+	}
+	return seat;
 }
 
 } // namespace
@@ -174,46 +249,93 @@ int32_t SeatLocalPlayerIn(int32_t vehicleHandle) {
 		return -1;
 	}
 
-	// The objective first, and it is not ceremony: WarpPedIntoCar reads it to
-	// decide which seat to give. Anything that is not the driver's objective
-	// takes the passenger arm, which walks to the first free slot itself.
-	using ObjFn  = void(__thiscall *)(void *, uint32_t, void *);
-	using WarpFn = void(__thiscall *)(void *, void *);
-	Func<ObjFn>(CPed__SetObjective)(ped, OBJECTIVE_ENTER_CAR_AS_PASSENGER, vehicle);
-	Func<WarpFn>(CPed__WarpPedIntoCar)(ped, vehicle);
-
-	// Which seat it actually gave us. Read back rather than assumed, because
-	// the engine chose it and the number is what the session has to be told.
-	const int32_t seat = PassengerSeatOf(vehicle, ped);
-	if (seat < 0) {
-		// It said yes and then seated nobody. Undo what the warp set so the
-		// player is not left believing they are in a car with no seat.
-		Field<bool>(ped, offs::PED_IN_VEHICLE)   = false;
-		Field<void *>(ped, offs::PED_MY_VEHICLE) = nullptr;
-		Field<uint32_t>(ped, offs::PED_OBJECTIVE)      = OBJECTIVE_NONE;
-		Field<uint32_t>(ped, offs::PED_PREV_OBJECTIVE) = OBJECTIVE_NONE;
-		Field<void *>(ped, offs::PED_CAR_IN_OBJECTIVE) = nullptr;
-		Log("seat: CPed::WarpPedIntoCar took the passenger arm and left us in no "
-		    "slot at all; put the player back on the pavement");
-		return -1;
+	// The animated way in: ask the engine to walk to the door and open it,
+	// which is what the other machine has been drawing for a remote player
+	// ever since entercar landed. This key used to call WarpPedIntoCar, and a
+	// warp is a teleport on both screens at once.
+	const int32_t want = FirstFreePassengerSeat(vehicle);
+	if (want < 0) {
+		if (!g_saidNoSlot) {
+			g_saidNoSlot = true;
+			Log("seat: the car said it had room and then named no free slot, so "
+			    "nobody got in");
+		}
+		return SEAT_LOCAL_REFUSED;
 	}
 
-	// The objective goes once the seat is taken, for the same reason
-	// UnseatRemotePed clears it: a ped left holding ENTER_CAR_AS_PASSENGER
-	// and a car pointer keeps trying to carry the objective out.
-	Field<uint32_t>(ped, offs::PED_OBJECTIVE)      = OBJECTIVE_NONE;
-	Field<uint32_t>(ped, offs::PED_PREV_OBJECTIVE) = OBJECTIVE_NONE;
-	Field<void *>(ped, offs::PED_CAR_IN_OBJECTIVE) = nullptr;
-
-	if (!g_saidSeated) {
-		g_saidSeated = true;
-		Log("seat: got into somebody else's car as a passenger, seat %d. The "
-		    "driver owns the physics, so nothing about this car goes on the "
-		    "wire from here",
-		    seat);
+	if (StartCarEntry(ped, vehicle, static_cast<uint8_t>(want))) {
+		g_entryCarHandle = vehicleHandle;
+		g_entrySeat      = static_cast<uint8_t>(want);
+		g_entryDeadline  = GetTickCount() + SEAT_ANIM_TIMEOUT_MS;
+		if (!g_saidWalking) {
+			g_saidWalking = true;
+			Log("seat: walking to the door to get in as a passenger, seat %d. "
+			    "The session is told which seat only once the engine has "
+			    "actually given it",
+			    want);
+		}
+		return SEAT_LOCAL_WALKING;
 	}
-	return seat;
+
+	// The engine refused to animate it: a car on its roof, a car moving, a
+	// door that will not open. Fall back rather than refuse, because getting
+	// in instantly is worse than getting in with the door open and better
+	// than the key doing nothing.
+	return WarpIntoSeat(ped, vehicle);
 }
+
+int32_t PollLocalSeatEntry() {
+	if (g_entryCarHandle < 0)
+		return SEAT_LOCAL_REFUSED;
+
+	void *const ped     = PlayerPed();
+	void *const vehicle = VehicleFromHandle(g_entryCarHandle);
+	if (!ped || !vehicle) {
+		// One half of it went while the ped was still walking. An entry takes
+		// seconds and a car can be destroyed inside one, which is the whole
+		// reason the car is held as a handle here and not as a pointer.
+		g_entryCarHandle = -1;
+		if (ped)
+			CancelCarEntry(ped);
+		return SEAT_LOCAL_REFUSED;
+	}
+
+	const uint8_t progress = PollCarEntry(ped, vehicle, g_entrySeat);
+	if (progress == SEAT_DONE) {
+		g_entryCarHandle = -1;
+		// Read the seat back instead of trusting the one that was asked for.
+		// The engine is what assigned it, and that number is what the session
+		// is about to be told.
+		const int32_t seat = PassengerSeatOf(vehicle, ped);
+		if (seat < 0)
+			return SEAT_LOCAL_REFUSED;
+		if (!g_saidSeated) {
+			g_saidSeated = true;
+			Log("seat: opened the door and got into somebody else's car as a "
+			    "passenger, seat %d. The driver owns the physics, so nothing "
+			    "about this car goes on the wire from here",
+			    seat);
+		}
+		return seat;
+	}
+
+	if (progress == SEAT_RUNNING && GetTickCount() < g_entryDeadline)
+		return SEAT_LOCAL_WALKING;
+
+	// Refused, interrupted, or out of time. Take the half-played entry off the
+	// ped - that is what gives the door back to the car - and seat them the
+	// old way, so the key still does something.
+	g_entryCarHandle  = -1;
+	const int dropped = CancelCarEntry(ped);
+	if (!g_saidGaveUp) {
+		g_saidGaveUp = true;
+		Log("seat: the door-opening entry did not finish (%d partial "
+		    "animation(s) faded), so the seat was taken directly instead",
+		    dropped);
+	}
+	return WarpIntoSeat(ped, vehicle);
+}
+
 
 // Get the local player out of the car they are riding in.
 //
@@ -279,6 +401,7 @@ bool UnseatLocalPlayer() {
 void AddSeatToBridge(WorldBridge &bridge) {
 	bridge.LocalWantsSeatToggle = &LocalWantsSeatToggle;
 	bridge.SeatLocalPlayerIn    = &SeatLocalPlayerIn;
+	bridge.PollLocalSeatEntry   = &PollLocalSeatEntry;
 	bridge.LocalIsPassenger     = &LocalIsPassenger;
 	bridge.UnseatLocalPlayer    = &UnseatLocalPlayer;
 }

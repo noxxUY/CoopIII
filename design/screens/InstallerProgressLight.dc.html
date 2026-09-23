@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CoopIII Installer, installing, light</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&amp;family=Fragment+Mono&amp;display=swap">
+<style>
+body{margin:0;background:#E7EAEE;color:#15191E;font-family:'Archivo','Segoe UI',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:#15191E}a:hover{color:#000000}
+button,input{font:inherit;color:inherit}
+button:focus-visible,input:focus-visible{outline:2px solid #14171B;outline-offset:2px}
+input::placeholder{color:#636D7A}
+@keyframes cq-drift{from{transform:translate(0px,0px)}to{transform:translate(-248.074px,-865.136px)}}
+@keyframes cq-march{to{stroke-dashoffset:-14}}
+@keyframes cq-pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.22)}}
+.cq-drift{animation:cq-drift 320s linear infinite}
+.cq-route{animation:cq-march 3.2s linear infinite}
+.cq-halo{transform-box:fill-box;transform-origin:center;animation:cq-pulse 5.5s ease-in-out infinite}
+@media (prefers-reduced-motion:reduce){.cq-drift,.cq-route,.cq-halo{animation:none!important}}
+</style>
+</helmet>
+<div style="width: 1120px; height: 860px; display: flex; flex-direction: column; overflow: hidden; background: #F4F5F7; color: #15191E; font-family: 'Archivo', 'Segoe UI', system-ui, sans-serif;">
+<header style="height: 40px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: space-between; padding-left: 14px; background: #E9ECEF; border-bottom: 1px solid #DADEE3;">
+<div style="display: flex; align-items: center; gap: 10px;">
+<img src="../assets/logo-mark.png" alt="CoopIII" style="display: block; height: 18px; width: auto;">
+<span style="font-size: 13px; font-weight: 600; color: #4A5360;">Installer</span>
+</div>
+<div style="display: flex; align-items: center; gap: 8px;">
+<span style="font-size: 12px; color: #5B6572;">v0.0.1</span>
+<div style="display: flex;">
+<button type="button" aria-label="Minimize" style="width: 46px; height: 39px; display: flex; align-items: center; justify-content: center; padding: 0; background: transparent; border: none; color: #4A5360; cursor: pointer;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 12h12"></path></svg></button>
+<button type="button" aria-label="Close" style="width: 46px; height: 39px; display: flex; align-items: center; justify-content: center; padding: 0; background: transparent; border: none; color: #4A5360; cursor: pointer;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"></path></svg></button>
+</div>
+</div>
+</header>
+<div style="flex-grow: 1; min-height: 0; display: flex;">
+<section aria-labelledby="steps-title" style="position: relative; width: 380px; flex-shrink: 0; box-sizing: border-box; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between; padding: 40px 40px 32px; background: #F4F5F7;">
+<svg aria-hidden="true" width="440" height="400" viewBox="0 0 440 400" style="position: absolute; top: 0; left: 0; display: block; pointer-events: none;">
+<defs>
+<linearGradient id="fadeInstB" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0.35" stop-color="#F4F5F7" stop-opacity="0"></stop>
+<stop offset="0.92" stop-color="#F4F5F7" stop-opacity="1"></stop>
+</linearGradient>
+<pattern id="cqTile" patternUnits="userSpaceOnUse" width="900" height="900" patternTransform="rotate(-16)">
+<rect x="0" y="0" width="46" height="16" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="20" width="46" height="24" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="53" width="46" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="118" width="46" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="199" width="46" height="22" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="225" width="46" height="18" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="252" width="46" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="305" width="46" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="386" width="46" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="429" width="46" height="34" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="0" y="472" width="46" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="564" width="46" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="629" width="46" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="710" width="46" height="29" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="743" width="46" height="23" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="775" width="46" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="0" width="104" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="53" width="104" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="118" width="60" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="119" y="118" width="40" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="199" width="104" height="44" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="55" y="252" width="60" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="119" y="252" width="40" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="305" width="104" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="336" width="104" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="386" width="104" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="429" width="104" height="34" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="55" y="472" width="104" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="564" width="104" height="29" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="597" width="104" height="23" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="629" width="104" height="72" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="55" y="710" width="104" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="775" width="45" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="104" y="775" width="55" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="0" width="58" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="53" width="58" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="118" width="58" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="199" width="58" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="252" width="58" height="22" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="278" width="58" height="18" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="305" width="58" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="336" width="58" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="386" width="58" height="34" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="168" y="429" width="58" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="472" width="58" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="564" width="58" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="629" width="58" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="671" width="58" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="710" width="58" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="775" width="58" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="0" width="58" height="22" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="26" width="58" height="18" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="53" width="58" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="118" width="58" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="199" width="58" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="252" width="58" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="305" width="58" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="347" width="58" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="386" width="58" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="429" width="58" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="472" width="58" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="514" width="58" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="564" width="58" height="20" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="588" width="58" height="32" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="629" width="58" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="671" width="58" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="710" width="58" height="20" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="734" width="58" height="32" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="775" width="58" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="0" width="88" height="16" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="20" width="88" height="24" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="53" width="88" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="118" width="88" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="160" width="88" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="199" width="88" height="22" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="225" width="88" height="18" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="252" width="88" height="44" rx="2" fill="#DADEE3"></rect>
+<rect x="302" y="305" width="51" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="357" y="305" width="33" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="386" width="38" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="344" y="386" width="46" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="429" width="88" height="34" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="302" y="472" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="564" width="88" height="20" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="588" width="88" height="32" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="629" width="88" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="660" width="88" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="710" width="38" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="344" y="710" width="46" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="775" width="88" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="0" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="53" width="88" height="29" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="86" width="88" height="23" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="118" width="88" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="160" width="88" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="199" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="252" width="88" height="16" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="272" width="88" height="24" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="305" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="386" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="429" width="38" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="441" y="429" width="46" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="472" width="88" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="503" width="88" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="564" width="88" height="29" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="597" width="88" height="23" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="629" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="710" width="88" height="56" rx="2" fill="#DADEE3"></rect>
+<rect x="399" y="775" width="88" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="0" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="53" width="88" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="118" width="88" height="72" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="496" y="199" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="252" width="38" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="538" y="252" width="46" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="305" width="88" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="336" width="88" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="386" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="429" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="472" width="88" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="503" width="88" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="564" width="51" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="551" y="564" width="33" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="629" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="710" width="88" height="56" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="496" y="775" width="88" height="62" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="841" width="88" height="50" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="0" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="53" width="88" height="56" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="593" y="118" width="88" height="72" rx="2" fill="#DADEE3"></rect>
+<rect x="593" y="199" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="252" width="88" height="44" rx="2" fill="#DADEE3"></rect>
+<rect x="593" y="305" width="88" height="72" rx="2" fill="#DADEE3"></rect>
+<rect x="593" y="386" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="429" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="472" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="564" width="88" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="629" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="710" width="88" height="29" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="743" width="88" height="23" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="775" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="823" width="88" height="68" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="0" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="53" width="88" height="20" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="77" width="88" height="32" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="118" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="199" width="51" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="756" y="199" width="33" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="252" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="305" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="386" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="429" width="51" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="756" y="429" width="33" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="472" width="88" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="503" width="88" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="564" width="88" height="56" rx="2" fill="#DADEE3"></rect>
+<rect x="701" y="629" width="88" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="671" width="88" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="710" width="88" height="56" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="701" y="775" width="88" height="116" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="798" y="0" width="54" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="856" y="0" width="35" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="53" width="54" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="856" y="53" width="35" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="118" width="93" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="199" width="93" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="252" width="93" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="305" width="93" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="386" width="93" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="429" width="40" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="842" y="429" width="49" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="472" width="93" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="503" width="93" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="564" width="54" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="856" y="564" width="35" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="629" width="93" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="710" width="93" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="775" width="40" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="842" y="775" width="49" height="116" rx="2" fill="#E3E6EA"></rect>
+</pattern>
+</defs>
+<g class="cq-drift"><rect x="-900" y="-700" width="2340" height="2100" fill="url(#cqTile)"></rect><g transform="rotate(-16)">
+<path class="cq-route" d="M297.5 -705.5 L297.5 -652.5 L394.5 -652.5" fill="none" stroke="#9AA3AE" stroke-width="2" stroke-dasharray="2 5" stroke-linecap="round"></path>
+<circle class="cq-halo" cx="297.5" cy="-705.5" r="13" fill="#14171B" opacity="0.10"></circle><circle cx="297.5" cy="-705.5" r="4.5" fill="#14171B"></circle>
+<circle class="cq-halo" cx="394.5" cy="-652.5" r="13" fill="#D20000" opacity="0.16"></circle><circle cx="394.5" cy="-652.5" r="4.5" fill="#D20000"></circle>
+<path class="cq-route" d="M297.5 194.5 L297.5 247.5 L394.5 247.5" fill="none" stroke="#9AA3AE" stroke-width="2" stroke-dasharray="2 5" stroke-linecap="round"></path>
+<circle class="cq-halo" cx="297.5" cy="194.5" r="13" fill="#14171B" opacity="0.10"></circle><circle cx="297.5" cy="194.5" r="4.5" fill="#14171B"></circle>
+<circle class="cq-halo" cx="394.5" cy="247.5" r="13" fill="#D20000" opacity="0.16"></circle><circle cx="394.5" cy="247.5" r="4.5" fill="#D20000"></circle>
+<path class="cq-route" d="M297.5 1094.5 L297.5 1147.5 L394.5 1147.5" fill="none" stroke="#9AA3AE" stroke-width="2" stroke-dasharray="2 5" stroke-linecap="round"></path>
+<circle class="cq-halo" cx="297.5" cy="1094.5" r="13" fill="#14171B" opacity="0.10"></circle><circle cx="297.5" cy="1094.5" r="4.5" fill="#14171B"></circle>
+<circle class="cq-halo" cx="394.5" cy="1147.5" r="13" fill="#D20000" opacity="0.16"></circle><circle cx="394.5" cy="1147.5" r="4.5" fill="#D20000"></circle>
+<path class="cq-route" d="M297.5 1994.5 L297.5 2047.5 L394.5 2047.5" fill="none" stroke="#9AA3AE" stroke-width="2" stroke-dasharray="2 5" stroke-linecap="round"></path>
+<circle class="cq-halo" cx="297.5" cy="1994.5" r="13" fill="#14171B" opacity="0.10"></circle><circle cx="297.5" cy="1994.5" r="4.5" fill="#14171B"></circle>
+<circle class="cq-halo" cx="394.5" cy="2047.5" r="13" fill="#D20000" opacity="0.16"></circle><circle cx="394.5" cy="2047.5" r="4.5" fill="#D20000"></circle>
+</g></g>
+<rect x="0" y="0" width="440" height="400" fill="url(#fadeInstB)"></rect>
+</svg>
+<div style="position: relative; display: flex; flex-direction: column; gap: 18px;">
+<img src="../assets/logo-mark.png" alt="CoopIII" style="display: block; width: 216px; height: auto;">
+<p style="margin: 0; max-width: 280px; font-size: 14px; line-height: 21px; color: #4A5360; text-wrap: pretty;">Sets up the co-op mod and the Essential Pack, the mods it was built and tested alongside.</p>
+</div>
+<div style="position: relative; display: flex; flex-direction: column; gap: 14px;">
+<h2 id="steps-title" style="margin: 0; font-size: 15px; line-height: 20px; font-weight: 600; color: #15191E;">Setup</h2>
+<ol style="margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; overflow: hidden; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 10px;">
+<li style="display: flex; align-items: center; gap: 14px; padding: 12px 14px; border-bottom: 1px solid #E1E4E8;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: center; background: #E5F3EB; border: 1px solid #B9DEC9; border-radius: 14px; color: #166B40;"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" style="display: block;"><path d="M20 6 9 17l-5-5"></path></svg></span>
+<div style="min-width: 0; display: flex; flex-direction: column; gap: 2px;">
+<span style="font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">Game version</span>
+<span style="font-size: 12px; line-height: 16px; color: #5B6572;">v1.0 retail</span>
+</div>
+</li>
+<li style="display: flex; align-items: center; gap: 14px; padding: 12px 14px; border-bottom: 1px solid #E1E4E8;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: center; background: #E5F3EB; border: 1px solid #B9DEC9; border-radius: 14px; color: #166B40;"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" style="display: block;"><path d="M20 6 9 17l-5-5"></path></svg></span>
+<div style="min-width: 0; display: flex; flex-direction: column; gap: 2px;">
+<span style="font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">Components</span>
+<span style="font-size: 12px; line-height: 16px; color: #5B6572;">12 of 12 selected</span>
+</div>
+</li>
+<li aria-current="step" style="display: flex; align-items: center; gap: 14px; padding: 12px 14px; border-bottom: 1px solid #E1E4E8;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; background: #14171B; border-radius: 14px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; color: #FFFFFF;">3</span>
+<div style="min-width: 0; display: flex; flex-direction: column; gap: 2px;">
+<span style="font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">Install</span>
+<span style="font-size: 12px; line-height: 16px; color: #4A5360;">Copies files into the game folder</span>
+</div>
+</li>
+<li style="display: flex; align-items: center; gap: 14px; padding: 12px 14px;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: center; border: 1px solid #CDD2D8; border-radius: 14px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; color: #5B6572;">4</span>
+<div style="min-width: 0; display: flex; flex-direction: column; gap: 2px;">
+<span style="font-size: 14px; line-height: 20px; font-weight: 600; color: #4A5360;">Done</span>
+<span style="font-size: 12px; line-height: 16px; color: #5B6572;">Open the launcher and play</span>
+</div>
+</li>
+</ol>
+</div>
+</section>
+<section aria-labelledby="main-title" style="flex-grow: 1; min-width: 0; box-sizing: border-box; display: flex; flex-direction: column; padding: 36px 44px 28px; background: #FAFAFB;">
+<h1 id="main-title" style="margin: 0; font-size: 28px; line-height: 34px; font-weight: 800; font-stretch: 125%; letter-spacing: -0.01em; color: #15191E;">Installing</h1>
+<p style="margin: 6px 0 0; max-width: 560px; font-size: 14px; line-height: 20px; color: #4A5360; text-wrap: pretty;">Keep this window open until it finishes. GTA III should stay closed meanwhile.</p>
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: 26px;">
+<div style="display: flex; align-items: baseline; justify-content: space-between; gap: 12px;">
+<span style="font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">7 of 12 installed</span>
+<span style="font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; line-height: 20px; color: #4A5360;">62%</span>
+</div>
+<div role="progressbar" aria-label="Install progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="62" style="height: 8px; overflow: hidden; background: #E1E4E8; border-radius: 4px;">
+<div style="width: 62%; height: 100%; background: #14171B; border-radius: 4px;"></div>
+</div>
+</div>
+<ul style="margin: 26px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;">
+<li style="grid-column: 1 / -1; height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #166B40;"><circle cx="12" cy="12" r="9"></circle><path d="M8 12.5l2.7 2.7L16 9.5"></path></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">CoopIII</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #166B40;">Done</span>
+</li>
+<li style="height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #166B40;"><circle cx="12" cy="12" r="9"></circle><path d="M8 12.5l2.7 2.7L16 9.5"></path></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">Ultimate ASI Loader</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #166B40;">Done</span>
+</li>
+<li style="height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #166B40;"><circle cx="12" cy="12" r="9"></circle><path d="M8 12.5l2.7 2.7L16 9.5"></path></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">CLEO</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #166B40;">Done</span>
+</li>
+<li style="height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #166B40;"><circle cx="12" cy="12" r="9"></circle><path d="M8 12.5l2.7 2.7L16 9.5"></path></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">Modloader</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #166B40;">Done</span>
+</li>
+<li style="height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #166B40;"><circle cx="12" cy="12" r="9"></circle><path d="M8 12.5l2.7 2.7L16 9.5"></path></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">SilentPatch</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #166B40;">Done</span>
+</li>
+<li style="height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #166B40;"><circle cx="12" cy="12" r="9"></circle><path d="M8 12.5l2.7 2.7L16 9.5"></path></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">Widescreen Fix</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #166B40;">Done</span>
+</li>
+<li style="height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #166B40;"><circle cx="12" cy="12" r="9"></circle><path d="M8 12.5l2.7 2.7L16 9.5"></path></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">Framerate Vigilante</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #166B40;">Done</span>
+</li>
+<li style="height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #E3E6EA; border: 1px solid #B7BEC7; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #14171B;"><circle cx="12" cy="12" r="9" stroke="#CDD2D8"></circle><path d="M12 3a9 9 0 0 1 9 9"></path></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #15191E;">GInput</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #14171B;">Installing</span>
+</li>
+<li style="height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #B7BEC7;"><circle cx="12" cy="12" r="9"></circle></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #5B6572;">RunDLL32 Fix</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #5B6572;">Waiting</span>
+</li>
+<li style="height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #B7BEC7;"><circle cx="12" cy="12" r="9"></circle></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #5B6572;">NoDEP</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #5B6572;">Waiting</span>
+</li>
+<li style="height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #B7BEC7;"><circle cx="12" cy="12" r="9"></circle></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #5B6572;">CrashInfo</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #5B6572;">Waiting</span>
+</li>
+<li style="height: 44px; box-sizing: border-box; display: flex; align-items: center; gap: 12px; padding: 0 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0; color: #B7BEC7;"><circle cx="12" cy="12" r="9"></circle></svg>
+<span style="flex-grow: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 20px; font-weight: 600; color: #5B6572;">Windowed Mode</span>
+<span style="flex-shrink: 0; font-size: 12px; line-height: 16px; font-weight: 600; color: #5B6572;">Waiting</span>
+</li>
+</ul>
+<div style="display: flex; flex-direction: column; gap: 8px; margin-top: 22px;">
+<h2 style="margin: 0; font-size: 13px; line-height: 18px; font-weight: 600; color: #4A5360;">Details</h2>
+<div style="box-sizing: border-box; padding: 12px 16px; background: #EFF1F4; border: 1px solid #E1E4E8; border-radius: 10px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 12.5px; line-height: 20px;">
+<div style="display: flex; gap: 12px; white-space: nowrap;"><span style="flex-shrink: 0; color: #166B40;">[ ok ]</span><span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #2A3038;">SilentPatch installed</span></div>
+<div style="display: flex; gap: 12px; white-space: nowrap;"><span style="flex-shrink: 0; color: #166B40;">[ ok ]</span><span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #2A3038;">Widescreen Fix installed</span></div>
+<div style="display: flex; gap: 12px; white-space: nowrap;"><span style="flex-shrink: 0; color: #166B40;">[ ok ]</span><span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #2A3038;">Framerate Vigilante installed</span></div>
+<div style="display: flex; gap: 12px; white-space: nowrap;"><span style="flex-shrink: 0; color: #14171B;">[ .. ]</span><span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #2A3038;">GInput: copying files into the game folder</span></div>
+</div>
+</div>
+<div style="margin-top: auto; display: flex; justify-content: flex-end; gap: 12px;">
+<button type="button" style="height: 48px; display: flex; align-items: center; justify-content: center; gap: 10px; padding: 0 20px; background: transparent; border: 1px solid #CDD2D8; border-radius: 8px; color: #2A3038; font-size: 15px; font-weight: 600; cursor: pointer;">Cancel</button>
+</div>
+</section>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1120,"height":860}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>

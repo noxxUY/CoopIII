@@ -14,17 +14,24 @@
 #include "config.h"
 #include "game/combat.h"
 #include "game/frame.h"
+#include "game/garage.h"
 #include "game/nametag.h"
+#include "game/object.h"
 #include "game/pause.h"
 #include "game/ped.h"
+#include "game/pickup.h"
+#include "game/population.h"
 #include "game/radar.h"
 #include "game/seat.h"
 #include "game/vehicle.h"
+#include "game/wanted.h"
 #include "game/verify.h"
 #include "game/world.h"
 #include "game/worldstate.h"
 #include "hook/hook.h"
 #include "log.h"
+
+#include <cstdlib>
 
 #include <windows.h>
 
@@ -54,15 +61,21 @@ void PreFrame() {
 	game::ClearPauseForTheWorld();
 	g_client.PreFrame();
 
-	// Right after the roster, so the radar agrees with the peds that were
-	// just spawned or destroyed. Not from the HUD draw: game/radar.cpp says
-	// why a blip has to be released even on a frame with no radar on screen.
-	game::UpdateRemoteBlips();
-
-	// Last, after the roster has spawned and despawned whatever it was going
-	// to: look at the list CWorld::Process is about to walk and take out
-	// anything it would fault on. game/world.h says why this exists.
-	game::GuardMovingList();
+	// The moving-list sweep does NOT run from here any more when the
+	// CWorld::Process detour took - it runs on entry to CWorld::Process,
+	// with nothing between it and the dereference at 0x004B1B25.
+	//
+	// The reason is the whole point of game/world.h: a PreFrame sweep sits
+	// before CGame::Process, and everything CGame::Process does before it
+	// calls CWorld::Process - CTheScripts::Process, CPopulation, CCarCtrl,
+	// the fire and explosion managers, and every CoopIII detour those reach
+	// - is in the gap. Running it twice a frame would cost twice as much and
+	// close nothing the later one does not.
+	//
+	// It stays here as the fallback, because a sweep that only runs before
+	// the frame is still better than no sweep at all if the detour failed.
+	if (!game::WorldProcessGuardInstalled())
+		game::GuardMovingList();
 }
 
 void PostFrame() {
@@ -78,10 +91,50 @@ void PostFrame() {
 	// avoid. Once a minute at 60 FPS, so it costs nothing and still puts a
 	// timestamp in the log.
 	const uint32_t frames = game::FramesSeen() + 1;
-	if (frames == 1 || frames % 3600 == 0)
+	if (frames == 1 || frames % 3600 == 0) {
 		Log("frame: %u frames, %s, %u remote player(s), %u ms rtt", frames,
 		    g_client.IsConnected() ? "connected" : "not connected",
 		    g_client.RemoteCount(), g_client.RoundTripMs());
+
+		// Ped drops, and only once anything has happened. Three numbers
+		// answer the only question worth asking in one glance, the same way
+		// the combat lines do (AGENTS.md, "the damage that never landed"):
+		// did our own peds drop anything, did we refuse the ones that are
+		// not ours, and did anything arrive from anybody else. A feature
+		// that does nothing has to say which of the three it stopped at.
+		const game::PickupStats &p = game::GetPickupStats();
+		if (p.dropsMade || p.dropsUnsent || p.dropsSuppressed ||
+		    p.dropsReceived || p.dropsLost || p.dropsDuplicate)
+			Log("frame: ped drops - %u shared, %u made with no session, %u "
+			    "refused for somebody else's ped, %u built off the wire, %u "
+			    "already there, %u lost to a full table",
+			    p.dropsMade, p.dropsUnsent, p.dropsSuppressed,
+			    p.dropsReceived, p.dropsDuplicate, p.dropsLost);
+
+		// Breakable street objects, on the same rule: only once something
+		// has happened, and the numbers chosen so a feature that is doing
+		// nothing has to say which step it stopped at. `broken here` counts
+		// every break this engine performed, including the ones applied off
+		// the wire, so that number moving while `reported` and `from the
+		// wire` stay at zero is the shape of "nothing is reaching anybody".
+		const game::ObjectStats &o = game::GetObjectStats();
+		if (o.breaksSeen || o.received)
+			Log("frame: street objects - %u broken here, %u reported, %u from "
+			    "the wire (%u had nothing here to break, %u already broken); "
+			    "quiet for %u explosion(s), %u replica(s), %u unowned",
+			    o.breaksSeen, o.reported, o.received, o.receivedUnmatched,
+			    o.receivedNoop, o.skippedExplosion, o.skippedReplica,
+			    o.skippedUnowned);
+
+		// What the moving-list sweep actually costs, measured on the machine
+		// it runs on rather than asserted in a comment. It is on the game
+		// thread once a frame, so this is the number that says whether it
+		// may stay there.
+		if (game::WorldProcessGuardInstalled())
+			Log("frame: moving-list sweep - %u node(s) last frame, %u us last, "
+			    "%u us worst", game::LastSweepNodes(), game::LastSweepMicros(),
+			    game::WorstSweepMicros());
+	}
 }
 
 DWORD WINAPI Boot(LPVOID) {
@@ -93,6 +146,22 @@ DWORD WINAPI Boot(LPVOID) {
 		LogOpen(Config::PathNextToModule("CoopIII.log"));
 
 	Log("CoopIII starting (pid %lu)", GetCurrentProcessId());
+
+	// docs/roadmap.md §5.6: dropping CoopIII.asi into the game folder must not
+	// change single player. The mod activates only when the game was started
+	// by the launcher, which puts this marker in the child's environment;
+	// environment blocks are inherited by CreateProcess children, so it needs
+	// no IPC and cannot be set by accident.
+	//
+	// Started any other way, this returns here having installed nothing: no
+	// hooks, no thread, no socket. One install serves both - the game launched
+	// normally for single player, launched through CoopIII for co-op.
+	if (const char *marker = std::getenv("COOPIII_LAUNCHED"); !marker || marker[0] == '\0') {
+		Log("not started from the CoopIII launcher, so CoopIII is standing down. "
+		    "Nothing was hooked and the game is untouched (roadmap §5.6).");
+		Log("To play co-op, start the game from coopiii-launcher.exe.");
+		return 0;
+	}
 	if (g_config.logToFile && LogPath() != Config::PathNextToModule("CoopIII.log"))
 		Log("log: another instance already holds CoopIII.log, so this one is writing to "
 		    "\"%s\". Two processes appending to one log interleave into nonsense.",
@@ -128,6 +197,16 @@ DWORD WINAPI Boot(LPVOID) {
 	}
 	g_started = true;
 
+	// The seatbelt on CWorld::Process, and the inspector it hands every
+	// surviving entity to. Installed straight after the frame hook and
+	// before anything that can create or destroy an entity, because the one
+	// thing it must not do is start late.
+	//
+	// Not fatal: without it the sweep falls back to PreFrame, which is where
+	// it was when it failed to catch three crashes in a row (game/world.h).
+	game::SetMovingListEntityInspector(&game::ClampClumpAnimations);
+	game::InstallWorldProcessGuard();
+
 	// Not fatal if this fails - the game just pauses the way it does in
 	// single player, which is wrong for a session but not a broken game.
 	if (g_config.menuPausesTheGame)
@@ -158,6 +237,13 @@ DWORD WINAPI Boot(LPVOID) {
 	if (!game::InstallVehicleHooks())
 		Log("CoopIII: a car exploding will not reach other players");
 
+	// The one door into the world. Not fatal if it fails to install: CoopIII
+	// then never notices an ambient pedestrian, which is where this project
+	// was before docs/population.md existed. AddPopulationToBridge checks the
+	// same thing and wires nothing if the door is shut.
+	if (!game::InstallPopulationHooks())
+		Log("CoopIII: ambient pedestrians stay local to each machine");
+
 	WorldBridge bridge = game::MakeWorldBridge();
 	// Clock and weather are wired here rather than inside MakeWorldBridge
 	// because they share nothing with the ped and vehicle code: different
@@ -166,6 +252,112 @@ DWORD WINAPI Boot(LPVOID) {
 	game::AddVehicleBlastToBridge(bridge);
 	game::SetSeatKey(g_config.seatKey);
 	game::AddSeatToBridge(bridge);
+	game::AddPopulationToBridge(bridge);
+	// The wanted level. Two reads and one write into the local player's own
+	// CWanted, and nothing else: the police are ambient entities that
+	// AddPopulationToBridge above has been replicating all along
+	// (docs/wanted.md §4.2).
+	game::InstallWantedBridge(bridge);
+
+	// Pickups. One detour, on CPickups::Update, and it is the only way a
+	// pickup can be collected in this build - docs/pickups.md 3 has the
+	// whole-image scan that says so.
+	//
+	// Not fatal either, and the log line matters: without it every machine
+	// keeps its own pickups, so two players can take the same shotgun and a
+	// hidden package counts once per player. That is exactly the behaviour
+	// this replaces, so a failure is a regression to it rather than a broken
+	// game.
+	if (!game::InstallPickupHook())
+		Log("CoopIII: pickups are local to each machine; two players can take "
+		    "the same one");
+
+	// Doors, garages and the Pay'n'Spray. One detour, on CGarage::Update,
+	// which is both how this machine finds out what its own state machine
+	// decided and the only place a garage somebody else is using can be held.
+	//
+	// Not fatal: without it every garage stays local, which is the behaviour
+	// this replaces - a garage that opens for one player is shut for
+	// everybody else, including the safehouse door.
+	if (!game::InstallGarageHook())
+		Log("CoopIII: doors and garages are local to each machine");
+
+	game::AddGaragesToBridge(bridge);
+
+	game::AddPickupsToBridge(bridge);
+	// The outbound half of the pickup seam, wired only once there is a
+	// session to claim against. Captureless lambdas so these are plain
+	// function pointers: the detour they are called from has no place to
+	// keep state.
+	{
+		game::PickupCallbacks pickups;
+		pickups.Claim = [](const PickupIdent &ident) {
+			g_client.ClaimPickup(ident);
+		};
+		pickups.Release = [](const PickupIdent &ident) {
+			g_client.ReleasePickup(ident);
+		};
+		pickups.Collected = [](const PickupIdent &ident) {
+			g_client.CollectedPickup(ident);
+		};
+		pickups.Dropped = [](const PickupDropBody &drop) {
+			return g_client.DroppedPickup(drop);
+		};
+		pickups.IsReplicatedPed = [](int32_t pedRef) {
+			return g_client.IsReplicatedPed(pedRef);
+		};
+		// Wired is not connected. Without this the seam hides every pickup
+		// in the world from the engine whenever the socket is down, which
+		// includes every second before the first connect and forever for
+		// anybody who installed the .asi without running a server.
+		pickups.HaveSession = []() { return g_client.IsConnected(); };
+		game::SetPickupCallbacks(pickups);
+	}
+
+	// What a dead pedestrian leaves on the pavement - docs/pickups.md 10.
+	// Two detours on the only two functions in the game that make a pickup
+	// main.scm did not.
+	//
+	// Separate from the exclusivity hook above and separately non-fatal,
+	// because the two failures are different. Without these a ped drop is
+	// one machine's own, which is exactly where this project was an hour
+	// ago; and a remote player's death keeps putting a gun on our pavement
+	// that their own machine does not have.
+	if (!game::InstallPedDropHooks())
+		Log("CoopIII: what a dead pedestrian drops stays on one machine");
+
+	// Breakable street objects - docs/objects.md. One detour on
+	// CObject::ObjectDamage, which is the only way anything in this build
+	// breaks a lamp post, and one on CWorld::TriggerExplosion, which is what
+	// keeps the first one quiet during a blast that every machine already
+	// agrees about.
+	//
+	// Not fatal: without it a row of lamp posts one player mowed down is a
+	// row of intact lamp posts on every other screen, which is exactly the
+	// behaviour this replaces.
+	if (!game::InstallObjectHooks())
+		Log("CoopIII: breaking street objects stays local to each machine");
+
+	game::AddObjectsToBridge(bridge);
+	{
+		game::ObjectCallbacks objects;
+		objects.Broken = [](const ObjectBreakBody &body) {
+			return g_client.ReportObjectBroken(body);
+		};
+		objects.IsReplicatedPed = [](int32_t pedRef) {
+			return g_client.IsReplicatedPed(pedRef);
+		};
+		objects.IsReplicatedVehicle = [](int32_t vehRef) {
+			return g_client.IsReplicatedVehicle(vehRef);
+		};
+		// Wired is not connected, the same distinction pickup.h paid for:
+		// without this the detour would walk two pool lookups on every
+		// collision in single player and then try to send into a dead socket.
+		objects.HaveSession = []() { return g_client.IsConnected(); };
+		objects.IsHost      = []() { return g_client.IsHost(); };
+		game::SetObjectCallbacks(objects);
+	}
+
 
 	if (!g_client.Start(g_config.host, g_config.port, g_config.nick, bridge)) {
 		Log("CoopIII: the network client failed to start; the frame hook stays "
@@ -182,11 +374,12 @@ DWORD WINAPI Boot(LPVOID) {
 	game::SetNametagScale(g_config.nametagScale);
 	game::InstallNametags(g_client);
 
-	// Blips need no detour at all - CHud::Draw already runs CRadar::DrawBlips
-	// over the game's own blip table every frame, so CoopIII only keeps the
-	// table right. This checks the table is really a blip table first, and
-	// refuses loudly rather than writing 32 slots of somebody else's memory.
-	game::InstallRadarBlips(g_client);
+	// And the minimap. A remote player is drawn the way the local one is, as
+	// the rotating arrow that shows which way they are facing, out of a detour
+	// on CRadar::DrawBlips itself (game/radar.h). Checks the function it is
+	// about to hook is really DrawBlips first, and refuses loudly rather than
+	// hooking over whatever else has patched it.
+	game::InstallRadarArrows(g_client);
 
 	Log("CoopIII ready");
 	return 0;
@@ -213,9 +406,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			// First, because the draw reads the roster straight out of the
 			// client and the client is about to be stopped.
 			game::RemoveNametags();
-			// Before the roster goes away, while the ped refs a blip is
-			// recognised by are still the ones we registered.
-			game::RemoveRadarBlips();
+			// Same reason: the arrow draw reads the roster every frame the
+			// radar is on screen, so the detour goes before the client does.
+			game::RemoveRadarArrows();
 			g_client.Stop();
 			game::RemovePausePolicy();
 			// Before the frame hook, and before MinHook goes away. Removing
@@ -229,6 +422,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			// the rest of the session, with CoopIII gone and nothing left to
 			// explain it.
 			game::RemoveVehicleHooks();
+			// After Client::Stop, which has already destroyed every replica.
+			// The peds this machine hosts are left alone: they are the engine's
+			// own pedestrians and go on being pedestrians without us.
+			game::RemovePopulationHooks();
+			// Before the frame hook, so the last thing the log says about
+			// the sweep is what it cost. The inspector goes with it: a
+			// dangling function pointer into an unloading DLL is a worse
+			// crash than the one this guard exists to stop.
+			game::RemoveWorldProcessGuard();
+			game::SetMovingListEntityInspector(nullptr);
 			game::RemoveFrameHook();
 			HookShutdown();
 		}

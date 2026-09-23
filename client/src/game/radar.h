@@ -1,115 +1,121 @@
-// Other players on the minimap.
-//
-// Nothing in CoopIII drew a blip before this. There was no reference to
-// CRadar anywhere in the tree, which made "los blips del resto de players no
-// salen en el minimapa" a missing feature rather than a bug.
+// Other players on the minimap, drawn the way the local player is drawn.
 //
 // ---------------------------------------------------------------------------
-// The one decision this file is about
+// What this used to be, and why it changed
 // ---------------------------------------------------------------------------
 //
-// CoopIII does not draw anything. It registers a blip with the game's radar
-// and the game draws it, out of CHud::Draw, with its own DrawBlips.
+// The first version of this file registered a BLIP_CHAR in the game's own
+// CRadar::ms_RadarTrace and let CRadar::DrawBlips draw it. That worked - the
+// blips appeared, the owner confirmed it - and it was still the wrong answer,
+// for one reason stated in one sentence:
 //
-// That is the project rule ("do what the engine does") but it is also just
-// the better feature, and it is worth writing down everything it buys for
-// free, because each item is something a hand-drawn sprite would have had to
-// get right on its own:
+//     "se ve un coso verde no se ve el blip como el jugador local de la
+//      flecha etc"
 //
-//   - the position. DrawBlips reads the entity's matrix position every frame,
-//     so a blip is never a snapshot behind and never needs correcting.
-//   - the car. A BLIP_CHAR whose ped is in a vehicle is drawn at the
-//     *vehicle's* position - DrawBlips does `if (ped->InVehicle())
-//     blipEntity = ped->m_pMyVehicle` itself. A driving player's blip moves
-//     with the car, not with the seat the engine will put them in next frame.
-//   - the rim. LimitRadarPoint clamps anything past m_radarRange onto the
-//     edge of the radar, so a player 400 m away already reads as "that
-//     direction, far", which is the behaviour GTA III gives every blip.
-//   - the radar rotating with the camera, the mask, the alpha, the draw
-//     order, the HUD-off and cutscene gates, the flash when the radar is the
-//     flashing HUD item. All of it, because it is the same code path the
-//     game's own mission markers take.
-//   - the teardown. ~CPed calls CRadar::ClearBlipForEntity(BLIP_CHAR,
-//     GetPedRef(this)), so a ped CoopIII destroys takes its blip with it.
+// A table entry can only ever be a square. Shape is not a field of
+// sRadarTrace; m_eRadarSprite is, but DrawBlips only reaches a sprite for
+// four of the twenty-one (BOMB, SAVE, SPRAY, WEAPON) and reaches it through
+// DrawRadarSprite, which does not rotate. So the table cannot express "a
+// person, facing that way", and a person facing a way is the whole of what a
+// player marker is.
 //
-// And it needs no hook at all. There is no detour in this file: the engine
-// already calls DrawBlips once a frame, so all CoopIII has to do is keep the
-// table right. The one thing that does have to be got right is the table's
-// bound, and addresses.h has the disassembly - 32 slots, no bounds check,
-// and CDarkel's kill register immediately after it.
+// The thing it could not express is not missing from the engine. It is what
+// the engine draws for *you*: CRadar::DrawBlips draws the local player
+// itself, before it touches the table at all, at the centre of the radar,
+// with DrawRotatingRadarSprite and CentreSprite, at
 //
-// ---------------------------------------------------------------------------
-// What a remote player looks like, and why
-// ---------------------------------------------------------------------------
+//     angle = FindPlayerHeading() - (PI + TheCamera.GetForward().Heading())
 //
-// GTA III already has an answer to "what does a person you should be able to
-// find look like on the radar", and it is opcode 391, ADD_BLIP_FOR_CHAR. Its
-// handler (0x0044079E) is four calls long and it says:
+// which is a heading measured against the camera - the reason it keeps
+// pointing where you are facing on a radar that turns with the camera.
 //
-//     SetEntityBlip(BLIP_CHAR, ped, RADAR_TRACE_GREEN, BLIP_DISPLAY_BOTH)
-//     ChangeBlipScale(blip, 3)
-//
-// so: a plain coloured square, scale 3, green, tracking the ped. That is
-// what a remote player gets. Nothing invented, no new sprite, no new colour.
-//
-// Two departures from that line, both deliberate:
-//
-// 1. BLIP_DISPLAY_BLIP_ONLY instead of BOTH. The difference between them is
-//    the 3D marker drawn in the world, and DrawBlips draws that only when
-//    CTheScripts::DbgFlag (0x0095CD87) is set, which a retail build never
-//    does. So the two are identical in a normal game and BLIP_ONLY is the
-//    one that stays identical if anything ever turns the flag on. Eight
-//    debug crosses hanging in the street is not a radar feature.
-//
-// 2. A player in a car is RADAR_TRACE_RED, not green. The reasoning is the
-//    same as for everything else here: it is the distinction the game itself
-//    makes. ADD_BLIP_FOR_CHAR uses colour 1 (green) and ADD_BLIP_FOR_CAR uses
-//    colour 0 (red), and those are the only two colours GTA III systematically
-//    attaches to a meaning. Shape is not available - every non-sprite blip in
-//    III is the same square, sprites are all named mission contacts (Asuka,
-//    Luigi, the save disc) and using one of those for a player would be
-//    inventing a vocabulary the game does not have. Scale is not available
-//    either: ADD_BLIP_FOR_CAR uses scale 3 as well.
-//
-//    The blip stays a BLIP_CHAR either way. Only the colour changes, so the
-//    engine keeps following the player through getting in and out, and the
-//    colour and the position can never disagree about whether somebody is
-//    driving - both come off the same two fields of the same CPed.
-//
-// One thing that is deliberately *not* corrected, and it is the opposite of
-// the call nametag.h makes. ShowRadarTrace draws the square as
-// SCREEN_SCALE_X(size) by SCREEN_SCALE_Y(size), which is the HUD's own 640 by
-// 448 grid, so on this install the Widescreen Fix's HudWidthScale decides how
-// square it comes out. A nametag steps around that because a label floating
-// over somebody's head is CoopIII's own element and has no reason to inherit
-// the HUD's aspect handling. A blip is not CoopIII's element: it is one of
-// the game's own blips, drawn by the game's own code, and it has to look like
-// the others on the same radar. Whatever the player's mod stack does to a
-// mission marker it should do to this, and it does, because it is the same
-// call.
+// So a remote player is drawn the same way, with the same sprite, the same
+// geometry, the same transforms and the same alpha curve, at their place on
+// the radar instead of at the centre. The blip table is gone; there is one
+// system, not two.
 //
 // ---------------------------------------------------------------------------
-// Written as a reconciliation
+// The four engine calls this is built out of
 // ---------------------------------------------------------------------------
 //
-// Same shape as Client::UpdateRemoteSeats and for the same reason: there are
-// too many races for one handler each. A player joins before their ped
-// exists; their ped is streamed in later; the engine can reap it; they can
-// die and be rebuilt; the campaign script can wipe the whole blip table on a
-// game load (CRadar::Initialise) or run out of slots.
+// Nothing here paints over the radar. Every step is the game's own, in the
+// order the game's own blip loop does them (addresses.h quotes it):
 //
-// So nothing here is an event handler. UpdateRemoteBlips runs every frame and
-// drives the table towards what the roster says, and every one of those races
-// falls out of the same loop.
+//   TransformRealWorldPointToRadarSpace  world x/y -> radar space, rotated
+//                                        by whatever the camera is doing,
+//                                        including top-down and look-behind
+//   LimitRadarPoint                      clamps to length 1, which is what
+//                                        pins a distant player to the rim
+//                                        instead of losing them, and returns
+//                                        how far past the rim they were
+//   CalculateBlipAlpha                   255 inside the radar, easing to 128
+//                                        by five times its range. The game's
+//                                        own "that direction, far".
+//   TransformRadarPointToScreenSpace     radar space -> pixels
 //
-// The load-bearing part is that **a blip handle is never trusted.** Every
-// frame CoopIII asks the table whether the slot it thinks it owns still holds
-// a BLIP_CHAR for its own ped ref, exactly the way ped.cpp's ResolveRemote
-// asks the pool whether a ped handle still resolves. If it does not, CoopIII
-// forgets it and makes a new one - and, importantly, does not clear it,
-// because by then the slot may belong to the script. CRadar::Initialise
-// resetting every m_BlipIndex to 1 is precisely the case a handle comparison
-// would get wrong and an "is it still mine" comparison gets right.
+// and then CSprite2d::Draw, the four-corner overload, which is the one
+// DrawRotatingRadarSprite itself ends in.
+//
+// The last of those is the only place CoopIII does not call the engine
+// function whole. CRadar::DrawRotatingRadarSprite builds its colour in place
+// as CRGBA(255, 255, 255, alpha) - only the alpha is an argument - so calling
+// it gives a white arrow and nothing else, and two identical white arrows on
+// one radar is exactly the confusion this feature exists to remove. Its body
+// is nine lines of arithmetic over numbers that are all in addresses.h, so
+// the quad is built here (MakeArrowQuad, below, and tools/clienttest holds it
+// to the retail disassembly) and handed to the same CSprite2d::Draw with a
+// colour. The sprite, the size, the rotation and the draw are all still the
+// engine's.
+//
+// ---------------------------------------------------------------------------
+// The colour
+// ---------------------------------------------------------------------------
+//
+// Green on foot, red in a car. Not picked: they are the two colours GTA III
+// itself attaches to a meaning, ADD_BLIP_FOR_CHAR's colour 1 and
+// ADD_BLIP_FOR_CAR's colour 0, and they are what the square already was - so
+// this change is a change of shape and nothing else. The actual RGBA is not
+// written down here either; it comes out of CRadar::GetRadarTraceColour, the
+// same lookup every blip on the same radar goes through, so a remote player
+// is the same green as a mission marker rather than a green of CoopIII's own.
+//
+// White was available and is wrong. The local player is white, and the owner
+// will be looking at his own arrow and somebody else's at the same time; that
+// is the one pair that has to be told apart at a glance.
+//
+// ---------------------------------------------------------------------------
+// The Widescreen Fix, and why this file answers it the opposite way to
+// nametag.h
+// ---------------------------------------------------------------------------
+//
+// nametag.h refuses to touch the HUD's 640x448 grid, because scaling x by
+// screenWidth/640 reinstates precisely the stretch ThirteenAG's fix exists to
+// remove, and a nametag is CoopIII's own element with no reason to inherit
+// the HUD's aspect handling.
+//
+// An arrow on the radar is the opposite case and gets the opposite answer. It
+// is not CoopIII's element. It is a copy of one of the game's, drawn on the
+// game's radar, an inch from the original - and if the two are scaled
+// differently they are visibly two different things. So this uses
+// SCREEN_SCALE_X/Y exactly as DrawRotatingRadarSprite does, down to retail's
+// truncation of both half-extents to whole pixels, and it reads the two
+// reciprocals out of the image at runtime rather than compiling in 1/640 and
+// 1/448, so that a mod which rescales the radar by patching them moves our
+// arrow with the game's.
+//
+// ---------------------------------------------------------------------------
+// Players with no ped (docs/roadmap.md §5.3)
+// ---------------------------------------------------------------------------
+//
+// The blip table could not do this: a BLIP_CHAR has nothing to track without
+// a ped, so the old BlipWanted required one and a player outside the
+// streaming radius fell off the radar entirely. Drawing it ourselves costs
+// one branch. A player with a live ped is drawn from the ped - or from
+// ped->m_pMyVehicle when they are in one, which is what DrawBlips does and is
+// what keeps the position, the heading and the colour from ever disagreeing
+// about whether somebody is driving. A player without one is drawn from the
+// pose on the wire, which is already there and already arriving. §5.3 is the
+// path that had to survive the change, and it is now the shorter half of it.
 //
 // Everything in this header is pure arithmetic, so tools/clienttest covers it
 // without the game. radar.cpp is the half that touches game memory, under the
@@ -119,6 +125,7 @@
 
 #include "addresses.h"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -130,189 +137,176 @@ namespace coopiii::game {
 
 // ---- installing -----------------------------------------------------------
 
-// Checks the blip table looks like a blip table and starts putting remote
-// players on it. There is no detour to install; this only decides whether the
-// table is safe to write and says so in the log. `client` is only ever read,
-// and only on the game thread.
-bool InstallRadarBlips(const Client &client);
-
-// Called from the frame pump, after the roster has spawned and despawned
-// whatever it was going to this frame. Cheap: a handful of loads per player
-// plus one pass over 32 bytes.
-void UpdateRemoteBlips();
-
-// Takes every blip CoopIII owns back off the radar. Safe to call twice.
-void RemoveRadarBlips();
-bool RadarBlipsInstalled();
-
-// ---- how many slots CoopIII is allowed -------------------------------------
+// Detours CRadar::DrawBlips and starts drawing remote players on the radar.
+// `client` is only ever read, and only on the game thread.
 //
-// The blip table is 32 entries and it belongs to the campaign script, which
-// is the only thing in the game that creates blips: every caller of
-// SetEntityBlip, SetCoordBlip and SetBlipSprite in the whole image is a
-// script opcode handler. CoopIII is a guest in it.
+// DrawBlips rather than CHud::Draw, and the reason is not that CHud::Draw is
+// taken (it is - nametag.cpp has it, and MinHook allows one hook per target -
+// but that is an argument about plumbing). It is that DrawBlips is where the
+// radar's own preconditions hold. It sets six render states at the top for
+// exactly this kind of drawing and leaves them set; it runs only when the
+// radar is actually on screen; and calling the original first puts our arrows
+// over the game's blips and its compass, which is the right order for a thing
+// that is a player rather than a map feature.
+bool InstallRadarArrows(const Client &client);
+void RemoveRadarArrows();
+bool RadarArrowsInstalled();
+
+// ---- the geometry, which is DrawRotatingRadarSprite's ---------------------
+
+constexpr float RADAR_PI      = 3.14159265358979323846f;
+constexpr float RADAR_HALFPI  = RADAR_PI * 0.5f;
+constexpr float RADAR_QUARTPI = RADAR_PI * 0.25f;
+
+// The half-extents, including retail's truncation.
 //
-// Being a guest matters more than usual here because SetEntityBlip has no
-// bounds check. With all 32 slots in use it writes the 33rd entry anyway,
-// over CDarkel::RegisteredKills, and hands back a handle for a slot that does
-// not exist (addresses.h has the arithmetic). So the free-slot count is not a
-// nicety, it is the guard - and CoopIII counts the slots itself rather than
-// trusting the engine to refuse.
+// "Half-extent" is what DrawRotatingRadarSprite's own variables are called
+// and it is slightly a lie: the four corners sit on a circle of this radius,
+// so the quad is sqrt(2) times it on a side, about 11 px at the reference
+// resolution where a DrawRadarSprite blip is 16. The arrow really is smaller
+// than the compass on the same radar. That is the engine's decision, and
+// matching the local player's arrow is the whole job.
 //
-// The reserve on top of that is politeness with a reason. If the script is
-// down to its last few slots, a mission marker the player needs is worth more
-// than knowing which street a team-mate is on, and the script cannot be told
-// to wait.
-
-// A quarter of the table, kept for the game's own blips. CoopIII takes a slot
-// only if this many would still be free afterwards.
-constexpr int RADAR_SCRIPT_RESERVE = 8;
-
-// At most one per other player. Named rather than spelled MAX_PLAYERS - 1 at
-// the call site so the bound is a stated intention.
-constexpr int RADAR_MAX_OUR_BLIPS = 7;
-
-// May CoopIII take one more slot, given how many are free right now (ours
-// already in use are not counted as free) and how many it already holds?
-inline bool MayTakeTraceSlot(int freeSlots, int oursHeld) {
-	if (oursHeld >= RADAR_MAX_OUR_BLIPS)
-		return false;
-	// Strictly greater: after taking one, RADAR_SCRIPT_RESERVE remain.
-	return freeSlots > RADAR_SCRIPT_RESERVE;
+// 0x004A5D10 computes SCREEN_SCALE_X(8.0) and SCREEN_SCALE_Y(8.0) and then
+// puts each through `fnstcw / or byte [esp+5],0Ch / fistp qword / fldcw`,
+// which is round-toward-zero into an integer - so the arrow's half-extents
+// are whole pixels. re3 keeps them as floats. Drawing beside the game's own
+// arrow means matching the game, not the decompilation.
+//
+// No lower clamp, deliberately. Below about 80 pixels of screen width the
+// truncation reaches zero and the arrow disappears - and so does the game's
+// own, in the same frame, for the same reason. A floor here would make
+// CoopIII's arrow visible on a radar that no longer has one.
+inline float RadarSpriteHalf(int screenPixels, float recipRef) {
+	if (screenPixels <= 0 || !(recipRef > 0.0f))
+		return 0.0f;
+	const float v = static_cast<float>(screenPixels) * recipRef * RADAR_SPRITE_HALF_REF;
+	if (!(v > 0.0f))
+		return 0.0f;
+	return std::floor(v);
 }
 
-// ---- the blip handle ------------------------------------------------------
+// The camera term in DrawBlips' angle, recovered from the engine rather than
+// read out of TheCamera.
 //
-// SetEntityBlip returns `slot | (m_BlipIndex << 16)`, and every ChangeBlip*
-// call goes back through GetActualBlipArrayIndex, which returns -1 unless the
-// top half still matches the slot's current m_BlipIndex. That is the engine's
-// own staleness check and it is the reason a handle is worth keeping.
+// TransformRealWorldPointToRadarSpace is
 //
-// It is also not enough on its own, twice over. GetActualBlipArrayIndex does
-// not range-check the low half at all - `and eax,0FFFFh` and straight into
-// the table - so a fabricated or corrupted handle reads and writes wherever
-// its low word points. And CRadar::Initialise sets every m_BlipIndex back to
-// 1, so a handle with generation 1 can start matching a slot it never owned.
+//     out.x = s*y + c*x,  out.y = c*y - s*x
 //
-// Hence both of the below, and hence TraceIsOurs further down.
-
-constexpr int32_t NO_BLIP = -1;
-
-inline int BlipSlot(int32_t handle) {
-	return static_cast<int>(static_cast<uint32_t>(handle) & 0xFFFFu);
-}
-inline uint16_t BlipGeneration(int32_t handle) {
-	return static_cast<uint16_t>((static_cast<uint32_t>(handle) >> 16) & 0xFFFFu);
+// over (in - vec2DRadarOrigin) / m_radarRange, where s and c are the sine and
+// cosine of whatever heading the camera has settled on this frame. Feed it
+// the point one radar range due north of the radar origin and x is 0 and y is
+// 1, so it hands back (s, c) exactly - and it does so having already taken
+// its own decision about top-down cameras, first person and looking behind,
+// which is four branches and three globals CoopIII then does not have to
+// find, read or keep right.
+//
+// It is also self-consistent by construction: the same function decides where
+// the arrow goes, so the arrow can never point one way while the radar is
+// rotated another.
+inline float RadarCameraHeading(float s, float c) {
+	return std::atan2(s, c);
 }
 
-// A handle CoopIII is willing to hand back to the engine. The generation has
-// to be non-zero because GetNewUniqueBlipIndex only ever returns 1 or more,
-// so a zero one is a handle that never came from it.
-inline bool BlipHandleUsable(int32_t handle) {
-	if (handle == NO_BLIP)
-		return false;
-	return BlipSlot(handle) < static_cast<int>(NUM_RADAR_BLIPS) &&
-	       BlipGeneration(handle) != 0;
+// DrawBlips' own expression, for somebody else's heading.
+//
+//     angle = heading - (PI + cameraHeading)
+//
+// The top-down branch of DrawBlips uses `PI + FindPlayerHeading()` instead,
+// and this covers that too rather than needing a second case: in top-down
+// TransformRealWorldPointToRadarSpace returns s = 0, c = 1, so
+// RadarCameraHeading gives 0 and this gives `heading - PI`, which is the same
+// angle as `heading + PI`. Sine and cosine do not distinguish them and
+// nothing downstream of here does anything else with the number.
+inline float ArrowAngle(float heading, float cameraHeading) {
+	return heading - (RADAR_PI + cameraHeading);
 }
 
-// ---- is that slot still ours ----------------------------------------------
+// The four corners CRadar::DrawRotatingRadarSprite builds, in the order it
+// hands them to CSprite2d::Draw.
 //
-// The whole of the staleness question, as arithmetic over the four fields
-// worth reading out of the table. Deliberately does not look at the
-// generation: what CoopIII cares about is not "is my handle still valid" but
-// "is the thing on the radar still the blip I made for this player", and the
-// second question survives CRadar::Initialise, a savegame load, a replay
-// restore and the script recycling the slot, all of which the first gets
-// wrong in the dangerous direction.
+// The loop at 0x004A5D94 is four iterations of
 //
-// entityHandle is the clincher. It is CPools::GetPedRef's ref for our own
-// ped, and nothing else in the game knows that number, so a BLIP_CHAR
-// carrying it in a slot marked in use is ours and nothing else can be.
-inline bool TraceIsOurs(bool inUse, uint32_t blipType, int32_t entityHandle,
-                        int32_t ourPedRef) {
-	return inUse && blipType == BLIP_CHAR && entityHandle == ourPedRef &&
-	       ourPedRef >= 0;
+//     a    = i * HALFPI + (angle - PI/4)
+//     x[i] = cx + (0.0*cos(a) + 1.0*sin(a)) * halfX
+//     y[i] = cy + (1.0*cos(a) - 0.0*sin(a)) * halfY
+//
+// with the 0.0 at 0x005F7110 and the 1.0 at 0x005F711C both still multiplied
+// through in the retail code. They are kept out of the arithmetic here and
+// left in the comment: writing `+ 0.0f * std::cos(a)` to be faithful to a
+// disassembly is faithfulness to the compiler, not to the engine.
+//
+// The draw order is 3, 2, 0, 1 - a triangle fan that walks the quad's corners
+// the right way round. Getting it wrong does not produce a wrong shape, it
+// produces a bow tie.
+struct ArrowQuad {
+	float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	float y[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+inline ArrowQuad MakeArrowQuad(float cx, float cy, float angle, float halfX,
+                               float halfY) {
+	ArrowQuad     quad;
+	const float   corrected = angle - RADAR_QUARTPI;
+	for (int i = 0; i < 4; ++i) {
+		const float a = static_cast<float>(i) * RADAR_HALFPI + corrected;
+		quad.x[i]     = cx + std::sin(a) * halfX;
+		quad.y[i]     = cy + std::cos(a) * halfY;
+	}
+	return quad;
 }
 
-// Does one table entry look like something CRadar wrote? Used once, over all
-// 32 slots, before CoopIII writes anything: if another mod has moved the
-// table or the image is not what verify.cpp thought it was, this is the
-// cheapest way to find out other than by corrupting it.
-//
-// A free slot is not inspected beyond m_bInUse, because ClearBlip leaves
-// m_nColor, m_wScale and both position vectors untouched - a cleared slot
-// keeps the last tenant's colour, so requiring anything of it would fail on a
-// perfectly healthy table.
-inline bool TraceEntrySane(bool inUse, uint32_t blipType, uint16_t display,
-                           uint16_t sprite) {
-	if (!inUse)
-		return true;
-	if (blipType < BLIP_CAR || blipType > BLIP_CONTACT_POINT)
-		return false;
-	if (display > BLIP_DISPLAY_BOTH)
-		return false;
-	// eRadarSprite runs 0..20 (RADAR_SPRITE_COUNT is 21), and RadarSprites is
-	// indexed by it with no check in DrawRadarSprite.
-	return sprite <= RADAR_SPRITE_WEAPON;
-}
+// The order CSprite2d::Draw wants them in. Named rather than spelled 3, 2, 0,
+// 1 at the call site so that it is a quoted fact and not a typo waiting to
+// happen: `sprite->Draw(curPosn[3], curPosn[2], curPosn[0], curPosn[1], col)`
+// at the tail of 0x004A5D10.
+constexpr int ARROW_DRAW_ORDER[4] = {3, 2, 0, 1};
 
-// ---- what colour, and whether there should be a blip at all ---------------
+// ---- what colour, and whether there is an arrow at all --------------------
 
 // Green on foot, red in a car, which is ADD_BLIP_FOR_CHAR's colour and
-// ADD_BLIP_FOR_CAR's colour respectively. See the header comment.
-inline uint32_t BlipColourFor(bool inVehicle) {
+// ADD_BLIP_FOR_CAR's colour respectively. These are indices into
+// CRadar::GetRadarTraceColour, not RGBA - see the header comment.
+inline uint32_t ArrowTraceColour(bool inVehicle) {
 	return inVehicle ? RADAR_TRACE_RED : RADAR_TRACE_GREEN;
 }
 
-// Whether a roster slot should have a blip on the radar this frame.
-//
-// `hasPed` is the one that carries the design: a BLIP_CHAR has nothing to
-// track without a ped, so today no ped means no blip. docs/roadmap.md §5.3
-// settles that a player beyond the streaming radius will be a map blip and
-// nothing else, and when that lands this is the single predicate that has to
-// change - see the note at the bottom of this file.
-//
-// haveState is required for the same reason ped.cpp requires a sampled pose
-// before spawning: a player whose first snapshot has not arrived has no
-// position, and a blip at the world origin is a blip in the water off
-// Portland.
-inline bool BlipWanted(bool active, bool haveState, bool hasPed) {
-	return active && haveState && hasPed;
+struct ArrowRgb {
+	uint8_t r, g, b;
+};
+
+// GetRadarTraceColour hands back one dword. DrawBlips takes it apart as
+// `(uint8)(color >> 24), (uint8)(color >> 16), (uint8)(color >> 8)` - so the
+// packing is 0xRRGGBBAA and the low byte, the one that looks like alpha, is
+// not used by anything: the blip loop passes its own alpha instead. This does
+// the same, and CalculateBlipAlpha supplies the alpha, which is how a distant
+// player comes out dimmer.
+inline ArrowRgb UnpackTraceColour(uint32_t packed) {
+	return ArrowRgb{static_cast<uint8_t>((packed >> 24) & 0xFFu),
+	                static_cast<uint8_t>((packed >> 16) & 0xFFu),
+	                static_cast<uint8_t>((packed >> 8) & 0xFFu)};
 }
 
-// ---- when distant players land (docs/roadmap.md §5.3) ---------------------
+// Whether a roster slot should have an arrow on the radar this frame.
 //
-// This is built so that change is a change to BlipWanted and one branch in
-// radar.cpp, not a rewrite.
+// Two predicates where the blip table needed three. `hasPed` is gone: an
+// arrow is drawn from a position and a heading, and a player with no ped
+// still has both, off the wire. What is left is that they are in the session
+// and that something has said where they are - a marker at the world origin
+// is a marker in the water off Portland, which is what a player whose first
+// snapshot has not arrived would get.
+inline bool ArrowWanted(bool active, bool havePose) {
+	return active && havePose;
+}
+
+// ---- the radar's own range ------------------------------------------------
 //
-// A player outside the streaming radius will have no ped, so their blip
-// cannot be a BLIP_CHAR. The engine's own answer for "a blip at a place
-// rather than on a thing" is BLIP_COORD, which CRadar::SetCoordBlip
-// (0x004A5590, recorded in addresses.h) creates and which DrawBlips draws
-// from m_vec2DPos in its third loop - the same square, the same colour table,
-// the same rim clamp. Nothing about how the blip looks would change, which is
-// the point of having chosen the game's own blip: a player walking out of the
-// streaming radius would hand over from an entity blip to a coord blip and
-// look identical doing it.
-//
-// Three things are already in place for that and one is not:
-//
-//   - the slot accounting, the reserve and the not-trusting-the-handle rule
-//     are all blip-kind-agnostic;
-//   - the position is already on the wire and already interpolated
-//     (RemotePlayer::interp), which is what a coord blip needs and an entity
-//     blip does not;
-//   - TraceIsOurs is the part that would need company, because a coord blip
-//     carries no entity handle to recognise it by. m_nEntityHandle is zero
-//     for one, so ownership would have to come from the slot plus the
-//     generation, i.e. GetActualBlipArrayIndex, with BlipHandleUsable in
-//     front of it. That is why both halves of the handle are already parsed
-//     here rather than only where they are used today.
-//
-// The one genuinely new piece is that a coord blip's position is not written
-// by any engine setter - the script only ever creates static ones - so
-// CoopIII would have to write m_vec2DPos and m_vecPos itself each frame,
-// at TRACE_POS_2D and TRACE_POS. That is a two-line write into a slot it
-// owns, and the offsets are already in addresses.h with their witnesses.
+// Only used to build the probe point for RadarCameraHeading, and only ever
+// read. DrawMap writes it every frame, 120 m on foot ramping to 350 in a fast
+// car; a zero would make the probe meaningless and a negative would turn the
+// radar inside out, so both are refused rather than divided by.
+inline bool RadarRangeUsable(float range) {
+	return range > 0.0f && range < 100000.0f;
+}
 
 } // namespace coopiii::game

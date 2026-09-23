@@ -1,0 +1,90 @@
+name: Release
+
+# Tag a commit v0.0.2 (or whatever is next) and push the tag; this builds
+# everything on Windows, runs the tests, and attaches CoopIII-Setup.exe to the
+# release under that exact name - which is the name the website's download
+# button links to:
+#
+#   https://github.com/noxxUY/CoopIII/releases/latest/download/CoopIII-Setup.exe
+#
+# The Setup carries CoopIII.asi, the launcher and CoopIII.ini inside it, so
+# that one file is the whole download.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      # The packages (enet, minhook, imgui, stb) are the slow part of a cold
+      # build, and they only change when xmake.lua does.
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/.xmake/packages
+          key: xmake-${{ runner.os }}-${{ hashFiles('xmake.lua') }}
+          restore-keys: xmake-${{ runner.os }}-
+
+      - name: Configure
+        run: xmake f -p windows -a x86 -m release -y
+
+      - name: Build
+        run: xmake -y
+
+      # The suites that need neither the game nor a window. A release that
+      # cannot pass these should not become a download.
+      - name: Test
+        shell: bash
+        run: |
+          set -e
+          out=build/windows/x86/release
+          for suite in interptest basetest clienttest patterntest sessiontest hooktest \
+                       uitest launchertest configtest installertest; do
+            xmake build -q "$suite"
+            printf '%-16s' "$suite"
+            "./$out/$suite.exe" > /dev/null && echo "ok" || { echo "FAILED"; "./$out/$suite.exe"; exit 1; }
+          done
+
+      - name: Check the Setup carries what it should
+        shell: bash
+        run: |
+          set -e
+          setup=build/windows/x86/release/CoopIII-Setup.exe
+          test -f "$setup"
+          size=$(stat -c%s "$setup")
+          echo "CoopIII-Setup.exe is $size bytes"
+          # It embeds the .asi and the launcher, so anything much smaller means
+          # the payload did not go in.
+          test "$size" -gt 2000000
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CoopIII-Setup
+          path: |
+            build/windows/x86/release/CoopIII-Setup.exe
+            build/windows/x86/release/CoopIII.asi
+            build/windows/x86/release/coopiii-launcher.exe
+            build/windows/x86/release/server.exe
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/windows/x86/release/CoopIII-Setup.exe
+            build/windows/x86/release/server.exe
+          generate_release_notes: true

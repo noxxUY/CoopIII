@@ -208,6 +208,54 @@ inline bool RotateOnto(const Vec3 &from, const Vec3 &to, const Vec3 &v, Vec3 &ou
 	return true;
 }
 
+// ---- which line the wire should carry -------------------------------------
+//
+// There are three candidate directions for an instant-hit shot, and they are
+// not three ways of saying the same thing. Retail's 3rd-person mouse camera
+// branch - the one every mouse-aiming player is on - pulls them apart:
+//
+//   the trail  CBulletTraces::AddTrace(source, target). source is the muzzle
+//              and target is the impact. This is the segment the shooter's
+//              own screen drew, which is the thing the report is about.
+//   the ray    CWeapon::ProcessLineOfSight(point1, point2). On that branch
+//              point1 is *not* the muzzle: it is the muzzle projected onto the
+//              camera's own axis (CCamera::Find3rdPersonCamTargetVector does
+//              `source += Dot(pos - source, target) * target`). So the ray and
+//              the trail are two different lines that happen to end near each
+//              other.
+//   the body   the ped's matrix forward. What an observer would derive on its
+//              own, and what the wire carried before docs/protocol.md 1.9.7.
+//
+// The origin on the wire is the muzzle, because that is where the muzzle flash
+// has to come out. So the direction has to be measured from the muzzle too, or
+// the observer draws a line parallel to the shooter's ray instead of the one
+// the shooter saw - offset by however far the muzzle is off the camera axis,
+// which is tens of centimetres and grows into degrees at close range.
+//
+// Hence the order: the drawn trail first, the traced ray second, the body
+// last. Each fallback is a real case rather than defensive padding - a weapon
+// that draws no trail (CWeapon::FireM16_1stPerson) still traces a ray, and a
+// weapon that does neither still has a ped pointing somewhere.
+enum ShotAimSource {
+	AIM_FROM_TRAIL = 0,   // the segment the engine drew
+	AIM_FROM_RAY,         // the segment the engine tested
+	AIM_FROM_BODY,        // the ped's own heading
+	AIM_FROM_NOTHING,     // not even that was usable
+};
+
+inline ShotAimSource ChooseShotDirection(const Vec3 &trailSum, int trails,
+                                         const Vec3 &raySum, int rays,
+                                         const Vec3 &forward, Vec3 &out) {
+	if (trails > 0 && UnitDirection(trailSum, out))
+		return AIM_FROM_TRAIL;
+	if (rays > 0 && UnitDirection(raySum, out))
+		return AIM_FROM_RAY;
+	if (UnitDirection(forward, out))
+		return AIM_FROM_BODY;
+	out = Vec3{0.0f, 0.0f, 0.0f};
+	return AIM_FROM_NOTHING;
+}
+
 // The three matrix rows for a projectile flying along `dir`, or false if
 // `dir` isn't a direction.
 //
@@ -496,6 +544,103 @@ inline bool IsForwardableDamage(uint8_t weapon) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// What killed the local player
+// ---------------------------------------------------------------------------
+//
+// Written for one report - "me subí a un auto y me morí" - and kept because
+// that report could not be answered from the log. `client: we died (killer net
+// 0, anim 173)` was everything CoopIII had to say about it, and anim 173 alone
+// is genuinely ambiguous. This turns it into a sentence.
+//
+// **ANIM_STD_NUM is a fingerprint, and it has exactly two sources.** 0ADh is
+// pushed to CPed::SetDie (0x004D37D0) from two places in the whole retail
+// image, found by scanning for `68 AD 00 00 00` (four hits, two of which are
+// a `call [ebp+5Ch]` and not SetDie at all) and resolving each rel32:
+//
+//   0x004D0F90  inside CPed::SetGetUp (0x004D0F20, the same function
+//               PEDSTATE_GETUP already names from CPed::ProcessControl).
+//               `mov dword [ebx+2C0h],0` - m_fHealth = 0 - then
+//               SetDie(0ADh, 4.0f, 0.0f). re3 Ped.cpp:5250-5252: the arm taken
+//               when a knocked-down ped has under 1.0 health AND its head is
+//               not above -0.3, i.e. it is pinned under something. The ramp
+//               into it is 40 bytes earlier at 0x004D10E1:
+//               `push 0 / push 0 / push [005F8528h] / mov ecx,ebx / push 11h /
+//               push 0 / call InflictDamage` -
+//               InflictDamage(nil, WEAPONTYPE_RUNOVERBYCAR,
+//                             CTimer::GetTimeStep(), PEDPIECE_TORSO, 0),
+//               every frame for as long as a car is sitting on the player.
+//
+//   0x004EADB8  inside CPed::InflictDamage, the in-vehicle arm already
+//               transcribed at CPed__InflictDamage in addresses.h.
+//
+// **And the in-vehicle arm is reachable by one cause only.** Four bytes past
+// that SetDie call, at 0x004EADCD, is
+// `mov dword [ebp+2C0h],3F800000h / xor al,al` - m_fHealth = 1.0f, return
+// false. That is the whole of the `method != WEAPONTYPE_DROWNING` side of
+// re3 PedFight.cpp:2408-2460 with no VC_PED_PORTS block in it, which is the
+// positive proof that retail 1.0 has none. So:
+//
+//   > A ped with bInVehicle set cannot be killed in retail GTA III 1.0 by
+//   > anything except drowning. Every other cause clamps its health to
+//   > exactly 1.0f and answers "did not die".
+//
+// Drowning in a car comes from CAutomobile::ProcessBuoyancy, which at
+// 0x00530A9D does `mov ecx,[ebp+1A4h]` (m_pDriver, the offset this file
+// already records as VEH_DRIVER) and then
+// InflictDamage(nil, 14h, CTimer::ms_fTimeStep, 0, 0), with the passenger
+// copy at 0x00530AED.
+//
+// What that buys the next session: a death "getting into a car" is either the
+// car being in water, or the player being on foot with a car on top of them -
+// and those two are a very long way apart. The second one is the one CoopIII
+// can cause: a replica car is placed by the network, not driven there.
+enum class DeathCause : uint8_t {
+	UNKNOWN,     // no damage reached us recently; the engine decided alone
+	DROWNED,     // WEAPONTYPE_DROWNING - the only in-vehicle death there is
+	CRUSHED,     // run over / rammed while on foot, which is what SetGetUp's
+	             // ANIM_STD_NUM arm is the end of
+	ORDINARY,    // an ordinary cause; the number says which
+};
+
+// How stale a recorded cause may be and still be called the reason. Generous
+// on purpose: SetGetUp's crush is one InflictDamage per frame, so the last one
+// is microseconds old, while a drowning tick can be a frame or two back.
+constexpr uint32_t DEATH_CAUSE_WINDOW_MS = 250;
+
+// `haveCause` is false when nothing has damaged us at all this life.
+inline DeathCause DeathCauseFor(bool haveCause, uint8_t cause, uint32_t ageMs) {
+	if (!haveCause || ageMs > DEATH_CAUSE_WINDOW_MS)
+		return DeathCause::UNKNOWN;
+	if (cause == WEAPONTYPE_DROWNING)
+		return DeathCause::DROWNED;
+	if (cause == WEAPONTYPE_RUNOVERBYCAR || cause == WEAPONTYPE_RAMMEDBYCAR)
+		return DeathCause::CRUSHED;
+	return DeathCause::ORDINARY;
+}
+
+// One sentence per combination, because the combination is the finding and a
+// reader of the log should not have to hold the disassembly in their head.
+inline const char *DeathStory(uint16_t animId, bool inVehicle, DeathCause cause) {
+	if (inVehicle) {
+		if (cause == DeathCause::DROWNED)
+			return "in a car, in the water - the only death the engine has for "
+			       "somebody in a seat";
+		return "in a car, and NOT by drowning, which retail 1.0 has no path for. "
+		       "Either bInVehicle was stale or something wrote the health "
+		       "directly; say so, it is a finding";
+	}
+	if (animId != ANIM_STD_NUM)
+		return "on foot, with a die animation, so an ordinary hit";
+	if (cause == DeathCause::CRUSHED)
+		return "on foot and crushed - knocked down with a car resting on us, "
+		       "taking CTimer::GetTimeStep() of RUNOVERBYCAR per frame until "
+		       "CPed::SetGetUp gave up. A replica car is placed by the network, "
+		       "not driven there";
+	return "on foot, ANIM_STD_NUM, and nothing damaged us recently - which "
+	       "leaves CPed::SetGetUp deciding we could not get up";
+}
+
 // ePedPieceTypes and the hit direction, both bounded because both arrive off
 // a socket and both steer a switch inside CPed::InflictDamage.
 inline bool IsKnownPedPiece(uint8_t piece) { return piece < PEDPIECE_COUNT; }
@@ -505,7 +650,7 @@ inline bool IsKnownDamageDirection(uint8_t direction) {
 
 // ---- engine ---------------------------------------------------------------
 //
-// Nothing below this line is reachable without the game. All five detours
+// Nothing below this line is reachable without the game. All nine detours
 // install together and remove together. A failure to install any one of
 // them gets recorded through hook/hook.h's failure list rather than being
 // fatal - a session with no muzzle flashes still beats a game that won't
@@ -518,9 +663,10 @@ inline bool IsKnownDamageDirection(uint8_t direction) {
 // start.
 
 // Detours CWeapon::Fire, CExplosion::AddExplosion,
-// CProjectileInfo::RemoveProjectile, CPed::InflictDamage and CPed::SetDie.
-// Returns false if any failed; the ones that succeeded stay installed and
-// the reasons are in HookFailures().
+// CProjectileInfo::RemoveProjectile, CPed::InflictDamage, CPed::SetDie,
+// CWeapon::ProcessLineOfSight, CWeapon::DoBulletImpact, CWeapon::DoDoomAiming
+// and CBulletTraces::AddTrace. Returns false if any failed; the ones that
+// succeeded stay installed and the reasons are in HookFailures().
 bool InstallCombatHooks();
 void RemoveCombatHooks();
 bool CombatHooksInstalled();

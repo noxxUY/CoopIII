@@ -1,0 +1,150 @@
+{
+  "note": [
+    "The Essential Pack: the mods CoopIII was built and tested alongside.",
+    "",
+    "CoopIII does not redistribute any of them. Every entry below is fetched",
+    "from its own project's download and checked against the hash recorded",
+    "here, so what lands in a player's game folder is the file its authors",
+    "published and nothing else.",
+    "",
+    "url and sha256 are deliberately empty. Fill one pair in per component",
+    "once you have read that project's licence and are happy to point the",
+    "Setup at it; the Setup shows a component with no url but refuses to",
+    "install it, rather than pretending it worked.",
+    "",
+    "To get a sha256 for a download:  certutil -hashfile <file> SHA256"
+  ],
+  "components": [
+    {
+      "id": "coopiii",
+      "name": "CoopIII",
+      "description": "The co-op mod, its launcher and CoopIII.ini.",
+      "version": "0.0.1",
+      "required": true,
+      "source": "local",
+      "destination": "",
+      "files": ["CoopIII.asi", "CoopIII.ini", "coopiii-launcher.exe"]
+    },
+    {
+      "id": "asiloader",
+      "name": "Ultimate ASI Loader",
+      "description": "Loads .asi mods. CoopIII needs it.",
+      "required": true,
+      "source": "download",
+      "homepage": "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases",
+      "url": "",
+      "sha256": "",
+      "destination": ""
+    },
+    {
+      "id": "cleo",
+      "name": "CLEO",
+      "description": "Adds support for custom scripts.",
+      "required": false,
+      "source": "download",
+      "homepage": "",
+      "url": "",
+      "sha256": "",
+      "destination": ""
+    },
+    {
+      "id": "modloader",
+      "name": "Modloader",
+      "description": "Install and manage mods from one folder.",
+      "required": false,
+      "source": "download",
+      "homepage": "",
+      "url": "",
+      "sha256": "",
+      "destination": ""
+    },
+    {
+      "id": "silentpatch",
+      "name": "SilentPatch",
+      "description": "Fixes many bugs, improves performance.",
+      "required": false,
+      "source": "download",
+      "homepage": "",
+      "url": "",
+      "sha256": "",
+      "destination": ""
+    },
+    {
+      "id": "widescreen",
+      "name": "Widescreen Fix",
+      "description": "Proper support for modern resolutions.",
+      "required": false,
+      "source": "download",
+      "homepage": "",
+      "url": "",
+      "sha256": "",
+      "destination": ""
+    },
+    {
+      "id": "vigilante",
+      "name": "Framerate Vigilante",
+      "description": "Smoother, steadier frame rate.",
+      "required": false,
+      "source": "download",
+      "homepage": "",
+      "url": "",
+      "sha256": "",
+      "destination": ""
+    },
+    {
+      "id": "ginput",
+      "name": "GInput",
+      "description": "Fixes keyboard, mouse and gamepad input.",
+      "required": false,
+      "source": "download",
+      "homepage": "",
+      "url": "",
+      "sha256": "",
+      "destination": ""
+    },
+    {
+      "id": "rundll32",
+      "name": "RunDLL32 Fix",
+      "description": "Fixes errors when the game starts.",
+      "required": false,
+      "source": "download",
+      "homepage": "",
+      "url": "",
+      "sha256": "",
+      "destination": ""
+    },
+    {
+      "id": "nodep",
+      "name": "NoDEP",
+      "description": "Turns off DEP to avoid crashes.",
+      "required": false,
+      "source": "download",
+      "homepage": "",
+      "url": "",
+      "sha256": "",
+      "destination": ""
+    },
+    {
+      "id": "crashinfo",
+      "name": "CrashInfo",
+      "description": "Tells you what caused a crash.",
+      "required": false,
+      "source": "download",
+      "homepage": "",
+      "url": "",
+      "sha256": "",
+      "destination": ""
+    },
+    {
+      "id": "windowed",
+      "name": "Windowed Mode",
+      "description": "Play GTA III in a window.",
+      "required": false,
+      "source": "download",
+      "homepage": "",
+      "url": "",
+      "sha256": "",
+      "destination": ""
+    }
+  ]
+}

@@ -102,15 +102,19 @@ a host-authoritative script (`campaign.md` §2).
       across the roster. Run in game 2026-09-22 and the size settled at
       nametagScale 1.35. See
       `client/src/game/nametag.h` for the design and the numbers.
-- [x] Remote players on the minimap. Not drawn by CoopIII at all: each player
-      gets an entry in the game's own `CRadar::ms_RadarTrace` through
-      `CRadar::SetEntityBlip(BLIP_CHAR, …)`, and `CHud::Draw`'s existing call
-      to `CRadar::DrawBlips` draws it. Green on foot and red in a car, which
-      are `ADD_BLIP_FOR_CHAR`'s and `ADD_BLIP_FOR_CAR`'s own colours, at
-      `ADD_BLIP_FOR_CHAR`'s own scale of 3. No detour, no protocol change.
-      The table is 32 slots with no bounds check on the far side, so CoopIII
-      counts the free ones itself and keeps a reserve for the campaign
-      script. Not yet run in game. See `client/src/game/radar.h`.
+- [x] Remote players on the minimap, as the rotating arrow the engine draws
+      the local player with — so a team-mate reads as a person facing a
+      direction rather than as a coloured square. Drawn from a detour on
+      `CRadar::DrawBlips`, after the original, out of the engine's own
+      `CentreSprite` and its own four-step blip preamble
+      (`TransformRealWorldPointToRadarSpace`, `LimitRadarPoint`,
+      `CalculateBlipAlpha`, `TransformRadarPointToScreenSpace`). Green on foot
+      and red in a car, which are `ADD_BLIP_FOR_CHAR`'s and
+      `ADD_BLIP_FOR_CAR`'s own colours, fetched from
+      `CRadar::GetRadarTraceColour` rather than written down. No protocol
+      change. It went through `CRadar::ms_RadarTrace` first and the table is
+      gone: the square is the one thing a table entry cannot stop being. See
+      `client/src/game/radar.h`. Not yet run in game.
 - [x] Decide the streaming policy (§2.1). Settled, see §5.3.
 
 Done when: two players can see each other walk around Portland and it looks
@@ -153,11 +157,15 @@ remove it. Somebody parked it, it is still there.
       (`client/src/game/ped.cpp`), driven live from `UpdateRemoteSeats`
       (`client/src/client.cpp`). A remote driver now sits in their car instead
       of standing where it is.
-- [ ] Play it through the engine's own API (`SetEnterCar`, `SetExitCar`,
-      `SetCarJack`, `SetPedPositionInCar`) so the animation plays instead of
-      an instant warp. Currently seated via `SetObjective` +
-      `WarpPedIntoCar`, deliberately, to get the entity relationship right
-      first; the animated version is the remaining piece here.
+- [x] Play it through the engine's own API. `CPed::SetEnterCar` opens the
+      door and `CPed::SetExitCar` closes it, both verified against the retail
+      image (`addresses.h`). The warp is still there and is still what
+      guarantees the seat: the animation is an attempt with a deadline, and
+      every way it can end short - refused, interrupted, the car driving off,
+      the player dying, the clock running out - falls back to
+      `WarpPedIntoCar` in the same frame. `CPed::SetCarJack` is recorded and
+      deliberately not called; see docs/protocol.md §1.14.
+      **Not yet run in the game.**
 - [x] Passengers: several players in one car, with the driver owning physics.
       A key the original game has no binding for (`seatKey`, G by default)
       puts the local player in the first free passenger seat of the nearest
@@ -250,15 +258,89 @@ screens.
 
 ### M4 - The world
 
-- [ ] Pickups: weapons, health, armour, hidden packages. Collection must be
-      exclusive, two players cannot take the same one.
-- [ ] Doors and garages, including safehouse doors and the save point.
+- [x] Pickups: weapons, health, armour, hidden packages. Collection is
+      exclusive - the client detects, the server arbitrates, the engine
+      awards, **in that order**, because a pickup reward cannot honestly be
+      taken back. Designed and built 2026-09-22; not yet run in game.
+      **[docs/pickups.md](pickups.md)** is the investigation and the design,
+      `client/src/game/pickup.*` is the seam, protocol **11**.
+      - The finding that shaped it: no spawn packet was needed. Every machine
+        already runs `main.scm` and creates all 448 script pickups itself from
+        literal coordinates, so the worlds already agreed and only the
+        exclusivity was missing.
+- [ ] Ped drops: the money and weapons a dead ped leaves. Out of M4's pickup
+      line deliberately - it is a *spawn* problem, not an exclusivity one. The
+      positions and amounts come straight out of `CGeneral::GetRandomNumber()`
+      and the ped is usually ambient, so it exists on one machine only
+      (`pickups.md` §1). Opcodes `0x84`-`0x8F` are reserved for it.
+- [ ] Remote players' kills counting toward a rampage. The frenzy already
+      starts for everybody (§5.10) and each machine counts only its own
+      player's kills, so the target is reached on whichever machine did the
+      killing. Small - M3 already carries death events - but it is a `CDarkel`
+      feature, not a pickup one.
+- [x] Doors and garages. Built 2026-09-22, not yet run in game.
+      **[protocol.md §1.16](protocol.md)** is the design,
+      `client/src/game/garage.*` is the seam, four opcodes in `0xA0..0xAF`.
+      - The finding that shaped it: nothing has to be spawned. All 32 garages
+        come out of `main.scm` at literal coordinates, so the worlds already
+        agree - only `CGarage::Update` asking `FindPlayerPed()` was missing.
+      - What travels is the **state transition**, never `m_fDoorPos`. The
+        door's height is derived on every machine from the state, at its own
+        frame rate, through the engine's own ramp - and it could not travel
+        even if it were worth it, because it is read against a door `CEntity`
+        that each machine resolves to its own pool pointer (§5.8's rule).
+      - Authority is a **union**, not §5.8's first-report-wins. A garage
+        belongs to the map so there is no owner, and a door is a *level*
+        rather than an event: first-report-wins would mean a door that never
+        closes, last-writer-wins would mean the first player to walk away
+        shutting it on the second.
+      - **The safehouse pedestrian door and the save point are NOT garages**
+        and are not done. They are `main.scm` objects (`#PLAYERSDOOR`,
+        swung by `034D ROTATE_OBJECT` from `save.sc`) gated on the local
+        player standing in a box, so syncing them means running the script
+        host-only or intercepting that opcode - M5, `campaign.md`. The save
+        menu staying local is also the safe answer.
+- [x] Pay'n'Spray: the repair and the repaint. The colours travel because the
+      retail `ChooseVehicleColour` is a per-machine round robin rather than an
+      RNG roll (§1.16.5) - same class as §5.9, third time, and re3 would have
+      given the wrong *reason* for the same right answer. The wanted level
+      does not travel; see the next line.
+- [ ] The wanted level a Pay'n'Spray clears. Deliberately left as a marked
+      seam rather than a second mechanism: §5.1 is designed and unbuilt and is
+      being worked on separately. Under §5.1's per-player design the current
+      behaviour is already correct - the player who paid gets their own stars
+      cleared by their own engine - so what this work does is stop an
+      *observer* clearing its own player's stars, and name the one place that
+      changes if §5.1 ever lands a shared wanted level (`protocol.md` §1.16.6).
 - [ ] Destructible objects, explosions, fires.
-- [ ] Wanted level. Design settled (§5.1: per-player, GTA Online style,
-      server-configurable). Not implemented yet; still not on the wire.
+- [x] Wanted level. Per-player, GTA Online's vehicle rule, server-configurable
+      (§5.1). Designed and built 2026-09-22; **not yet run in the game**.
+      **[docs/wanted.md](wanted.md)** is the investigation and the design,
+      `client/src/game/wanted.*` is the seam, and the wire cost is four spare
+      bits of a flags byte that was already going out plus two in `S_Welcome`.
+      - The finding that shaped it: **the police needed nothing.** A cop ped
+        is a `RANDOM_CHAR` and a police car a `RANDOM_VEHICLE`, so both
+        already passed population.md's host tests unchanged - the wanted
+        player's own engine spawns them, `CCopPed` can only chase
+        `FindPlayerPed()` so they chase that player, and every other machine
+        has been receiving them as ambient replicas all along. Nobody had
+        noticed because no machine had ever had a reason to make one.
+      - The other one: crimes are already attributed correctly, because
+        `CEventList::RegisterEvent` reports nothing unless the criminal is
+        the local player's own ped. M3 replaying somebody else's shot here
+        cannot raise this machine's stars.
 - [ ] Ambient peds and traffic: an ownership model, or accept divergence.
       `protocol.md` §3 currently accepts divergence. Honest for v1, wrong for
-      a finished mod.
+      a finished mod. **Designed 2026-09-22 in [population.md](population.md)**:
+      whoever's engine made it owns it, caught at `CWorld::Add`. **Built and
+      measured in a live session 2026-09-22 for pedestrians**: two machines,
+      eleven pedestrians between them, and both engines counting eleven rather
+      than twenty-two. The counter rewriting the design called for turned out
+      to be unnecessary - `CPed::CPed` already counts a replica the moment it
+      is constructed, so the generator was seeing the shared crowd all along
+      (`population.md` §1.3.1). Traffic is step 4 and the same measurement has
+      to be repeated for it, because `CCarCtrl`'s counters are not maintained
+      the same way.
 
 ### M5 - Campaign, Tier 2
 
@@ -316,14 +398,13 @@ Everything that has to travel, and where it stands. Sources are re3 members
 | State | `m_nPedState`, `m_nMoveState` | ✅ sent; `m_nMoveState` is also applied, so the engine picks the walk/run animation itself |
 | Animation | `AnimationId` + time, base **and** partial | ✅ sent and applied via `CAnimManager::BlendAnimation`. Run in game 2026-09-22, every weapon the owner tried |
 | Weapon | `m_weapons[]`, `m_currentWeapon` | ✅ sent and applied via `CPed::GiveWeapon` + `SetCurrentWeapon`, so the model is in the hand. Ammo is not on the wire (M3) |
-| Aim | yaw/pitch | ⚠️ both sent; yaw applied via `CPed::SetAimFlag`. Pitch is not applied: `CPed::AimGun` hard-codes 0 for non-player peds (`protocol.md` §1.8.3), so it needs a detour, and that belongs with M3 |
-| Shots | event | ✅ sent reliably and replayed through the real `CWeapon::Fire`, so impacts happen for real (`combat.cpp`) |
-| Damage / death | event | ✅ sent by the shooter, applied by the victim through `CPed::InflictDamage`, with the one exemption that lets an authorised hit past the remote-attacker rule. Run end to end in game 2026-09-21. Death is also **held by the session** and replayed on the join packet, so somebody who joins while a player is lying in the road gets a corpse rather than a live player on zero health (`protocol.md` §2.8.1) |
 | Aim | yaw/pitch | ⚠️ both sent; yaw applied via `CPed::SetAimFlag`. Pitch is still not applied to the *ped*: `CPed::AimGun` hard-codes 0 for non-player peds (`protocol.md` §1.8.3), so a remote player's arms stay level. It no longer costs a wrong bullet — the shot is aimed at the target rather than through the ped (§1.9.7) — so what is left is cosmetic and belongs with the ped work rather than with M3 |
 | Shots | event | ✅ sent reliably and replayed through the real `CWeapon::Fire`, so impacts happen for real (`combat.cpp`). Since 2026-09-22 the shot's own direction is on the wire and the observer aims with it, so the trail, the decal and the line of sight follow the shooter instead of an interpolated ped's heading (`protocol.md` §1.9.7) |
-| Damage / death | event | ✅ sent by the shooter, applied by the victim through `CPed::InflictDamage`, with the one exemption that lets an authorised hit past the remote-attacker rule. Run end to end in game 2026-09-21 |
-| Enter/exit vehicle | event | ⚠️ the remote ped is now seated (`SeatRemotePed`), but through `WarpPedIntoCar` rather than `SetEnterCar`, so no animation plays yet |
-| Wanted level | `CPlayerInfo::m_pWanted` | ❌ design settled (§5.1), not implemented |
+| Ammo | `m_weapons[].m_nAmmoTotal` | ❌ not on the wire. A remote player's gun has CoopIII's invented 1000 rounds, so an observer never sees anybody run dry or reload |
+| Damage / death | event | ✅ sent by the shooter, applied by the victim through `CPed::InflictDamage`, with the one exemption that lets an authorised hit past the remote-attacker rule. Run end to end in game 2026-09-21. Death is also **held by the session** and replayed on the join packet, so somebody who joins while a player is lying in the road gets a corpse rather than a live player on zero health (`protocol.md` §2.8.1) |
+| Enter/exit vehicle | event | ✅ the remote ped opens the door and climbs in through `CPed::SetEnterCar`, and climbs out through `CPed::SetExitCar`. `UpdateRemoteSeats` drives it on a deadline with `WarpPedIntoCar` behind it, so the seat is guaranteed even when the animation is not (§1.14). Carjacking plays the ordinary entry rather than the jack animation, on purpose. Not yet run in the game |
+| Riding as a passenger | event | ✅ CoopIII's own control, since the original game has none: a key asks for the first free passenger seat and the engine picks it (`game/seat.cpp`) |
+| Wanted level | `CPlayerPed::m_pWanted` (**not** `CPlayerInfo`, +0x53C on the ped) | ✅ 4 spare bits of `PlayerStateBody::flags` — three for the level, one for whether it is the player's own or the session's — plus 2 bits of `S_Welcome::flags` for the rule. Per-player by default with GTA Online's shared-vehicle rule; `shared` and `off` are server options. The police themselves travel as ambient replicas and cost nothing extra (**[wanted.md](wanted.md)**). Not yet run in the game |
 
 ### Vehicle
 
@@ -339,10 +420,10 @@ nothing else. The address is no longer the obstacle.
 | Health / state | `m_fHealth` `0x200` (1000 = full), `bEngineOn` `0x1F5` bit 4, `m_bSirenOrAlarm` `0x22E` | ✅ sent and applied; flags on change only, so the siren does not restart every frame |
 | Appearance | `m_currentColour1/2` `0x19C`/`0x19D` | ✅ carried by the spawn packet, so both machines get the same car rather than two random paint jobs |
 | Occupants | `pDriver` `0x1A4`, `pPassengers[8]` `0x1A8`, `m_nNumMaxPassengers` `0x1CC` | ✅ every seat is sent, seated (`SeatRemotePed`) and, since `protocol.md` §2.8.2, remembered by the session so a late joiner is told about passengers and not just drivers |
-| Destroyed | `VEH_WRECKED` on the wire | ⚠️ sent and remembered when it comes from the car's driver, and a wreck is then left out of the backfill. A car destroyed while **parked** has nobody to report it at all — §5.8 |
-| Extra components | `m_aExtras[2]` `0x19E` | ❌ each machine picks its own at construction — §5.9 |
+| Destroyed | `VEH_WRECKED` on the wire | ✅ all four kinds of car have somebody entitled to report it — a driver through `C_VehicleBlowUp`, and the three ownerless kinds (a map generator's car, a traffic car, a session car somebody parked) through `C_UnownedBlowUp`. §5.8, closed 2026-09-22. A traffic car carries the transform it blew up at, since its host stops streaming it the moment it burns out — protocol 16 |
+| Extra components | `m_aExtras[2]` `0x19E` | ✅ carried by the spawn packet and applied through `ms_compsToUse` around the constructor, since they are cloned into the clump at construction and cannot be written afterwards. §5.9 |
 | Spawn / despawn | `CREATE_CAR` path, `sizeof(CAutomobile)` `0x5A8` | ✅ run in the game, both deletion gates shut |
-| Damage model | panels, doors, lights, wheels | ❌ not designed. `CDamageManager` is the first `CAutomobile` member, at `+0x288` |
+| Damage model | `CDamageManager` at `+0x288`: panels, doors, lights, wheels | ⚠️ designed, built, and **not run in the game**. [docs/cardamage.md](cardamage.md). Only panels and doors travel, and the other two rows of that list came off the wire with a measurement rather than a shrug: a tyre never bursts in retail 1.0 (`CAutomobile::BurstTyre` is in the vtable and nothing dispatches to it), and a broken light is exactly a damaged panel, so the receiver derives it. Gunfire and explosions turn out not to dent a car at all — they reach `CVehicle::InflictDamage`, which takes health and nothing else — so the one thing that diverges is a collision, which is the one thing nobody simulates twice. A change-only reliable packet, merged as a componentwise maximum because every ladder in `CDamageManager` climbs and none descends. Phase one is the car with a driver; §5.8's other three kinds are the same rules on the same key and are named work. Needs a `PROTOCOL_VERSION` bump for opcodes 0x3A/0x3B |
 
 ### World
 
@@ -350,11 +431,17 @@ nothing else. The address is no longer the obstacle.
 |---|---|
 | Clock | ✅ follows the host's `CClock`, not a clock the server keeps on its own. The host reports at 1 Hz; everyone else is moved only once they are more than 3 game minutes out, so the HUD clock and the sun do not stutter. Run in game 2026-09-21, including a host handover mid-session and the 12-hour jump the engine makes on death |
 | Weather | ✅ follows the host's `CWeather`. Both ends of the blend are sent, since a single type describes where the sky is going and not where it is. Needs an in-game run |
-| Pickups | ❌ needs exclusive collection |
-| Garages / doors | ❌ |
-| Explosions, fires | ❌ |
-| Destroyed objects | ❌ |
-| Ambient peds, traffic | ❌ deliberately out of v1 |
+| Pickups | ✅ exclusive. Claim on approach, first claim wins at the server, and the winner's own engine does the awarding through its own `CPickup::Update` switch. Observers replay the engine's removal and push the collection into their own `aPickUpsCollected`, which is what makes a rampage start and a hidden package count everywhere for free. [docs/pickups.md](pickups.md). Not yet run in game |
+| Pickups a dead ped drops | ✅ the host reads back what its own engine created - the money roll, the scatter, the ammo - and every observer replays it through `CPickups::GenerateNewOne`, after which it is an ordinary pickup. Fixed a bug on the way: a player's death used to drop a gun on the pavement of every machine except their own |
+| Rampage sharing | ❌ decided in §5.10 and **not built**. An observer replays the removal and counts a hidden package, but nothing starts `CDarkel` on the other machines, so a `KILLFRENZY` pickup today starts a rampage for whoever reached it |
+| Pickup mines | ❌ deliberately left local. Script-only, barely used in retail III, and their branch is about arming and exploding rather than giving anybody anything |
+| Garages / doors | ✅ all 32 garages. One bit each on the wire - "my own state machine has this one away from where this type rests" - and the union of everybody's bits is what each machine holds its own doors to, so a safehouse opens for whoever walks up and a spray shop closes over whoever is inside. The door's *height* never travels: every machine derives it from the state through the engine's own ramp, which is §1.11's health-versus-destruction argument applied to a door. `protocol.md` §1.15, protocol **needs a bump**, not yet run in game. **The safehouse pedestrian door and the save point are not garages** and are not covered - they are `main.scm` objects swung by `034D ROTATE_OBJECT`, so they belong to M5 (§1.15.7) |
+| Pay'n'Spray | ✅ repair and repaint travel as one reliable event carrying the two colours the owner's engine chose. They have to: the retail `ChooseVehicleColour` is **not** an RNG roll, it is `(m_lastColorVariation + 1) % m_numColours` plus a tiebreak against the local player's own car - both machine-local, so two engines calling it paint two different cars. Same class as §5.9, third time. The wanted level deliberately does **not** travel and there is a marked seam where it would (§1.15.6); an observer is stopped from running the arm that would clear its own player's stars |
+| Fires | ✅ §5.7, all three phases. Whatever lit it - a molotov, a rocket, a burning car, a burning player - and it burns the other player for real |
+| Explosions | ✅ replayed at the position the owner sends, and the engine's own `CWorld::TriggerExplosion` then damages everything in the radius on every machine |
+| Destroyed objects | 🟡 §5.13 and [docs/objects.md](objects.md). Breaking is shared: the machine that owns whatever hit it reports, the host reports what nobody owns, and every observer replays the engine's own `CObject::ObjectDamage`. Two of the three measurements took work away rather than adding it - an explosion already broke the same objects everywhere, and a bullet has never broken one at all. **Uprooting is the open half**: a lamp post shows its damaged model on both screens and may still be standing on one of them. Not yet run in game |
+| Ambient peds | ✅ shared, and the crowd does not double - measured in game 2026-09-22 (`population.md` §1.3.1) |
+| Ambient traffic | ✅ shared the same way, model, both colours and both extras on the spawn so nobody builds a differently-painted car. Measured the same day, same result: the two engines count the union rather than twice it |
 
 ### Campaign
 
@@ -390,11 +477,31 @@ Server option `WantedLevel`:
 | `shared` | The whole session shares the highest wanted level. |
 | `off` | No wanted level at all. |
 
-Note the engine constraint: the wanted level lives in `CPlayerInfo`, and there
-is exactly one of those (§2.3). Remote players are `CPed`s, so their stars are
-CoopIII's own state, and the police AI has to be driven from it rather than
-read out of the engine. That makes `perplayer` more work than `shared`. It is
-still the right default.
+**Built 2026-09-22. [docs/wanted.md](wanted.md) is the investigation, the
+design and the measurements; it supersedes the paragraph that used to be here
+and the table above still stands.** The two things this section had wrong:
+
+- **The name.** The wanted level does not live in `CPlayerInfo`. It hangs off
+  `CPlayerPed` at `+0x53C`, which is the end of `CPed` — so the constraint in
+  §2.3 is right for a sharper reason than it gave: a `CCivilianPed` is
+  *exactly* `sizeof(CPed)` bytes, and every remote player and every replica in
+  CoopIII is one, so there is physically nowhere for a second wanted level and
+  no engine code that would read one.
+- **The cost, which was backwards.** `perplayer` is close to free and `shared`
+  is the work. Each machine already runs its own `CWanted`, generates its own
+  police from it, and attributes only its own player's crimes to it — the
+  engine's `CEventList::RegisterEvent` reports a crime only when the criminal
+  is `FindPlayerPed()`, so a replayed shot from another player cannot move
+  your stars. And the police need nothing at all: a cop ped is a `RANDOM_CHAR`
+  and a police car a `RANDOM_VEHICLE`, so [population.md](population.md) has
+  been replicating both since it shipped. What is actually hard is `shared`,
+  where a level held by more than one machine needs a rule for coming back
+  down that no single machine can decide alone (`wanted.md` §4.5).
+
+The police AI is **not** driven from CoopIII's state, and must not be:
+`CCopPed` reaches for `FindPlayerPed()` nineteen times and has no "chase this
+ped" path at all. CoopIII writes one number into the engine's own `CWanted`
+and the engine does the rest.
 
 ### 5.2 Friendly fire - server-configurable, off by default
 
@@ -411,19 +518,28 @@ The consequence to get right is the transition. A player crossing into your
 radius must spawn smoothly rather than popping in mid-stride, and one leaving
 must despawn without leaving a corpse behind. The handoff is where the work is.
 
-**The blip half of this is already built** (M1, `client/src/game/radar.h`) and
-it was built so this would not need rebuilding. Today a remote player's blip is
-a `BLIP_CHAR` tracking their `CPed`; a player with no ped gets no blip, and
-that is one predicate, `BlipWanted`. When distant players land it becomes a
-`BLIP_COORD` created with `CRadar::SetCoordBlip` (recorded in `addresses.h`),
-drawn by the same `DrawBlips` loop with the same square, the same colour table
-and the same rim clamp — so the handover is invisible on screen, which is the
-whole reason the game's own blip was used rather than a sprite of our own. The
-slot accounting and the reserve are already blip-kind-agnostic. Two things are
-new: a coord blip carries no entity handle, so ownership has to come from the
-slot plus the generation rather than from `TraceIsOurs`; and no engine setter
-moves a coord blip, so CoopIII writes `m_vec2DPos`/`m_vecPos` itself each frame
-from the position already on the wire. `radar.h` says both at the bottom.
+**The marker half of this is done** (`client/src/game/radar.h`), and it is no
+longer the part that needs planning.
+
+It was a `BLIP_CHAR` in the game's own `CRadar::ms_RadarTrace` at first, which
+made this section a list of things to arrange: a coord blip for players with no
+ped, ownership without an entity handle to recognise it by, writing
+`m_vec2DPos` by hand every frame because no engine setter moves a coord blip.
+None of that is needed now. A remote player is drawn directly, as the rotating
+arrow the engine draws the local player with, out of a detour on
+`CRadar::DrawBlips` — and an arrow is a position and a heading, both of which
+arrive on the wire whether or not there is a ped to hang them on.
+
+So the streaming transition costs one branch, and it is already written:
+`ResolveArrow` reads the live `CPed` (or the car it is sitting in) when there
+is one and the last snapshot when there is not. `CRadar::LimitRadarPoint` pins
+anyone past the radar's range to the rim and `CRadar::CalculateBlipAlpha` dims
+them as they go, both the engine's own, so a player walking out of the
+streaming radius loses their ped and their nametag and keeps their arrow,
+without the arrow changing in any way as they cross.
+
+What is left of §5.3 is the ped half: when to stop spawning, how to despawn
+without leaving a corpse, and how to bring somebody back in mid-stride.
 
 ### 5.4 Mission failure on death - it fails, as in single player
 
@@ -675,6 +791,87 @@ from the driver or, for a car with no driver, from the host and nobody else.
 Not a new field on the snapshot — a parked car has no snapshot to put it on,
 which is the whole problem.
 
+### 5.8.1 Who owns a car, and what changing hands means. Decided 2026-09-22.
+
+§5.8 above says who may *report* a car. This says who may *simulate* one, and
+it is the rule the two bugs from the 2026-09-22 session both broke.
+
+**The rule.**
+
+> A session car has exactly one owner at a time: the player in seat 0. The
+> owner simulates it and streams `C_VehicleState`; every other machine
+> corrects it and writes nothing that makes its own engine act on it.
+> Ownership moves only through the reliable, ordered `C_EnterVehicle` /
+> `C_ExitVehicle` pair. **Between an exit and the next enter the car has no
+> owner, and a car with no owner is simulated by nobody** — every machine
+> holds it at the last transform the session gave, with its controls and
+> velocities at rest.
+
+Three things follow, and none of them needed a wire change: the server already
+implements its half (`Session::NoteEnterVehicle` moves the driver out of the
+old car first, `MayReportVehicle` refuses a snapshot from anyone but the
+driver, and a claim that names a netId the session already has re-claims it
+rather than allocating a second one).
+
+1. **Entering a session car as driver claims it.** Already true, through
+   `Client::ObservedVehicleWeAreDriving`, and it matched on the engine's own
+   pool reference so it cannot pick the wrong one of two identical parked
+   cars.
+
+2. **The claimer keeps a row for the car it claimed.** This was the hole. The
+   server broadcasts `S_VehicleSpawn` to everyone *except* the claimer —
+   correctly; it is a car from the claimer's own world and they already have
+   it — so the claimer was the one machine in the session with no record of
+   that car. Step out, walk round, get back in, and nothing recognises it:
+   the claim path registers the same physical `CVehicle` under a **second
+   netId**, and every observer then holds two cars for it, one following the
+   driver and one frozen. In the session log that is vehicle 364 and vehicle
+   475, same model 104, same extras 3/-1, no despawn between them.
+
+   The row is marked `RemoteVehicle::ours`, which is the whole difference
+   between it and an observed car: it is never spawned (the car is already
+   there) and never despawned (a car this engine made is not CoopIII's to
+   delete — running `DespawnRemoteVehicle` on it would destroy one of the
+   player's own traffic cars, quite possibly with the player in it, because a
+   socket closed).
+
+3. **The previous owner stops simulating it, and so does everyone else.** The
+   owner's own machine stops sending on exit; that was already true. What was
+   not is the other end: every observer went on replaying the last driver's
+   snapshot at the car — velocity, steering, throttle, engine — every frame
+   for the rest of the session. `RemoteVehicle::last` is frozen at whatever
+   snapshot happened to arrive last before its owner stepped out, and
+   `C_VehicleState` is unreliable and unordered, so that is not even reliably
+   the last one sent.
+
+   **That is what makes a used car impossible to get back into.**
+   `CVehicle::CanPedEnterCar` (`0x005522F0`, disassembled into
+   `addresses.h`) refuses any car whose `m_vecMoveSpeed` or `m_vecTurnSpeed`
+   has a magnitude-squared over `0.04`, and `CPed::SeekCar` (`0x004D3F90`)
+   answers that refusal with `CPed::RestorePreviousState` while leaving
+   `m_objective` at `ENTER_CAR_AS_DRIVER`. There is no timeout in it: the
+   next frame walks the ped back to the same door, and the player walks at
+   the car forever.
+
+   So a driverless car gets `WorldBridge::RestRemoteVehicle` instead of the
+   controls half of `ApplyRemoteVehicle`. Health, damage and `VEH_WRECKED`
+   still flow — a joiner has to be shown the shot-up car somebody parked —
+   because those belong to the session whoever is or is not driving. What
+   takes a driver to mean anything is the throttle and the velocity.
+
+   Rested every frame it is parked, not once on the transition: the transform
+   is pinned after physics every frame, so a car held a hair off the ground
+   never lands and the engine would keep adding gravity to
+   `m_vecMoveSpeed.z`. One frame of gravity cannot reach `0.04`; twenty can.
+
+**What this does not do.** It does not touch the ambient population's cars
+(`population.md` §1.3.1 is explicit that traffic replication promises no
+handoff). `CorrectAmbientCarReplica` still only *guards* — it stops correcting
+a replica the local player is driving without claiming it, so the session goes
+on telling everybody else where its owner thinks it is. Getting into somebody
+else's *traffic* car is still not an ownership change, and it should be: that
+is the next piece, and it is the same rule applied to a second roster.
+
 ### 5.9 A car's extra components are picked per machine. Named work.
 
 `CVehicle::SetModelIndex` (`0x00551170`) copies
@@ -698,6 +895,159 @@ claimer samples them beside the colours, the receiver writes them after
 construction and before the model is set up.
 
 ---
+
+
+---
+
+### 5.10 A rampage is shared - one at a time, for the whole session
+
+Decided 2026-09-22. Collecting a `KILLFRENZY` pickup starts the frenzy for
+everybody, everybody's kills count toward it, and passing or failing it does so
+for the whole session.
+
+**The engine gives no real choice.** A rampage is `CDarkel`, and `CDarkel` is a
+singleton with one kill count, one timer and one HUD counter. Retail's own
+`CanBePickedUp` already refuses a second killfrenzy pickup while one is running
+(`CDarkel::FrenzyOnGoing`, `0x00420E60`). Per-player rampages would mean
+CoopIII owning the frenzy state, the target, the clock and the HUD for every
+player - that is not a pickup feature, it is a reimplementation of `CDarkel`,
+and it belongs nowhere near M4.
+
+**It is also the better game.** "Kill 20 Diablos in two minutes" is the most
+obviously co-operative thing in GTA III. Eight private rampages happening in
+the same street is worse in every way.
+
+**And it costs nothing to build**, which is the part worth knowing: every
+machine runs `rampage.sc`, and that script asks `HAS_PICKUP_BEEN_COLLECTED`.
+Pushing a remote collection into each machine's own `aPickUpsCollected` ring
+makes every machine's own script start the same frenzy in the same frame, with
+its own HUD, its own timer and its own failure condition. No packet for any of
+it.
+
+**The trade-off, plainly:** the difficulty is not rebalanced, so a four-player
+rampage is trivial. Accepted for M4. If it matters later the fix is a
+server-side multiplier on the kill target - which needs the script intercepted,
+i.e. M5 - and **not** a per-player split.
+
+### 5.11 A hidden package collected by one player counts for everybody
+
+Decided 2026-09-22. Server option `HiddenPackages = shared | perplayer`,
+default **`shared`**. `perplayer` is named so the option exists and is not
+implemented in M4.
+
+- **The engine has one counter.** `m_nCollectedPackages` is `CPlayerInfo+0xB4`
+  and there is exactly one `CPlayerInfo` (§2.3). Remote players are `CPed`s.
+  Per-player packages would be CoopIII's own state, and `rewards.sc` - which
+  polls the count to unlock the weapons at the hideout - would then be reading
+  a number that means something different on every machine.
+- **The array cannot hold the alternative.** 100 packages per player against
+  320 general pickup slots is three players, and the object pool pays for every
+  one of them.
+- **§5.5, fidelity wins.** The single-player experience of hidden packages is
+  that the map empties as you clear it. A shared world where seven players walk
+  past a package only the eighth can see is the version that feels wrong.
+- **Same free mechanism as §5.10.** The observer increments its own counter and
+  pushes the collection into its own `aPickUpsCollected`, and its own
+  `packages.sc` and `rewards.sc` produce the "34 of 100" message, the reward
+  weapons and the million at 100 by themselves.
+
+**The trade-off, plainly:** eight players finish the packages in an eighth of
+the time, and the 100% grind - one of the longest solo activities in III -
+collapses. That is the right price for a shared map, and groups who disagree
+get the option.
+
+### 5.12 Ammunition is reported honestly - server-configurable, off by default
+
+Decided 2026-09-22. Server option `ammoSync = true | false`, default
+**`false`**. `docs/protocol.md` §1.9.6 is the wire and the engine argument;
+this is the decision.
+
+`false` is what CoopIII has always done: a remote player's gun is handed a
+fixed thousand rounds at spawn and nobody ever watches anybody else run dry.
+`true` puts each player's real count for their own weapons on the wire, so a
+firefight has the same numbers on every screen.
+
+- **It is not a shared inventory, and that is the point.** Two players
+  carrying different weapons is the normal case and stays that way. The option
+  decides whether *your own* counts are honest on *other people's* screens,
+  not what anybody is carrying.
+- **Off by default on §5.5 grounds, inverted.** Honest ammunition is the
+  higher-fidelity answer, but it is also the one that can be *wrong* - it puts
+  a number on the wire that the observer's own engine is simultaneously
+  editing, and §1.9.6 is a page about keeping those two from fighting. A
+  default that cannot misbehave is worth more than a default that is more
+  faithful when it works.
+- **Same shape as §5.2.** One bit in `S_Welcome.flags`, enforced by the server
+  refusing to relay and by the client refusing to apply.
+### 5.13 A broken street object is a latch, and the measurement took most of the job away
+
+Decided 2026-09-22. [docs/objects.md](objects.md) is the investigation; this is
+what was settled and why it is smaller than it looked.
+
+**Breaking is a state, not a destroy-and-replace.** `CObject::ObjectDamage`
+(`0x004BB240`) frees nothing, allocates nothing and touches no world list -
+every one of its nine arms writes flags on the object that is already standing
+there. So the whole feature is a one-way latch: two players breaking the same
+crate is not a conflict, applying a break twice is a no-op, and there is no
+creation, deletion or ownership handshake in it anywhere. That is the reason
+this is a much smaller thing than an ambient ped or a car, and it was not
+obvious going in - the intuitive guess is that the engine swaps in a broken
+object, and it does not.
+
+**Two measurements struck most of the planned work, which is now four times.**
+
+- **An explosion already agrees.** The object arm of
+  `CWorld::TriggerExplosionSectorList` computes its damage as
+  `300 * min((radius - distance) * 2 / radius, 1)` - two positions and a
+  radius, no RNG, no impulse, no timestep - and CoopIII already replays every
+  explosion at a position every machine agrees on. Objects blown up by a blast
+  therefore break identically everywhere for free. This is §5.7's pavement-fire
+  finding again, reached the same way. The seam goes deliberately quiet inside
+  `CWorld::TriggerExplosion` (two callers in the whole image) rather than
+  sending one reliable packet per bin per rocket.
+- **A bullet has never broken one.** `CWeapon::FireInstantHit`'s object arm
+  adds sparks, clears `bIsStatic` and applies a force, and stops. A whole-image
+  scan for calls to `ObjectDamage` finds five sites and **none of them is in
+  `CWeapon`**. The brief for this work said "a car driving into them and
+  gunfire"; the binary says gunfire was never in it.
+
+So the entire remaining feature is *somebody drove into it*, and that is what
+was built.
+
+**Named by where the map put it**: `m_objectMatrix`'s position plus the model
+index, the pickup's answer rather than the parked car's or the ambient ped's.
+A map object has no generator index to borrow and needs no server-allocated
+name, because the map already placed 1851 identical copies before a packet was
+sent. The equivalent of `pickups.md`'s 312-coordinate check was done: all 1851
+breakable map instances compared pairwise inside each model, closest pair
+0.5992 m, nothing under 0.50 m. `tools/objecttest` carries that number so the
+tolerance cannot quietly grow into it.
+
+**§5.8's answer had to move one entity across, and the binary is what says
+so.** An ownerless world entity is the host's - except that
+`CPopulation::ManagePopulation` turns any map object more than 80 m from the
+local player back into a pristine dummy, so an object across town from the host
+is not a `CObject` on the host at all and the host has nothing to observe.
+§5.8 works for a parked car because the *server* holds a row for it whatever
+the distance; here there is no row and there must not be one. What transplants
+is the shape: exactly one reporter, chosen by ownership - **the machine that
+owns whatever broke it**, and the host for whatever nobody owns.
+
+That same 80 m rule is why there is no server table and no backfill. The engine
+throws the state away when the last player leaves the block, so a broken object
+has a lifetime of one visit and nothing a joiner could be told would still be
+true by the time they finished loading. It is also why divergence is
+self-limiting: once everybody walks away, both machines are pristine again.
+
+**The open half, named rather than quietly skipped.** Uprooting - a lamp post
+falling over - is a different mechanism from breaking: `CPhysical` clears
+`bIsStatic` when the impulse beats `m_fUprootLimit` and local physics takes it
+from there, which §2.4 says is not reproducible. Objects that *vanish* (crates,
+pallets, cones, barriers - effects 3, 50, 60, 70, 80) are fully handled.
+Objects with effect 1 (lamp posts, traffic lights, meters, bins, benches) now
+show their damaged model everywhere, but one screen may still have the post
+standing. Opcodes `0xC2`-`0xCF` are reserved for the resting place if somebody
+wants it.
 
 ## 6. Rules that keep paying off
 

@@ -121,6 +121,53 @@ bool LocalPlayerExists() {
 	return PlayerPed() != nullptr;
 }
 
+// Whether this session reports ammunition honestly. Set from S_Welcome via
+// WorldBridge::SetAmmoSync, and read in the three places the engine decides
+// how much ammunition a remote ped has: here (sampling), GiveWeaponTo
+// (spawning) and combat.cpp (replaying a shot).
+//
+// Off is not a degraded version of on - it is the behaviour this file has
+// always had, and the file-scope default is off so a client that never gets
+// a welcome behaves the way it used to.
+bool g_ammoSync = false;
+
+// &ped->m_weapons[slot], or null for a slot number that is not a weapon.
+//
+// CPed::m_weapons is thirteen 0x18-byte elements at +0x35C and the engine's
+// own eWeaponType doubles as the index, so the bound is the whole safety
+// argument: a slot of 13 or more reads past the array and into
+// m_storedWeapon and m_currentWeapon, which are the next members.
+static_assert(INVENTORY_SLOTS == offs::NUM_WEAPON_SLOTS,
+              "the wire's inventory is CPed::m_weapons, not a parallel idea of one");
+
+void *WeaponSlot(void *ped, uint8_t slot) {
+	if (slot >= offs::NUM_WEAPON_SLOTS)
+		return nullptr;
+	return reinterpret_cast<uint8_t *>(ped) + offs::PED_WEAPONS +
+	       static_cast<size_t>(slot) * offs::SIZEOF_WEAPON;
+}
+
+// m_nAmmoInClip is an int32 in the engine and a uint16 on the wire, because
+// CWeapon::Reload caps it at the weapon's m_nAmountofAmmunition and the
+// largest value in stock weapon.dat is 1000. weapon.dat is data the player
+// can edit though, so this saturates rather than truncating: a modded clip
+// past 65535 is reported as 65535, which is wrong by a number nobody can
+// count, where a truncation would be wrong by 65536 and could read as zero.
+uint16_t ClipOnWire(int32_t clip) {
+	if (clip <= 0)
+		return 0;
+	if (clip > 0xFFFF)
+		return 0xFFFF;
+	return static_cast<uint16_t>(clip);
+}
+
+// And the total, which CPed::GiveWeapon caps at 99999 (`cmp eax,0x1869F` at
+// 0x004CF9E0) - so it fits a uint32 with room to spare and only needs the
+// negative guarded.
+uint32_t TotalOnWire(int32_t total) {
+	return total <= 0 ? 0u : static_cast<uint32_t>(total);
+}
+
 bool SampleLocalPlayer(PlayerStateBody &out) {
 	void *ped = PlayerPed();
 	if (!ped)
@@ -157,13 +204,26 @@ bool SampleLocalPlayer(PlayerStateBody &out) {
 	// Weapon. m_currentWeapon doubles as an index into m_weapons and as the
 	// eWeaponType itself, so the slot gets bounds-checked before use. This is
 	// exactly why sampling was held off until the offsets were confirmed.
-	out.weapon = WEAPONTYPE_UNARMED;
+	out.weapon    = WEAPONTYPE_UNARMED;
+	out.ammoClip  = 0;
+	out.ammoTotal = 0;
 	const uint8_t slot = Field<uint8_t>(ped, offs::PED_CURRENT_WEAPON);
-	if (slot < offs::NUM_WEAPON_SLOTS) {
-		const uint32_t type = Field<uint32_t>(
-		    ped, offs::PED_WEAPONS + slot * offs::SIZEOF_WEAPON + offs::WEAPON_TYPE);
+	if (void *const held = WeaponSlot(ped, slot)) {
+		const uint32_t type = Field<uint32_t>(held, offs::WEAPON_TYPE);
 		if (IsInventoryWeapon(static_cast<uint8_t>(type)))
 			out.weapon = static_cast<uint8_t>(type);
+
+		// The count for the gun in our hands, and only that one. The other
+		// twelve slots go out on C_PlayerAmmo when they change - see
+		// Client::SendLocalAmmo and AmmoSlotBody.
+		//
+		// Read off the slot the engine is actually indexing rather than off
+		// out.weapon: if some other mod has left a slot whose m_eWeaponType
+		// does not match its index, the engine still fires out of this one.
+		if (g_ammoSync) {
+			out.ammoClip  = ClipOnWire(Field<int32_t>(held, offs::WEAPON_AMMO_IN_CLIP));
+			out.ammoTotal = TotalOnWire(Field<int32_t>(held, offs::WEAPON_AMMO_TOTAL));
+		}
 	}
 
 	// Aim. While aiming, m_fLookDirection is the target yaw the engine is
@@ -233,6 +293,50 @@ bool SampleLocalPlayerModel(uint16_t &modelId) {
 	if (!ped)
 		return false;
 	modelId = Field<uint16_t>(ped, offs::MODEL_INDEX);
+	return true;
+}
+
+// Every one of the local player's thirteen weapon slots, plus which one is
+// in their hands.
+//
+// An unowned slot is reported as unowned rather than skipped, because losing
+// a weapon is a fact somebody has to be told: `CWeapon::Initialise` puts
+// WEAPONTYPE_UNARMED back in the slot, HasWeapon goes false, and an observer
+// who never hears about it leaves that player armed for the rest of the
+// session.
+//
+// `held` is m_currentWeapon, which is the index into the array as well as
+// the eWeaponType (addresses.h). Out of range it is reported as
+// WEAPONTYPE_UNARMED, whose slot is 0 - which is the slot the engine itself
+// falls back to.
+bool SampleLocalAmmo(AmmoSlotBody *out, uint8_t &held) {
+	void *const ped = PlayerPed();
+	if (!ped || !out)
+		return false;
+
+	const uint8_t current = Field<uint8_t>(ped, offs::PED_CURRENT_WEAPON);
+	held = current < offs::NUM_WEAPON_SLOTS ? current : WEAPONTYPE_UNARMED;
+
+	for (uint8_t w = 0; w < INVENTORY_SLOTS; ++w) {
+		out[w].weapon = w;
+		out[w].flags  = 0;
+		out[w].clip   = 0;
+		out[w].total  = 0;
+		void *const slot = WeaponSlot(ped, w);
+		if (!slot)
+			continue;
+		// A slot the player does not own holds a m_eWeaponType that is not
+		// its own index - that is exactly the test CPed::GiveWeapon uses for
+		// HasWeapon (`cmp [esi+ebx+35Ch],ebp` at 0x004CF9C9). It goes out as
+		// an unowned slot rather than as an empty one: the leftover members
+		// are not a count of anything, and "I do not have this weapon" is
+		// news in its own right.
+		if (Field<uint32_t>(slot, offs::WEAPON_TYPE) != w)
+			continue;
+		out[w].flags = AMMO_SLOT_OWNED;
+		out[w].clip  = ClipOnWire(Field<int32_t>(slot, offs::WEAPON_AMMO_IN_CLIP));
+		out[w].total = TotalOnWire(Field<int32_t>(slot, offs::WEAPON_AMMO_TOTAL));
+	}
 	return true;
 }
 
@@ -668,8 +772,15 @@ void DespawnRemote(RemotePlayer &player) {
 // works: CWorld::Process rewrites every moving entity's bone matrices from
 // its animations, and only then runs ProcessControl. CoopIII's inbound hook
 // sits before both, so a bone matrix written here is gone before the frame
-// draws. An m_nMoveState or bIsAimingGun written here, on the other hand, is
-// exactly what the engine reads on its way past.
+// draws. A bIsAimingGun written here, on the other hand, is exactly what the
+// engine reads on its way past.
+//
+// m_nMoveState is the exception, and it took until 2026-09-22 to notice:
+// CPed::Idle runs from ProcessControl's state switch, before SetMoveAnim,
+// and its non-still arm ends in `if (!IsPlayer()) SetMoveState(PEDMOVE_STILL)`
+// (addresses.h, CPed__Idle). So the move state written from PreFrame is
+// always overwritten before anything reads it, and the locomotion animation
+// has only ever come from BlendRemoteAnim below. docs/protocol.md §1.13.4.
 
 // CAnimBlendAssocGroup::numAssociations for one group, or 0 if the anim
 // files haven't loaded yet. This is what makes playing a received animId
@@ -704,7 +815,7 @@ float SafeAnimTime(float wire) {
 // tries again next change.
 // Both defined below, with the rest of the clump bookkeeping.
 void *FindAnimById(void *clump, uint16_t animId);
-bool  MakeAnimRoom(RemotePlayer &player, void *clump);
+bool  MakeAnimRoom(RemotePlayer &player, void *clump, void *keepAssoc);
 
 bool BlendRemoteAnim(RemotePlayer &player, void *clump, int pedGroup, uint16_t animId,
                      float animTime, float animSpeed, bool applySpeed) {
@@ -718,7 +829,7 @@ bool BlendRemoteAnim(RemotePlayer &player, void *clump, int pedGroup, uint16_t a
 	// without RpAnimBlendClumpUpdateAnimations writing past the end of its
 	// node array. Reviving one that is already there is free, so only a
 	// genuine addition has to ask.
-	if (!FindAnimById(clump, animId) && !MakeAnimRoom(player, clump))
+	if (!FindAnimById(clump, animId) && !MakeAnimRoom(player, clump, nullptr))
 		return false;
 
 	using BlendFn = void *(__cdecl *)(void *, int, int, float);
@@ -826,7 +937,16 @@ void DropAnimNow(void *assoc) {
 // be back here.
 //
 // Returns how many were dropped.
-int PruneAnims(void *clump, uint16_t keepA, uint16_t keepB, int surplus) {
+// `keepAssoc`, when non-null, is one more that must survive whatever its
+// blend weight is: the ped's m_pVehicleAnim. That association is not one
+// CoopIII applied and has no id here to spare it by, and it is the only
+// thing holding the finish callback that ends a door-opening chain. Drop it
+// and the ped stays in PED_ENTER_CAR with nothing left to finish - a remote
+// player frozen half inside a car, which is precisely the failure the seat
+// deadline exists to make impossible and which should not be reachable from
+// inside the safety net either.
+int PruneAnims(void *clump, uint16_t keepA, uint16_t keepB, void *keepAssoc,
+               int surplus) {
 	if (surplus <= 0)
 		return 0;
 
@@ -839,6 +959,8 @@ int PruneAnims(void *clump, uint16_t keepA, uint16_t keepB, int surplus) {
 
 	ForEachAnim(clump, [&](void *assoc) {
 		if (n >= MAX_TRACKED)
+			return;
+		if (assoc == keepAssoc)
 			return;
 		const int32_t id = Field<int32_t>(assoc, ANIM_ID);
 		if (id == static_cast<int32_t>(keepA) || id == static_cast<int32_t>(keepB))
@@ -873,34 +995,41 @@ int PruneAnims(void *clump, uint16_t keepA, uint16_t keepB, int surplus) {
 // Keep a clump inside the engine's limit whatever put the animations there.
 //
 // MakeAnimRoom only runs when CoopIII wants to add one, and CoopIII is not
-// the only thing adding: CPed::ProcessControl and CPed::SetMoveAnim blend
-// animations onto a remote ped every frame without asking anybody. So this
-// runs unconditionally, once per remote ped per frame, before CGame::Process
-// gets the chance to walk the clump.
+// the only thing adding. The engine's two contributors are now known by
+// name rather than guessed at (docs/protocol.md §1.13.5): CPed::Idle blends
+// ANIM_STD_IDLE_BIGGUN on a 3000-8500 ms random timer while the ped is
+// still, and CPed::SetInTheAir blends ANIM_STD_FALL_GLIDE whenever
+// CheckIfInTheAir finds no ground under a ped whose position came off the
+// wire. Neither asks anybody, and the second one fires on ordinary streamed
+// movement. So this runs unconditionally, once per remote ped per frame,
+// before CGame::Process gets the chance to walk the clump.
 //
 // It is the last line of defence for a crash that has no symptoms until it
 // happens, so it is deliberately not conditional on anything CoopIII knows.
-void EnforceAnimLimit(RemotePlayer &player, void *clump) {
+void EnforceAnimLimit(RemotePlayer &player, void *ped, void *clump) {
 	const int count = CountAnims(clump);
 	const int surplus = AnimClumpSurplus(count + 1);   // +1: room to still add one
 	if (surplus <= 0)
 		return;
 
 	const int dropped =
-	    PruneAnims(clump, player.appliedAnimId, player.appliedAnimId2, surplus);
+	    PruneAnims(clump, player.appliedAnimId, player.appliedAnimId2,
+	               ped ? Field<void *>(ped, offs::PED_VEHICLE_ANIM) : nullptr,
+	               surplus);
 	if (dropped > 0)
 		Log("bridge: %s's ped was carrying %d animations, past what the engine's "
 		    "node array can index; dropped %d",
 		    player.nick.c_str(), count, dropped);
 }
 
-bool MakeAnimRoom(RemotePlayer &player, void *clump) {
+bool MakeAnimRoom(RemotePlayer &player, void *clump, void *keepAssoc) {
 	const int count = CountAnims(clump);
 	if (AnimClumpHasRoom(count))
 		return true;
 
 	const int dropped = PruneAnims(clump, player.appliedAnimId,
-	                               player.appliedAnimId2, AnimClumpSurplus(count));
+	                               player.appliedAnimId2, keepAssoc,
+	                               AnimClumpSurplus(count));
 	if (dropped > 0)
 		Log("bridge: %s's ped had %d animations on it, which is past what "
 		    "RpAnimBlendClumpUpdateAnimations can index; dropped %d",
@@ -1159,7 +1288,7 @@ void ApplyAnimGroup(RemotePlayer &player, void *ped, void *clump) {
 		if (!old)
 			continue;   // not playing: nothing to re-hang
 
-		if (!MakeAnimRoom(player, clump))
+		if (!MakeAnimRoom(player, clump, nullptr))
 			break;   // no room, and the old group keeps playing
 
 		void *const fresh =
@@ -1229,6 +1358,10 @@ void *WeaponInfo(uint8_t weaponType) {
 // this usable as a precondition for replaying a shot and not just a cosmetic
 // update. False means "not yet": the model is still streaming, caller should
 // try again next frame.
+// Defined just below, and used from inside GiveWeaponTo: the two are the
+// spawn half and the steady half of the same job.
+void WriteSlotAmmo(void *ped, uint8_t slot, uint16_t clip, uint32_t total);
+
 bool GiveWeaponTo(RemotePlayer &player, void *ped, uint8_t want) {
 	if (!IsInventoryWeapon(want))
 		return false;
@@ -1257,11 +1390,11 @@ bool GiveWeaponTo(RemotePlayer &player, void *ped, uint8_t want) {
 		}
 	}
 
-	// Ammo isn't on the wire yet (M3 owns that). A remote player's clip only
-	// affects what CoopIII draws, and an empty one leaves the weapon stuck
-	// in WEAPONSTATE_OUT_OF_AMMO with the wrong idle pose - so give enough
-	// that the engine treats the gun as usable. GiveWeapon only adds on a
-	// weapon change, and the engine caps the total at 99999 regardless.
+	// With ammo sync off: the invented amount this file has always used. A
+	// remote player's clip affects nothing anyone can see, and an empty one
+	// leaves the weapon in WEAPONSTATE_OUT_OF_AMMO with the wrong idle pose,
+	// so give enough that the engine treats the gun as usable. GiveWeapon
+	// only adds on a weapon change and the engine caps the total at 99999.
 	constexpr uint32_t REMOTE_AMMO = 1000;
 
 	using GiveFn = uint32_t(__thiscall *)(void *, int, uint32_t);
@@ -1269,11 +1402,116 @@ bool GiveWeaponTo(RemotePlayer &player, void *ped, uint8_t want) {
 	Func<GiveFn>(CPed__GiveWeapon)(ped, static_cast<int>(want), REMOTE_AMMO);
 	Func<SetFn>(CPed__SetCurrentWeapon)(ped, want);
 	player.appliedWeapon = want;
+
+	// With it on, the invented amount is immediately overwritten with what
+	// its owner says. GiveWeapon is still the call that makes the slot
+	// exist: it runs CWeapon::Initialise on a slot the ped did not have, and
+	// SetCurrentWeapon is what puts the model in the hand. Neither of them
+	// is asked to be the source of the number.
+	if (g_ammoSync)
+		WriteSlotAmmo(ped, want, player.ammoClip[want], player.ammoTotal[want]);
 	return true;
+}
+
+// Hold a remote ped's weapon slot at the count its owner reported.
+//
+// Called every time a pose is applied, which is 25 Hz, because this machine
+// has two other writers of the same four bytes and neither of them is the
+// authority:
+//
+//   CWeapon::Fire decrements m_nAmmoInClip at 0x0055C7D1 and m_nAmmoTotal at
+//   0x0055C7E9 for every shot combat.cpp replays;
+//
+//   CCivilianPed::ProcessControl runs CWeapon::Update on the held slot every
+//   frame, which fires CWeapon::Reload (0x005639D0) on its own CTimer
+//   schedule and refills the clip out of the total.
+//
+// Neither is wrong to do it - they are the engine behaving normally - but
+// the owner is authoritative for their own ped everywhere else in CoopIII
+// and there is no reason for ammunition to be the exception. So the wire
+// wins, restated often enough that nothing local can accumulate.
+void WriteSlotAmmo(void *ped, uint8_t slot, uint16_t clip, uint32_t total) {
+	void *const weapon = WeaponSlot(ped, slot);
+	if (!weapon)
+		return;
+	// A slot the ped was never given. Writing into it would leave a CWeapon
+	// whose m_eWeaponType does not match its index, which is what the engine
+	// reads as HasWeapon.
+	if (Field<uint32_t>(weapon, offs::WEAPON_TYPE) != slot)
+		return;
+
+	Field<int32_t>(weapon, offs::WEAPON_AMMO_IN_CLIP) = static_cast<int32_t>(clip);
+	Field<int32_t>(weapon, offs::WEAPON_AMMO_TOTAL)   = static_cast<int32_t>(
+	    total > 0x7FFFFFFFu ? 0x7FFFFFFF : total);
+
+	// The state is derived rather than sent. WEAPONSTATE_RELOADING is a
+	// deadline in CTimer::GetTimeInMilliseconds, which is a local clock that
+	// pauses and gets rescaled (protocol.h, PacketHeader) - a remote
+	// machine's copy of it would mean nothing here. What matters is the one
+	// distinction anybody can see: a gun with nothing behind it is out of
+	// ammo, and a gun with something behind it is ready to fire.
+	Field<uint32_t>(weapon, offs::WEAPON_STATE) =
+	    (clip == 0 && total == 0) ? WEAPONSTATE_OUT_OF_AMMO : WEAPONSTATE_READY;
 }
 
 void ApplyWeapon(RemotePlayer &player, void *ped) {
 	GiveWeaponTo(player, ped, player.last.weapon);
+
+	// The held slot, every tick, from the snapshot that carried it. Outside
+	// GiveWeaponTo because that one returns early when the weapon has not
+	// changed, and the count changes while the weapon does not - which is
+	// what a firefight is.
+	if (g_ammoSync && player.appliedWeapon == player.last.weapon &&
+	    player.last.weapon < INVENTORY_SLOTS)
+		WriteSlotAmmo(ped, player.last.weapon, player.last.ammoClip,
+		              player.last.ammoTotal);
+}
+
+// A slot this player is carrying but not holding, off C_PlayerAmmo.
+//
+// The ped may not have the weapon at all, and giving it one costs nothing
+// here: CPed::GiveWeapon on its own touches no model. Only
+// CPed::SetCurrentWeapon instantiates an RwAtomic, and this deliberately
+// does not call it - putting somebody's spare shotgun in their hands because
+// they picked up shells for it is not what happened on their machine.
+//
+// Zero ammunition still gets the weapon given. The alternative is skipping
+// it, and then a player who has fired their pistol dry stops existing as a
+// pistol owner to everybody else - HasWeapon goes false and
+// GET_AMMO_IN_CHAR_WEAPON answers 0 for the wrong reason.
+void ApplyRemoteAmmoSlot(RemotePlayer &player, const AmmoSlotBody &slot) {
+	void *const ped = ResolveRemote(player);
+	if (!ped || !IsInventoryWeapon(slot.weapon))
+		return;
+
+	using GiveFn = uint32_t(__thiscall *)(void *, int, uint32_t);
+	void *const weapon = WeaponSlot(ped, slot.weapon);
+	if (!weapon)
+		return;
+
+	// They no longer have it - dropped on death, or taken by the script.
+	//
+	// The slot is emptied by hand rather than through an engine call. The
+	// engine's own way back is CWeapon::Initialise, which also reloads and
+	// touches the weapon model; all that is wanted here is for HasWeapon to
+	// go false, and HasWeapon is `m_eWeaponType == index`. The weapon in the
+	// hand is left alone - that one belongs to ApplyWeapon, which has the
+	// model to tear down as well and gets its answer from the snapshot.
+	if (!(slot.flags & AMMO_SLOT_OWNED)) {
+		if (slot.weapon == player.appliedWeapon)
+			return;
+		Field<uint32_t>(weapon, offs::WEAPON_TYPE)        = WEAPONTYPE_UNARMED;
+		Field<uint32_t>(weapon, offs::WEAPON_STATE)       = WEAPONSTATE_READY;
+		Field<int32_t>(weapon, offs::WEAPON_AMMO_IN_CLIP) = 0;
+		Field<int32_t>(weapon, offs::WEAPON_AMMO_TOTAL)   = 0;
+		Field<uint32_t>(weapon, offs::WEAPON_TIMER)       = 0;
+		return;
+	}
+
+	if (Field<uint32_t>(weapon, offs::WEAPON_TYPE) != slot.weapon)
+		Func<GiveFn>(CPed__GiveWeapon)(ped, static_cast<int>(slot.weapon), 0u);
+
+	WriteSlotAmmo(ped, slot.weapon, slot.clip, slot.total);
 }
 
 // bIsShooting - the state of holding the trigger down, not a shot itself.
@@ -1529,12 +1767,20 @@ void ApplyRemoteFire(RemotePlayer &player, void *ped) {
 // returns having assigned no seat at all. addresses.h has the disassembly
 // that shows this.
 //
-// The animated entry (CPed::SetEnterCar) is skipped on purpose. It's a
-// multi-second negotiation with door states, a walk to the handle, and an
-// animation that can get interrupted or refused - none of which an observer
-// can drive off a stream of events that just says "they're in the car now".
-// The owner's machine plays that animation for its own player; this machine
-// only hears the result.
+// That warp is no longer the way a remote player normally gets into a car -
+// it is what happens when the real way cannot be made to work. The real way
+// is CPed::SetEnterCar, further down, and the two have to live beside each
+// other because the first thing the animated entry needs is somewhere to
+// fail to.
+//
+// This comment used to say the animated entry was skipped on purpose,
+// because "an observer cannot drive a multi-second negotiation off a stream
+// of events that just says they're in the car now". Half of that is still
+// true and is the reason for every guard below: the entry really can be
+// refused or interrupted at any point, silently. What was wrong was the
+// conclusion. An observer does not have to *drive* the negotiation - it
+// starts it, watches it, and takes the seat by force if it does not finish.
+// The seat is guaranteed either way; only the door opening is optional.
 
 // Which passenger slot holds this ped, or -1. Bounded by the car's own
 // m_nNumMaxPassengers, capped at the array's actual length - that field is
@@ -1542,6 +1788,18 @@ void ApplyRemoteFire(RemotePlayer &player, void *ped) {
 // no matter what it says. Declared early because the seating path uses this
 // to undo a warp that half-applied.
 void UnseatRemotePed(RemotePlayer &player);
+
+// The engine halves of the two above, on raw CPed / CVehicle pointers.
+//
+// Split out rather than copied when the ambient population seam needed to
+// seat a traffic driver (docs/population.md §3 step 6). Everything in here
+// is about a ped and a car; everything left in the two functions below is
+// about a RemotePlayer's bookkeeping and its log line. A third hand-written
+// copy of `SetObjective then WarpPedIntoCar` is a third place to get the
+// order wrong, and getting it wrong is a ped who believes he is in a car
+// that has never heard of him.
+bool SeatPedInCar(void *ped, void *car, uint8_t seat);
+int  UnseatPedFromCar(void *ped);
 
 int PassengerSlotOf(void *car, void *ped) {
 	void *const   *seats = &Field<void *>(car, offs::VEH_PASSENGERS);
@@ -1553,13 +1811,42 @@ int PassengerSlotOf(void *car, void *ped) {
 	return -1;
 }
 
-bool SeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t seat) {
-	void *const ped = ResolveRemote(player);
-	if (!ped)
+// Whoever is already in that seat, taken out of it before somebody else is
+// put in. Returns true if it had to move anyone.
+//
+// The engine will not do this for you. CVehicle::SetDriver is two stores and
+// a RegisterReference; it overwrites pDriver and never looks at the ped that
+// was there, which is then left with bInVehicle set, m_pMyVehicle pointing
+// at a car that has never heard of it, and PED_DRIVING. CWorld::Process then
+// calls SetPedPositionInCar on it every frame, asking a car which seat this
+// ped is in and being told none.
+//
+// This is not the observer deciding that somebody left a car. It is the
+// observer making room for a seating the session has already stated: two
+// peds cannot both be the driver, and the one the session names wins. The
+// player who lost the seat gets their own exit event a moment later and the
+// two agree from then on.
+bool EvictSeatOccupant(void *car, uint8_t seat, void *incoming) {
+	void *occupant = nullptr;
+	if (seat == 0) {
+		occupant = Field<void *>(car, offs::VEH_DRIVER);
+	} else {
+		const size_t slot = static_cast<size_t>(seat) - 1;
+		if (slot < offs::VEH_MAX_PASSENGERS)
+			occupant = (&Field<void *>(car, offs::VEH_PASSENGERS))[slot];
+	}
+	if (!occupant || occupant == incoming)
 		return false;
-	void *const car = ResolveRemoteVehicle(vehicle);
-	if (!car)
+
+	UnseatPedFromCar(occupant);
+	return true;
+}
+
+bool SeatPedInCar(void *ped, void *car, uint8_t seat) {
+	if (!ped || !car)
 		return false;
+
+	EvictSeatOccupant(car, seat, ped);
 
 	// A dead ped can't be seated. Failing quietly here beats failing inside
 	// the warp: CPed::SetObjective returns on PED_DIE/PED_DEAD before writing
@@ -1583,13 +1870,30 @@ bool SeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t seat) {
 	const bool seated = seat == 0 ? Field<void *>(car, offs::VEH_DRIVER) == ped
 	                              : PassengerSlotOf(car, ped) >= 0;
 	if (!seated) {
-		Log("bridge: %s did not take seat %u of vehicle %u; putting them back "
-		    "on foot",
-		    player.nick.c_str(), seat, vehicle.netId);
-		UnseatRemotePed(player);
+		UnseatPedFromCar(ped);
 		return false;
 	}
 	return true;
+}
+
+bool SeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t seat) {
+	void *const ped = ResolveRemote(player);
+	if (!ped)
+		return false;
+	void *const car = ResolveRemoteVehicle(vehicle);
+	if (!car)
+		return false;
+
+	if (SeatPedInCar(ped, car, seat))
+		return true;
+
+	Log("bridge: %s did not take seat %u of vehicle %u; putting them back "
+	    "on foot",
+	    player.nick.c_str(), seat, vehicle.netId);
+	// SeatPedInCar already put the engine state back; this is the
+	// RemotePlayer bookkeeping half, which it knows nothing about.
+	UnseatRemotePed(player);
+	return false;
 }
 
 // The other direction. There's no WarpPedOutOfCar to call - the sequence
@@ -1600,10 +1904,9 @@ bool SeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t seat) {
 //
 // Safe to call on a ped who isn't in a car at all, which is what lets it
 // double as a plain "make sure they're on foot".
-void UnseatRemotePed(RemotePlayer &player) {
-	void *const ped = ResolveRemote(player);
+int UnseatPedFromCar(void *ped) {
 	if (!ped)
-		return;
+		return 0;
 
 	// "In a vehicle" and "has a vehicle" are two separate questions, and both
 	// need asking. When a car gets destroyed under a seated ped, the
@@ -1672,6 +1975,14 @@ void UnseatRemotePed(RemotePlayer &player) {
 	// pose stream the whole way. Written directly rather than routed through
 	// CPed::SetObjective, because what's wanted is a flat "no objective," not
 	// whatever SetObjective would restore instead.
+	//
+	// It is also, as of 2026-09-22, the answer to docs/protocol.md §6's
+	// first open question. CPed::ProcessObjective's own guard is
+	// `cmp dword [ebx+164h],0 / je` - a ped holding OBJECTIVE_NONE runs no
+	// objective at all, whatever its state, whether or not ProcessControl
+	// runs. This write and the PED_IDLE one above are the whole of "a
+	// remote ped must not run its own AI". Do not remove either as
+	// housekeeping; §1.13.3 is why.
 	Field<uint32_t>(ped, offs::PED_OBJECTIVE)      = OBJECTIVE_NONE;
 	Field<uint32_t>(ped, offs::PED_PREV_OBJECTIVE) = OBJECTIVE_NONE;
 	Field<void *>(ped, offs::PED_CAR_IN_OBJECTIVE) = nullptr;
@@ -1684,26 +1995,345 @@ void UnseatRemotePed(RemotePlayer &player) {
 	// animation belonged to the engine rather than to us, so there is no id
 	// here to fade and ApplyOverlay would leave it running forever. See
 	// FadeOutAllPartials.
-	if (void *const clump = ClumpOf(ped)) {
-		const int dropped = FadeOutAllPartials(clump);
+	void *const clump = ClumpOf(ped);
+	return clump ? FadeOutAllPartials(clump) : 0;
+}
 
-		// Once, because a stuck steering pose is exactly the kind of thing
-		// that gets reported as "sometimes the driving animation stays on
-		// forever" and is impossible to place afterwards.
-		static bool said = false;
-		if (dropped > 0 && !said) {
-			said = true;
-			Log("bridge: %s left a seat still carrying %d partial animation(s); "
-			    "faded them out, because the engine's steering pose is not one "
-			    "we applied and nothing else would have removed it",
-			    player.nick.c_str(), dropped);
-		}
+void UnseatRemotePed(RemotePlayer &player) {
+	void *const ped = ResolveRemote(player);
+	if (!ped)
+		return;
+
+	const int dropped = UnseatPedFromCar(ped);
+
+	// Once, because a stuck steering pose is exactly the kind of thing that
+	// gets reported as "sometimes the driving animation stays on forever"
+	// and is impossible to place afterwards.
+	static bool said = false;
+	if (dropped > 0 && !said) {
+		said = true;
+		Log("bridge: %s left a seat still carrying %d partial animation(s); "
+		    "faded them out, because the engine's steering pose is not one "
+		    "we applied and nothing else would have removed it",
+		    player.nick.c_str(), dropped);
 	}
 
 	player.appliedWeapon  = 0xFFFF;
 	player.appliedAnimId  = ANIM_NONE;
 	player.appliedAnimId2 = ANIM_NONE;
 }
+
+// ---- and the same two with the door open ----------------------------------
+//
+// CPed::SetEnterCar and CPed::SetExitCar. Everything above this line happens
+// in one call; everything below takes about a second, can be refused without
+// saying so, and is driven to a deadline by Client::UpdateRemoteSeats with
+// the warp standing behind it.
+//
+// Three facts out of addresses.h shape all of it:
+//
+//  1. Neither call *does* the entry. They put the ped into PED_ENTER_CAR or
+//     PED_EXIT_CAR and hang an animation on it; CWorld::Process's walk over
+//     the moving list is what calls EnterCar() / ExitCar() every frame after
+//     that, and a chain of animation-finish callbacks ends with the seat
+//     being assigned. So there is no return value to read and no callback to
+//     hook - the only honest way to know how it went is to look at the ped.
+//
+//  2. SetEnterCar refuses silently. Health, IsPedInControl, the door's two
+//     busy flags, bIsBeingCarJacked and m_pVehicleAnim are each enough for
+//     it to fall through to SetMoveState(PEDMOVE_STILL) and return, leaving
+//     the ped standing exactly where it was with nothing to show for the
+//     call. Hence the guards below: not because the engine would crash, but
+//     because a refusal that is noticed here becomes a warp this frame
+//     instead of a ped standing still until the deadline runs out.
+//
+//  3. Giving up costs a call. An entry dropped without QuitEnteringCar
+//     leaves the door's bit set in m_nGettingInFlags and m_nNumGettingIn
+//     counting somebody who is not coming - and that flag is the first thing
+//     SetEnterCar tests, so the door is then refused to everybody for the
+//     rest of the car's life. That is the door-shaped version of the stuck
+//     driving animation FadeOutAllPartials exists for, and it is why
+//     AbandonSeatRemotePed is on the bridge rather than being something the
+//     client could forget.
+
+// Which door belongs to which seat. Not a choice: SetExitCar picks the door
+// from the seat the ped is sitting in, and this is that mapping read
+// backwards, so the two directions agree by construction.
+uint16_t DoorForSeat(uint8_t seat) {
+	switch (seat) {
+	case 0:  return offs::CAR_DOOR_LF;   // pDriver
+	case 1:  return offs::CAR_DOOR_RF;   // pPassengers[0]
+	case 2:  return offs::CAR_DOOR_LR;   // pPassengers[1]
+	case 3:  return offs::CAR_DOOR_RR;   // pPassengers[2]
+	default: return 0;                   // no door of its own, so no animation
+	}
+}
+
+uint8_t DoorFlag(uint16_t door) {
+	switch (door) {
+	case offs::CAR_DOOR_LF: return offs::CAR_DOOR_FLAG_LF;
+	case offs::CAR_DOOR_LR: return offs::CAR_DOOR_FLAG_LR;
+	case offs::CAR_DOOR_RF: return offs::CAR_DOOR_FLAG_RF;
+	case offs::CAR_DOOR_RR: return offs::CAR_DOOR_FLAG_RR;
+	default:                return 0;
+	}
+}
+
+// How far a car may be drifting and still be worth walking up to, squared.
+//
+// The entry animation lines the ped up against the car's door over several
+// frames, and a car that is going anywhere leaves it behind - the ped ends
+// up being dragged along beside a moving vehicle, which looks far worse than
+// appearing in the seat. Half a metre per second is the width of "parked,
+// settling on its suspension".
+constexpr float ENTER_MAX_CAR_SPEED_SQ = 0.5f * 0.5f;
+
+// And how far away the ped may be, squared. Beyond this the engine walks
+// them across the street to the handle, which is a second of a remote player
+// moving somewhere their owner never went.
+constexpr float ENTER_MAX_PED_DIST_SQ = 8.0f * 8.0f;
+
+float DistanceSq(const float *a, const float *b) {
+	const float dx = a[0] - b[0];
+	const float dy = a[1] - b[1];
+	const float dz = a[2] - b[2];
+	return dx * dx + dy * dy + dz * dz;
+}
+
+// Is this ped in the seat we asked for?
+//
+// The driver's seat is exact. A passenger's is not, and deliberately so:
+// PedSetInCarCB puts a passenger in the slot its door names and the warp
+// path takes the first free slot, so "somewhere in this car" is the same
+// standard SeatPedInCar has always held itself to. Tightening it here and
+// not there would just mean the animation reports failure for a seating the
+// warp would have called a success.
+bool PedIsInSeat(void *ped, void *car, uint8_t seat) {
+	return seat == 0 ? Field<void *>(car, offs::VEH_DRIVER) == ped
+	                 : PassengerSlotOf(car, ped) >= 0;
+}
+
+bool PedIsEnteringCar(void *ped, void *car) {
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state != PEDSTATE_ENTER_CAR && state != PEDSTATE_CARJACK)
+		return false;
+	// m_pMyVehicle is set by SetEnterCar_AllClear and nilled by the
+	// reference the car registered on it, so this also answers "is the car
+	// this entry was for still there".
+	return Field<void *>(ped, offs::PED_MY_VEHICLE) == car;
+}
+
+// The objective triple, cleared. Written out rather than routed through
+// CPed::ClearObjective for the reason UnseatPedFromCar gives: what is wanted
+// is a flat "no objective", not whatever SetObjective would restore instead,
+// and OBJECTIVE_NONE is half of the off switch for a remote ped's AI
+// (docs/protocol.md §1.13.3).
+void ClearPedObjective(void *ped) {
+	Field<uint32_t>(ped, offs::PED_OBJECTIVE)      = OBJECTIVE_NONE;
+	Field<uint32_t>(ped, offs::PED_PREV_OBJECTIVE) = OBJECTIVE_NONE;
+	Field<void *>(ped, offs::PED_CAR_IN_OBJECTIVE) = nullptr;
+}
+
+int AbandonPedEnterCar(void *ped) {
+	if (!ped)
+		return 0;
+
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state == PEDSTATE_ENTER_CAR || state == PEDSTATE_CARJACK)
+		Func<void(__thiscall *)(void *)>(CPed__QuitEnteringCar)(ped);
+
+	// QuitEnteringCar nils m_pVehicleAnim and restores bUsesCollision, and
+	// leaves the ped idle. It does not clear the objective - the engine's
+	// own callers always follow it with something that sets one, and we
+	// cannot afford to.
+	ClearPedObjective(ped);
+
+	// The same wholesale partial fade the exit does, for the same reason:
+	// the door-opening chain is not made of animations CoopIII applied, so
+	// there is no id to fade and nothing else would remove one that is left
+	// over. Cheap, and this is the path that runs when something has already
+	// gone differently from the plan.
+	void *const clump = ClumpOf(ped);
+	return clump ? FadeOutAllPartials(clump) : 0;
+}
+
+bool BeginPedEnterCar(void *ped, void *car, uint8_t seat) {
+	if (!ped || !car)
+		return false;
+
+	// A door of its own, or there is no animation to play. Seats past the
+	// fourth share the rear doors and the engine picks for itself; rather
+	// than guess, those are warped.
+	const uint16_t door = DoorForSeat(seat);
+	const uint8_t  flag = DoorFlag(door);
+	if (!door || !flag)
+		return false;
+
+	// Everything SetEnterCar itself would refuse on, asked first so a
+	// refusal becomes a warp this frame rather than a ped standing still
+	// until the deadline. In the engine's own order.
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+		return false;
+	if (Field<bool>(ped, offs::PED_IN_VEHICLE))
+		return false;   // already in something; the caller takes them out first
+	if (Field<void *>(ped, offs::PED_VEHICLE_ANIM))
+		return false;
+	if (Field<float>(ped, offs::PED_HEALTH) <= 0.0f)
+		return false;
+	if (!ClumpOf(ped))
+		return false;
+
+	const uint8_t gettingIn  = Field<uint8_t>(car, offs::VEH_GETTING_IN_FLAGS);
+	const uint8_t gettingOut = Field<uint8_t>(car, offs::VEH_GETTING_OUT_FLAGS);
+	if ((gettingIn & flag) || (gettingOut & flag))
+		return false;
+	if (Field<uint8_t>(car, offs::VEH_FLAGS_C) & offs::VEH_IS_BEING_CARJACKED)
+		return false;
+
+	// Two of our own, which the engine does not check because in single
+	// player nobody ever asks a ped to get into a car that is 30 metres away
+	// and accelerating.
+	const float *const carPos   = &Field<float>(car, offs::POSITION);
+	const float *const pedPos   = &Field<float>(ped, offs::POSITION);
+	const float *const carSpeed = &Field<float>(car, offs::MOVE_SPEED);
+	const float        speedSq  = carSpeed[0] * carSpeed[0] +
+	                      carSpeed[1] * carSpeed[1] + carSpeed[2] * carSpeed[2];
+	if (!(speedSq <= ENTER_MAX_CAR_SPEED_SQ))
+		return false;   // written to catch a NaN as well as a fast car
+	if (DistanceSq(pedPos, carPos) > ENTER_MAX_PED_DIST_SQ)
+		return false;
+
+	// Make room, the same way the warp does, and for the same reason: two
+	// peds cannot both be the driver.
+	EvictSeatOccupant(car, seat, ped);
+
+	// The objective first. SetEnterCar_AllClear reads it to decide whether
+	// the right-front door counts as a jack, and PedSetInCarCB reads it
+	// again at the end to decide between SetDriver and AddPassenger - so
+	// this is what actually chooses the seat, exactly as it is for the warp.
+	//
+	// It also means m_objective is not OBJECTIVE_NONE for the length of the
+	// animation, which is the one window in which a remote ped runs
+	// CPed::ProcessObjective. That arm is `if (IsPedInControl())` and
+	// IsPedInControl is false in PED_ENTER_CAR, so it does nothing; and
+	// PedSetInCarCB ends with RestorePreviousObjective, which puts back the
+	// m_prevObjective SetObjective saved - OBJECTIVE_NONE, because that is
+	// what UnseatPedFromCar leaves behind. The off switch survives the trip.
+	const uint32_t objective = seat == 0 ? OBJECTIVE_ENTER_CAR_AS_DRIVER
+	                                     : OBJECTIVE_ENTER_CAR_AS_PASSENGER;
+	using ObjectiveFn = void(__thiscall *)(void *, uint32_t, void *);
+	Func<ObjectiveFn>(CPed__SetObjective)(ped, objective, car);
+
+	// m_vehDoor is an input, not an output: SetEnterCar switches on it to
+	// find the door flag and the door node, and SetEnterCar_AllClear writes
+	// the argument straight back into it. A word, not a dword.
+	Field<uint16_t>(ped, offs::PED_VEH_DOOR) = door;
+
+	using EnterFn = void(__thiscall *)(void *, void *, uint32_t);
+	Func<EnterFn>(CPed__SetEnterCar)(ped, car, door);
+
+	// Did it take? This is the whole reason the call is wrapped: it has no
+	// return value and its refusal is a move-state write.
+	if (!PedIsEnteringCar(ped, car)) {
+		ClearPedObjective(ped);
+		return false;
+	}
+	return true;
+}
+
+uint8_t PollPedEnterCar(void *ped, void *car, uint8_t seat) {
+	if (!ped || !car)
+		return SEAT_LOST;
+	if (PedIsInSeat(ped, car, seat)) {
+		// The engine's own end of the entry left m_objective wherever
+		// RestorePreviousObjective put it. Make it flat, because a
+		// CCivilianPed holding an ENTER_CAR objective and a car pointer is
+		// the thing that walks back to the car and tries again.
+		ClearPedObjective(ped);
+		return SEAT_DONE;
+	}
+	return PedIsEnteringCar(ped, car) ? SEAT_RUNNING : SEAT_LOST;
+}
+
+// The way out, animated. There is no guard list to mirror here because
+// SetExitCar does its own: CanPedExitCar covers the car being upside down or
+// moving too fast, and the PED_EXIT_CAR / PED_DRAG_FROM_CAR test covers
+// being asked twice. Passing 0 for the door lets it work the door out from
+// the seat the ped is actually in, which is the only version of that mapping
+// that cannot disagree with the engine.
+bool BeginPedExitCar(void *ped) {
+	if (!ped || !Field<bool>(ped, offs::PED_IN_VEHICLE))
+		return false;
+	void *const car = Field<void *>(ped, offs::PED_MY_VEHICLE);
+	if (!car || Field<uintptr_t>(car, offs::VTABLE) != CAutomobile__vtable)
+		return false;
+
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state == PEDSTATE_EXIT_CAR || state == PEDSTATE_DRAG_FROM_CAR)
+		return true;   // already on its way out; saying no would start a warp
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+		return false;
+
+	using ExitFn = void(__thiscall *)(void *, void *, uint32_t);
+	Func<ExitFn>(CPed__SetExitCar)(ped, car, 0);
+
+	return Field<uint32_t>(ped, offs::PED_STATE) == PEDSTATE_EXIT_CAR;
+}
+
+bool BeginSeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t seat) {
+	void *const ped = ResolveRemote(player);
+	if (!ped)
+		return false;
+	void *const car = ResolveRemoteVehicle(vehicle);
+	if (!car)
+		return false;
+	return BeginPedEnterCar(ped, car, seat);
+}
+
+uint8_t PollSeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t seat) {
+	void *const ped = ResolveRemote(player);
+	if (!ped)
+		return SEAT_LOST;
+	void *const car = ResolveRemoteVehicle(vehicle);
+	if (!car)
+		return SEAT_LOST;
+	return PollPedEnterCar(ped, car, seat);
+}
+
+void AbandonSeatRemotePed(RemotePlayer &player) {
+	void *const ped = ResolveRemote(player);
+	if (!ped)
+		return;
+
+	const int dropped = AbandonPedEnterCar(ped);
+
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("bridge: %s's door-opening animation was taken off them before it "
+		    "finished (%d partial animation(s) faded); the seat the session "
+		    "gave them is applied directly instead",
+		    player.nick.c_str(), dropped);
+	}
+
+	// Whatever the entry blended is gone, so whatever the wire wants has to
+	// be driven again from scratch.
+	player.appliedAnimId  = ANIM_NONE;
+	player.appliedAnimId2 = ANIM_NONE;
+}
+
+bool BeginUnseatRemotePed(RemotePlayer &player) {
+	void *const ped = ResolveRemote(player);
+	return ped && BeginPedExitCar(ped);
+}
+
+// client.h carries its own copy of PED_EXIT_CAR, because the client layer is
+// engine-free and cannot include addresses.h. Two hardcoded copies of a
+// number that only agree with themselves are worth nothing; this is what
+// makes them agree with each other.
+static_assert(WIRE_PEDSTATE_EXIT_CAR == PEDSTATE_EXIT_CAR,
+              "client.h's idea of PED_EXIT_CAR and addresses.h's must match");
 
 void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	void *ped = ResolveRemote(player);
@@ -1715,7 +2345,7 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	// than twelve animations on it makes RpAnimBlendClumpUpdateAnimations
 	// write its node array over its own return address, and the ped being
 	// seated or dead does not make that any less true.
-	EnforceAnimLimit(player, ClumpOf(ped));
+	EnforceAnimLimit(player, ped, ClumpOf(ped));
 
 	// Also before every early return below, and for a reason of its own: a
 	// player who catches fire and then gets into a car, or dies, still has
@@ -1724,8 +2354,11 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	// (CPed::IsPedInControl), but putting one out is always allowed.
 	ApplyRemoteFire(player, ped);
 
-	// A seated ped belongs to the engine now. CPed::ProcessControl puts it
-	// back in its seat from the car's own matrix every frame, so everything
+	// A seated ped belongs to the engine now. CWorld::Process - its fifth
+	// walk over the moving list, not CPed::ProcessControl, which is where
+	// this comment used to point - calls SetPedPositionInCar on anything
+	// with bInVehicle set and puts it back in its seat from the car's own
+	// matrix every frame, so everything
 	// below would get overwritten at best - and at worst the re-file and the
 	// move state drag the ped half out of the car for the part of the frame
 	// physics and collision actually look at.
@@ -1734,7 +2367,30 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	// authority on where this player is, so the pose stream has to stop
 	// being one too. Health still applies, since that's about the player and
 	// not about where they are.
-	if (player.Seated()) {
+	//
+	// The same holds while they are *climbing in*, and for the same reason
+	// rather than a similar one: it is the same walk over the moving list,
+	// calling EnterCar() instead of SetPedPositionInCar, and LineUpPedWithCar
+	// is what carries the ped from where it was standing to the seat. A
+	// position written over the top of that is the ped being yanked back to
+	// the pavement 25 times a second for the length of the animation.
+	//
+	// And the second half of the test is the ped's, not the session's, which
+	// is what makes this self-healing. The condition below is
+	// CWorld::Process's own (`bInVehicle && ... || EnteringCar()`, re3
+	// World.cpp:1971), so it is true exactly when the engine is in fact
+	// positioning this ped and false the instant it stops - whatever the
+	// session still believes. Three things that used to need handling stop
+	// needing it: a ped dropped out of a seat to make room for somebody the
+	// session says is driving; a get-out animation that finishes before the
+	// exit event arrives; and an entry that the engine abandoned without
+	// anybody noticing. In all three the ped is back on the pose stream on
+	// the very next frame instead of standing frozen until a packet says so.
+	const uint32_t pedState      = Field<uint32_t>(ped, offs::PED_STATE);
+	const bool     engineHasThem = Field<bool>(ped, offs::PED_IN_VEHICLE) ||
+	                           pedState == PEDSTATE_ENTER_CAR ||
+	                           pedState == PEDSTATE_CARJACK;
+	if ((player.Seated() || player.Entering()) && engineHasThem) {
 		Field<float>(ped, offs::PED_HEALTH) = player.last.health;
 		Field<float>(ped, offs::PED_ARMOUR) = player.last.armour;
 		return;
@@ -1771,17 +2427,21 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	// snapshot happens to still name, or asking a dead ped to aim, is how
 	// you get a corpse standing up mid-fall. The state is read off the ped
 	// rather than off player.last.health because the ped is what actually
-	// has a death animation running.
-	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
-	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+	// has a death animation running. Read once at the top of the function,
+	// because the seat test above needs the same value.
+	if (pedState == PEDSTATE_DIE || pedState == PEDSTATE_DEAD)
 		return;
 
-	// The locomotion animation isn't chosen here. Writing m_nMoveState is
-	// what makes CPed::SetMoveAnim - called later this same frame by
-	// CPed::ProcessControl - blend the walk, run, sprint or idle for this
-	// ped's own animation style. Do it the other way round, blending the
-	// animation directly and leaving move state stale, and the engine just
-	// changes its mind a few milliseconds later and fades ours back out.
+	// The move state, which this comment used to claim was what made the
+	// remote player walk. It is not, and never was: CPed::Idle writes
+	// PEDMOVE_STILL over it every frame before CPed::SetMoveAnim reads it,
+	// because the ped is a CCivilianPed and Idle leaves only the player
+	// alone (docs/protocol.md §1.13.4). The walk comes from ApplyAnimation
+	// blending the wire's animId directly, below.
+	//
+	// It is still written, because it is what the ped reports to anything
+	// else that asks - a co-op mission script included - and because it
+	// costs one store. Nothing may be built on it being read by the engine.
 	Field<uint32_t>(ped, offs::PED_MOVE_STATE) = ClampMoveState(player.last.moveState);
 
 	ApplyWeapon(player, ped);
@@ -1792,6 +2452,20 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 
 } // namespace
 
+bool StartCarEntry(void *ped, void *car, uint8_t seat) {
+	return BeginPedEnterCar(ped, car, seat);
+}
+
+uint8_t PollCarEntry(void *ped, void *car, uint8_t seat) {
+	return PollPedEnterCar(ped, car, seat);
+}
+
+int CancelCarEntry(void *ped) {
+	if (!ped)
+		return 0;
+	return AbandonPedEnterCar(ped);
+}
+
 // The two things game/combat.cpp needs from in here, nothing else.
 //
 // Both thin wrappers on purpose, not copies. ResolveRemotePed is the only
@@ -1800,6 +2474,13 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 // owns `RemotePlayer::appliedWeapon`, and two writers of that field would
 // fight over when a weapon model gets rebuilt.
 void *ResolveRemotePed(RemotePlayer &player) { return ResolveRemote(player); }
+
+void SetAmmoSync(bool enabled) { g_ammoSync = enabled; }
+bool AmmoSyncOn() { return g_ammoSync; }
+
+void WriteRemoteSlotAmmo(void *ped, uint8_t slot, uint16_t clip, uint32_t total) {
+	WriteSlotAmmo(ped, slot, clip, total);
+}
 
 bool GiveRemoteWeapon(RemotePlayer &player, void *ped, uint8_t weapon) {
 	return GiveWeaponTo(player, ped, weapon);
@@ -1811,12 +2492,154 @@ bool RemotePlayerForPed(const void *ped, uint16_t &netId) {
 
 int32_t StdAnimGroupCount() { return AnimGroupCount(ASSOCGRP_STD); }
 
+// ---- what game/world.cpp's CWorld::Process sweep hands every entity -------
+//
+// The same twelve-slot bound MakeAnimRoom and EnforceAnimLimit enforce, but
+// applied to *every* clump on the moving list rather than only to the peds
+// CoopIII drives - which is the difference between a rule about CoopIII's
+// peds and a rule about the engine's array.
+//
+// It has to be this wide. CoopIII changes what the engine's own pedestrians
+// do: it replicates them, it seats them, it takes limbs off them, it kills
+// them from the wire and it keeps them alive past a death their host already
+// ran. Any of that can leave a ped CoopIII does not have a roster entry for
+// carrying more associations than the engine can index, and the engine's
+// reaction is not a wrong pose, it is
+// RpAnimBlendClumpUpdateAnimations writing its node array over its own saved
+// registers and handing CWorld::Process's walk a cursor made of animation
+// data (addresses.h, AnimNodeArrayOverflow).
+//
+// Mirrors walk 1's own two tests before it touches anything: a null
+// m_rwObject and a non-clump are exactly what the engine skips, and looking
+// at either would be looking at something that is not an animation list.
+void ClampClumpAnimations(void *entity) {
+	if (!entity)
+		return;
+	void *const clump = ClumpOf(entity);
+	if (!clump)
+		return;
+	// `cmp byte ptr [eax],2` at 0x004B1B2C. RwObject::type, rpCLUMP.
+	if (*reinterpret_cast<const uint8_t *>(clump) != RW_TYPE_CLUMP)
+		return;
+
+	const int count = CountAnims(clump);
+	if (!AnimNodeArrayOverflows(count))
+		return;
+
+	// One association is kept back whatever its weight: a ped's
+	// m_pVehicleAnim. It is not one CoopIII applied, so there is no id to
+	// spare it by, and it carries the callback that finishes a door-opening
+	// chain - drop it and the ped stays in PED_ENTER_CAR with nothing left
+	// to end it. The type test is what makes reading +0x1D8 legal: this
+	// sweep is handed vehicles and objects too, and that offset is a ped
+	// field.
+	void *keepAssoc = nullptr;
+	if ((Field<uint8_t>(entity, offs::ENTITY_FLAGS_A) & 7) == offs::ENTITY_TYPE_PED)
+		keepAssoc = Field<void *>(entity, offs::PED_VEHICLE_ANIM);
+
+	const int dropped =
+	    PruneAnims(clump, ANIM_NONE, ANIM_NONE, keepAssoc,
+	               count - MAX_CLUMP_ANIM_ASSOCS);
+
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("world: an entity on the moving list was carrying %d animations, "
+		    "past the %d RpAnimBlendClumpUpdateAnimations can index; dropped "
+		    "%d before CWorld::Process walked it. Its vtable is %08X (and this "
+		    "will not be said again)",
+		    count, MAX_CLUMP_ANIM_ASSOCS, dropped,
+		    static_cast<unsigned>(Field<uintptr_t>(entity, offs::VTABLE)));
+	}
+}
+
+// ---- what the ambient population seam borrows -----------------------------
+//
+// Four thin exports, and each one is here rather than copied into
+// population.cpp because the copy is what would go wrong. PlaceRemotePed's
+// three steps took two in-game sessions to find; the seating order is a
+// precondition rather than tidiness; and the animation group bound is an
+// unchecked subscript into a four-element array. None of that gets safer for
+// being written out a second time next to a different roster type.
+
+void PlaceReplicaPed(void *ped, const Vec3 &pos, float heading, bool inWorld) {
+	if (ped)
+		PlaceRemotePed(ped, pos, heading, inWorld);
+}
+
+uint16_t ReadPedBaseAnim(void *ped) {
+	if (!ped)
+		return ANIM_NONE;
+	void *const clump = ClumpOf(ped);
+	if (!clump)
+		return ANIM_NONE;
+	AnimSample base, partial;
+	ReadDominantAnims(clump, base, partial);
+	return base.id;
+}
+
+// One animation onto a replica's clump, through the engine's own blender.
+//
+// The whole of docs/protocol.md §1.13.4 in one call: this, not m_nMoveState,
+// is what makes a non-player ped walk. `CPed::Idle` overwrites the move state
+// with PEDMOVE_STILL before `SetMoveAnim` can read it, so a replicated
+// pedestrian that is only told its move state stands in its idle pose and
+// slides.
+//
+// No animTime and no speed, unlike a remote player's. An ambient ped's
+// locomotion animation takes its rate from the engine and its phase is not
+// something anyone can see is wrong on a stranger - which is exactly the
+// argument for leaving both off the wire (protocol.h, AmbientPedState).
+bool BlendReplicaAnim(void *ped, uint16_t animId) {
+	if (!ped)
+		return false;
+	void *const clump = ClumpOf(ped);
+	if (!clump)
+		return false;
+
+	const int pedGroup = Field<int32_t>(ped, offs::PED_ANIM_GROUP);
+	const AnimPlan plan = PlanAnim(animId, pedGroup, AnimGroupCount(pedGroup),
+	                               AnimGroupCount(ASSOCGRP_STD));
+	if (!plan.valid)
+		return false;
+
+	// The same twelve-slot limit a remote player's clump lives under, and it
+	// is not a soft one: past MAX_CLUMP_ANIM_ASSOCS,
+	// RpAnimBlendClumpUpdateAnimations writes its node array over its own
+	// return address. A replica carries far fewer animations than a player
+	// does - one locomotion anim from here, plus whatever CPed::Idle and
+	// SetInTheAir add on their own (§1.13.5) - so this should never fire.
+	// "Should never" is why it is checked rather than assumed.
+	if (!FindAnimById(clump, animId)) {
+		const int count = CountAnims(clump);
+		if (!AnimClumpHasRoom(count)) {
+			const int dropped =
+			    PruneAnims(clump, animId, ANIM_NONE, nullptr,
+			               AnimClumpSurplus(count));
+			if (!AnimClumpHasRoom(count - dropped))
+				return false;
+		}
+	}
+
+	using BlendFn = void *(__cdecl *)(void *, int, int, float);
+	return Func<BlendFn>(CAnimManager__BlendAnimation)(
+	           clump, plan.group, static_cast<int>(animId), plan.blendDelta) != nullptr;
+}
+
+bool SeatReplicaPed(void *ped, void *car, uint8_t seat) {
+	return SeatPedInCar(ped, car, seat);
+}
+
+void UnseatReplicaPed(void *ped) { UnseatPedFromCar(ped); }
+
 WorldBridge MakeWorldBridge() {
 	WorldBridge b;
 	b.SampleLocalPlayer = &SampleLocalPlayer;
 	b.RequestModel      = &RequestModel;
 	b.IsModelReady      = &IsModelReady;
 	b.SampleLocalPlayerModel = &SampleLocalPlayerModel;
+	b.SampleLocalAmmo        = &SampleLocalAmmo;
+	b.ApplyRemoteAmmo        = &ApplyRemoteAmmoSlot;
 	b.ApplyRemotePose   = &ApplyRemotePose;
 	b.SpawnRemote       = &SpawnRemote;
 	b.DespawnRemote     = &DespawnRemote;
@@ -1827,9 +2650,19 @@ WorldBridge MakeWorldBridge() {
 	b.SampleLocalVehicleIdentity = &SampleLocalVehicleIdentity;
 	b.SampleLocalVehicleHandle   = &SampleLocalVehicleHandle;
 	b.ApplyRemoteVehicle   = &ApplyRemoteVehicle;
+	b.RestRemoteVehicle    = &RestRemoteVehicle;
 	b.CorrectRemoteVehicle = &CorrectRemoteVehicle;
+	// What shape a car is in (docs/cardamage.md). Beside the state pair
+	// because they are the same seam, and separate from it because damage is
+	// an event on the reliable channel and state is a 25 Hz sample.
+	b.SampleLocalVehicleDamage = &SampleLocalVehicleDamage;
+	b.ApplyRemoteVehicleDamage = &ApplyRemoteVehicleDamage;
 	b.SeatRemotePed        = &SeatRemotePed;
 	b.UnseatRemotePed      = &UnseatRemotePed;
+	b.BeginSeatRemotePed   = &BeginSeatRemotePed;
+	b.PollSeatRemotePed    = &PollSeatRemotePed;
+	b.AbandonSeatRemotePed = &AbandonSeatRemotePed;
+	b.BeginUnseatRemotePed = &BeginUnseatRemotePed;
 
 	// Combat. These three live in game/combat.cpp because they're driven by
 	// detours rather than the frame pump, and because every address they use
@@ -1841,6 +2674,14 @@ WorldBridge MakeWorldBridge() {
 	b.ApplyRemoteDamage   = &ApplyRemoteDamage;
 	b.KillRemotePed       = &KillRemotePed;
 	b.SetFriendlyFire     = &SetFriendlyFire;
+	b.SetAmmoSync         = &SetAmmoSync;
+
+	// Asked of CVehicle::m_pDriver, not of the roster. Wired in down here
+	// rather than beside the other vehicle entries because it answers a
+	// question about the *engine*, and because the thing it protects is the
+	// one place a claim in flight can leave a car frozen under its own
+	// driver. WorldBridge::LocalDrivesVehicle says the rest.
+	b.LocalDrivesVehicle = &LocalDrivesVehicle;
 
 	// Every address in the spawn path comes from the game's own
 	// COMMAND_CREATE_CHAR / COMMAND_DELETE_CHAR handlers (addresses.h records

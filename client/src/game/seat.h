@@ -53,6 +53,19 @@ bool UnseatLocalPlayer();
 // Is the local player a passenger right now - in a car, but not driving it?
 bool LocalIsPassenger();
 
+// What SeatLocalPlayerIn means when it does not return a seat number.
+//
+// The seat key now asks the engine to walk the player to the door and open
+// it, the same way a remote player's replica has since entercar landed. That
+// takes frames, so the answer is no longer available on the frame the key was
+// pressed. SEAT_LOCAL_REFUSED and SEAT_LOCAL_WALKING live in client.h, beside
+// the ones the replica path uses.
+
+// Drive an entry that SeatLocalPlayerIn started. Same three answers, with a
+// seat number meaning it finished this frame. Cheap and safe to call every
+// frame with nothing in flight.
+int32_t PollLocalSeatEntry();
+
 void AddSeatToBridge(WorldBridge &bridge);
 
 } // namespace coopiii::game

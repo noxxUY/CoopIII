@@ -317,3 +317,52 @@ were arrived at. They are the head start for panels/doors/lights/wheels
 | a `CDamageManager` engine-status setter | `0x00545940` | function | medium | Seven instructions: `mov [ecx+4], min(arg, 0FAh)`. A saturating byte write, so `+4` is the engine byte and 250 is its ceiling. `CVehicle::InflictDamage`'s "set on fire" arm pushes `0E1h` (225) into it at `0x00551BE1`, which is what "this car is burning" means in the engine. Only this function was read; nothing that reads `+4` was. |
 | `CAutomobile::m_aCarNodes` | `+0x37C` | offset | **low** | One subscript, `[ebp+ebx*4+37Ch]`, in the function above. Nothing else. A wrong node array does not crash, it writes into a neighbouring member — which is the failure mode that cost this project the car-on-its-side round. |
 | `CVehicle::InflictDamage` entry point | — | function | none | Its instructions at `0x00551BA5`..`0x00551C5A` were read and are transcribed in `addresses.h`, because they are what proves the health-is-not-destruction claim. The function *start* was never located and is deliberately not recorded anywhere: nothing CoopIII does needs to call it. |
+
+## Ambient peds and traffic
+
+Leads for `population.md`, which needs the engine's own population counters so
+it can tell the generator how crowded the street really is. **None of these is
+proved and none may be used until it is.**
+
+The anchor is `CPopulation::ms_nTotalMissionPeds` at `0x008F5F70`, which *is*
+verified and is in `addresses.h`. Reading re3's `Population.h` declaration
+order outwards from it gives the table below - and declaration order is not
+memory order, which is exactly the assumption that has been wrong four times on
+this project.
+
+| What | Guess | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| `CPopulation::MaxNumberOfPedsInUse` | `0x008F5F74` | **low** | Next after the anchor in re3's declaration order, 4 references. Order alone. |
+| `CPopulation::ms_nNumCivMale` | `0x008F5F78` | **very low** | Would be next again, but it carries **116 references**. A counter for one pedestrian type does not get touched from 116 places; something much more widely used lives there and the order has already broken by this point. Treat the whole outward walk as refuted from here on. |
+| `CPopulation::ms_nNumCivFemale` | `0x008F5F7C` | **very low** | Same walk, 29 references. Same objection. |
+| `CPopulation::ManagePopulation` | — | none | Not located. This is the function to find first: whichever counters it compares before deciding to add a pedestrian *are* the counters, and finding it settles the whole table without guessing at layout. |
+| the other **two** car counters | `0x00885BB0`, `0x009411F0` | **the set is certain, the names are not** | Two of the six terms `GenerateOneRandomCar` adds up before comparing against `MaxNumberOfCarsInUse`. They are `NumFiretrucksOnDuty` and `NumAmbulancesOnDuty` in some order and nothing seen so far says which. **Two of the original four are now proved and gone from this row**: `CCarCtrl::UpdateCarCount` (`0x004202E0`) switches on `VehicleCreatedBy` through two jump tables, and the table index is the enum, so `0x008F1B54` is `NumMissionCars` and `0x008F29E0` is `NumParkedCars` - the second independent witness they needed. `0x008F29F0` is `NumPermanentCars` from the same tables and was never in the sum, which agrees with re3. All three are in `addresses.h` now. |
+| `CPed::m_nCreatedBy` | — | none | Needed to tell an ambient ped from a mission one, so CoopIII does not replicate the campaign's peds as traffic. |
+
+
+## Pickups - what could not be proved statically (2026-09-22)
+
+Everything the pickup work actually uses is in `addresses.h` with its
+disassembly (`docs/pickups.md` is the write-up). Three things did not make it,
+and each is here because of *what* cannot be checked rather than because it was
+not looked at.
+
+| What | Value | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| `MI_PICKUP_*`, the eight model-index globals at `0x005F5B10`..`0x005F5B2C` | the addresses | **the addresses are certain, the values are not checkable on disk** | They read `0xFFFF` in the file: `CModelInfo` fills them at load from the IDE, so the numbers belong to that install. The *addresses* are pinned by what the code does with each one - `+0x2C4 = 100.0f` is armour, `+0x2C0 = 100.0f` is health, one takes a wanted star off, one is gated on `CDarkel::FrenzyOnGoing`, one is collectable only from a vehicle - which is a stronger identification than re3's declaration order would have been. But nothing here confirms a *value*, and the only way to is to read them in-process. `pickup.cpp` only ever compares against them, never assumes a number. |
+| `CPickups::RemoveAllFloatingPickups` | `0x004307FF` | high | Named from behaviour, not from a symbol: it walks all 336 slots and removes exactly types 12 and 13. Recorded because it is a third witness for the array bound, and it is never called. |
+| The pickup camera globals at `0x0095CD70`, `0x008F29E8`, `0x009404C8`, `0x008E289C` | - | medium | Written by the `CAMERA` model's arm of the award switch at `0x004310A6`, so **retail 1.0 does have the pickup camera that re3 keeps behind `CAMERA_PICKUP`**. Interesting, unused, and unverified beyond that one write site. |
+
+**Update, same day: the traffic half is done and it went exactly that way.**
+`CCarCtrl::GenerateOneRandomCar`, `CarDensityMultiplier`,
+`MaxNumberOfCarsInUse`, `NumRandomCars` and `NumLawEnforcerCars` are in
+`addresses.h` with their proofs, found by walking opcode 491 to its handler and
+letting the handler name the multiplier, the multiplier name the generator and
+the generator name its own counters. The pedestrian half is still open and the
+same route applies to it.
+
+The right route is the one that has worked every other time here: find the
+function, read what it compares, and let that name the globals. Walking a
+struct or a static block outwards from one known member is how the anim-group
+bound, the node array and `ANIM_STD_NUM` all went wrong.
+

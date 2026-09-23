@@ -18,6 +18,12 @@
 //        to be wrong. Watch for a muzzle flash and a gunshot, and check the
 //        *local* player isn't losing health - that's the bulletproof guard
 //        around the replay doing its job.
+// -pitch rakes those shots up and down instead of firing them level. The one
+//        thing an observer's engine cannot invent for itself is the slope:
+//        CWeapon::FireInstantHit copies target.z from source.z for every ped
+//        that is not the local player, so a replayed shot is flat unless the
+//        wire's direction is really being applied. Trails that stay level
+//        under -pitch mean it is not.
 // -throw holds a molotov and lobs one every three seconds, sends the
 //        explosion a beat later. The two halves are kept separate: the throw
 //        makes a bottle appear and fly, the explosion proves the observer's
@@ -68,6 +74,22 @@
 //        and your own machine decides what that costs you. And check the
 //        ghost's health does not move, because an observer's fire may not
 //        take health off the player it is drawn on.
+// -wanted N
+//        claims N stars, the way a real client reports its own CWanted.
+//        docs/wanted.md §7 is the list this exists to work through, and it is
+//        the only way to reach any of it with one real game in front of you:
+//        a real player's level comes out of crimes their own engine watched
+//        them commit, so nothing short of a second machine can produce one.
+//
+//        What to watch is the receiving end, and none of it is the ghost.
+//        With the default per-player rule, walk past it and your own stars
+//        must stay empty - proximity spreads nothing. Get into its car
+//        (-car -wanted 4) and yours should climb to four within a tick, and
+//        the police that turn up are then your own engine's, generated from
+//        your own CWanted, chasing you. Get out again and they must stay:
+//        a level that evaporated at the door is the bug §4.4 argues against.
+//        With the server set to `shared`, the stars should arrive wherever
+//        you are standing and go again when the ghost drops to zero.
 // -hurt  makes the shots real, in both directions. Needs the server started
 //        with -friendlyfire, or it does nothing at all and that is the gate
 //        working.
@@ -92,6 +114,16 @@
 //        eventually stops having a ped, and the blip has to survive that.
 //        On foot only; with -car the blip follows the car and this would be
 //        testing the car.
+// -limbs claims a pedestrian of its own three metres in front of the player,
+//        as if the ghost's engine had generated one, and then takes it apart:
+//        the head, both arms and both legs, one every three seconds, in
+//        C_PedBodyPart packets (protocol 17). Then it despawns the ped and
+//        claims another. That is the observer half of dismemberment with no
+//        second game: the player's machine builds a replica and runs
+//        CPed::RemoveBodyPart on it for each packet. Watch for each limb to
+//        vanish with a spray of blood, the arms and legs to fly off, and the
+//        game to still be running after a few rounds. The head does not fly;
+//        the engine never spawns one (re3 RemoveBodyPart, `nodeId != PED_HEAD`).
 //
 // Connects like a real client, finds whoever else is in the session, and
 // walks a slow circle a few metres from them. The ghost itself isn't the
@@ -121,6 +153,12 @@ namespace {
 constexpr float ORBIT_RADIUS_M = 4.0f;
 constexpr float ORBIT_PERIOD_S = 12.0f;
 
+// How far -pitch tilts the shot either side of level, and how long one sweep
+// takes. 40 degrees because a trail that steep is unmistakable against a
+// street; 6 seconds because the whole point is to watch it move.
+constexpr float    SHOT_PITCH_DEG    = 40.0f;
+constexpr uint32_t SHOT_PITCH_PERIOD = 6000;
+
 // -far. The radar reaches 120 m on foot (addresses.h, RADAR_RANGE_ON_FOOT_M),
 // so 20 to 200 m crosses the rim well inside it and well outside it. The
 // periods are long because the speed is the tangent of the orbit and a
@@ -133,6 +171,11 @@ constexpr float FAR_BREATHE_S = 60.0f;    // out and back
 } // namespace
 
 int main(int argc, char **argv) {
+	// Unbuffered, for the same reason as server/cli/console.cpp: the ghost is
+	// always stopped by being killed, and a redirected, buffered stdout dies
+	// with it.
+	std::setvbuf(stdout, nullptr, _IONBF, 0);
+
 	const char    *host = argc > 1 ? argv[1] : "127.0.0.1";
 	const uint16_t port = argc > 2 ? uint16_t(std::atoi(argv[2])) : DEFAULT_PORT;
 	const char    *nick = argc > 3 ? argv[3] : "ghost";
@@ -154,11 +197,17 @@ int main(int argc, char **argv) {
 	// the observer half runs the engine's own CAutomobile::BlowUpCar on a
 	// CAutomobile CoopIII built by hand, and nothing headless can touch that.
 	bool blowUpFlag = false;
+	bool limbsFlag  = false;
+	bool pitchFlag  = false;
 	// -extras A,B: the extra components the ghost claims its car has, which
 	// is how the extras sync gets looked at. Default is "none on either
 	// slot", because 0/0 would quietly fit component 0 twice and look like a
 	// working sync whether or not anything crossed the wire.
 	int8_t extra1 = -1, extra2 = -1;
+	// -wanted N: the ghost claims N stars. docs/wanted.md §7 is what this is
+	// for; 0 is off and is the default, because a ghost that was always
+	// wanted would put police on every test that has nothing to do with them.
+	int wantedLevel = 0;
 	for (int i = 1; i < argc; ++i) {
 		if (std::strcmp(argv[i], "-car") == 0)
 			carFlag = true;
@@ -180,6 +229,18 @@ int main(int argc, char **argv) {
 			farFlag = true;
 		if (std::strcmp(argv[i], "-blowup") == 0)
 			blowUpFlag = true;
+		if (std::strcmp(argv[i], "-limbs") == 0)
+			limbsFlag = true;
+		if (std::strcmp(argv[i], "-pitch") == 0)
+			pitchFlag = true;
+		if (std::strcmp(argv[i], "-wanted") == 0 && i + 1 < argc) {
+			wantedLevel = std::atoi(argv[i + 1]);
+			if (wantedLevel < 0)
+				wantedLevel = 0;
+			if (wantedLevel > WANTED_LEVEL_CEILING)
+				wantedLevel = WANTED_LEVEL_CEILING;
+			++i;
+		}
 		if (std::strcmp(argv[i], "-extras") == 0 && i + 1 < argc) {
 			int a = -1, b = -1;
 			if (std::sscanf(argv[i + 1], "%d,%d", &a, &b) >= 1) {
@@ -227,6 +288,28 @@ int main(int argc, char **argv) {
 		shootFlag = true;
 		std::printf("-hurt implies -shoot, so the damage has a muzzle flash\n");
 	}
+
+	// -pitch is the trail test. A flat shot is the one thing an observer's own
+	// engine would have produced anyway - CWeapon::FireInstantHit copies
+	// target.z from source.z for every ped that is not the local player - so a
+	// flat ghost cannot tell a working direction from a missing one. Sweeping
+	// the pitch makes the answer visible from across the street: the trails
+	// rake up and down, or they lie flat and the wire is not being used.
+	if (pitchFlag && !shootFlag) {
+		shootFlag = true;
+		std::printf("-pitch implies -shoot, since it is the shots it tilts\n");
+	}
+	if (pitchFlag)
+		std::printf("-pitch: sweeping the shot direction %.0f degrees up and down, so "
+		            "a flat trail on screen means the direction is not arriving\n",
+		            SHOT_PITCH_DEG);
+	if (wantedLevel > 0)
+		std::printf("-wanted %d: the ghost claims %d star%s. With the default "
+		            "rule, get into its car and yours should climb to %d; with "
+		            "the session set to shared, they should climb wherever you "
+		            "are standing\n",
+		            wantedLevel, wantedLevel, wantedLevel == 1 ? "" : "s",
+		            wantedLevel);
 
 	WallClock::Start();
 
@@ -320,6 +403,17 @@ int main(int argc, char **argv) {
 	uint32_t       nextBlowUpMs  = 0;
 	uint32_t       reclaimAtMs   = 0;   // 0 = not waiting to reclaim
 	bool           carIsWrecked  = false;
+
+	// -limbs. One pedestrian at a time: claimed, named by the server, taken
+	// apart one limb per step, then despawned and claimed again. The order is
+	// the five nodes InflictDamage passes, head first.
+	constexpr uint8_t  LIMB_ORDER[] = {2, 3, 4, 7, 8};
+	constexpr uint32_t LIMB_STEP_MS = 3000;
+	constexpr uint16_t LIMB_PED_MODEL = 7;   // MI_MALE01
+	uint32_t limbTempId   = 0;               // the claim in flight, 0 = none
+	uint16_t limbPedNetId = INVALID_NETID;
+	size_t   limbNext     = 0;
+	uint32_t limbNextMs   = 0;
 
 	uint8_t  targetId  = 0xFF;
 	uint16_t targetNetId = INVALID_NETID;
@@ -430,12 +524,63 @@ int main(int argc, char **argv) {
 					targetId   = 0xFF;
 					haveTarget = false;
 				}
+			} else if (const S_PedSpawn *ps = msg.as<S_PedSpawn>()) {
+				if (limbTempId != 0 && ps->ownerPlayerId == myId &&
+				    ps->tempId == limbTempId) {
+					limbPedNetId = ps->netId;
+					limbTempId   = 0;
+					limbNext     = 0;
+					// A moment for the player's machine to stream the model and
+					// build the replica before the first limb arrives for it.
+					limbNextMs   = WallClock::NowMs() + LIMB_STEP_MS;
+					std::printf("our pedestrian is net %u\n", limbPedNetId);
+				}
 			} else if (const S_EnterVehicle *e = msg.as<S_EnterVehicle>()) {
 				if (e->playerId == myId && myVehicleNetId == INVALID_NETID) {
 					myVehicleNetId = e->body.netId;
 					nextSwitchMs   = WallClock::NowMs() + IN_MS;
 					nextBlowUpMs   = WallClock::NowMs() + DRIVE_MS;
 					std::printf("our car is net %u\n", myVehicleNetId);
+				}
+			}
+		}
+
+		// -limbs: claim a pedestrian in front of the player, then take it apart.
+		if (limbsFlag && client.IsConnected() && myId != 0xFF && haveTarget) {
+			const uint32_t now = WallClock::NowMs();
+			if (limbPedNetId == INVALID_NETID && limbTempId == 0) {
+				static uint32_t nextTemp = 1;
+				C_PedSpawn claim{};
+				InitHeader(claim, now);
+				claim.tempId       = nextTemp++;
+				claim.body.modelId = LIMB_PED_MODEL;
+				claim.body.pedType = 4;   // PEDTYPE_CIVMALE
+				claim.body.pos.x   = target.x + 3.0f * -std::sin(targetHeading);
+				claim.body.pos.y   = target.y + 3.0f * std::cos(targetHeading);
+				claim.body.pos.z   = target.z;
+				// Facing the player, so the limbs that fly go past them.
+				claim.body.heading = targetHeading + 3.1415927f;
+				client.Send(claim, CH_EVENT);
+				limbTempId = claim.tempId;
+				std::printf("claimed a pedestrian in front of the player\n");
+			} else if (limbPedNetId != INVALID_NETID && now >= limbNextMs) {
+				if (limbNext < sizeof(LIMB_ORDER)) {
+					C_PedBodyPart off{};
+					InitHeader(off, now);
+					off.body.netId     = limbPedNetId;
+					off.body.node      = LIMB_ORDER[limbNext];
+					off.body.direction = static_cast<int8_t>(limbNext % 4);
+					client.Send(off, CH_EVENT);
+					std::printf("took node %u off ped %u\n", off.body.node, limbPedNetId);
+					++limbNext;
+					limbNextMs = now + LIMB_STEP_MS;
+				} else {
+					C_PedDespawn gone{};
+					InitHeader(gone, now);
+					gone.netId = limbPedNetId;
+					client.Send(gone, CH_EVENT);
+					std::printf("despawned ped %u; claiming another\n", limbPedNetId);
+					limbPedNetId = INVALID_NETID;
 				}
 			}
 		}
@@ -533,6 +678,26 @@ int main(int argc, char **argv) {
 			if (burnFlag && std::fmod(t, 8.0f) < 4.0f)
 				pkt.body.flags |= PF_ON_FIRE;
 
+			// -wanted N: claim N stars, earned rather than borrowed.
+			//
+			// The only way to look at docs/wanted.md from a live game with
+			// one real player in it. A real client's level comes out of its
+			// own CWanted, so nothing short of a second machine committing a
+			// crime can produce one - and the thing worth watching is the
+			// receiving end: whether getting into the ghost's car gives you
+			// its stars, and whether the police that then turn up are your
+			// own engine's.
+			//
+			// Never borrowed. A ghost claiming a borrowed level would be
+			// claiming there is a third player it took the level from, and in
+			// the shared rule that is exactly the value the receiver is meant
+			// to ignore - so the one flag that would make this mode do
+			// nothing is the one it must not set.
+			if (wantedLevel > 0)
+				pkt.body.flags = FlagsWithWanted(pkt.body.flags,
+				                                 static_cast<uint8_t>(wantedLevel),
+				                                 /*borrowed=*/false);
+
 			client.Send(pkt, CH_SNAPSHOT);
 
 			// ---- combat ----------------------------------------------------
@@ -569,8 +734,22 @@ int main(int argc, char **argv) {
 				// Roughly where a held gun sits: chest height, at the ped.
 				shot.body.origin = Vec3{pkt.body.pos.x, pkt.body.pos.y,
 				                        pkt.body.pos.z + 0.6f};
-				shot.body.dir    = Vec3{-std::sin(pkt.body.aimYaw),
-				                        std::cos(pkt.body.aimYaw), 0.0f};
+				// Level unless -pitch, in which case it rakes up and down. The
+				// tilt is the only thing in a ghost's shot that an observer
+				// could not have invented for itself, so it is the only thing
+				// that proves the direction crossed the wire.
+				float pitch = 0.0f;
+				if (pitchFlag) {
+					const float phase =
+					    static_cast<float>(nowMs % SHOT_PITCH_PERIOD) /
+					    static_cast<float>(SHOT_PITCH_PERIOD);
+					pitch = SHOT_PITCH_DEG * 0.0174532925f *
+					        std::sin(phase * 6.2831853f);
+				}
+				const float flat = std::cos(pitch);
+				shot.body.dir    = Vec3{-std::sin(pkt.body.aimYaw) * flat,
+				                        std::cos(pkt.body.aimYaw) * flat,
+				                        std::sin(pitch)};
 				shot.body.speed  = 0.0f;   // instant hit: no projectile
 				client.Send(shot, CH_EVENT);
 

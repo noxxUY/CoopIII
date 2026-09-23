@@ -505,13 +505,98 @@ asking "is that character shooting" should get the same answer everywhere, and
 for no other reason. What makes a remote player look like they are shooting is
 §1.9.4.
 
-#### 1.9.6 Ammunition is not synced
+#### 1.9.6 Ammunition travels, behind a server switch
 
-`CPed::GiveWeapon` gives a remote ped a large fixed amount and the replay resets
-that slot to `WEAPONSTATE_READY` before each shot. A remote player's clip is not
-a thing anyone can see; what it *can* do is make `CWeapon::Fire` refuse
-(`if (m_nAmmoInClip <= 0) return false`) and silently stop rendering their
-shots. Syncing the real count would buy nothing and add a failure mode.
+**This section used to say the opposite.** It said a remote player's clip is
+not a thing anyone can see, so syncing it "would buy nothing and add a failure
+mode". The first half is wrong and the second half is the thing to design
+around rather than a reason not to.
+
+What was wrong: `CPed::GiveWeapon` handed every remote ped an invented 1000
+rounds, so nobody ever watched anybody else run dry, nobody ever saw a reload,
+and the HUD-level truth of a firefight - who is nearly out, who has to back
+off - was a number CoopIII made up. It is visible in the only way that matters
+in co-op, which is that you cannot tell when the person covering you is about
+to stop covering you.
+
+**Which of the two numbers.** `CWeapon` has both, and they do different jobs.
+Everything here is read out of the retail 1.0 binary, not out of re3:
+
+| | |
+|---|---|
+| `m_nAmmoInClip` (`+0x08`) | **Gates firing.** `CWeapon::Fire` opens `cmp dword [edi+8],0 / jg` at `0x0055C4A2` and returns false on an empty clip, before anything is drawn. It decrements it at `0x0055C7D1`. |
+| `m_nAmmoTotal` (`+0x0C`) | **What the game reports.** `CHud::Draw` loads it at `0x00506052` and prints either `"%d"` or `"%d-%d"` depending on the weapon's `m_nAmountofAmmunition` (`CWeaponInfo +0x10`, tested `<= 1 \|\| >= 1000` at `0x00506063`/`0x0050606C`). `GET_AMMO_IN_CHAR_WEAPON` (opcode 1050, handler `0x00588F22`) answers with `m_nAmmoTotal` and nothing else. `CWeapon::Fire` decrements it too, at `0x0055C7E9`, for anyone whose total is under 25000 or who is the local player. |
+
+So both go on the wire. Sending one and deriving the other is a guess:
+`CWeapon::Reload` (`0x005639D0`) fills the clip out of the total, capped at
+`m_nAmountofAmmunition`, on a `CTimer` deadline that means nothing on another
+machine.
+
+**Where each one rides.** The weapon in the player's hands is the one that
+changes every time a trigger is pulled, so its two counts are six more bytes
+on `PlayerStateBody` (65 to 71). At 25 Hz across eight players that is about
+1 KB/s for the whole session, which §2.3's budget has room for, and a dropped
+packet is corrected 40 ms later - the same argument `PF_ON_FIRE` makes.
+
+The other twelve slots change when somebody walks over a pickup or a mission
+grants a weapon, which is minutes apart. They go out on `C_PlayerAmmo` /
+`S_PlayerAmmo` (0xB0/0xB1), one slot per packet, reliable, **on change only** -
+the shape `C_PlayerModel` settled on. Each one carries an `AMMO_SLOT_OWNED`
+bit, because "I do not have this weapon" and "I have it with nothing in it"
+are different facts and the engine keeps them apart the same way: `HasWeapon`
+is `m_weapons[w].m_eWeaponType == w`, the comparison `CPed::GiveWeapon` makes
+at `0x004CF9C9`. Collapse the two and an observer calls `CPed::GiveWeapon`
+thirteen times and hands every remote player the whole armoury, empty. Putting all thirteen in the snapshot
+would be 91 bytes per player per tick, more than the entire rest of the
+snapshot, to restate numbers nobody touched. Putting the *held* slot on the
+reliable channel instead would be ten ordered packets a second out of an Uzi,
+queued in front of the shots and the damage that actually need the ordering.
+
+The held slot is deliberately never sent as a `C_PlayerAmmo`. Both ends mirror
+the snapshot's count into their per-slot table, so the table is complete
+whichever hand the number arrived in, and a weapon switch costs no packet.
+
+**Who wins, and the trap.** An observer's copy of somebody else's ammunition
+has three writers and only one of them is entitled to it:
+
+1. the wire, which is the owner's own engine;
+2. `CWeapon::Fire`, every time §1.9.2 replays a shot - it spends a round out
+   of the observer's copy, from a magazine the observer does not own;
+3. `CWeapon::Update`, which `CCivilianPed::ProcessControl` runs on the held
+   slot every frame, reloading on its own `CTimer` schedule.
+
+The wire wins. The owner is authoritative for their own ped everywhere else in
+CoopIII (§2.1, §1.10) and there is no reason for ammunition to be the
+exception. Concretely: the held slot is rewritten from the newest snapshot
+every time a pose is applied, so nothing local can accumulate for more than
+40 ms, and a replayed shot puts back exactly what it spent.
+
+**And a replayed shot must never be refused.** This is the trap, and it is
+worse than the bug ammo sync exists to fix because it is silent. `CWeapon::Fire`
+returns false on an empty clip *and* while the slot is `WEAPONSTATE_RELOADING`
+or `WEAPONSTATE_OUT_OF_AMMO` - and its own tail, at `0x0055C80D` onward, is
+what puts the slot into those states. If the observer's copy were allowed to
+disagree with the owner, remote players would stop shooting on your screen
+while they were still shooting on theirs, and only in a long firefight. So the
+slot is forced into a state `Fire` cannot refuse for the length of that one
+call, and the owner's number is written back immediately afterwards.
+
+`WEAPONSTATE_RELOADING` is not synced and should not be: it is a deadline in
+`CTimer::GetTimeInMilliseconds`, a clock that pauses and gets rescaled (§1.2).
+The observer derives the state instead - nothing behind the gun is
+`WEAPONSTATE_OUT_OF_AMMO`, anything else is `WEAPONSTATE_READY`.
+
+**The switch.** `SESSION_AMMO_SYNC`, bit 1 of `S_Welcome.flags`, next to
+friendly fire and enforced the same way in both places: the server refuses to
+relay a `C_PlayerAmmo` with the bit clear, and a client with the bit clear
+ignores the snapshot's two ammo fields and goes on handing a remote ped the
+fixed amount. Off is the default and off is *exactly* the old behaviour, not a
+degraded version of it.
+
+It is **not a shared inventory**, and that distinction is the whole request:
+two players carrying different weapons is the normal case and nothing here
+changes it. What the switch decides is whether each player's own counts are
+honest on everybody else's screen.
 
 #### 1.9.7 The direction goes on the wire, and the observer aims with it
 
@@ -552,15 +637,17 @@ damage, broken one layer down.
 
 So:
 
-**Sampling.** `dir` is now the unit direction of the line the shooter's own
-engine traced, read from `CWeapon::ProcessLineOfSight` (`0x00564C00`) while the
-local player's `CWeapon::Fire` is running. That function is a thunk with seven
-call sites and all seven are weapon fire, so it is the one place every
-instant-hit path states its line — whichever branch produced it, the camera's,
-a lock-on's or the hand bone's. Nothing about the branching has to be
-re-implemented to read it. A shotgun traces five rays 7.5° apart and symmetric
-about the aim; the unit directions are averaged, so `dir` is the middle of the
-cone.
+**Sampling.** `dir` is the unit direction of the streak the shooter's own
+screen drew, read from `CBulletTraces::AddTrace` (`0x00518E90`) while the local
+player's `CWeapon::Fire` is running. A shotgun draws one per pellet, and the
+unit directions are averaged, so `dir` is the middle of the cone rather than
+whichever pellet flew furthest.
+
+It was, for one round, the direction of the line the engine *traced*, read from
+`CWeapon::ProcessLineOfSight` (`0x00564C00`). That is still the fallback, and
+for a weapon that traces without drawing — `CWeapon::FireM16_1stPerson` — it is
+the only answer there is. But it is the wrong one whenever both exist, and
+§1.9.7.1 is why.
 
 **Applying.** The observer turns the engine's own proposal onto that line
 inside `CWeapon::DoDoomAiming` (`0x00562EB0`), which is handed `target` as a
@@ -584,13 +671,11 @@ interoperates, at the old quality.
 
 **What is left over, honestly.**
 
-- *The 3rd-person mouse camera's offset.* The shooter's own ray starts on the
-  camera ray at the point nearest the muzzle
-  (`CCamera::Find3rdPersonCamTargetVector` does `source += Dot(pos - source,
-  target) * target`), while the trail is drawn from the muzzle. The two are a
-  few tens of centimetres apart laterally and converge with distance, so the
-  observer's reconstruction of the segment is right at the near end and can
-  differ by a few centimetres at the far end of a long shot. Sub-degree.
+- ~~*The 3rd-person mouse camera's offset.*~~ This entry used to say the ray
+  and the trail "converge with distance" and are "sub-degree" apart. They do
+  not converge: they are **parallel**, so the gap is the same at every
+  distance, and it is the gap that made the observer's line the wrong line.
+  §1.9.7.1 is the correction and the fix.
 - *Interpolation.* The origin is on the wire, so a stale ped no longer moves
   the trail at all. What is still stale is the ped the trail comes *out of*:
   the muzzle flash particles are placed at the wire origin, but the hand
@@ -619,6 +704,137 @@ interoperates, at the old quality.
   `ProcessLineOfSight` themselves, so if the pointer arriving at
   `DoBulletImpact` is not the `point2` the engine just traced, nothing wrote
   it. Strictly cosmetic — the ray had already been traced either way.
+
+#### 1.9.7.1 The ray and the streak are two different lines
+
+Reported again after §1.9.7 shipped, and the second report rules out the first
+explanation: *"las balas si van a donde el remote apunta y la animacion de
+apuntar se ve bien, pero el otro jugador ve la trayectoria de las balas yendo a
+otro lugar."* The bullets land where they should. The **drawn line** does not.
+
+That is not the aim-pitch limitation, because the bullets arrive. It is this:
+**§1.9.7 put the direction of the ray on the wire and the position of the
+muzzle beside it, and on the branch that matters those two belong to different
+lines.**
+
+`CWeapon::FireInstantHit`'s 3rd-person mouse camera branch — the branch a
+mouse-aiming player is on for every single shot — does not trace from the
+barrel. It asks `CCamera::Find3rdPersonCamTargetVector` for a `src` and a
+`trgt`, and that function's mouse arm ends `source += Dot(pos - source, target)
+* target`: the muzzle projected onto the camera's own axis. Then:
+
+| what | which point | where in the retail binary |
+|---|---|---|
+| the ray that is traced | `src`, on the camera axis | `ProcessLineOfSight` at `0x0055D907`, point1 is `[esp+0E8h]` |
+| the streak that is drawn | `source`, the muzzle | `DoBulletImpact` at `0x0055F73A`, source is `[esp+90h]`, copied from `fireSource` at `0x0055D316` and never written again |
+
+The two lines are **parallel**, offset by however far the hand sits off the
+camera axis — tens of centimetres, and the same at every distance, because
+parallel lines do not converge. An observer handed the ray's direction and told
+to fire from the muzzle draws neither of them: it draws a third line through
+the muzzle parallel to the shooter's ray, which at a close impact is several
+degrees off the streak the shooter saw.
+
+**The fix is to sample the thing the report is about.** `dir` now comes from
+`CBulletTraces::AddTrace` (`0x00518E90`) — the one function in the engine that
+is handed the two points of the streak, and the only place all six trail
+callers funnel through (two in `DoBulletImpact`, two in `FireShotgun`, two in
+`FireInstantHitFromCar`). Its near end *is* the muzzle, which is what the wire
+already carries as `origin`, so origin and direction finally describe the same
+segment and the observer's replay reconstructs it by construction rather than
+by luck.
+
+The sampler runs after the `DoBulletImpact` repair above, so what it measures is
+the corrected segment and not the uninitialised one.
+
+`combat.h`'s `ChooseShotDirection` is the whole decision — trail, then ray,
+then body — and `clienttest` pins it, including that a trail and a ray from the
+same trigger pull really are different lines.
+
+**The client says the number now.** Nobody had ever measured the gap; both
+rounds argued about it from the source. The first shot of a session logs where
+the ray started, where the streak started, how far apart they are and how many
+degrees lie between the two directions. An observer logs the segment it drew
+for the first remote shot against the direction that arrived. Two lines in two
+logs, and the comparison stops needing two people looking at two screens.
+
+**Still no wire change, `PROTOCOL_VERSION` stays 16.** `ShotBody` is untouched;
+only what gets written into `dir` changed, and an older client interoperates at
+the old quality.
+
+**What a live run measured, and what it did not.** One game, one server, and
+`ghost -shoot -pitch` — which rakes a remote player's shots 40° up and down,
+because a flat shot is the one thing an observer's own engine would have
+produced for itself and so proves nothing:
+
+```
+combat: hooked CBulletTraces::AddTrace at 0x00518E90
+combat: pointed our first replayed shot along its owner's own line instead of
+        along our copy of their ped. The two were 12.4 degrees apart - their
+        line is (-0.97 -0.15 0.21), their ped here is facing (-0.99 -0.11 0.00)
+combat: drew a remote player's first bullet trail from (882.34 -305.73 9.32)
+        to (855.69 -309.80 15.13), along the (-0.97 -0.15 0.21) their own
+        machine sent
+```
+
+The drawn segment is `(-26.65, -4.07, 5.81)`, which normalises to
+`(-0.966, -0.148, 0.211)`, and its near end is the wire origin to the
+centimetre. So the **applying** half is exact: given a `dir`, the observer
+draws that `dir`, out of the wire's origin, pitch and all.
+
+The **sampling** half — the change this section is about — was not run in the
+game. It only happens when the local player pulls a trigger, the test save
+carries no weapon, and synthetic keyboard input cannot reach GTA III's cheat
+path (AgentPad writes `CPad` state; `CPad::AddToPCCheatString` is fed by
+`RsKeyboardEventHandler`, which is a different door). It is covered by
+`clienttest` and by the disassembly above, and the first shot of the next real
+session will print its own measurement.
+
+#### 1.9.7.2 It *was* partly the resolution, on the shooter's own screen
+
+The first report guessed the screen resolution and §1.9.7 ruled it out. That
+was right about the trail and wrong as a general answer, and the retail binary
+is unambiguous about the part that is true.
+
+`Find3rdPersonCamTargetVector` turns the crosshair's screen fraction into two
+angles. The vertical one is `(0.5 - multY) * 1.8 * 0.5 * FOV`. The horizontal
+one is the same **times an aspect ratio** (`fmul st,st(4)` at `0x0046B646`,
+absent from the vertical arm). And that aspect ratio is not the shape of the
+window: it is `1.777778` or `1.333333`, chosen by a preference byte at
+`0x0095CD23` — the widescreen toggle — at `0x0046B611`.
+
+The crosshair sprite, meanwhile, is drawn at a fixed fraction of the screen,
+and in retail that fraction is `0.53` across, not `0.5`. Off centre, which is
+the only reason the factor bites at all.
+
+So with the widescreen toggle not matching what is actually being rendered,
+every mouse-aimed shot leaves the barrel about **0.8° to one side of the
+crosshair**, always the same side: `(0.53 - 0.5) · 1.8 · 0.5 · FOV · (16/9 −
+4/3)`, which at a 70° FOV is 15 cm at ten metres. That is "el que dispara ve el
+trail de las balas hacia un lado", and it is world space, so every screen draws
+the same wrong line and no amount of netcode moves it.
+
+**Measured on this install, not assumed.** The Widescreen Fix in
+`modloader/_ESSENTIALS` is exactly the kind of mod that would already have
+fixed this, so the client reads the selection site at startup and compares it
+against retail's bytes. It said:
+
+```
+combat: the game still aims the retail way - a mouse-aimed shot's horizontal
+        angle is scaled by 1.7778 or 1.3333 depending on the widescreen toggle
+        (currently on), not by the shape of the window.
+```
+
+Nothing has patched it, the toggle is **on** (so the game aims as if the screen
+were 16:9), and the window that run reported in its own title was **958×1000** —
+an aspect of 0.96. `(0.53 − 0.5) · 1.8 · 0.5 · 70 · (1.778 − 0.958)` is about
+**1.5°**, roughly 26 cm to one side at ten metres and 80 cm at thirty.
+
+So noxx's first guess was right about something real, just not about the thing
+he was looking at: his shots leave the barrel to one side of his own crosshair,
+in single player, because the game aims for a screen shape he is not using.
+
+Retail's, not ours. Worth knowing before anybody spends another round on it.
 
 ### 1.10 Damage, death and respawn: the attacker decides the hit, the victim decides the health
 
@@ -1167,7 +1383,865 @@ the third time, so it is a test rather than a comment.
 so a late joiner's backfilled car has them too. `Session::Vehicle` carries them
 between the claim and the backfill.
 
+### 1.13 A remote ped's AI: two fields, not a state threshold and not a skipped frame
+
+This answers §6 open question 1, which had been open since this document was
+written. It was measured against `gta3.exe` on 2026-09-22; `addresses.h`
+carries the instructions, under `what CPed::ProcessControl actually does`.
+
+**The answer is neither of the two options §6 named, and the reason is the
+same for both: they are aimed at the wrong thing.** The AI that would make a
+remote player wander off does not live in "`ProcessControl` running". It lives
+in two fields, `m_nPedState` and `m_objective`, and CoopIII has been holding
+both in the harmless position since the seating work without ever saying so.
+So there is nothing to build, and there is something to write down, because
+the next person to read `Ped.h:260` will reach for the same two wrong options.
+
+#### 1.13.1 `PED_STATES_NO_AI` is not what its name says
+
+`PED_STATES_NO_AI` is 34, confirmed from the retail image rather than from
+re3's enum: `CPed::ProcessControl`'s state switch is
+
+```
+004CB11B  mov eax,[ebx+224h]      m_nPedState
+004CB127  dec eax
+004CB128  cmp eax,36h             1..55 are in the table
+004CB12D  ja  004CB9F0            the default arm
+004CB133  jmp [eax*4 + 005F8778h]
+```
+
+and reading that 55-entry table off the file confirms every value in re3's
+`ePedState` against retail, `PED_STATES_NO_AI` included.
+
+Three things follow, and each one on its own sinks the idea:
+
+1. **State 34's own table entry is the default arm**, and so are twenty of the
+   other fifty-four. The default arm is `fstp st(0) / jmp 004CB784`, and
+   `004CB784` is `call [vtable+48h]`, i.e. `SetMoveAnim`. Taking it skips the
+   per-state function and *nothing else*. Everything before the switch —
+   the alpha fade, `BuildPedLists`, `ProcessBuoyancy`, the collision-damage
+   block, `CPhysical::ProcessControl`, `UpdatePosition`, `PlayFootSteps`,
+   `ProcessObjective`, `AimGun` — and everything after it still runs.
+2. **The name describes a bound, not a switch.** re3 uses `PED_STATES_NO_AI`
+   in exactly three places and all three are predicates:
+   `IsPedInControl()` (`m_nPedState <= 34`), `CanPedReturnToState()`, and the
+   `m_fHealth <= 1.0f` auto-`SetDie` in `ProcessControl`. It means "above here
+   the ped is being driven by a sequence rather than by its own head", which
+   is a fact *about* the states, not a gate that turns anything off.
+3. **Crossing it breaks something that works.** `IsPedInControl` is
+   `CFireManager::StartFire`'s gate for a ped (`0x004795C2`, §1.10.7), so a
+   ped parked at 35 or above can never be set on fire — the burning remote
+   player, confirmed in game, would stop working the day this shipped.
+   Parking at 34 exactly keeps the fire and buys nothing, because 34 already
+   means the default arm.
+
+For completeness, two neighbouring thresholds that are *not* affected, because
+guessing about them is how this idea would come back: `CPed::SetObjective`
+gates on `DyingOrDead()` only, so seating would survive; and `IsPedShootable`
+(`<= PED_STATES_NO_ST`, 40) is inlined at three AI target-selection sites and
+is not in the damage path at all, so damage would survive. The fire is the one
+that dies.
+
+#### 1.13.2 Skipping `ProcessControl` costs more than the AI does
+
+The other option, refusing `CCivilianPed::ProcessControl` for a ped CoopIII
+owns, is implementable — every remote player is a `CCivilianPed`, and
+`RemotePlayerForPed` already answers "is this one ours" — and it would work.
+It would also take away the following, all of which a remote player currently
+gets for free and would have to be reimplemented by hand:
+
+| What goes with it | Why it matters |
+|---|---|
+| `CVisibilityPlugins::SetClumpAlpha` at `0x004C8981` | The **only** thing in the engine that raises a ped's clump alpha. A ped that never runs `ProcessControl` is never drawn. This is the same fact the render block in `addresses.h` reaches from the other end, and it is how the second invisible ped was found. |
+| `CPhysical::ProcessControl` (`0x00495F10`) | Gravity and collision response. Snapshots arrive at 25 Hz and frames at 60; between them this is what keeps a remote player standing on the ground instead of hanging in the air at the last sample. |
+| `Die()` in the `PED_DIE` arm, and the `SetDead` else arm | A corpse's death animation is played out here and the transition to `PED_DEAD` happens here. Skip it and a killed remote player stays mid-fall forever. M4, confirmed in game. |
+| `AimGun` (`0x004C6AA0`) | §1.8.3's whole design: CoopIII sets `bIsAimingGun` and lets the engine rotate the torso. No `ProcessControl`, no aim. |
+| `CalculateNewOrientation`, `UpdatePosition`, `PlayFootSteps`, `ServiceTalking` | Facing eased toward `m_fRotationDest`, the animation's own translation applied, footstep sounds and dust, voice. |
+
+Only two of those could be replaced cheaply (the alpha write is two known
+calls). The rest is the engine doing a remote player's presentation, and
+CoopIII would be trading a small AI problem for a large reimplementation.
+
+`CWeapon::Update`, which would otherwise be on that list, is not: `combat.cpp`
+already forces a remote ped's weapon slot to `WEAPONSTATE_READY` with a full
+clip before every replayed shot (§1.9.6), so the weapon state machine is
+already not the engine's business.
+
+Two things that *look* like they need `ProcessControl` and do not, both worth
+knowing because they have been written down wrongly in this repo:
+
+- **A seated ped is positioned by `CWorld::Process`, not by
+  `CPed::ProcessControl`.** The fifth walk over `ms_listMovingEntityPtrs`
+  calls `SetPedPositionInCar()` on anything with `bInVehicle` set, from
+  outside `ProcessControl` entirely.
+- **Animations are advanced by `CWorld::Process`'s first walk**
+  (`RpAnimBlendClumpUpdateAnimations`), also outside it.
+
+#### 1.13.3 What the AI actually is, and where the off switch already is
+
+`CPed::ProcessControl` contains exactly two places where a ped decides
+something for itself, and both are already disarmed on a remote player:
+
+**`ProcessObjective` (`0x004D94E0`)** is skipped whole by its own guard:
+
+```
+004D9527  cmp dword [ebx+164h], 0     m_objective != OBJECTIVE_NONE
+004D952E  je  004D9544                ...or the entire body is skipped
+```
+
+`UnseatRemotePed` writes `OBJECTIVE_NONE` into that dword, and the comment
+beside it already explains why — a `CCivilianPed` left holding
+`ENTER_CAR_AS_DRIVER` walks back to the car. That write is the off switch. It
+costs one dword and it holds whatever the ped's state is.
+
+**The state switch** is disarmed by `m_nPedState` being `PED_IDLE`, which is
+where `CCivilianPed`'s constructor leaves it and where `UnseatRemotePed` puts
+it back. `PED_IDLE`'s arm is `CPed::Idle` (`0x004D0690`), and `Idle` cannot
+change the ped's state: its whole repertoire is fading one animation in or
+out and writing `m_nMoveState`. Nothing a remote player's ped runs today can
+take it to `PED_WANDER_PATH`, `PED_FLEE_*`, `PED_SEEK_*` or `PED_ATTACK`,
+because nothing calls `SetWanderPath` or `SetObjective` on it and
+`bRespondsToThreats` is cleared at spawn.
+
+So the "remote players wander off on their own" this document feared has not
+been possible since the seating work landed, and the feature that closed it
+was written for a different reason. **That is the answer: keep both fields,
+and say in one place that keeping them is load-bearing rather than tidy.**
+
+#### 1.13.4 The one thing this did find: the move-state mechanism has never worked
+
+`CPed::Idle`'s non-still arm is:
+
+```
+004D077E  cmp  dword [ebx+22Ch], 1     m_nMoveState == PEDMOVE_STILL
+004D0789  je   004D07C1               (the still arm)
+004D07A6  call 004D48E0                CPed::IsPlayer()
+004D07AD  jne  004D0949                ...a player is left alone
+004D07B5  push 1 / call 004C5A30       SetMoveState(PEDMOVE_STILL)
+```
+
+`Idle` runs from the switch, and `SetMoveAnim` runs *after* the switch. So on
+a `CCivilianPed` — which every remote player is — the move state CoopIII
+writes from `PreFrame` is overwritten with `PEDMOVE_STILL` before
+`SetMoveAnim` ever reads it, and `SetMoveAnim`'s first line is
+`if (m_nStoredMoveState == m_nMoveState) return`.
+
+§1.8.3 and the M1 notes say the locomotion animation is driven "by writing
+`m_nMoveState` and letting `CPed::SetMoveAnim` pick". **That has never once
+happened.** Remote players walk because `ApplyAnimation` blends the wire's
+`animId` directly through `CAnimManager::BlendAnimation`, and that is the only
+thing that has ever made them walk. The `m_nMoveState` write is kept — other
+things read it, and it is what a co-op mission script would see — but it is
+not the mechanism and nothing may be built on the belief that it is.
+
+Worth noticing for its own sake: that `if (!IsPlayer())` in `Idle` is the same
+shape as `CFireManager::StartFire`'s, which §1.10.7 already copies. GTA III
+has more than one of these, and they are the engine agreeing that some peds'
+movement is not its to decide. Where one exists, take its branch rather than
+inventing a mechanism.
+
+#### 1.13.5 The residual, which is a short list and not an AI
+
+What is left is the engine acting *on* a remote ped rather than deciding for
+it. Each has its own answer and none of them wants a general suppressor:
+
+| Thing | Where | State today |
+|---|---|---|
+| `SetInTheAir` blends `ANIM_STD_FALL_GLIDE` (id `0x98`) when `CheckIfInTheAir` finds no ground | `0x004D0CA0` | Cosmetic and self-correcting; one of the two engine sources of clump animations. `EnforceAnimLimit` keeps it survivable. |
+| `Idle` blends `ANIM_STD_IDLE_BIGGUN` (id `0x0A`) on a 3000-8500 ms random timer while still | `0x004D0690` | The other engine source. Same seatbelt. |
+| `m_fHealth <= 1.0f && m_nPedState <= 34` → `SetDie(ANIM_STD_KO_FRONT)` | inside `ProcessControl` | An observer deciding a death. Harmless today because the owner announces its own death (§1.10.4) and the observer's `SetDie` reaches the same place, but it is an observer deciding, and §1.10 says observers do not. |
+| `ProcessBuoyancy` → drowning | inside `ProcessControl` | Known, §1.10.2. `WEAPONTYPE_DROWNING` has its own arm in `InflictDamage` with no proof flag; the `InflictDamage` detour is what actually stops it. |
+| `SetWaitState(WAITSTATE_STUCK)` at `m_panicCounter == 50` | inside `ProcessControl` | Needs a colliding ped that is `IsPedInControl`. Adds an animation. Not seen. |
+
+**The anim pile-up** reported in a live session (`9 animations ... dropped 1`,
+then 10, then 8) is now accounted for by name rather than by "the engine adds
+its own without asking": `ApplyAnimGroup` up to five, `BlendRemoteAnim` one,
+`ApplyOverlay` one held deliberately, `SetMoveAnim`'s single idle blend at
+spawn, plus `IDLE_BIGGUN` and `FALL_GLIDE`. `EnforceAnimLimit` stays; it is
+not a seatbelt for something unknown any more, and the twelve-slot bound from
+`RpAnimBlendClumpUpdateAnimations` is what makes it necessary either way.
+
+#### 1.13.6 What ambient NPC sync can rely on
+
+`docs/population.md` §2.4 is blocked on this question, so, plainly: **a
+replicated pedestrian does not need a new mechanism, and there is no ini
+switch to wait for.** It needs the same two fields a remote player already
+holds, set at creation and kept:
+
+- `m_nPedState = PED_IDLE` (1). Do not put a replicated ped on a wander path.
+  `CPopulation::AddPed`'s ambient route calls `SetWanderPath`, and that call —
+  not `ProcessControl` — is what makes a pedestrian walk somewhere of its own
+  choosing. A replicated ped is created the `CREATE_CHAR` way, as a
+  `MISSION_CHAR`, exactly as `SpawnRemote` does.
+- `m_objective = OBJECTIVE_NONE` (0), with `m_prevObjective` and
+  `m_carInObjective` cleared alongside it, the way `UnseatRemotePed` does.
+- `bRespondsToThreats = false` and `bAllowMedicsToReviveMe = false` at spawn,
+  already part of `SpawnRemote`'s registration.
+
+With those, `ProcessControl` runs, the ped is drawn, falls to the ground and
+plays whatever animation the wire names, and decides nothing. What it will
+still do is the §1.13.5 list, and a replicated pedestrian gets those for the
+same price a remote player does. `PROTOCOL_VERSION` does not move for any of
+this.
+
 ---
+
+### 1.13 Pickups: the client detects, the server arbitrates, the engine awards
+
+Protocol **11**. `docs/pickups.md` is the whole investigation and design; this
+is the wire.
+
+**There is no spawn packet, and that is the finding rather than an omission.**
+CoopIII does not suppress the main script on clients (M5 Tier 2, not built), so
+every machine runs `main.scm` and creates all 448 script pickups itself, from
+literal coordinates, through a `CPickups::GenerateNewOne` that never touches
+the RNG. The worlds already agree. What was missing was never the pickup, it
+was the exclusivity: two players standing on the same shotgun and both engines
+awarding it.
+
+**There is no snapshot either.** A pickup is not continuous state, it is a
+small number of discrete facts - taken, denied, live again - and putting "who
+got the shotgun" on the unreliable channel is the mistake §2.8 already made
+once with `driverPlayerId`.
+
+| opcode | name | to | body |
+|---|---|---|---|
+| `0x80` | `C_PickupClaim` | server | `PickupIdent` (16) |
+| `0x81` | `S_PickupTaken` | everyone **but** the collector | `uint8 playerId` + `PickupIdent` |
+| `0x82` | `S_PickupDenied` | the loser alone | `PickupIdent` |
+| `0x83` | `C_PickupRelease` | server | `PickupIdent` |
+| `0x84` | `S_PickupGrant` | the claimant alone | `PickupIdent` |
+| `0x85` | `C_PickupCollected` | server | `PickupIdent` |
+
+All six ride `CH_EVENT`. `0x86`-`0x8F` are reserved for the drop replication
+M4 defers.
+
+#### 1.13.1 The identity is a position and a model, not a slot
+
+The engine's own handle is `slot | (generation << 16)` and it is **per
+process**: `GenerateNewOne` hands out the first free slot in `[0,320)`, and ped
+drops allocate out of the same range, so one player killing a pedestrian in
+traffic moves that machine's cursor and every later script pickup lands
+somewhere different from everyone else's. Slot agreement survives about a
+minute of play.
+
+Both ends resolve an ident by nearest-match within **0.25 m** of the same
+model. Tolerance rather than an exact float compare: script pickups really are
+bit-identical on both machines, but a ped drop's z comes out of
+`CWorld::FindGroundZFor3DCoord` and nothing here should depend on that landing
+on the same bit in two processes.
+
+`flags` carries one bit, `PICKUP_F_BRIBE`. The pickup model indices are runtime
+globals `CModelInfo` fills from the IDE, so the number is that install's and
+nobody else's - and the server needs exactly one thing from it, because a
+bribe's `PICKUP_ON_STREET_SLOW` window is 300 s where everything else's is
+720 s.
+
+#### 1.13.2 The claim goes out on approach, and that is what removes the race
+
+The client claims at **4 m**; the engine collects at about 1.34 m. At walking
+speed the answer is in hand half a second before contact.
+
+That ordering is load-bearing. A pickup reward cannot honestly be revoked -
+ammo already fired, health already spent in a fight, a bribe that has already
+cleared a wanted star - so the arbitration has to happen **before** the award
+and not after it. The client enforces it by stashing and nilling `m_pObject`
+for every pickup it has not been granted, around the engine's own
+`CPickups::Update`: `CPickup::Update` returns false immediately on a nil
+object, below the respawn branch and above everything else, so the engine
+physically cannot award a pickup CoopIII has not unblocked. There is no race to
+lose.
+
+#### 1.13.3 A grant is a reservation; only a collection removes anything
+
+Claiming on approach means claiming things you turn out not to want - a health
+pickup at full health, a bribe with no wanted level, or simply a street you
+walked down. So a grant tells the claimant alone, and nothing is removed from
+anybody's world until the claimant's own engine has actually taken it:
+
+```
+    client  ---- C_PickupClaim ------>  server      at 4 m
+    client  <--- S_PickupGrant -------  server      reserved; nobody else told
+    (the engine's own CPickups::Update runs on an unblocked pickup)
+    client  ---- C_PickupCollected -->  server      it took it
+    others  <--- S_PickupTaken -------  server      remove your copy
+```
+
+or, when the player leaves the radius without collecting, `C_PickupRelease`
+ends the reservation and the pickup is available again everywhere, having never
+been removed anywhere.
+
+The collection is **detected, not decided**: CoopIII holds the reservation, the
+engine's own touch test, `CanBePickedUp` and award switch run, and the slot
+being empty afterwards is what gets reported. Nothing re-implements the four
+refusals `CanBePickedUp` makes; a refusal simply shows up as a reservation
+handed back.
+
+`S_PickupTaken` reaches everyone except the collector, whose own engine has
+already removed their copy. Each of them replays the engine's own removal tail
+and pushes the collection into their own `CPickups::aPickUpsCollected` -
+without which the observer's `rampage.sc` and `rewards.sc` never notice,
+because that ring is the only thing `HAS_PICKUP_BEEN_COLLECTED` reads.
+
+A reservation nobody gives back would be a pickup nobody can have, so the
+server expires one after 15 s, and a player leaving drops every reservation
+they hold while keeping everything they collected.
+
+An observer deliberately does not replay the *reward*. Health, armour, money
+and weapons belong to one player and that player's own engine has already
+applied them. The single exception is the hidden package counter, which is
+shared by decision (`roadmap.md` §5.11) and is one increment.
+
+#### 1.13.4 Respawn: the server owns availability, each engine owns appearance
+
+The engine writes `m_nTimer = CTimer::m_snTimeInMilliseconds + k`, an absolute
+stamp on a **local** clock that starts when that machine's game started and
+stops while it is paused. The constant travels; the deadline must not.
+
+So the server records when it granted a pickup and how long that type stays
+gone, and denies a claim inside the window. Each client's engine is free to
+bring the object back whenever its own rule says so - the respawn branch also
+insists the local player is more than 10 m away, which genuinely fires at
+different moments on different machines. That divergence is harmless once
+availability is the server's: a copy that comes back early is simply blocked
+until the window closes, and a copy that comes back late means its owner cannot
+claim yet. A client only claims when its local object exists, so it never holds
+a grant it cannot consume; if one goes away between the claim and the answer it
+sends `C_PickupRelease` and the reservation ends at once.
+
+Note that the window only starts at the **collection**, not at the claim: a
+reservation carries no respawn time because nothing has been picked up.
+
+#### 1.13.5 A taken-record is a lock, not a tombstone
+
+`C_PickupRelease` has a second meaning, and it is needed because the script
+reuses coordinates. Of 312 script pickup positions, 29 same-model pairs sit
+within 2 m of each other and **all 29 are at distance exactly zero** - the
+Ammu-Nation counter's in-stock/out-of-stock pair in the two arms of one `if`,
+and the 20 rampages, each re-created at its original spot after two failures.
+None of them is ever live twice at once (every rampage handler runs `0215
+destroy_pickup` first), so the ident does not alias - but a `PICKUP_ONCE`
+record would otherwise block the re-created pickup forever.
+
+So a client whose engine has a live object at a key that client previously
+removed on an `S_PickupTaken` says so once, and the server drops the record.
+It costs nothing to notice: the client is already walking its pickup table
+every frame for the proximity test.
+
+#### 1.13.6 A joiner is told what is already gone
+
+The backfill carries one `S_PickupTaken` per *collected* record - reservations
+are left out, because nothing has been picked up and there is nothing for the
+joiner to remove. Without it the joiner
+is the one player in the session who can still see - and walk into - every
+hidden package the group has already collected.
+
+---
+
+### 1.14 Getting into a car takes a second, and the wire does not
+
+A remote player used to appear in a seat. `CPed::WarpPedIntoCar` is one call
+and it is over before the frame is: no door opens, nothing is animated, the
+ped is simply somewhere else. Getting out was the same in reverse.
+
+The engine's own way in is `CPed::SetEnterCar`, and it is not a call you make
+and read the answer to. It puts the ped into `PED_ENTER_CAR` and hangs an
+animation on it; `CWorld::Process`'s walk over `ms_listMovingEntityPtrs` -
+the same walk that already positions a seated ped, §1.13.2 - calls
+`EnterCar()` on it every frame after that, and a chain of animation-finish
+callbacks ends by assigning the seat. It takes the better part of a second
+and it can stop at any point in that second without saying so.
+
+So the session says "seat 2 of car 41" and the engine says "walking towards a
+door", and the two are both true. Four things follow, and they are the whole
+design.
+
+#### 1.14.1 A third state, in the loop that already had two
+
+`RemotePlayer` had `seatVehicleNetId` (what the session asks for) and
+`seatedVehicleNetId` (what the engine has), with `UpdateRemoteSeats` driving
+one toward the other every frame because the ped and the car each take as
+long as their model does to stream. That shape did not need changing, only
+extending: `enteringVehicleNetId` is a third field in the same loop, and
+every race the animation adds - the car despawning mid-entry, the player
+dying mid-entry, the session naming a different car mid-entry, the engine
+quietly giving up - falls out of the same per-frame comparison rather than
+needing a handler of its own.
+
+#### 1.14.2 The animation is an attempt; the seat is not
+
+**The warp did not go away and must not.** It is what the entry falls back
+to, and every path out of an unfinished entry ends there in the same frame:
+
+| how it ends | what happens |
+|---|---|
+| the engine refuses to start it | warp, same frame - a refusal costs nothing |
+| the engine stops without seating them | give the door back, then warp |
+| the deadline passes (2.5 s) | give the door back, then warp |
+| the car is despawned or blown up | give the door back, no seat |
+| the player dies | give the door back, no seat |
+
+A player who teleports into a seat is one bad frame. A player stuck half
+inside a car is the rest of the session, and this project has been bitten by
+that shape of bug before - the driving animation that stuck forever, fixed in
+`ped.cpp` by `FadeOutAllPartials`.
+
+One attempt per enter event, marked spent before it is made rather than after
+it succeeds, so that a refusal and a timeout both count. Otherwise a ped that
+cannot get in is asked to again, forever, at sixty frames a second.
+
+#### 1.14.3 Giving up costs a call, and skipping it breaks the car
+
+`CPed::QuitEnteringCar` is not tidiness. An entry dropped without it leaves
+the door's bit set in the car's `m_nGettingInFlags` and `m_nNumGettingIn`
+counting somebody who is not coming - and that flag is the *first* thing
+`SetEnterCar` tests, so the door is then refused to everybody for the rest of
+the car's life. It is the door-shaped version of the stuck animation above.
+
+That is why abandoning is a bridge call rather than something the client
+could forget, and why `UnseatPlayer` makes it first: every caller that takes
+somebody out of a car now also takes them out of the doorway.
+
+#### 1.14.4 Getting out is started by the snapshot, not by the event
+
+`S_ExitVehicle` is reliable and it is too late to animate from. The owner
+sends it when their own `bInVehicle` goes false, and that is the *last* thing
+their get-out animation does - starting from it would put every observer a
+whole animation behind a player who is already running down the street.
+
+`PlayerStateBody::pedState` has been on the wire since protocol 2 and has
+never been read by anything. It says `PED_EXIT_CAR` the moment the owner's
+engine starts the exit, which is a second earlier and exactly on time. So the
+snapshot decides *how* they leave and the event still decides *that* they
+left. Nothing on the wire changed.
+
+The entry has no equivalent and cannot have one: the claim is sent at the end
+of the owner's get-in animation too, so an observer learns which car a player
+is getting into only once they are in it. The entry therefore plays about an
+animation late, and the guards in `BeginPedEnterCar` exist to refuse it when
+that lateness would show - a car already driving away, or a ped too far from
+the door to reach it without being dragged across the street. Sending the
+claim at the *start* of the local entry would fix this and is the obvious
+next step, but it moves the server's record of who is driving a car to a
+player who is not in it yet, which §2.8.3 makes load-bearing.
+
+#### 1.14.5 The pose stream asks the ped, not the session
+
+`ApplyRemotePose` stopped writing a seated player's position when seating was
+written, because the car became the authority on where they are. The same now
+holds while they are climbing in, for the same reason rather than a similar
+one: it is the same walk over the moving list, and `LineUpPedWithCar` is what
+carries the ped from the pavement to the seat.
+
+The test is the engine's own (`bInVehicle || EnteringCar()`, re3
+`World.cpp:1971`) rather than the roster's opinion, which is what makes it
+self-healing. Three things that would otherwise each need handling stop
+needing it: a ped dropped out of a seat to make room for whoever the session
+says is driving; a get-out animation that finishes before the exit event
+arrives; and an entry the engine abandoned without anybody noticing. In all
+three the ped is back on the pose stream on the next frame instead of
+standing frozen until a packet says so.
+
+#### 1.14.6 Carjacking: the seat is handled, the animation is not
+
+`EnterVehicleBody` has carried a `jack` byte since protocol 3 and nothing has
+ever written a one into it. The receiving side now says so explicitly rather
+than ignoring it, and does not play `CPed::SetCarJack`. Two reasons, and the
+second is the one that would still hold if the first were fixed.
+
+**It would not run — for a remote ped, which is the only ped this is about.**
+`SetCarJack` returns without doing anything when the car's `VehicleCreatedBy`
+is `MISSION_VEHICLE` (the gate is at `0x004E032B`), and that is what every car
+CoopIII creates is, because it is what stops the engine reaping it.
+
+That sentence was first written without its qualifier, and the qualifier
+matters. The bail sits **after** the `CPed::IsPlayer` call at `0x004E0310`, and
+the `jne` at `0x004E0319` jumps the whole guard block for anything `IsPlayer()`
+says yes to — so it does not touch the local player pressing F on a session
+car. The ped that would play this animation is always a `CCivilianPed`, so the
+animation really is unavailable on exactly the cars a session has; it is just
+not unavailable to *everybody*. `addresses.h` carries the disassembly, read out
+of the retail image rather than from `re3`.
+
+**It would decide something that is not ours to decide.** `SetCarJack`'s
+animation chain ends by dragging the ped in the seat out of it. That is this
+machine deciding that some *other* player left a car, which is the
+host-authoritative rule backwards.
+
+What the jack actually needed is handled without the flag. Seating somebody
+into an occupied seat used to overwrite `pDriver` and leave the previous
+occupant with `bInVehicle` set, `m_pMyVehicle` pointing at a car that had
+never heard of them, and `CWorld::Process` asking that car every frame which
+seat they were in. Now whoever holds the seat is taken out of it first - not
+a decision, a consequence of the session having already said who is sitting
+there, and two peds cannot both be the driver. Their own machine sends their
+exit a moment later and the two agree from then on. The visible difference
+from real jacking is that the jacker plays the ordinary get-in animation
+rather than hauling somebody through the door.
+
+---
+
+### 1.15 A car's damage model: three of the four fields converge on their own
+
+The whole design is [docs/cardamage.md](cardamage.md), because it is long and
+most of it is the argument for what does *not* travel. What belongs here is the
+wire decision and the one sentence that produced it.
+
+`roadmap.md` §4 listed the gap as "panels, doors, lights, wheels". Measured
+against the binary, two of those four need no packet at all. **A tyre never
+bursts in retail 1.0**: `m_wheelStatus` has three writers, `ProgressWheelDamage`
+is only reachable from an `ApplyDamage` arm nothing ever passes a wheel to, and
+`CAutomobile::BurstTyre` (`0x0053C0E0`) has no call site anywhere — its address
+appears once in the whole file, in `CAutomobile`'s vtable slot 31, and the three
+`call dword [reg+7Ch]` sites in `.text` are all COM calls in the movie and
+networking code. What is left is `FuckCarCompletely`, inside a `BlowUpCar` §1.11
+already replays everywhere. **And a broken light is exactly a damaged panel**:
+`SetLightStatus` has one caller, is always passed the literal 1, and sits two
+instructions from the `ProgressPanelDamage` call for the same panel.
+
+`m_engineStatus` goes the same way for a different reason: the tail of
+`CAutomobile::VehicleDamage` recomputes it from `m_fHealth` every frame on every
+machine, and health has been on the wire since M2.
+
+So the packet is panels and doors. Eight bytes, reliable, sent only when
+something got worse, and **not a field on the 25 Hz snapshot** — for the same
+reason §5.8 gives for the blow-up: a snapshot is sent by a driver, and the cars
+this is most needed for do not have one.
+
+Two properties of the data do the rest of the work. It is **absolute state**,
+so a duplicate is a no-op and a drop is repaired by the next report; and it
+**only ever climbs**, because `ProgressPanelDamage` and `ProgressDoorDamage`
+both refuse at 3 and nothing but a respray lowers either. The merge is
+therefore a componentwise maximum — commutative, associative, idempotent — and
+the session lands in the same place whatever order reports arrive in and
+whoever sent them. That is what lets §5.8's reporter rules carry over to a value
+that is not a boolean, instead of inventing a fourth ownership model.
+
+The one trap worth repeating here: **`m_doorStatus` is not a description of the
+car.** Two of its four values are a door somebody opened, and `CPed` writes
+`DOOR_STATUS_SWINGING` over `DOOR_STATUS_MISSING` unconditionally, so the byte
+goes *down* while the car still has a hole in it. What travels is a damage
+level, mapped once at the sampling end.
+
+---
+
+### 1.16 Garages, doors and the Pay'n'Spray: the transition travels, the door does not
+
+Status: **built 2026-09-22, not yet run in the game.** Client seam
+`client/src/game/garage.{h,cpp}`, four opcodes in the reserved `0xA0..0xAF`
+block, and it moves `PROTOCOL_VERSION` to 18 along with the nine branches it
+was merged with.
+
+Before this, nothing about a garage travelled. A garage that opened for one
+player was shut for everybody else, including the safehouse garages and the
+spray shops.
+
+#### 1.16.1 Nothing has to be spawned, which is the whole starting point
+
+All 32 garages are created by `main.scm` from literal coordinates
+(`init.sc`, opcode `0219 create_garage`), so every machine already agrees
+about where each one is, what type it is and how tall its door is. This is
+the same finding that shaped the pickup work (`docs/pickups.md`): the worlds
+already agree, and only the *behaviour* is missing.
+
+What is missing is that `CGarage::Update` (`0x004222D0`) asks
+`FindPlayerPed()`, `FindPlayerVehicle()` and `FindPlayerCoors()` — the local
+player and nobody else. A remote player standing in their safehouse is, to
+this machine's state machine, nobody standing anywhere.
+
+#### 1.16.2 Two kinds of transition, and only one of them is news
+
+Every garage type's state machine has the same skeleton, and the split is
+clean:
+
+- **out of `GS_OPENING` or `GS_CLOSING`: derived.** Ramp `m_fDoorPos` by the
+  door's fixed speed times `CTimer::ms_fTimeStep`, call `UpdateDoorsHeight()`,
+  and on reaching the limit take the resting state and play a sound. Every
+  machine can compute all of that from the state alone.
+- **out of a resting state: decided**, from the local player's position, car,
+  money and wanted level.
+
+So the **state transition** goes on the wire and the **door position** never
+does. Three reasons, in order of how much they cost to get wrong:
+
+1. It is §1.11's argument again. A car's destruction travels as an event and
+   not as `m_fHealth`, because the number is a consequence and the event is
+   the cause. A door's height is a consequence that changes 60 times a second
+   while its cause changes about six times in a whole visit.
+2. `m_fDoorPos` is meaningless on its own. It is read against `m_fDoorHeight`
+   and applied to one or two door `CEntity`s that `CGarage::RefreshDoorPointers`
+   resolves to a **per-machine pool pointer**. Sending a height would be
+   sending a machine a float derived from its own map data — the same mistake
+   `docs/roadmap.md` §5.8 refuses for a parked car's transform.
+3. Snapshots arrive at 25 Hz and doors move at 60. Driving the state lets each
+   machine animate at its own frame rate and get the sound, the camera and the
+   `UpdateDoorsHeight` push for free, out of the engine's own code.
+
+#### 1.16.3 Authority: nobody owns a garage, so it is a union
+
+A garage belongs to the map, not to a player. §5.8 settled the shape for a
+parked car — "whoever saw it may say so, first report wins, and no transform
+travels because the map put it there on every machine" — and **half of it
+carries over exactly**: anybody may report, and no transform travels.
+
+The other half does not, and the difference is worth stating because it is the
+difference between an event and a level:
+
+| | a car being destroyed (§5.8) | a door being open (here) |
+|---|---|---|
+| shape | a fact that happens once | a level that is true while somebody is there |
+| reduction | first report wins | the union of everybody's |
+| a second report | a duplicate, dropped | another player also holding it |
+| going back | never | the normal case |
+
+First-report-wins here would mean a door that never closes. Last-writer-wins
+would mean the first player to walk away shuts the door on the second. The
+union is the only reduction that is correct in both directions and for any
+number of players, and it is one `OR` in `Client::RemoteGarageMask`.
+
+Each machine reports **one bit per garage**: *my own state machine has this
+garage away from where this type of garage rests*. A garage's resting position
+is one of two things and the classification is the whole of it:
+
+- **rests open** — `GARAGE_RESPRAY`, `GARAGE_BOMBSHOP1..3`, `GARAGE_CRUSHER`.
+  These stand open and close over a car being worked on, so *shut* is the
+  news.
+- **rests shut** — everything else: the three hideouts (the safehouse
+  garages, which `init.sc` calls `GARAGE_SAVEONE/TWO/THREE`), the mission
+  lockups, the collection garages, the script-driven doors. *Open* is the
+  news.
+
+That gives "whoever opens it, everybody sees it open" for a safehouse and
+"whoever is inside it, everybody sees it shut" for a spray shop, out of one
+bit and one `OR`.
+
+#### 1.16.4 An observer must not run the arm that ends a visit
+
+This is the part that is not obvious, and it is why there is a detour on
+`CGarage::Update` rather than a field write from `PreFrame`.
+
+The Pay'n'Spray's entire effect — the repair, the repaint, the money and the
+wanted level — lives in the `GS_FULLYCLOSED` arm of *this machine's*
+`CGarage::Update`, and it acts on `FindPlayerVehicle()` and `FindPlayerPed()`.
+Hold that garage shut on an observer and let the engine run, and two seconds
+later the observer's own car is repainted and the observer's own stars are
+cleared because a stranger across the city bought a paint job. The same is
+true of the bomb shops (a free bomb, $1000 taken) and the crusher.
+
+So while a remote report holds a *serviced* garage shut, the detour runs the
+ramp and then stops. The two moving arms are pure animation and always run,
+which is what gets the door and the door-closed sound right on every machine
+for nothing. `GarageUpdateMayRun` in `client/src/game/garage.h` is that rule
+and `tools/clienttest` pins it.
+
+Letting go is not a no-op either. A serviced garage sitting at
+`GS_FULLYCLOSED` has `m_nTimeToStartAction` already in the past — its
+`GS_CLOSING` arm set it on the way down — so the first unsuppressed frame
+after the hold comes off would fire the completion arm anyway. Releasing
+therefore winds the door back up through the engine's own `OpenThisGarage`,
+which is the observer's copy of "the visit ended".
+
+#### 1.16.5 The respray colour has to travel, and not for the reason you would guess
+
+`docs/roadmap.md` §5.9 says the model info picks a car's appearance "at
+random". That is true of the *extra components* and it is **not** true of the
+colours. The retail `CVehicleModelInfo::ChooseVehicleColour` (`0x00520FD0`)
+contains no call to `CGeneral::GetRandomNumber` at all:
+
+```
+m_lastColorVariation = (m_lastColorVariation + 1) % m_numColours
+col1 = m_colours1[m_lastColorVariation]
+col2 = m_colours2[m_lastColorVariation]
+if (numColours > 1 && FindPlayerVehicle() is this model && its colours match)
+        advance once more
+```
+
+It is a **round robin over the model's own colour table**, with a tiebreak
+against whatever the local player happens to be driving. Both halves are
+machine-local state: the cursor counts every car of that model the process has
+ever built, and `FindPlayerVehicle` is a different car on every machine.
+
+The conclusion is the same as if it *had* been an RNG roll — the colour has to
+travel — but the reason is stronger. An RNG could in principle be seeded to
+agree. "How many Kurumas has this process made" cannot be, and neither can
+"what is the local player sitting in right now".
+
+So `C_Respray` carries the two colours **read back off the car the owner's
+engine actually painted**, and no observer ever calls `ChooseVehicleColour`.
+The repair travels with it: `m_fHealth = 1000`, `m_fFireBlowUpTimer = 0` and
+`CAutomobile::Fix()` (`0x0053C240`), which is what the owner's arm did.
+
+`vehicleNetId` is `INVALID_NETID` when the car is not a session car — a player
+can drive an unclaimed traffic car into a spray shop. The packet still goes
+out, because the doors and the sound are worth replaying on their own.
+
+One more packet goes with it, and it belongs to §1.15 rather than here. `Fix()`
+cleans the car on screen and touches none of the bookkeeping around it: the
+server's damage record, the observer's row, and the owner's own high-water mark
+all still hold the dents that have just been sprayed off. So the owner follows
+the `C_Respray` with a `C_VehicleDamage` carrying `VEH_DAMAGE_RESET`, on the
+same reliable ordered channel and in that order, which is the one report that
+lowers a car. `docs/cardamage.md` §6.2 is why each of the three matters and why
+the last one is the dangerous one.
+
+#### 1.16.6 The wanted level does not travel, and there is a seam where it would
+
+The third effect of a respray is `FindPlayerPed()->m_pWanted->Reset()`
+(`CWanted::Reset`, `0x004AD790`). It is **not** on the wire and this packet has
+no field for it.
+
+- The wanted level is not on the wire at all yet. `docs/roadmap.md` §5.1 has
+  it designed (per-player, GTA Online style, server-configurable) and
+  unbuilt, and it is being worked on separately.
+- Under §5.1's per-player design the correct behaviour is already what
+  happens: the player who paid gets their own stars cleared, on their own
+  machine, by the engine, with no help from CoopIII. Clearing anybody else's
+  would be wrong.
+- What an observer must not do is clear its *own* player's stars because
+  somebody else bought a paint job, and it does not — that falls out of
+  §1.16.4 for free.
+
+The seam is one marked comment in `ApplyRemoteResprayImpl`
+(`client/src/game/garage.cpp`, `SEAM (wanted level)`) plus the suppression in
+§1.16.4. If §5.1 ever lands a *shared* wanted level, those are the two places
+that change, and the change is a call into whatever seam that work exposes —
+never a second `CWanted::Reset` of CoopIII's own.
+
+#### 1.16.7 What this does not cover: the safehouse *door*
+
+The safehouse **garage** is `GARAGE_HIDEOUT_*` and is covered. The safehouse
+**pedestrian door** is not a garage at all. `init.sc` creates it as a script
+object (`$PORTLAND_HIDEOUT_DOOR = init_object #PLAYERSDOOR`) and `save.sc`
+swings it with `034D ROTATE_OBJECT`, gated on the local player standing in a
+literal box. The save screen behind it is `03D8 show_save_screen` from the
+same script.
+
+None of that is reachable from `CGarages`. Every machine runs its own copy of
+`main.scm`, so the door opens for whoever walks up and for nobody else, and
+syncing it means either running the script host-only or intercepting
+`ROTATE_OBJECT` — both of which are **M5** (`docs/campaign.md`). This section
+does not touch it, and the save menu stays local, which is also the safe
+answer: a save is a write to the player's own `GTA3sf*.b`.
+
+#### 1.16.8 The packets
+
+| Opcode | Name | Ch | Payload |
+|---|---|---|---|
+| 0xA0 | `C_GARAGE_STATE` | 1 | `deviating` `u32`, one bit per garage. Sent on change only |
+| 0xA1 | `S_GARAGE_STATE` | 1 | `playerId` + the mask. Relayed to everyone except the sender, and replayed in the backfill for every player whose mask is non-zero |
+| 0xA2 | `C_RESPRAY` | 1 | `vehicleNetId` `u16`, `garage` `u8`, `colour1` `u8`, `colour2` `u8` |
+| 0xA3 | `S_RESPRAY` | 1 | `playerId` + the above |
+| 0xA4-0xAF | - | - | Reserved for the rest of the garage block |
+
+Thirty-two bits because `CGarages::Update`'s loop bound is a literal
+`cmp ebx,20h`, not `CGarages::NumGarages`.
+
+The server arbitrates nothing here and that is not laziness — there is no
+owner for a report to be a lie about. Compare `OnVehicleState`, which *does*
+check, because a car has a driver. What the server does is remember, so a
+joiner can be told: the mask is a level sent on change, so without a backfill
+a joiner would hear nothing until the door closed and would then be told a
+door they never saw open had shut.
+### 1.17 A broken lamp post is a latch, and only one machine says so
+
+`docs/objects.md` is the investigation. Four things from it belong here,
+because they are what the wire looks like the way it does.
+
+**Breaking is a state.** `CObject::ObjectDamage` (`0x004BB240`) frees nothing,
+allocates nothing and touches no world list - every one of its nine arms writes
+flags on the object that is already standing there. So this is a latch, not a
+lifecycle: two players breaking the same crate is not a conflict, applying the
+same break twice is a no-op, and there is no exclusivity to arbitrate. That is
+the whole difference from §1.13's pickups, which look superficially similar and
+are not.
+
+**Most of it was already agreed, and it was measured rather than assumed.** The
+object arm of `CWorld::TriggerExplosionSectorList` computes its damage as
+`300 * min((radius - distance) * 2 / radius, 1)` - two positions and a radius,
+no RNG - and §1.9.3 already replays every explosion at an agreed position. So
+objects blown up by a blast break identically everywhere for free, and the seam
+stays silent inside `CWorld::TriggerExplosion` rather than sending duplicates.
+And a bullet never breaks one at all: `CWeapon::FireInstantHit`'s object arm
+applies a force and sparks, and there is no `ObjectDamage` call anywhere in
+`CWeapon`. What is left is a collision, and only a collision.
+
+**Named by where the map put it.** `m_objectMatrix`'s position plus the model
+index - `sscanf`'d out of an IPL text file that is identical on every install,
+so unlike a ped drop's z it is not computed at runtime at all. Not the pool
+index: `CPopulation::ManagePopulation` converts every map object more than 80 m
+from *the local player* into a dummy and back again, so the object pool churns
+harder than any other pool in the game. The tolerance is 0.25 m and the closest
+same-model pair among all 1851 breakable map instances is 0.5992 m.
+
+**Reported by the machine that owns whatever broke it**, and by the host when
+nothing owns it. `roadmap.md` §5.8's literal answer - an ownerless world entity
+is the host's - does not transplant, because an object 80 m from the host is
+not a `CObject` on the host at all and the host has nothing to observe. The
+*shape* transplants: exactly one reporter, chosen by ownership. An observer
+that breaks the object locally is not suppressed; it just says nothing.
+
+There is no server table and no backfill, for the same reason there is no
+persistence anywhere in this: the engine throws the state away at 80 m, so
+nothing a joiner could be told would still be true by the time they finished
+loading.
+
+---
+
+### 1.18 The wanted level: four spare bits, and the police are already paid for
+
+[docs/wanted.md](wanted.md) is the design, the GTA Online research behind it
+and the disassembly it rests on. What belongs here is only what crosses the
+wire, which is less than anything else in this document.
+
+**Nothing new was added.** `PlayerStateBody::flags` had four bits free after
+`PF_ON_FIRE`, and they carry the whole outbound half:
+
+| bits | name | meaning |
+|---|---|---|
+| 4-6 | `PF_WANTED_MASK` | this player's wanted level, 0..6 |
+| 7 | `PF_WANTED_BORROWED` | the level is the session's, not this player's own |
+
+It rides the unreliable snapshot for the same reason `PF_ON_FIRE` does
+(§1.10.7): it is a state with a lifetime rather than an event, and a dropped
+packet is corrected 40 ms later. Three bits hold 0..7 while the engine's
+ceiling is 6, so the eighth value is clamped on the way in rather than
+trusted.
+
+The session's rule goes the other way, in two spare bits of `S_Welcome::flags`
+beside `SESSION_FRIENDLY_FIRE`: `perplayer` (0, the default), `shared` (1),
+`off` (2). Same place as friendly fire and for the same reason - it governs
+something the client has to apply locally. Unlike friendly fire there is no
+server-side half at all: a wanted level never passes through the server as
+anything but a number in a snapshot, so there is nothing to refuse.
+
+**`PF_WANTED_BORROWED` is a bit of wire spent on one deadlock**, and it is
+worth saying why here rather than only in `wanted.md` §4.5. In `shared`, A
+earns four stars and B is raised to four to match. A dies and clears. Without
+the bit, B is still reporting four, so A is immediately raised back to four by
+a level that only exists because A had it - and neither can get out until
+everybody happens to die within the same 40 ms. With it, the session's floor
+is the maximum over players who are *not* borrowing, and B's echo goes when
+A's original does.
+
+**No packet carries anything about the police.** A cop ped is created as a
+`RANDOM_CHAR` and a police car as a `RANDOM_VEHICLE`, so both already travel
+on the ambient ped and traffic streams (§1.13, [population.md](population.md))
+with no change and no case made for them. The wanted player's own engine makes
+them, `CCopPed` can only pursue `FindPlayerPed()` so they pursue that player,
+and every other machine has been receiving them as replicas that decide
+nothing since the day that code shipped.
+
+**`PROTOCOL_VERSION` is 18 for this, along with the other nine branches it was
+merged with.** No struct grew and no layout moved - the meaning of two existing
+bytes changed, which is still a wire change, and version 18 is the one number
+all of it landed under.
+
+One thing did collide with another branch, and it was not an opcode. This work
+put the session's wanted rule in `SessionFlags` bits 1-2 while the ammunition
+work took bit 1 for `SESSION_AMMO_SYNC`, so a session with ammo sync on would
+also have told every client its wanted rule was `shared`. The rule moved to
+bits 2-3 at the merge; see `SessionFlags` in `protocol.h`. `PlayerFlags` bits
+4-7 were free and stayed free, and **this feature allocates no opcode at all**.
 
 ## 2. Design decisions
 
@@ -1213,7 +2287,7 @@ Rejected: raw UDP + hand-rolled reliability (rebuilding ENet badly), TCP
 | World state (clock, weather) | 1 Hz, host → server → everyone | `CClock`/`CWeather` update per frame but change slowly (`Game.cpp:1031-1032`), and a game minute is a real second, so anything faster is repetition (§2.7) |
 | Events | on occurrence, reliable | shots, damage, enter/exit, death |
 
-Bandwidth check at 8 players: 7 remotes × 25 Hz × ~72 B ≈ 12.6 KB/s down per
+Bandwidth check at 8 players: 7 remotes × 25 Hz × ~78 B ≈ 13.7 KB/s down per
 client. Small enough that v1 doesn't quantize anything, just plain `float32`.
 Bit-packing can come later.
 
@@ -1435,9 +2509,12 @@ In:
 - On-foot player: position, heading, move state, animation, health, armour
 - Weapons: current weapon, aim direction, shot events
 - Vehicles: the driver's vehicle (transform, steer/gas/brake, health, engine)
-- Enter/exit/carjack, using the engine's own API so animations play correctly:
-  `SetEnterCar` (`Ped.h:701`), `SetExitCar` (703), `SetCarJack` (711),
-  `SetPedPositionInCar` (565)
+- Enter/exit, using the engine's own API so animations play correctly:
+  `SetEnterCar` (`0x004E0920`), `SetExitCar` (`0x004E1010`),
+  `QuitEnteringCar` (`0x004E0E00`), `SetPedPositionInCar`. Done, with the
+  warp behind it as the guarantee; §1.14. Carjacking is the exception -
+  `SetCarJack` (`0x004E0220`) is verified and deliberately not called
+  (§1.14.6)
 - Damage/death/respawn: `InflictDamage` (612), `SetDie` (545), `SetDead` (546).
   The design is §1.10
 - Clock + weather, taken from the host's own game (§2.7)
@@ -1455,7 +2532,8 @@ Out (deliberately, for v1):
   design is in [campaign.md](campaign.md); read it before touching anything
   script-related. Nothing in v1 is throwaway: Tier 2 replicates mission
   entities through exactly the machinery listed above.
-- Pickups, wanted level, stats.
+- Stats. (Pickups are in - §1.13; the wanted level is in as of 2026-09-22 -
+  §1.14.)
 
 Rationale: the smallest slice where two people can drive around Liberty City
 together and it feels right. Everything cut is cut because it needs an ownership
@@ -1470,10 +2548,10 @@ model that doesn't exist yet.
 | Opcode | Name | Ch | Payload |
 |---|---|---|---|
 | 0x01 | `C_HELLO` | 1 | protocol version, nickname, model id |
-| 0x02 | `S_WELCOME` | 1 | your `playerId`, your `netId`, server tick rate, world state, `hostPlayerId` (§2.7), session flags (§1.10.3) |
+| 0x02 | `S_WELCOME` | 1 | your `playerId`, your `netId`, server tick rate, world state, `hostPlayerId` (§2.7), session flags - friendly fire (§1.10.3) and ammo sync (§1.9.6) |
 | 0x03 | `S_PLAYER_JOIN` | 1 | `playerId`, `netId`, nickname, model id, transform, then condition: health `float`, armour `float`, weapon `u8`, flags `u8` (`PJF_POS_VALID`, `PJF_DEAD`), death anim `u16` (§2.8.1) |
 | 0x04 | `S_PLAYER_LEAVE` | 1 | `playerId`, reason |
-| 0x10 | `C_PLAYER_STATE` | 0 | pos `float[3]`, heading `float`, `m_vecMoveSpeed` `float[3]`, `m_nMoveState` `u8`, `m_nPedState` `u8`, anim `u16` + time `float` + speed `float`, partial anim `u16` + time `float`, health `float`, armour `float`, weapon `u8`, aim yaw/pitch `float[2]`, flags `u8` (64 bytes) |
+| 0x10 | `C_PLAYER_STATE` | 0 | pos `float[3]`, heading `float`, `m_vecMoveSpeed` `float[3]`, `m_nMoveState` `u8`, `m_nPedState` `u8`, anim `u16` + time `float` + speed `float`, partial anim `u16` + time `float`, health `float`, armour `float`, weapon `u8`, the held weapon's ammo (clip `u16` + total `u32`, §1.9.6), aim yaw/pitch `float[2]`, flags `u8` (71 bytes) |
 | 0x11 | `S_PLAYER_STATE` | 0 | `playerId` + the above |
 | 0x12 | `C_VEHICLE_STATE` | 0 | `netId`, pos `float[3]`, quat `float[4]`, move/turn speed `float[6]`, steer/gas/brake `float[3]`, gear `u8`, health `float`, flags `u8` |
 | 0x13 | `S_VEHICLE_STATE` | 0 | same, relayed |
@@ -1488,9 +2566,30 @@ model that doesn't exist yet.
 | 0x34 | `S_VEHICLE_SPAWN` | 1 | `netId`, model id, transform, colours, extras `i8[2]` (§1.12), then condition: health `float`, flags `u8` including `VEH_WRECKED` (§2.8.1) |
 | 0x35 | `S_VEHICLE_DESPAWN` | 1 | `netId`. Declared and never sent: nothing in the server removes a car from the session, and a wreck is a wreck rather than a removal (§1.11.4) |
 | 0x36 | `C_VEHICLE_BLOWUP` / 0x37 `S_VEHICLE_BLOWUP` | 1 | `netId`, pos `float[3]`, quat `float[4]`; `S_` also carries `playerId` (§1.11) |
+| 0x38 | `C_UNOWNED_BLOWUP` / 0x39 `S_UNOWNED_BLOWUP` | 1 | a car nobody is driving: key (`kind` `u8`, `id` `u16`) plus pos `float[3]` and quat `float[4]`; `S_` also carries `reporterPlayerId`. Three kinds - a car generator index, an ambient car's `netId`, a session `netId`. Only the ambient kind reads the transform; a parked car sits where the map put it on every machine and the sender zeroes those bytes |
+| 0x3A | `C_VEHICLE_DAMAGE` / 0x3B `S_VEHICLE_DAMAGE` | 1 | what shape a car is in: `netId` `u16`, `panels` `u32` (`CDamageManager::m_panelStatus`, seven nibbles), `doors` `u16` (six doors, two bits each); `S_` also carries `playerId`. Change-only and absolute, merged as a componentwise maximum on both ends. Accepted from the car's recorded driver and nobody else, the same gate `C_VEHICLE_STATE` uses. [docs/cardamage.md](cardamage.md) |
+| 0x3C-0x3F | - | - | Reserved for the rest of the vehicle block |
 | 0x40 | `S_WORLD_STATE` | 1 | game hour/minute, both weather types, `hostPlayerId` (§2.7) |
 | 0x41 | `C_WORLD_STATE` | 1 | the host's own hour/minute and weather pair; dropped from anyone else |
 | 0x50 | `C_CHAT` / 0x51 `S_CHAT` | 1 | `playerId`, text |
+| 0x80 | `C_PICKUP_CLAIM` | 1 | `PickupIdent`: pos `float[3]`, model index `i16`, type `u8`, flags `u8` (§1.13). Sent on approach, at 4 m |
+| 0x81 | `S_PICKUP_TAKEN` | 1 | `playerId` + `PickupIdent`. To everyone **except** the collector, whose own engine already removed their copy (§1.13.3) |
+| 0x82 | `S_PICKUP_DENIED` | 1 | `PickupIdent`. To the loser alone; nothing to undo, because the engine never saw an object there |
+| 0x83 | `C_PICKUP_RELEASE` | 1 | `PickupIdent`. A grant that could not be consumed, a reservation the player walked away from, or a key the script has re-created (§1.13.5) |
+| 0x84 | `S_PICKUP_GRANT` | 1 | `PickupIdent`. To the claimant alone. A *reservation* - nothing is removed anywhere until a collection is reported (§1.13.3) |
+| 0x85 | `C_PICKUP_COLLECTED` | 1 | `PickupIdent`. The holder's engine actually took it. Detected, not decided |
+| 0x86 | `C_PICKUP_DROP` / 0x87 `S_PICKUP_DROP` | 1 | `PickupIdent` + quantity; `S_` also carries the owner's `playerId` (§1.13) |
+| 0x88-0x8F | - | - | Reserved for pickups |
+| 0xA0 | `C_GARAGE_STATE` | 1 | `deviating` `u32`, one bit per garage: "my own state machine has this garage away from where this type of garage rests" (§1.16.3). Sent on change only |
+| 0xA1 | `S_GARAGE_STATE` | 1 | `playerId` + the mask. To everyone except the sender, and replayed in the backfill for every player whose mask is non-zero |
+| 0xA2 | `C_RESPRAY` / 0xA3 `S_RESPRAY` | 1 | `vehicleNetId` `u16`, `garage` `u8`, `colour1` `u8`, `colour2` `u8`; `S_` also carries `playerId`. The colours are read off the car the owner's engine painted, because `ChooseVehicleColour` is a per-machine round robin (§1.16.5). The wanted level is deliberately not here (§1.16.6) |
+| 0xA4-0xAF | - | - | Reserved for the rest of the garage block |
+| 0xB0 | `C_PLAYER_AMMO` / 0xB1 `S_PLAYER_AMMO` | 1 | one weapon slot the sender is **not** holding: weapon `u8`, flags `u8` (`AMMO_SLOT_OWNED`), clip `u16`, total `u32`. `S_` also carries `playerId`. On change only, and dropped by the server unless the session has `SESSION_AMMO_SYNC` (§1.9.6). The held weapon's ammo rides the snapshot instead |
+| 0xC0 | `C_OBJECT_BROKEN` | 1 | `ObjectBreakBody`: `ObjectIdent` (pos `float[3]` = `m_objectMatrix`'s position, model index `i16`, 2 pad), `amount` `float`, `state` `u8`, 3 pad (§1.17) |
+| 0xC1 | `S_OBJECT_BROKEN` | 1 | `playerId` + `ObjectBreakBody`. To everyone but the reporter |
+| 0xC2-0xCF | - | - | Reserved for breakable objects - where a knocked-over lamp post came to rest is the named open half (`objects.md` §8) |
+| 0xD8 | `C_PED_DEATH` / 0xD9 `S_PED_DEATH` | 1 | an ambient pedestrian his host's engine killed: `netId` `u16`, anim `u16`. Host-only, like the despawn and the limb, and the one of the three the server **keeps** - a joiner is handed the corpse (`population.md` §5) |
+| 0xDA-0xDF | - | - | Reserved beside it, for whatever else only a ped's host can witness |
 
 ---
 
@@ -1517,10 +2616,17 @@ come from the retail 1.0 binary, with re3 used only as the map. They live in
 
 ## 6. Open questions
 
-1. **Ped AI suppression.** A remote `CPed` must not run its own AI. Options:
-   park `m_nPedState` in a state past `PED_STATES_NO_AI` (`Ped.h:260`), or skip
-   `ProcessControl` for owned-remote peds. Needs testing. It's the detail most
-   likely to cause "remote players wander off on their own".
+1. ~~**Ped AI suppression.**~~ **Answered 2026-09-22 — see §1.13.** Neither of
+   the two options this question named. `PED_STATES_NO_AI` is a bound used by
+   `IsPedInControl`, not a gate on `ProcessControl`: state 34's own entry in
+   the retail state switch is the default arm, twenty other states share it,
+   and taking it skips the per-state function and nothing else — while parking
+   *past* 34 stops a remote player being able to catch fire. And skipping
+   `ProcessControl` costs the clump alpha fade (so the ped is never drawn),
+   `CPhysical::ProcessControl`, the death animation, aiming and footsteps.
+   The AI is two fields, `m_nPedState` and `m_objective`, and CoopIII has been
+   holding both since the seating work. Nothing was built; §1.13.6 says what
+   ambient NPC sync can rely on.
 2. **Vehicle authority handoff** when a driver exits, or when two clients both
    think they own a car. Probably a server-assigned owner with a grace period.
 3. **Streaming divergence.** Client A may have a model resident that client B

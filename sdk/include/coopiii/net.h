@@ -103,6 +103,10 @@ public:
 
 	void Disconnect(PeerId peer, uint8_t reason);
 
+	// ENet's own estimate of the round trip to this peer, in ms. The server
+	// GUI shows it per player; nothing in the protocol depends on it.
+	uint32_t RoundTripMs(PeerId peer) const;
+
 	// Blocks up to timeoutMs waiting for the first event, then drains the rest.
 	void Service(std::vector<ServerEvent> &out, uint32_t timeoutMs = 0);
 

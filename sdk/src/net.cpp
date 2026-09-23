@@ -190,6 +190,12 @@ void NetServer::BroadcastRaw(const void *bytes, size_t len, Channel ch, PeerId e
 	}
 }
 
+uint32_t NetServer::RoundTripMs(PeerId peer) const {
+	if (!m_host || peer >= m_host->peerCount)
+		return 0;
+	return m_host->peers[peer].roundTripTime;
+}
+
 void NetServer::Disconnect(PeerId peer, uint8_t reason) {
 	if (!m_host || peer >= m_host->peerCount)
 		return;

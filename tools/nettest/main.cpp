@@ -6,12 +6,15 @@
 //
 //   xmake build nettest && xmake run nettest
 //
-// Expects a server already listening on DEFAULT_PORT.
+// Expects a server already listening on DEFAULT_PORT, or on the port given as
+// the second argument (`nettest 127.0.0.1 2005`).
 
 #include "coopiii/net.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -104,6 +107,12 @@ C_Hello MakeHello(const char *nick) {
 
 int main(int argc, char **argv) {
 	const char *host = argc > 1 ? argv[1] : "127.0.0.1";
+	// Optional, and only because a second session on this machine may already
+	// be holding DEFAULT_PORT with a server built from a different tree -
+	// AGENTS.md says use another port rather than kill it, and until now
+	// there was no way to.
+	const uint16_t port =
+	    argc > 2 ? static_cast<uint16_t>(std::atoi(argv[2])) : DEFAULT_PORT;
 
 	if (!NetInit()) {
 		std::printf("enet init failed\n");
@@ -118,8 +127,8 @@ int main(int argc, char **argv) {
 	std::vector<NetClient *> all  = {&a, &b, &c, &d};
 	std::vector<std::vector<Message>> inbox(4);
 
-	std::printf("connecting to %s:%u\n", host, DEFAULT_PORT);
-	if (!a.Connect(host, DEFAULT_PORT) || !b.Connect(host, DEFAULT_PORT)) {
+	std::printf("connecting to %s:%u\n", host, port);
+	if (!a.Connect(host, port) || !b.Connect(host, port)) {
 		std::printf("connect failed (is server.exe running?)\n");
 		NetDeinit();
 		return 1;
@@ -143,7 +152,10 @@ int main(int argc, char **argv) {
 	const Message *welcomeMsg = FindOp(inbox[0], OP_S_WELCOME);
 	Check(welcomeMsg != nullptr, "alice got S_WELCOME");
 
-	uint8_t aliceId = INVALID_PLAYER;
+	uint8_t aliceId     = INVALID_PLAYER;
+	// Copied out now, not read off `welcomeMsg` later: the inbox is cleared
+	// several times below and that pointer is into its storage.
+	uint8_t sessionFlags = 0;
 	if (welcomeMsg) {
 		const auto *w = welcomeMsg->as<S_Welcome>();
 		Check(w != nullptr, "welcome has the expected size");
@@ -151,7 +163,8 @@ int main(int argc, char **argv) {
 			Check(w->reject == REJECT_NONE, "not rejected");
 			Check(w->snapshotHz == SNAPSHOT_HZ, "server reports 25 Hz");
 			Check(w->netId != INVALID_NETID, "got a netId");
-			aliceId = w->playerId;
+			aliceId      = w->playerId;
+			sessionFlags = w->flags;
 		}
 	}
 
@@ -265,6 +278,102 @@ int main(int argc, char **argv) {
 		}
 	Check(FindOp(inbox[1], OP_S_CHAT) != nullptr, "chat echoes to sender too");
 
+	// --- a limb off a pedestrian (protocol 17) -----------------------------
+	//
+	// Alice's engine makes a pedestrian and then takes its head off. Bob has
+	// to hear about the head; alice, whose engine did it, must not; and the
+	// two things the server refuses - a limb off somebody else's ped, and a
+	// node that is not a limb - must reach nobody.
+	inbox[0].clear();
+	inbox[1].clear();
+
+	C_PedSpawn born{};
+	InitHeader(born, 3000);
+	born.tempId       = 77;
+	born.body.modelId = 7;
+	born.body.pedType = 4;   // PEDTYPE_CIVMALE
+	born.body.pos     = {5.0f, 6.0f, 7.0f};
+	a.Send(born, CH_EVENT);
+	PumpUntil(both, inbox, 2000,
+	          [&] { return FindOp(inbox[0], OP_S_PED_SPAWN) != nullptr; });
+
+	uint16_t pedNetId = INVALID_NETID;
+	if (const Message *m = FindOp(inbox[0], OP_S_PED_SPAWN))
+		if (const auto *s = m->as<S_PedSpawn>())
+			pedNetId = s->netId;
+
+	std::printf("\na limb off a pedestrian\n");
+	Check(pedNetId != INVALID_NETID, "alice's pedestrian got a netId");
+
+	inbox[0].clear();
+	inbox[1].clear();
+
+	C_PedBodyPart head{};
+	InitHeader(head, 3100);
+	head.body.netId     = pedNetId;
+	head.body.node      = 2;   // PED_HEAD
+	head.body.direction = 3;
+	a.Send(head, CH_EVENT);
+
+	C_PedBodyPart notYours = head;
+	notYours.body.node = 3;
+	b.Send(notYours, CH_EVENT);
+
+	C_PedBodyPart torso = head;
+	torso.body.node = 0;
+	a.Send(torso, CH_EVENT);
+
+	// The refusals are silence, so give them time to not arrive.
+	PumpUntil(both, inbox, 500, [&] { return false; });
+
+	Check(CountOp(inbox[1], OP_S_PED_BODY_PART) == 1, "bob hears about exactly one limb");
+	if (const Message *m = FindOp(inbox[1], OP_S_PED_BODY_PART))
+		if (const auto *s = m->as<S_PedBodyPart>())
+			Check(s->body.netId == pedNetId && s->body.node == 2 &&
+			          s->body.direction == 3,
+			      "the head, of alice's pedestrian, from the side it was hit");
+	Check(CountOp(inbox[0], OP_S_PED_BODY_PART) == 0,
+	      "alice is not told about her own limb, or about bob's attempt on it");
+
+	// --- and the pedestrian dying ------------------------------------------
+	//
+	// Same three questions as the limb, plus the one a limb never raised:
+	// this one the server *keeps*, so a second death for the same life is a
+	// duplicate and has to be refused rather than relayed.
+	std::printf("\na pedestrian dying\n");
+	inbox[0].clear();
+	inbox[1].clear();
+
+	C_PedDeath pedDied{};
+	InitHeader(pedDied, 3200);
+	pedDied.body.netId  = pedNetId;
+	pedDied.body.animId = 17;
+	a.Send(pedDied, CH_EVENT);
+
+	C_PedDeath notYoursEither = pedDied;
+	notYoursEither.body.animId = 20;
+	b.Send(notYoursEither, CH_EVENT);   // bob does not host her pedestrian
+
+	C_PedDeath stranger{};
+	InitHeader(stranger, 3210);
+	stranger.body.netId  = 0xBEEF;
+	stranger.body.animId = 13;
+	a.Send(stranger, CH_EVENT);         // a ped the session never named
+
+	C_PedDeath again = pedDied;
+	a.Send(again, CH_EVENT);            // and the same death a second time
+
+	PumpUntil(both, inbox, 500, [&] { return false; });
+
+	Check(CountOp(inbox[1], OP_S_PED_DEATH) == 1,
+	      "bob hears about exactly one death");
+	if (const Message *m = FindOp(inbox[1], OP_S_PED_DEATH))
+		if (const auto *s = m->as<S_PedDeath>())
+			Check(s->body.netId == pedNetId && s->body.animId == 17,
+			      "alice's pedestrian, in the animation her engine chose");
+	Check(CountOp(inbox[0], OP_S_PED_DEATH) == 0,
+	      "alice is not told about a death her own engine decided");
+
 	// --- world state -------------------------------------------------------
 	inbox[0].clear();
 	PumpUntil(both, inbox, 2000,
@@ -356,7 +465,7 @@ int main(int argc, char **argv) {
 
 	// --- carol joins into all of that --------------------------------------
 	inbox[2].clear();
-	if (!c.Connect(host, DEFAULT_PORT)) {
+	if (!c.Connect(host, port)) {
 		std::printf("  [FAIL] carol could not connect\n");
 		++g_failures;
 	}
@@ -434,7 +543,7 @@ int main(int argc, char **argv) {
 	Check(FindOp(inbox[2], OP_S_DEATH) != nullptr, "carol, who was here, sees it happen");
 
 	inbox[3].clear();
-	if (!d.Connect(host, DEFAULT_PORT)) {
+	if (!d.Connect(host, port)) {
 		std::printf("  [FAIL] dave could not connect\n");
 		++g_failures;
 	}
@@ -459,6 +568,55 @@ int main(int argc, char **argv) {
 	c.Disconnect();
 	d.Disconnect();
 	PumpUntil(both, inbox, 500, [&] { return false; });
+
+	// --- ammunition, with the server switch off ----------------------------
+	//
+	// Off is the default, so this is what an ordinary server.exe does, and it
+	// is the half of the switch worth driving over a real socket: with the
+	// bit clear the server must not pass a C_PlayerAmmo on, whatever a client
+	// sends it. The on half is arithmetic on the session and is covered by
+	// sessiontest, which can set the flag without restarting a process.
+	std::printf("\nammunition is not relayed unless the server says so\n");
+	const bool ammoSync = (sessionFlags & SESSION_AMMO_SYNC) != 0;
+	std::printf("  (this server has ammo sync %s)\n", ammoSync ? "on" : "off");
+
+	inbox[0].clear();
+	inbox[1].clear();
+	C_PlayerAmmo ammo;
+	InitHeader(ammo, 0);
+	ammo.slot.weapon = 4;   // shotgun
+	ammo.slot.flags  = AMMO_SLOT_OWNED;
+	ammo.slot.clip   = 8;
+	ammo.slot.total  = 40;
+	b.Send(ammo, CH_EVENT);
+	// Chat behind it on the same reliable, ordered channel: once the chat has
+	// come back we know the ammo packet has been through the server and been
+	// dealt with, so "nothing arrived" is an answer rather than a timeout.
+	C_Chat marker;
+	InitHeader(marker, 0);
+	std::strncpy(marker.text, "ammo-marker", CHAT_LEN - 1);
+	b.Send(marker, CH_EVENT);
+	PumpUntil(both, inbox, 2000,
+	          [&] { return FindOp(inbox[0], OP_S_CHAT) != nullptr; });
+	Check(FindOp(inbox[0], OP_S_CHAT) != nullptr, "the marker behind it arrived");
+	const size_t ammoRelays = CountOp(inbox[0], OP_S_PLAYER_AMMO);
+	if (ammoSync) {
+		Check(ammoRelays == 1, "the ammo packet in front of it was relayed");
+		for (const Message &m : inbox[0]) {
+			if (m.opcode != OP_S_PLAYER_AMMO)
+				continue;
+			if (const auto *a = m.as<S_PlayerAmmo>()) {
+				Check(a->playerId == bobId, "stamped with the sender's slot");
+				Check(a->slot.weapon == 4 && a->slot.clip == 8 && a->slot.total == 40,
+				      "and the numbers came through untouched");
+			}
+		}
+		// Bob is not told what Bob is carrying.
+		Check(CountOp(inbox[1], OP_S_PLAYER_AMMO) == 0,
+		      "and it did not come back to the player who sent it");
+	} else {
+		Check(ammoRelays == 0, "and the ammo packet in front of it was dropped");
+	}
 
 	// --- leave -------------------------------------------------------------
 	inbox[0].clear();

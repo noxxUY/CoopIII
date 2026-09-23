@@ -1,36 +1,34 @@
-// Putting remote players on the radar. radar.h has the design and the
+// Drawing remote players on the minimap. radar.h has the design and the
 // reasoning; this is the half that touches game memory.
 //
 // ---------------------------------------------------------------------------
-// There is no hook in this file, and that is the point
+// The hook, and why it is on DrawBlips
 // ---------------------------------------------------------------------------
 //
-// CHud::Draw already calls CRadar::DrawMap and then CRadar::DrawBlips, once a
-// frame, and DrawBlips already walks all 32 entries of CRadar::ms_RadarTrace
-// and draws whatever it finds. So a remote player appears on the minimap the
-// moment there is an entry for them, drawn by the game's own code, on the
-// game's own schedule, with the game's own colours.
+// CRadar::DrawBlips is detoured and the original is called first, so the
+// arrows land on a finished radar: the map, the game's own blips, the compass
+// and the local player's own arrow are all already there.
 //
-// Which also means this file must not touch CHud::Draw: nametag.cpp already
-// detours it, MinHook allows one hook per target, and a second one would
-// either fail to install or silently displace the tags.
+// CHud::Draw would also have worked in principle and it is the wrong place in
+// practice, for three reasons and only the third is about plumbing.
 //
-// ---------------------------------------------------------------------------
-// Why the reconcile runs from PreFrame rather than from the draw
-// ---------------------------------------------------------------------------
+//   - DrawBlips sets six render states at the top of itself - z-write and
+//     z-test off, vertex alpha on, src-alpha/inv-src-alpha blending, fog off
+//     - and never puts them back. Drawing from inside it means drawing in
+//     exactly the state the engine set up for drawing blips. Drawing after
+//     CHud::Draw returns means drawing in whatever state the last thing the
+//     HUD did happened to leave behind.
+//   - DrawBlips is the thing that knows whether the radar is on screen. It
+//     is called from inside a conditional in CHud::Draw and it has its own
+//     two gates on top of that. A radar overlay that hangs off the HUD has to
+//     re-derive all of that; one that hangs off the radar inherits it.
+//   - and CHud::Draw is already detoured by nametag.cpp. MinHook allows one
+//     hook per target, and that detour draws its tags *before* the original
+//     so the local player's HUD stays on top of them - so there is not even a
+//     post-original moment to borrow.
 //
-// Hooking CRadar::DrawBlips was the obvious alternative and it is worse in
-// one specific way. DrawBlips is called from inside a conditional in
-// CHud::Draw, and the radar is not drawn at all when the player has the HUD
-// off, during a cutscene, or while the radar is the flashing HUD item. A
-// reconcile that only runs when the radar is drawn would leave blips for
-// players who have left sitting in the table for as long as the HUD is
-// hidden - invisible, but occupying slots out of 32 that the campaign script
-// needs, which is the resource this file is most careful with.
-//
-// PreFrame runs every frame regardless, and it runs after Client::PreFrame
-// has finished spawning and despawning peds, so the roster and the peds agree
-// by the time this looks at them.
+// The old version of this file had no hook at all, because keeping a table
+// right needs no hook. Drawing does.
 //
 // ---------------------------------------------------------------------------
 // Nothing here changes a ped
@@ -39,116 +37,110 @@
 // Same rule as nametag.cpp. This resolves each player's ped read-only and
 // does not call ped.cpp's ResolveRemote, because that clears the handle and
 // re-arms the spawn when a ped has gone - correct for the network path, and
-// not something a radar update gets to decide. If the ped is not there this
-// frame there is no blip this frame, and Client::PreFrame sorts it out on its
-// own schedule.
+// not something a drawing pass gets to decide. If the ped is not there this
+// frame the arrow comes off the wire instead, which is the one case the old
+// blip table could not cover at all.
+//
+// ---------------------------------------------------------------------------
+// Failing loudly
+// ---------------------------------------------------------------------------
+//
+// The install refuses rather than guesses, in the same spirit as the blip
+// table check it replaces. Before the detour goes in it checks that the seven
+// bytes at CRadar::DrawBlips are the prologue the disassembly says they are,
+// and that CRadar::RadarSprites[4] really is CRadar::CentreSprite - which is
+// one pointer compare that catches the image having moved, another mod having
+// rebuilt the sprite table, and this file's own addresses being wrong, all at
+// once. Either failing means CoopIII says so in the log and draws nothing,
+// rather than hooking a function that is not DrawBlips.
 #include "radar.h"
 
 #include "client.h"
+#include "hook/hook.h"
 #include "log.h"
 
 #include <cstdint>
+#include <cstring>
 
 namespace coopiii::game {
 
 namespace {
 
-using GetPedFn        = void *(__cdecl *)(int32_t);
-// All __cdecl, all four arguments a dword wide - the retail call site cleans
-// `add esp,10h` after four pushes, and the callee reads them at [esp+8],
-// [esp+0Ch], [esp+10h] and [esp+14h]. m_eBlipDisplay is a word in the table,
-// but the argument that fills it is not.
-using SetEntityBlipFn = int32_t(__cdecl *)(uint32_t, int32_t, uint32_t, uint32_t);
-using ClearBlipFn     = void(__cdecl *)(int32_t);
-using ChangeBlipFn    = void(__cdecl *)(int32_t, int32_t);
-
-const Client *g_client    = nullptr;
-bool          g_installed = false;
-
-// What CoopIII believes it owns on the radar, per roster slot. Kept here
-// rather than on RemotePlayer for the same reason nametag.cpp keeps its
-// occlusion state here: it is nothing to do with the roster. It is a fact
-// about this machine's radar, and client.h belongs to another agent.
-struct OurBlip {
-	int32_t  handle = NO_BLIP;
-	uint32_t colour = 0xFFFFFFFFu;   // not a trace colour: "nothing applied"
-	int32_t  pedRef = -1;            // the ped it was made for
+// CVector2D, and CRGBA. Both are what the engine's own signatures take.
+struct Vec2f {
+	float x, y;
 };
-OurBlip g_blips[MAX_PLAYERS];
+struct Rgba {
+	uint8_t r, g, b, a;
+};
 
-// Said once each, never per frame. With this many mods patching the same
-// binary, a feature that quietly does nothing is the failure to design
-// against - but a log full of one line is no use either.
-bool g_saidFirstBlip = false;
-bool g_saidNoSlots   = false;
-bool g_saidLostBlip  = false;
+using DrawBlipsFn   = void(__cdecl *)();
+using GetPedFn      = void *(__cdecl *)(int32_t);
+using TransformFn   = void(__cdecl *)(Vec2f *, const Vec2f *);
+using LimitPointFn  = float(__cdecl *)(Vec2f *);
+using BlipAlphaFn   = uint8_t(__cdecl *)(float);
+using TraceColourFn = uint32_t(__cdecl *)(uint32_t, uint32_t);
+using SpriteQuadFn  = void(__thiscall *)(void *, float, float, float, float, float,
+                                         float, float, float, const Rgba *);
 
-// ---- the table ------------------------------------------------------------
+Detour        g_drawBlips;
+const Client *g_client = nullptr;
 
-template <class T>
-T &Trace(int slot, size_t offset) {
-	return *reinterpret_cast<T *>(CRadar__ms_RadarTrace +
-	                              static_cast<uintptr_t>(slot) * SIZEOF_RADAR_TRACE +
-	                              offset);
+// The two reciprocals SCREEN_SCALE_X/Y are built from, read out of the image
+// once at install. Cached rather than read per arrow because they are
+// constants of the build; re-read per *frame* would be defensible, per
+// player is just sixteen loads nobody asked for.
+float g_recipRefWidth  = 0.0f;
+float g_recipRefHeight = 0.0f;
+
+// Said once each, never per frame.
+bool g_saidFirstArrow  = false;
+bool g_saidNoTexture   = false;
+bool g_saidBadRange    = false;
+
+// The retail prologue of CRadar::DrawBlips (0x004A42F0):
+//
+//     53              push ebx
+//     56              push esi
+//     57              push edi
+//     55              push ebp
+//     83 C4 80        add  esp,-80h
+//
+// Seven bytes, which is more than the five MinHook needs to place a jump, so
+// this is exactly the span the detour is about to overwrite.
+constexpr uint8_t DRAW_BLIPS_PROLOGUE[] = {0x53, 0x56, 0x57, 0x55, 0x83, 0xC4, 0x80};
+
+// ---- thin wrappers, named after the engine functions they are -------------
+
+void ToRadarSpace(Vec2f &out, const Vec2f &in) {
+	Func<TransformFn>(CRadar__TransformRealWorldPointToRadarSpace)(&out, &in);
 }
 
-bool TraceInUse(int slot) {
-	return Trace<uint8_t>(slot, TRACE_IN_USE) != 0;
+float LimitRadarPoint(Vec2f &point) {
+	return Func<LimitPointFn>(CRadar__LimitRadarPoint)(&point);
 }
 
-// Free slots, not counting the ones CoopIII is already using - those are in
-// use, so they are not free, which is exactly what MayTakeTraceSlot expects.
-int CountFreeTraceSlots() {
-	int free = 0;
-	for (int slot = 0; slot < static_cast<int>(NUM_RADAR_BLIPS); ++slot) {
-		if (!TraceInUse(slot))
-			++free;
-	}
-	return free;
+uint8_t CalculateBlipAlpha(float dist) {
+	return Func<BlipAlphaFn>(CRadar__CalculateBlipAlpha)(dist);
 }
 
-// Does the slot CoopIII thinks it owns still hold CoopIII's blip? See
-// TraceIsOurs in radar.h for why this asks about the contents rather than
-// validating the handle.
-bool StillOurs(const OurBlip &ours) {
-	if (!BlipHandleUsable(ours.handle))
-		return false;
-	const int slot = BlipSlot(ours.handle);
-	return TraceIsOurs(TraceInUse(slot), Trace<uint32_t>(slot, TRACE_BLIP_TYPE),
-	                   Trace<int32_t>(slot, TRACE_ENTITY_HANDLE), ours.pedRef);
+void ToScreenSpace(Vec2f &out, const Vec2f &in) {
+	Func<TransformFn>(CRadar__TransformRadarPointToScreenSpace)(&out, &in);
 }
 
-// ---- the engine's blip calls ----------------------------------------------
-
-int32_t SetEntityBlipForPed(int32_t pedRef, uint32_t colour) {
-	return Func<SetEntityBlipFn>(CRadar__SetEntityBlip)(
-	    BLIP_CHAR, pedRef, colour, uint32_t(BLIP_DISPLAY_BLIP_ONLY));
+// The second argument is m_bDim, and the inversion is easy to get backwards:
+// a *set* m_bDim selects the lighter of the two colours. SetEntityBlip leaves
+// it at 1, so every script blip in the game is the lighter pair, and a player
+// has to be too or they would be the only dark green thing on the radar.
+uint32_t GetRadarTraceColour(uint32_t colour) {
+	return Func<TraceColourFn>(CRadar__GetRadarTraceColour)(colour, 1);
 }
 
-void ClearBlip(int32_t handle) {
-	Func<ClearBlipFn>(CRadar__ClearBlip)(handle);
-}
-
-// ADD_BLIP_FOR_CHAR's own scale, and it has to be set after the fact because
-// SetEntityBlip writes m_wScale = 1 itself. ShowRadarTrace draws the square
-// from -size to +size with a one-wider black border, so 1 is about four
-// pixels across at the HUD's reference resolution - which is why the script
-// never leaves it there for anything it wants you to find.
-void ChangeBlipScale(int32_t handle, int32_t scale) {
-	Func<ChangeBlipFn>(CRadar__ChangeBlipScale)(handle, scale);
-}
-
-void ChangeBlipColour(int32_t handle, uint32_t colour) {
-	Func<ChangeBlipFn>(CRadar__ChangeBlipColour)(handle, static_cast<int32_t>(colour));
-}
-
-constexpr int32_t BLIP_SCALE_PLAYER = 3;
-
-// ---- the ped --------------------------------------------------------------
+// ---- where somebody is, and which way they are facing ---------------------
 
 // A remote player's live CPed, read-only. The vtable check is nametag.cpp's,
-// and it is what turns a recycled pool slot into a null rather than into a
-// blip following a pedestrian around.
+// and it is what turns a recycled pool slot into a null rather than into an
+// arrow following a pedestrian around.
 void *LivePed(const RemotePlayer &player) {
 	if (!player.active || player.poolHandle < 0)
 		return nullptr;
@@ -160,135 +152,213 @@ void *LivePed(const RemotePlayer &player) {
 	return ped;
 }
 
-// Exactly the test DrawBlips itself makes before deciding to draw a
-// BLIP_CHAR at the car's position instead of the ped's: `cmp byte
-// [eax+314h],0 / je` then `mov edi,[eax+310h] / test edi,edi`. Reading the
-// same two fields is what keeps the colour and the position from ever
-// disagreeing about whether somebody is driving.
-bool PedIsInVehicle(void *ped) {
-	return Field<bool>(ped, offs::PED_IN_VEHICLE) &&
-	       Field<void *>(ped, offs::PED_MY_VEHICLE) != nullptr;
+// Exactly the test DrawBlips makes before deciding to draw a BLIP_CHAR at the
+// car's position instead of the ped's: `cmp byte [eax+314h],0 / je` then
+// `mov edi,[eax+310h] / test edi,edi`.
+void *VehicleOf(void *ped) {
+	if (!Field<bool>(ped, offs::PED_IN_VEHICLE))
+		return nullptr;
+	return Field<void *>(ped, offs::PED_MY_VEHICLE);
 }
 
-// ---- one player -----------------------------------------------------------
-
-void DropOurRecord(OurBlip &ours) {
-	ours.handle = NO_BLIP;
-	ours.colour = 0xFFFFFFFFu;
-	ours.pedRef = -1;
-}
-
-// Gives up the slot and says so. Only for blips CoopIII still owns - a slot
-// that has stopped being ours is the script's now and must not be cleared.
+// CPlaceable::GetForward().Heading(), which is FindPlayerHeading's own
+// arithmetic: `fld [edx+14h] / fchs / fld [edx+18h] / fpatan`, i.e.
+// Atan2(-forward.x, forward.y) over the entity's matrix.
 //
-// The pool check is the teardown case. ClearBlip calls SetRadarMarkerState,
-// which resolves the entity out of CPools::ms_pPedPool to clear its bHasBlip,
-// and RemoveRadarBlips runs from DLL_PROCESS_DETACH where the engine may
-// already have shut its pools down. A null pool pointer there means there is
-// nothing left to tidy and a live one means it is safe to.
-void ReleaseBlip(OurBlip &ours) {
-	if (StillOurs(ours) && Global<void *>(CPools__ms_pPedPool) != nullptr)
-		ClearBlip(ours.handle);
-	DropOurRecord(ours);
+// It is the same quantity the wire carries. CPed::m_fRotationCur is the angle
+// CPlaceable::SetHeading builds the matrix from, and SetRotateZOnly writes
+// forward = (-sin a, cos a), so Atan2(-fx, fy) is a again. That is what lets
+// the two sources below be used interchangeably without a conversion.
+float EntityHeading(void *entity) {
+	const float fx = Field<float>(entity, offs::MATRIX_FWD + 0);
+	const float fy = Field<float>(entity, offs::MATRIX_FWD + 4);
+	return std::atan2(-fx, fy);
 }
 
-// Pass one for one player: give the slot back if it should not be ours, and
-// notice if it has stopped being ours without anyone saying so. Runs for
-// every player before anything is counted, so a slot let go of this frame is
-// available again this frame.
-void ReleaseIfUnwanted(uint8_t id, const RemotePlayer &player, bool connected) {
-	OurBlip &ours = g_blips[id];
-	if (ours.handle == NO_BLIP)
-		return;
+// Everything one arrow needs, resolved before anything is drawn.
+struct Arrow {
+	Vec2f world{};
+	float heading   = 0.0f;
+	bool  inVehicle = false;
+	bool  fromPed   = false;   // for the log line, and nothing else
+};
 
-	void *const ped = connected ? LivePed(player) : nullptr;
-	const bool  want =
-	    connected && BlipWanted(player.active, player.haveState, ped != nullptr);
-
-	// Stopped being ours: the ped died and ~CPed cleared the blip, the script
-	// wiped the table on a game load, or a slot we let go of got recycled.
-	// Forget it rather than clearing it - by now the slot may be somebody
-	// else's.
-	if (!StillOurs(ours)) {
-		// Only worth a line when we still wanted it. A blip that went away
-		// because the player left is the system working.
-		if (want && !g_saidLostBlip) {
-			g_saidLostBlip = true;
-			Log("radar: the blip for player %u is gone from slot %d - the ped was "
-			    "destroyed or the game reused the slot. It will be put back, and "
-			    "this is only reported once",
-			    id, BlipSlot(ours.handle));
+// Whichever of the two sources knows where this player is.
+//
+// The engine first, when it has an answer. A live ped - or the car it is
+// sitting in, which is what DrawBlips itself redirects to - is the truth this
+// machine is already rendering, and reading it means the arrow can never
+// disagree with the ped standing under the nametag.
+//
+// The wire otherwise. A player whose ped has not streamed in, or who is
+// outside whatever streaming radius CoopIII eventually grows, still has a
+// position and a heading arriving twenty-five times a second, and an arrow
+// needs nothing else. docs/roadmap.md §5.3.
+bool ResolveArrow(const RemotePlayer &player, Arrow &out) {
+	if (void *ped = LivePed(player)) {
+		out.fromPed        = true;
+		void *const entity = VehicleOf(ped);
+		if (entity != nullptr) {
+			out.inVehicle = true;
+			out.world.x   = Field<float>(entity, offs::POSITION + 0);
+			out.world.y   = Field<float>(entity, offs::POSITION + 4);
+			out.heading   = EntityHeading(entity);
+			return true;
 		}
-		DropOurRecord(ours);
-		return;
+		out.world.x = Field<float>(ped, offs::POSITION + 0);
+		out.world.y = Field<float>(ped, offs::POSITION + 4);
+		out.heading = EntityHeading(ped);
+		return true;
 	}
 
-	// A ped that was destroyed and respawned is a different ped with a
-	// different ref, and a blip pointed at the old one tracks nothing.
-	if (!want || ours.pedRef != player.poolHandle)
-		ReleaseBlip(ours);
+	// No ped. `last` rather than the interpolation buffer, on purpose:
+	// InterpBuffer::SampleDelayed drives a playback clock and ped.cpp already
+	// advances it once a frame, so calling it from the draw would move that
+	// clock twice per frame in a way ped.cpp cannot see. A radar pixel is
+	// worth a hundred metres of world at this range; the newest snapshot is
+	// more than close enough and it costs nothing.
+	if (player.haveState) {
+		out.world.x = player.last.pos.x;
+		out.world.y = player.last.pos.y;
+		out.heading = player.last.heading;
+		return true;
+	}
+	if (player.haveSeedPose) {
+		out.world.x = player.seedPose.pos.x;
+		out.world.y = player.seedPose.pos.y;
+		out.heading = player.seedPose.heading;
+		return true;
+	}
+	return false;
 }
 
-// Pass two for one player: take a slot if they should have one and do not,
-// and keep the colour honest if they do.
-void EnsureBlip(uint8_t id, const RemotePlayer &player, int &freeSlots,
-                int &oursHeld) {
-	OurBlip &ours = g_blips[id];
+// ---- the draw -------------------------------------------------------------
 
-	void *const ped = LivePed(player);
-	if (!BlipWanted(player.active, player.haveState, ped != nullptr))
+// The two gates DrawBlips itself opens with. The original has already run and
+// has already returned early if either of these is set, in which case it set
+// no render states either - so this is not belt and braces, it is the
+// difference between drawing into a state the engine prepared and drawing
+// into whatever was there.
+bool RadarIsOnScreen() {
+	if (Global<uint8_t>(TheCamera + CAMERA_WIDESCREEN_ON) != 0)
+		return false;   // widescreen bars: from here, a cutscene
+	return Global<uint8_t>(CHud__m_Wants_To_Draw_Hud) != 0;
+}
+
+void DrawArrows() {
+	if (g_client == nullptr || !g_client->IsConnected())
+		return;
+	if (!RadarIsOnScreen())
 		return;
 
-	const uint32_t colour = BlipColourFor(PedIsInVehicle(ped));
-
-	if (ours.handle != NO_BLIP) {
-		++oursHeld;
-		// On change only. ChangeBlipColour is cheap, but so is the compare,
-		// and writing a field every frame is how a bug hides in the noise.
-		if (colour != ours.colour) {
-			ChangeBlipColour(ours.handle, colour);
-			ours.colour = colour;
+	// CRadar::LoadTextures runs at game start and CRadar::RemoveRadarSections
+	// throws them away again, so between a game load and the next load this
+	// is a CSprite2d with no texture. Drawing it would queue untextured white
+	// quads over the radar.
+	void *const centre = Ptr<void>(CRadar__CentreSprite);
+	if (Field<void *>(centre, 0) == nullptr) {
+		if (!g_saidNoTexture) {
+			g_saidNoTexture = true;
+			Log("radar: CRadar::CentreSprite has no texture loaded, so there is "
+			    "nothing to draw a player arrow with. This is normal between a "
+			    "game load and the next; reported once");
 		}
 		return;
 	}
 
-	if (!MayTakeTraceSlot(freeSlots, oursHeld)) {
-		if (!g_saidNoSlots) {
-			g_saidNoSlots = true;
-			Log("radar: only %d of the game's %u blip slots are free and %d are "
-			    "already ours, so player %u gets no blip. The campaign script owns "
-			    "this table and CoopIII will not take the last of it; reported once",
-			    freeSlots, unsigned(NUM_RADAR_BLIPS), oursHeld, id);
+	const int screenW = Global<int32_t>(RsGlobal__maximumWidth);
+	const int screenH = Global<int32_t>(RsGlobal__maximumHeight);
+	const float halfX = RadarSpriteHalf(screenW, g_recipRefWidth);
+	const float halfY = RadarSpriteHalf(screenH, g_recipRefHeight);
+	// Zero means the game's own arrow has vanished into the truncation too.
+	// See RadarSpriteHalf.
+	if (!(halfX > 0.0f) || !(halfY > 0.0f))
+		return;
+
+	const float range = Global<float>(CRadar__m_radarRange);
+	if (!RadarRangeUsable(range)) {
+		if (!g_saidBadRange) {
+			g_saidBadRange = true;
+			Log("radar: CRadar::m_radarRange reads %f, which is not a radar "
+			    "range, so remote players cannot be placed on the minimap this "
+			    "frame; reported once",
+			    range);
 		}
 		return;
 	}
 
-	const int32_t handle = SetEntityBlipForPed(player.poolHandle, colour);
-	if (!BlipHandleUsable(handle)) {
-		// Cannot happen with a free slot in hand, which is the point of
-		// counting first - but if it ever does, the alternative is writing
-		// through a handle for a slot that does not exist, and the slot after
-		// the last one is CDarkel's kill register.
-		Log("radar: CRadar::SetEntityBlip returned 0x%08X for player %u, which is "
-		    "not a usable blip handle; leaving them off the radar",
-		    static_cast<unsigned>(handle), id);
-		return;
+	// Which way the camera has the radar turned, asked of the engine's own
+	// transform rather than of TheCamera. radar.h::RadarCameraHeading has the
+	// derivation; the short version is that the point one radar range due
+	// north of the radar origin lands on exactly (sin, cos) of the angle.
+	const Vec2f &origin = Global<Vec2f>(CRadar__vec2DRadarOrigin);
+	const Vec2f  north{origin.x, origin.y + range};
+	Vec2f        sincos{};
+	ToRadarSpace(sincos, north);
+	const float cameraHeading = RadarCameraHeading(sincos.x, sincos.y);
+
+	const uint8_t localId = g_client->LocalPlayerId();
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+		if (id == localId)
+			continue;   // you are the centre sprite, drawn by the engine
+
+		const RemotePlayer &player = g_client->PlayerSlot(id);
+		if (!ArrowWanted(player.active, player.haveState || player.haveSeedPose))
+			continue;
+
+		Arrow arrow;
+		if (!ResolveArrow(player, arrow))
+			continue;
+
+		// The engine's own four steps, in the engine's own order.
+		Vec2f       radarPoint{};
+		ToRadarSpace(radarPoint, arrow.world);
+		const float dist  = LimitRadarPoint(radarPoint);
+		const uint8_t alpha = CalculateBlipAlpha(dist);
+		Vec2f       screen{};
+		ToScreenSpace(screen, radarPoint);
+
+		const ArrowQuad quad = MakeArrowQuad(screen.x, screen.y,
+		                                     ArrowAngle(arrow.heading, cameraHeading),
+		                                     halfX, halfY);
+
+		const ArrowRgb rgb =
+		    UnpackTraceColour(GetRadarTraceColour(ArrowTraceColour(arrow.inVehicle)));
+		const Rgba colour{rgb.r, rgb.g, rgb.b, alpha};
+
+		const int *o = ARROW_DRAW_ORDER;
+		Func<SpriteQuadFn>(CSprite2d__DrawFourCorners)(
+		    centre, quad.x[o[0]], quad.y[o[0]], quad.x[o[1]], quad.y[o[1]],
+		    quad.x[o[2]], quad.y[o[2]], quad.x[o[3]], quad.y[o[3]], &colour);
+
+		if (!g_saidFirstArrow) {
+			g_saidFirstArrow = true;
+			Log("radar: player %u (\"%s\") is an arrow on the minimap - %s, %s, "
+			    "%.0fx%.0f px, alpha %u",
+			    id, player.nick.c_str(),
+			    arrow.inVehicle ? "red (in a vehicle)" : "green (on foot)",
+			    arrow.fromPed ? "from their ped" : "from the wire",
+			    halfX * 2.0f, halfY * 2.0f, unsigned(alpha));
+		}
 	}
+}
 
-	ChangeBlipScale(handle, BLIP_SCALE_PLAYER);
+void __cdecl HookedDrawBlips() {
+	// The original first: the map, the game's blips, the compass and the local
+	// player's own arrow all belong under ours.
+	g_drawBlips.Original<DrawBlipsFn>()();
 
-	ours.handle = handle;
-	ours.colour = colour;
-	ours.pedRef = player.poolHandle;
-	--freeSlots;
-	++oursHeld;
-
-	if (!g_saidFirstBlip) {
-		g_saidFirstBlip = true;
-		Log("radar: player %u (\"%s\") is on the minimap - slot %d, %s, scale %d",
-		    id, player.nick.c_str(), BlipSlot(handle),
-		    colour == RADAR_TRACE_RED ? "red (in a vehicle)" : "green (on foot)",
-		    BLIP_SCALE_PLAYER);
+	// Same containment as the frame hook: a throw escaping into the engine
+	// would unwind through frames that know nothing about C++ exceptions.
+	try {
+		DrawArrows();
+	} catch (...) {
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			Log("radar: the arrow draw threw; remote players may be missing from "
+			    "the minimap from here on");
+		}
 	}
 }
 
@@ -296,96 +366,95 @@ void EnsureBlip(uint8_t id, const RemotePlayer &player, int &freeSlots,
 
 // ---- installing -----------------------------------------------------------
 
-bool InstallRadarBlips(const Client &client) {
-	for (OurBlip &blip : g_blips)
-		blip = OurBlip{};
-	g_saidFirstBlip = false;
-	g_saidNoSlots   = false;
-	g_saidLostBlip  = false;
-	g_installed     = false;
-	g_client        = nullptr;
+bool InstallRadarArrows(const Client &client) {
+	g_client         = nullptr;
+	g_saidFirstArrow = false;
+	g_saidNoTexture  = false;
+	g_saidBadRange   = false;
 
-	// Before writing a single entry, check the table looks like CRadar's.
-	// verify.cpp has already refused to load against any other image, so a
-	// failure here means something patched or moved the table at runtime -
-	// and the consequence of writing it anyway is not a missing blip, it is
-	// 32 arbitrary slots of somebody else's memory.
-	int bad   = 0;
-	int inUse = 0;
-	for (int slot = 0; slot < static_cast<int>(NUM_RADAR_BLIPS); ++slot) {
-		const bool used = TraceInUse(slot);
-		if (used)
-			++inUse;
-		if (!TraceEntrySane(used, Trace<uint32_t>(slot, TRACE_BLIP_TYPE),
-		                    Trace<uint16_t>(slot, TRACE_BLIP_DISPLAY),
-		                    Trace<uint16_t>(slot, TRACE_RADAR_SPRITE)))
-			++bad;
-	}
-
-	if (bad != 0) {
-		Log("radar: NOT putting players on the minimap. %d of the %u entries at "
-		    "CRadar::ms_RadarTrace (0x%08X) do not look like radar blips, so "
-		    "something has moved or patched the table and writing it would "
-		    "corrupt whatever is really there",
-		    bad, unsigned(NUM_RADAR_BLIPS), unsigned(CRadar__ms_RadarTrace));
+	// Is the function about to be detoured the one this file was written
+	// against? verify.cpp has already refused to load against any other image,
+	// so a mismatch here means something patched DrawBlips at runtime - and
+	// hooking a function whose first seven bytes are somebody else's jump is
+	// how two mods quietly break each other.
+	if (std::memcmp(reinterpret_cast<const void *>(CRadar__DrawBlips),
+	                DRAW_BLIPS_PROLOGUE, sizeof(DRAW_BLIPS_PROLOGUE)) != 0) {
+		const uint8_t *at = reinterpret_cast<const uint8_t *>(CRadar__DrawBlips);
+		Log("radar: NOT drawing players on the minimap. CRadar::DrawBlips at "
+		    "0x%08X starts %02X %02X %02X %02X %02X %02X %02X, not the prologue "
+		    "this was built against - something else has already patched it, and "
+		    "hooking over that would break both",
+		    unsigned(CRadar__DrawBlips), at[0], at[1], at[2], at[3], at[4], at[5],
+		    at[6]);
 		return false;
 	}
 
-	g_client    = &client;
-	g_installed = true;
-	Log("radar: remote players will be blips on the minimap. "
-	    "CRadar::ms_RadarTrace at 0x%08X, %u slots of 0x%02X, %d in use by the "
-	    "game right now, %d reserved for it",
-	    unsigned(CRadar__ms_RadarTrace), unsigned(NUM_RADAR_BLIPS),
-	    unsigned(SIZEOF_RADAR_TRACE), inUse, RADAR_SCRIPT_RESERVE);
+	// One pointer compare that checks three things at once: the sprite table
+	// is where addresses.h says, CentreSprite is where addresses.h says, and
+	// entry 4 is still the one the table shipped with.
+	void *const inTable =
+	    Global<void *>(CRadar__RadarSprites + RADAR_SPRITE_CENTRE * sizeof(void *));
+	if (inTable != reinterpret_cast<void *>(CRadar__CentreSprite)) {
+		Log("radar: NOT drawing players on the minimap. "
+		    "CRadar::RadarSprites[%u] is 0x%08X, not CRadar::CentreSprite "
+		    "(0x%08X) - the sprite table has been moved or rebuilt, and the "
+		    "arrow would be drawn with whatever is there instead",
+		    unsigned(RADAR_SPRITE_CENTRE), unsigned(uintptr_t(inTable)),
+		    unsigned(CRadar__CentreSprite));
+		return false;
+	}
+
+	// The HUD reciprocals, read rather than compiled in, so a mod that
+	// rescales the radar by patching them takes our arrow with it. radar.h
+	// has the reasoning and why this file answers the Widescreen Fix question
+	// the opposite way to nametag.h.
+	g_recipRefWidth  = Global<float>(RADAR_RECIP_REF_WIDTH);
+	g_recipRefHeight = Global<float>(RADAR_RECIP_REF_HEIGHT);
+	if (!(g_recipRefWidth > 0.0f) || !(g_recipRefHeight > 0.0f)) {
+		Log("radar: NOT drawing players on the minimap. The HUD scale "
+		    "reciprocals at 0x%08X and 0x%08X read %f and %f, which cannot be "
+		    "1/640 and 1/448 or anything a mod would have replaced them with",
+		    unsigned(RADAR_RECIP_REF_WIDTH), unsigned(RADAR_RECIP_REF_HEIGHT),
+		    g_recipRefWidth, g_recipRefHeight);
+		return false;
+	}
+
+	if (!g_drawBlips.Install("CRadar::DrawBlips",
+	                         reinterpret_cast<void *>(CRadar__DrawBlips),
+	                         reinterpret_cast<void *>(&HookedDrawBlips))) {
+		Log("radar: FAILED to hook CRadar::DrawBlips at 0x%08X; remote players "
+		    "will not be on the minimap",
+		    unsigned(CRadar__DrawBlips));
+		for (const auto &f : HookFailures())
+			Log("radar:   %s: %s", f.name.c_str(), f.reason.c_str());
+		return false;
+	}
+
+	g_client = &client;
+
+	const float stockW = 1.0f / HUD_REF_WIDTH;
+	const float stockH = 1.0f / HUD_REF_HEIGHT;
+	Log("radar: remote players will be arrows on the minimap. Hooked "
+	    "CRadar::DrawBlips at 0x%08X, drawing CRadar::CentreSprite (0x%08X) "
+	    "through CSprite2d::Draw",
+	    unsigned(CRadar__DrawBlips), unsigned(CRadar__CentreSprite));
+	if (g_recipRefWidth != stockW || g_recipRefHeight != stockH) {
+		Log("radar: the HUD scale reciprocals are %g and %g, not the stock %g "
+		    "and %g - something has rescaled the radar, and the player arrows "
+		    "are following it rather than the built-in numbers",
+		    g_recipRefWidth, g_recipRefHeight, stockW, stockH);
+	}
 	return true;
 }
 
-void UpdateRemoteBlips() {
-	if (!g_installed || g_client == nullptr)
-		return;
-
-	// Not connected is not the same as no players: dropping the session has
-	// to take the blips with it, or they sit on the radar tracking peds that
-	// are about to be destroyed.
-	const bool    connected = g_client->IsConnected();
-	const uint8_t localId   = g_client->LocalPlayerId();
-
-	// Two passes, and the order is the point. Releasing first means a slot
-	// given up this frame - a player who left, a ped that was rebuilt - is
-	// free again by the time the count below is taken, instead of being
-	// counted as the script's until the next frame.
-	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
-		if (id == localId) {
-			// You are the centre sprite, not a blip.
-			if (g_blips[id].handle != NO_BLIP)
-				ReleaseBlip(g_blips[id]);
-			continue;
-		}
-		ReleaseIfUnwanted(id, g_client->PlayerSlot(id), connected);
-	}
-
-	if (!connected)
-		return;
-
-	int freeSlots = CountFreeTraceSlots();
-	int oursHeld  = 0;
-	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
-		if (id == localId)
-			continue;
-		EnsureBlip(id, g_client->PlayerSlot(id), freeSlots, oursHeld);
-	}
+void RemoveRadarArrows() {
+	if (g_drawBlips.IsInstalled())
+		g_drawBlips.Remove();
+	g_client = nullptr;
 }
 
-void RemoveRadarBlips() {
-	for (OurBlip &blip : g_blips)
-		ReleaseBlip(blip);
-	g_installed = false;
-	g_client    = nullptr;
-}
-
-bool RadarBlipsInstalled() {
-	return g_installed;
+bool RadarArrowsInstalled() {
+	return g_drawBlips.IsInstalled();
 }
 
 } // namespace coopiii::game

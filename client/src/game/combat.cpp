@@ -1,9 +1,13 @@
 #include "combat.h"
 
+#include "clock.h"
 #include "hook/hook.h"
 #include "log.h"
 #include "ped.h"
 #include "pedanim.h"
+// For NoteHostedPedDeath. The CPed::SetDie detour lives here and the ambient
+// half of what it witnesses is answered there - see HookedSetDie.
+#include "population.h"
 
 #include <cstdio>
 
@@ -42,6 +46,9 @@ namespace {
 //                                     one branch out of four
 //   CWeapon::DoDoomAiming             the engine's own seam for moving a shot
 //                                     that has been aimed and not yet traced
+//   CBulletTraces::AddTrace           and the one place the streak a player
+//                                     actually sees is decided, which is not
+//                                     the same line as the ray above
 
 Detour g_fire;
 Detour g_explode;
@@ -51,6 +58,7 @@ Detour g_setDie;
 Detour g_lineOfSight;
 Detour g_bulletImpact;
 Detour g_doomAiming;
+Detour g_addTrace;
 
 // What S_Welcome said about friendly fire (docs/roadmap.md §5.2). Off until
 // a session says otherwise, which is also the right answer for a client that
@@ -163,11 +171,17 @@ bool g_saidProjectileEnded  = false;
 //              wire is the old ped-forward fallback rather than the aim
 //   repaired   retail drew one of our own trails to an uninitialised point
 //              and we gave it the ray's far end instead
+//   measured   how far apart our own ray and our own trail actually are, in
+//              metres and degrees, the first time we fire. That number is the
+//              one this round turned on and nobody had ever taken it
 bool g_saidAimApplied    = false;
 bool g_saidAimNotAsked   = false;
 bool g_saidAimNoDir      = false;
 bool g_saidNoLocalRay    = false;
 bool g_saidTrailRepaired = false;
+bool g_saidTrailMeasured = false;
+bool g_saidTrailOrigin   = false;
+bool g_saidReplayTrail   = false;
 
 // One flag per gate rather than one for all of them, because the gates are
 // not alternatives. "No ped yet" is normal in the first second of a session
@@ -464,10 +478,21 @@ struct LocalRay {
 	bool         sampling = false;
 	int          rays     = 0;
 	Vec3         sum{};
+	// Where the ray started. On three of FireInstantHit's four branches this
+	// is the muzzle; on the 3rd-person mouse camera branch it is the muzzle
+	// projected onto the camera's own axis, and that difference is the whole
+	// of this round.
+	Vec3         nearEnd{};
 	// The far end of the last ray, and the pointer the engine handed us for
 	// it. The pointer is the evidence, not the value - see HookedDoBulletImpact.
 	const float *point2  = nullptr;
 	Vec3         farEnd{};
+
+	// And the segment the engine actually *drew*, which is a different line.
+	int  trails = 0;
+	Vec3 trailSum{};
+	Vec3 trailStart{};
+	Vec3 trailEnd{};
 };
 
 LocalRay g_localRay;
@@ -518,8 +543,9 @@ bool __cdecl HookedProcessLineOfSight(const float *point1, const float *point2,
 			g_localRay.sum.z += unit.z;
 			++g_localRay.rays;
 		}
-		g_localRay.point2 = point2;
-		g_localRay.farEnd = Vec3{point2[0], point2[1], point2[2]};
+		g_localRay.point2  = point2;
+		g_localRay.nearEnd = Vec3{point1[0], point1[1], point1[2]};
+		g_localRay.farEnd  = Vec3{point2[0], point2[1], point2[2]};
 	}
 
 	return g_lineOfSight.Original<LineOfSightFn>()(point1, point2, point, entity, type,
@@ -580,6 +606,68 @@ void __fastcall HookedDoBulletImpact(void *self, void * /*edx*/, void *shooter,
 
 	g_bulletImpact.Original<ImpactHookFn>()(self, nullptr, shooter, victim, source,
 	                                        target, point, aheadX, aheadY);
+}
+
+// __cdecl void CBulletTraces::AddTrace(CVector *start, CVector *target).
+//
+// The streak, and the only thing in this file that measures what the player
+// actually *saw* rather than what the engine computed on the way there.
+//
+// Read out of the retail function rather than re3's declaration: 0x00518E90
+// is `xor eax,eax / push ebx`, then `mov edx,[esp+8]` and `mov ecx,[esp+0Ch]`
+// for the two arguments and a bare `ret`, so it is __cdecl with start first.
+// It copies edx's three floats to 0x0072B1B8 + slot*0x1C and ecx's three to
+// +0x0C, sets the in-use byte at +0x18 and gives the slot a life of
+// `25 + GetRandomNumber() % 32` frames at +0x1A.
+//
+// Why sample here rather than at the ray: because the two are different lines
+// and it is this one that is drawn. On FireInstantHit's 3rd-person mouse
+// camera branch - the branch a mouse-aiming player is on for every shot - the
+// ray runs from the muzzle projected onto the camera axis, while the trail
+// runs from the muzzle. An observer handed the *ray's* direction and told to
+// fire from the muzzle draws a line parallel to the shooter's ray, offset by
+// however far the muzzle sits off that axis. Handed the *trail's* direction it
+// draws the shooter's own segment, because both ends now come from the same
+// two points.
+//
+// One trigger pull can produce several: a shotgun draws one per pellet. The
+// unit directions are summed for the same reason the rays are - the average of
+// the unit vectors is the middle of the cone, where the average of the raw
+// vectors would be dragged by whichever pellet flew furthest.
+//
+// Read-only. The original always runs, unchanged, for everybody.
+using AddTraceFn = void(__cdecl *)(const float *, const float *);
+
+void __cdecl HookedAddTrace(const float *start, const float *target) {
+	if (g_localRay.sampling && start && target) {
+		Vec3 unit;
+		if (UnitDirection(Vec3{target[0] - start[0], target[1] - start[1],
+		                       target[2] - start[2]},
+		                  unit)) {
+			g_localRay.trailSum.x += unit.x;
+			g_localRay.trailSum.y += unit.y;
+			g_localRay.trailSum.z += unit.z;
+			if (g_localRay.trails == 0) {
+				g_localRay.trailStart = Vec3{start[0], start[1], start[2]};
+				g_localRay.trailEnd   = Vec3{target[0], target[1], target[2]};
+			}
+			++g_localRay.trails;
+		}
+	} else if (g_replaying && g_replayAim.ped && start && target &&
+	           !g_saidReplayTrail) {
+		// The other end of the same measurement, once. The shooter's log says
+		// where their streak went; this says where ours went for the same
+		// weapon. Two machines, two lines, and until now the only instrument
+		// for comparing them was somebody looking at two screens.
+		g_saidReplayTrail = true;
+		Log("combat: drew a remote player's first bullet trail from (%.2f %.2f %.2f) "
+		    "to (%.2f %.2f %.2f), along the (%.2f %.2f %.2f) their own machine sent. "
+		    "That start is the muzzle off the wire, not our copy of their ped",
+		    start[0], start[1], start[2], target[0], target[1], target[2],
+		    g_replayAim.dir.x, g_replayAim.dir.y, g_replayAim.dir.z);
+	}
+
+	g_addTrace.Original<AddTraceFn>()(start, target);
 }
 
 // __cdecl void CWeapon::DoDoomAiming(CEntity *shooter, CVector *source,
@@ -689,19 +777,74 @@ void RecordLocalShot(const void *weapon, const void *shooter,
 	// to it costs exactly the behaviour this change is fixing and never less.
 	ReadForward(shooter, ev.shot.dir);
 
-	// The line the engine actually traced, averaged over however many rays
-	// this discharge was. This is the aim - the camera's, the lock-on's or the
-	// hand bone's, whichever branch ran - and no branch logic of our own was
-	// needed to get it, which is the point of sampling rather than deriving.
+	// The line the engine actually *drew*, averaged over however many streaks
+	// this discharge was, falling back to the line it traced and then to the
+	// body. combat.h's ChooseShotDirection is the decision and the comment
+	// above it is why it is in that order.
+	//
+	// Measured from the muzzle, because the muzzle is what goes on the wire as
+	// the origin, and an origin and a direction taken off two different lines
+	// reconstruct neither of them.
 	if (IsInstantHitWeapon(ev.shot.weapon)) {
-		Vec3 aim;
-		if (g_localRay.rays > 0 && UnitDirection(g_localRay.sum, aim)) {
+		Vec3                aim;
+		const ShotAimSource from =
+		    ChooseShotDirection(g_localRay.trailSum, g_localRay.trails, g_localRay.sum,
+		                        g_localRay.rays, ev.shot.dir, aim);
+		if (from != AIM_FROM_NOTHING)
 			ev.shot.dir = aim;
-		} else if (!g_saidNoLocalRay) {
+
+		// The measurement this round exists for, once per session: how far the
+		// ray the engine tested is from the streak it drew. Everything above
+		// is an argument that they differ; this is the number.
+		if (from == AIM_FROM_TRAIL && g_localRay.rays > 0 && !g_saidTrailMeasured) {
+			g_saidTrailMeasured = true;
+			Vec3 rayDir;
+			if (UnitDirection(g_localRay.sum, rayDir)) {
+				const float dot     = vec::Dot(rayDir, aim);
+				const float clamped = dot > 1.0f ? 1.0f : (dot < -1.0f ? -1.0f : dot);
+				const Vec3  off{g_localRay.nearEnd.x - ev.shot.origin.x,
+				                g_localRay.nearEnd.y - ev.shot.origin.y,
+				                g_localRay.nearEnd.z - ev.shot.origin.z};
+				Log("combat: our own shot traced a ray from (%.2f %.2f %.2f) and drew "
+				    "its trail from (%.2f %.2f %.2f) - %.2f m apart, %.1f degrees "
+				    "between the two directions. The wire carries the trail's, because "
+				    "the origin on it is the muzzle. Anything above a few centimetres "
+				    "here is CWeapon::FireInstantHit's mouse-camera branch tracing from "
+				    "the camera axis instead of the barrel",
+				    g_localRay.nearEnd.x, g_localRay.nearEnd.y, g_localRay.nearEnd.z,
+				    g_localRay.trailStart.x, g_localRay.trailStart.y,
+				    g_localRay.trailStart.z, std::sqrt(vec::LengthSq(off)),
+				    std::acos(clamped) * 57.2957795f);
+			}
+		}
+
+		// And the assumption underneath all of it, stated once rather than
+		// assumed forever: the streak starts at the muzzle we are sending.
+		// Three of the four branches copy CWeapon::Fire's fireSource into the
+		// local the trail is drawn from, so this should be zero; if it ever is
+		// not, the observer's flash and the observer's trail come apart and
+		// the log says so instead of the user having to.
+		if (from == AIM_FROM_TRAIL && !g_saidTrailOrigin) {
+			const Vec3 gap{g_localRay.trailStart.x - ev.shot.origin.x,
+			               g_localRay.trailStart.y - ev.shot.origin.y,
+			               g_localRay.trailStart.z - ev.shot.origin.z};
+			if (vec::LengthSq(gap) > 0.01f) {
+				g_saidTrailOrigin = true;
+				Log("combat: our own trail does not start where we say the shot does - "
+				    "the streak begins at (%.2f %.2f %.2f) and the wire carries "
+				    "(%.2f %.2f %.2f), %.2f m away. Everyone watching will draw the "
+				    "muzzle flash and the trail from that one point anyway",
+				    g_localRay.trailStart.x, g_localRay.trailStart.y,
+				    g_localRay.trailStart.z, ev.shot.origin.x, ev.shot.origin.y,
+				    ev.shot.origin.z, std::sqrt(vec::LengthSq(gap)));
+			}
+		}
+
+		if (from == AIM_FROM_BODY && !g_saidNoLocalRay) {
 			g_saidNoLocalRay = true;
-			Log("combat: our own shot with weapon %u traced no line we could read, so "
-			    "the direction on the wire is our ped's body heading rather than our "
-			    "aim. Everyone watching will draw the trail flat",
+			Log("combat: our own shot with weapon %u drew no trail and traced no line "
+			    "we could read, so the direction on the wire is our ped's body heading "
+			    "rather than our aim. Everyone watching will draw the trail flat",
 			    ev.shot.weapon);
 		}
 	}
@@ -910,6 +1053,29 @@ void __cdecl HookedRemoveProjectile(void *info, void *projectile) {
 // So the rule is stated here, once, positively: nothing on this machine may
 // damage a player this machine does not own. Anything the local player did
 // on purpose becomes a packet instead.
+// The last cause that actually reached the local player, and when.
+//
+// Kept for one reader: HookedSetDie, which has the animation the engine picked
+// and no idea why. CPed::SetGetUp's crush death makes no InflictDamage call in
+// the frame it kills - it writes m_fHealth = 0 and calls SetDie itself - so the
+// cause has to come from the frame before it. Hence a remembered value with an
+// age on it rather than an argument. combat.h, DeathCauseFor.
+//
+// Only what got through is recorded. A hit this machine refused on somebody
+// else's behalf never touched our health and is not why we died.
+struct LastLocalDamage {
+	uint8_t  cause = 0;
+	uint32_t atMs  = 0;
+	bool     have  = false;
+};
+LastLocalDamage g_lastLocalDamage;
+
+void NoteLocalDamage(uint32_t method) {
+	g_lastLocalDamage.cause = static_cast<uint8_t>(method);
+	g_lastLocalDamage.atMs  = WallClock::NowMs();
+	g_lastLocalDamage.have  = true;
+}
+
 using InflictThisFn = bool(__thiscall *)(void *, void *, uint32_t, float, uint32_t,
                                          uint32_t);
 using InflictHookFn = bool(__fastcall *)(void *, void *, void *, uint32_t, float,
@@ -988,6 +1154,7 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 	// the health is read either side of the call. So it is.
 	if (fire && localPed && self == localPed &&
 	    (!g_saidFireBurned || !g_saidFireNoMove)) {
+		NoteLocalDamage(method);
 		const float before = Field<float>(localPed, offs::PED_HEALTH);
 		const bool  died   = g_inflictDamage.Original<InflictHookFn>()(
             self, nullptr, damagedBy, method, damage, piece, direction);
@@ -1056,22 +1223,42 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 		return false;
 	}
 
+	// Anything still here is a hit this machine is letting through, and if it
+	// is ours it is a candidate reason for the next death. Recorded before the
+	// call because the call can be the death.
+	if (localPed && self == localPed)
+		NoteLocalDamage(method);
+
 	return g_inflictDamage.Original<InflictHookFn>()(self, nullptr, damagedBy, method,
 	                                                 damage, piece, direction);
 }
 
 // __thiscall void CPed::SetDie(AnimationId anim, float delta, float speed).
 //
-// Here to answer one question: which animation did the engine pick for the
-// local player's death? Nothing else can say. The snapshot can't - a death
-// animation is created with a blendAmount of 0 and doesn't become the
-// dominant one until several frames later, by which point the player has
-// been lying on the floor with nobody else told about it.
+// Two things ride this one hook, because CPed::SetDie is one address and an
+// address carries one detour.
+//
+// **The local player.** Which animation did the engine pick for this death?
+// Nothing else can say. The snapshot can't - a death animation is created
+// with a blendAmount of 0 and doesn't become the dominant one until several
+// frames later, by which point the player has been lying on the floor with
+// nobody else told about it.
 //
 // The announcement itself doesn't depend on this hook. Client::UpdateLocalLife
 // watches the sampled health and announces a death with ANIM_NONE if this
 // never fired, so a failed install costs the right animation and nothing
 // else.
+//
+// **Every other ped.** This is also the only moment an *ambient* pedestrian
+// this machine hosts dies, and unlike the player's death there is no second
+// witness at all: an ambient ped carries no health on the wire
+// (protocol.h, AmbientPedState, and the omission is deliberate), so nothing
+// downstream could infer it. game/population.cpp decides which of those peds
+// this machine is entitled to speak about - the same hosted-and-named filter
+// its BodyPartHook applies - and queues the ones that pass.
+//
+// A failed install therefore costs the whole ambient death feature, not just
+// its animation. That is stated at the call rather than worked out later.
 using SetDieHookFn = void(__fastcall *)(void *, void *, uint32_t, float, float);
 using SetDieThisFn = void(__thiscall *)(void *, uint32_t, float, float);
 
@@ -1083,15 +1270,101 @@ void __fastcall HookedSetDie(void *self, void * /*edx*/, uint32_t animId, float 
 	// and for a player MakePlayerSafe has made undamageable. Both would look
 	// like a death from the outside, so the test is the transition rather
 	// than the state: alive before, PED_DIE after.
-	const uint32_t before =
-	    localPlayer ? Field<uint32_t>(self, offs::PED_STATE) : PEDSTATE_NONE;
-	const bool wasDying = before == PEDSTATE_DIE || before == PEDSTATE_DEAD;
+	//
+	// Read for every ped now, not just the player. It is one dword off an
+	// object the engine is about to rewrite anyway, and the alternative -
+	// trusting the call - announces a death every time something shoots a
+	// corpse.
+	const uint32_t before = self ? Field<uint32_t>(self, offs::PED_STATE) : PEDSTATE_NONE;
+	const bool wasDying   = before == PEDSTATE_DIE || before == PEDSTATE_DEAD;
 
 	g_setDie.Original<SetDieHookFn>()(self, nullptr, animId, delta, speed);
 
-	if (localPlayer && !wasDying &&
-	    Field<uint32_t>(self, offs::PED_STATE) == PEDSTATE_DIE)
+	if (!self || wasDying || Field<uint32_t>(self, offs::PED_STATE) != PEDSTATE_DIE)
+		return;
+
+	if (localPlayer) {
+		// Said here and not in Client::AnnounceDeath, because this is the only
+		// place that still has the three facts at the same time: the animation
+		// the engine picked, whether we were in a seat when it picked it, and
+		// what last damaged us. By the time the queue is drained the ped is a
+		// corpse and bInVehicle has been cleared.
+		//
+		// combat.h has the disassembly this reads from. The short version:
+		// animation 173 comes from exactly two places in the image, and a ped
+		// in a car can only die of drowning, so those two facts together name
+		// the death.
+		const bool       inVehicle = Field<bool>(self, offs::PED_IN_VEHICLE);
+		const DeathCause cause =
+		    DeathCauseFor(g_lastLocalDamage.have, g_lastLocalDamage.cause,
+		                  WallClock::NowMs() - g_lastLocalDamage.atMs);
+		Log("combat: we died - anim %u, %sin a vehicle, last cause %s (%u) %u ms "
+		    "ago. %s",
+		    animId, inVehicle ? "" : "not ",
+		    g_lastLocalDamage.have ? "recorded" : "none",
+		    g_lastLocalDamage.have ? g_lastLocalDamage.cause : 0u,
+		    g_lastLocalDamage.have
+		        ? WallClock::NowMs() - g_lastLocalDamage.atMs
+		        : 0u,
+		    DeathStory(static_cast<uint16_t>(animId), inVehicle, cause));
+		g_lastLocalDamage = LastLocalDamage{};
+
 		RecordLocalDeath(animId);
+		return;
+	}
+
+	// Not the player, so it is a pedestrian - ours, somebody else's replica,
+	// or one the session has never heard of. population.cpp is the only
+	// thing that can tell those apart, and it drops the two it is not
+	// entitled to speak about.
+	//
+	// animId is narrowed to 16 bits here and on the wire, which is the same
+	// width PlayerStateBody and C_Death already use for an AnimationId. The
+	// retail enum's last member is 0ADh.
+	NoteHostedPedDeath(self, static_cast<uint16_t>(animId));
+}
+
+// One line at startup, and it exists to close a question rather than to change
+// anything: **is the trail business about the screen resolution?**
+//
+// The trail itself cannot be - it is two world-space points from end to end
+// (addresses.h). But the *aim* on the 3rd-person mouse camera branch is scaled
+// horizontally by an aspect ratio, and in retail that aspect ratio is one of
+// two constants picked by the widescreen menu toggle rather than the shape of
+// the window. With the toggle not matching what is being rendered, every shot
+// leaves the barrel about 0.8 degrees to one side of the crosshair - always the
+// same side, on every screen, with or without CoopIII.
+//
+// And this install has ThirteenAG's Widescreen Fix in `_ESSENTIALS`, whose
+// whole job is that class of problem. So rather than assume, read it: if the
+// selection site still holds retail's bytes, nothing has touched it and the
+// two constants below are what the game aims with. If it does not, somebody
+// has, and the numbers are theirs.
+void ReportAimAspect() {
+	const uint8_t *const site =
+	    reinterpret_cast<const uint8_t *>(CCamera__AimAspectSelect);
+	bool retail = true;
+	for (size_t i = 0; i < sizeof(kAimAspectSelectBytes); ++i)
+		if (site[i] != kAimAspectSelectBytes[i])
+			retail = false;
+
+	if (!retail) {
+		Log("combat: something has rewritten how the game turns the crosshair into a "
+		    "shot direction (0x%08X is no longer retail's `cmp byte [0x%08X],0`). The "
+		    "Widescreen Fix is the likely author and that is a good thing - but it "
+		    "means the aiming aspect ratio here is not one this file can predict",
+		    CCamera__AimAspectSelect, CMenuManager__PrefsUseWideScreen);
+		return;
+	}
+
+	Log("combat: the game still aims the retail way - a mouse-aimed shot's horizontal "
+	    "angle is scaled by %.4f or %.4f depending on the widescreen toggle (currently "
+	    "%s), not by the shape of the window. The crosshair is drawn at a fixed "
+	    "fraction of the screen, so with those two disagreeing every shot leaves the "
+	    "barrel a fraction of a degree to one side of the sight, on every screen at "
+	    "once. Not a sync bug, and not something the wire can fix",
+	    Global<float>(kAimAspectWide), Global<float>(kAimAspectStandard),
+	    Global<uint8_t>(CMenuManager__PrefsUseWideScreen) ? "on" : "off");
 }
 
 } // namespace
@@ -1105,6 +1378,7 @@ bool InstallCombatHooks() {
 	g_dropped        = 0;
 	g_localRay       = LocalRay{};
 	g_replayAim      = ReplayAim{};
+	g_lastLocalDamage = LastLocalDamage{};
 
 	struct Spec {
 		const char *name;
@@ -1127,6 +1401,8 @@ bool InstallCombatHooks() {
 	     reinterpret_cast<void *>(&HookedDoBulletImpact), &g_bulletImpact},
 	    {"CWeapon::DoDoomAiming", CWeapon__DoDoomAiming,
 	     reinterpret_cast<void *>(&HookedDoDoomAiming), &g_doomAiming},
+	    {"CBulletTraces::AddTrace", CBulletTraces__AddTrace,
+	     reinterpret_cast<void *>(&HookedAddTrace), &g_addTrace},
 	};
 
 	bool all = true;
@@ -1143,6 +1419,8 @@ bool InstallCombatHooks() {
 	if (!all)
 		for (const auto &f : HookFailures())
 			Log("combat:   %s: %s", f.name.c_str(), f.reason.c_str());
+
+	ReportAimAspect();
 
 	return all;
 }
@@ -1165,6 +1443,7 @@ void RemoveCombatHooks() {
 	g_lineOfSight.Remove();
 	g_bulletImpact.Remove();
 	g_doomAiming.Remove();
+	g_addTrace.Remove();
 	g_count = g_head = 0;
 	g_friendlyFire   = false;
 	g_localRay       = LocalRay{};
@@ -1175,7 +1454,8 @@ bool CombatHooksInstalled() {
 	return g_fire.IsInstalled() && g_explode.IsInstalled() &&
 	       g_removeProjectile.IsInstalled() && g_inflictDamage.IsInstalled() &&
 	       g_setDie.IsInstalled() && g_lineOfSight.IsInstalled() &&
-	       g_bulletImpact.IsInstalled() && g_doomAiming.IsInstalled();
+	       g_bulletImpact.IsInstalled() && g_doomAiming.IsInstalled() &&
+	       g_addTrace.IsInstalled();
 }
 
 void SetFriendlyFire(bool enabled) { g_friendlyFire = enabled; }
@@ -1234,15 +1514,25 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
 	void *const weapon = reinterpret_cast<uint8_t *>(ped) + offs::PED_WEAPONS +
 	                     static_cast<size_t>(shot.weapon) * offs::SIZEOF_WEAPON;
 
-	// CWeapon::Fire refuses on an empty clip and on a reloading or
-	// out-of-ammo state, and reloads on its own schedule via CTimer. A
-	// remote player's clip isn't something anyone can see, and it's not
-	// something this machine gets an opinion on - so the slot gets put back
-	// into a state the engine will always fire from. docs/protocol.md §1.9.6.
-	constexpr int32_t REMOTE_CLIP = 500;
+	// The shot goes off no matter what this machine's copy of their clip
+	// says, and it goes off through the engine's own path.
+	//
+	// CWeapon::Fire refuses on an empty clip - `cmp dword [edi+8],0 / jg` at
+	// 0x0055C4A2, which returns false before anything is drawn - and it also
+	// refuses while the slot is reloading or out of ammo. Their machine has
+	// already decided they fired. If this copy were allowed to disagree,
+	// remote players would stop shooting on your screen while they were
+	// still shooting on theirs, which is a worse bug than the one ammo sync
+	// exists to fix: it is silent, and it only happens in a long firefight.
+	//
+	// So the slot is forced into a state Fire cannot refuse, and whatever
+	// Fire spends out of it is thrown away afterwards - see the restore
+	// below. Nothing here is the authority on the number; the wire is.
+	constexpr int32_t REPLAY_CLIP = 500;
+	const uint8_t     firedSlot   = shot.weapon;
 	Field<uint32_t>(weapon, offs::WEAPON_STATE)       = WEAPONSTATE_READY;
-	Field<int32_t>(weapon, offs::WEAPON_AMMO_IN_CLIP) = REMOTE_CLIP;
-	Field<int32_t>(weapon, offs::WEAPON_AMMO_TOTAL)   = REMOTE_CLIP;
+	Field<int32_t>(weapon, offs::WEAPON_AMMO_IN_CLIP) = REPLAY_CLIP;
+	Field<int32_t>(weapon, offs::WEAPON_AMMO_TOTAL)   = REPLAY_CLIP;
 	Field<uint32_t>(weapon, offs::WEAPON_TIMER)       = 0;
 
 	// Clamped for the same reason every other wire position is: the fire
@@ -1306,6 +1596,32 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
 	{
 		ReplayGuard guard;
 		Func<FireThisFn>(CWeapon__Fire)(weapon, ped, source);
+	}
+
+	// Undo what the engine just spent.
+	//
+	// CWeapon::Fire's tail decrements m_nAmmoInClip (`dec dword [edi+8]` at
+	// 0x0055C7D1) and, for a ped that is not the local player, m_nAmmoTotal
+	// as well (0x0055C7E9, taken whenever the total is under 25000). Both of
+	// those are this machine's opinion about somebody else's ammunition, and
+	// this machine does not get one - the owner is authoritative for their
+	// own ped, which is the rule everywhere else in CoopIII.
+	//
+	// Restored to the last number their own engine reported for this exact
+	// slot, which is why RemotePlayer keeps a table per weapon rather than
+	// only the held one: `shot.weapon` is what the shooter fired, and a
+	// snapshot for a different weapon can easily be the most recent thing to
+	// arrive.
+	//
+	// With ammo sync off the slot goes back to the fixed amount GiveWeaponTo
+	// hands out, which is where it was before this call.
+	if (AmmoSyncOn() && firedSlot < INVENTORY_SLOTS && player.ammoKnown[firedSlot]) {
+		WriteRemoteSlotAmmo(ped, firedSlot, player.ammoClip[firedSlot],
+		                    player.ammoTotal[firedSlot]);
+	} else {
+		Field<uint32_t>(weapon, offs::WEAPON_STATE)       = WEAPONSTATE_READY;
+		Field<int32_t>(weapon, offs::WEAPON_AMMO_IN_CLIP) = REPLAY_CLIP;
+		Field<int32_t>(weapon, offs::WEAPON_AMMO_TOTAL)   = REPLAY_CLIP;
 	}
 
 	if (pointGunAt)
