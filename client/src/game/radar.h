@@ -124,6 +124,7 @@
 #pragma once
 
 #include "addresses.h"
+#include "../chatfeed.h"
 
 #include <cmath>
 #include <cstddef>
@@ -285,6 +286,20 @@ inline ArrowRgb UnpackTraceColour(uint32_t packed) {
 	return ArrowRgb{static_cast<uint8_t>((packed >> 24) & 0xFFu),
 	                static_cast<uint8_t>((packed >> 16) & 0xFFu),
 	                static_cast<uint8_t>((packed >> 8) & 0xFFu)};
+}
+
+// A player's arrow is in their chat colour, so a name in the chat and a mark on
+// the radar are the same person at a glance. In a vehicle it is a shade darker,
+// which is all that is left of green on foot and red in a car.
+constexpr uint8_t ARROW_IN_VEHICLE_SHADE = 160;   // of 255
+
+inline ArrowRgb PlayerArrowRgb(uint8_t playerId, bool inVehicle) {
+	const NickColour c = ChatNickColour(playerId);
+	if (!inVehicle)
+		return ArrowRgb{c.r, c.g, c.b};
+	return ArrowRgb{static_cast<uint8_t>(c.r * ARROW_IN_VEHICLE_SHADE / 255),
+	                static_cast<uint8_t>(c.g * ARROW_IN_VEHICLE_SHADE / 255),
+	                static_cast<uint8_t>(c.b * ARROW_IN_VEHICLE_SHADE / 255)};
 }
 
 // Whether a roster slot should have an arrow on the radar this frame.

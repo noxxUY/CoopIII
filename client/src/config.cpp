@@ -57,10 +57,12 @@ std::string Config::SanitizeNick(const std::string &raw) {
 	return out.empty() ? std::string("Player") : out;
 }
 
-// For A-Z and 0-9 the virtual-key code is the uppercase character itself, and
-// F1 to F12 run from 0x70. Any other name is one we have no table for, so it is
-// left alone rather than guessed at.
+// For A-Z and 0-9 the virtual-key code is the uppercase character itself, F1
+// to F12 run from 0x70 and Tab is 0x09. Any other name is one we have no table
+// for, so it is left alone rather than guessed at.
 int Config::ParseKey(const std::string &value) {
+	if (IEquals(value, "tab"))
+		return 0x09;
 	if (value.size() == 1) {
 		const char c = value[0];
 		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
@@ -123,12 +125,21 @@ bool Config::ParseIni(const std::string &text) {
 		} else if (IEquals(key, "seatkey")) {
 			if (const int vk = ParseKey(value))
 				seatKey = vk;
+		} else if (IEquals(key, "voteyeskey")) {
+			if (const int vk = ParseKey(value))
+				voteYesKey = vk;
+		} else if (IEquals(key, "votenokey")) {
+			if (const int vk = ParseKey(value))
+				voteNoKey = vk;
 		} else if (IEquals(key, "chatkey")) {
 			if (const int vk = ParseKey(value))
 				chatKey = vk;
 		} else if (IEquals(key, "listkey")) {
 			if (const int vk = ParseKey(value))
 				listKey = vk;
+		} else if (IEquals(key, "scoreboardkey")) {
+			if (const int vk = ParseKey(value))
+				scoreboardKey = vk;
 		} else if (IEquals(key, "showversion")) {
 			showVersion = ParseBool(value, showVersion);
 		} else if (IEquals(key, "password")) {

@@ -361,6 +361,15 @@ bool SpawnAmbientCarReplica(RemoteAmbientCar &car);
 void DespawnAmbientCarReplica(RemoteAmbientCar &car);
 void CorrectAmbientCarReplica(RemoteAmbientCar &car, const VehicleTransform &at);
 
+// The session has made this machine the host of the car this replica copies
+// (protocol.h, S_AmbientAdopt). The engine half: off the replica table the
+// two damage detours and the car AI detours read, the replica-only flags back
+// to a generated car's (game/adopt.h, CarBytesAfterAdoption), and with a
+// driver in it, COMMAND_CAR_WANDER_RANDOMLY's body. False, having changed
+// nothing, for a car that is gone, a wreck or not a CAutomobile.
+// population.cpp keeps the books around it.
+bool AdoptAmbientCarReplica(RemoteAmbientCar &car);
+
 // Is the local player at the wheel of this replica? The question
 // CorrectAmbientCarReplica has always asked the engine, with an answer the
 // roster can act on - getting into somebody else's traffic is an ownership

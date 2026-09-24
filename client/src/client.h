@@ -22,6 +22,7 @@
 #include "interp.h"
 #include "moneysync.h"
 #include "netthread.h"
+#include "rampagevoteview.h"
 #include "sessiontime.h"
 
 #include <coopiii/protocol.h>
@@ -31,12 +32,63 @@
 
 namespace coopiii {
 
+// Is a car entry the engine is still running actually getting anywhere?
+//
+// The deadline alone used to answer this, and it was shorter than the thing it
+// was timing. Measured off the game's own anim\ped.ifp, the chain for a front
+// door is CAR_align 0.03 + CAR_open 0.93 + CAR_getin 0.63 + CAR_close 0.47 =
+// 2.07 s, which is what the log shows a clean entry taking; a van's back door
+// is VAN_openL 0.53 + VAN_getinL 1.60 + VAN_closeL 1.37 = 3.53 s; a driver who
+// went in by the passenger door adds CAR_shuffle's 0.63. Against a flat 2.5 s,
+// every entry into the back of a Pony was warped, and a front door had 0.4 s
+// of slack - less than a background window's lost frames, because CTimer caps
+// the step and the animation then runs slower than the wall clock.
+//
+// So the question is asked of the animation instead: `mark` is anything that
+// changes while it plays (ped.cpp reads it off m_pVehicleAnim), and an entry
+// whose animation has not moved for SEAT_ANIM_STALL_MS of running frames is
+// stuck. The deadline stays behind it as the cap, and it is generous now.
+//
+// A long gap between two looks is frames that did not run at all - a window
+// being dragged, a breakpoint - and is not held against the entry.
+constexpr uint32_t SEAT_ANIM_STALL_MS    = 1000;
+constexpr uint32_t SEAT_ANIM_POLL_GAP_MS = 500;
+
+struct EntryWatch {
+	uint32_t movedMs  = 0;
+	uint32_t polledMs = 0;
+	uint32_t mark     = 0;
+
+	void Begin(uint32_t nowMs, uint32_t firstMark) {
+		movedMs  = nowMs;
+		polledMs = nowMs;
+		mark     = firstMark;
+	}
+
+	// One more look. True once the animation has stood still for too long.
+	bool Stalled(uint32_t nowMs, uint32_t newMark) {
+		const uint32_t gap = nowMs - polledMs;
+		if (gap > SEAT_ANIM_POLL_GAP_MS)
+			movedMs += gap;
+		polledMs = nowMs;
+		if (newMark != mark) {
+			mark    = newMark;
+			movedMs = nowMs;
+		}
+		return nowMs - movedMs >= SEAT_ANIM_STALL_MS;
+	}
+};
+
 struct RemotePlayer {
 	bool         active  = false;
 	uint8_t      playerId = 0xFF;
 	uint16_t     netId   = 0;
 	std::string  nick;
 	uint16_t     modelId = 0;
+	// The name their model 0 is loaded under on their machine - "player", or
+	// "playerp" in the prison clothes. Empty until they say, which means
+	// "whatever ours is". Only means anything while modelId is 0.
+	char         look[PLAYER_LOOK_LEN] = {};
 
 	InterpBuffer interp;
 	// Last snapshot as received, for fields interpolation doesn't cover
@@ -156,6 +208,9 @@ struct RemotePlayer {
 	// a player stuck half-inside a car is a bad session.
 	uint16_t enteringVehicleNetId = INVALID_NETID;
 	uint32_t enterDeadlineMs      = 0;
+	// Whether that entry's animation is still moving. The bridge keeps it;
+	// a stall is reported as SEAT_LOST, ahead of the deadline.
+	EntryWatch enterWatch;
 	// One animated attempt per enter event. Cleared when the session says
 	// something new about where this player is sitting; without it, an entry
 	// that times out is just retried, and the ped spends the rest of the
@@ -180,6 +235,9 @@ struct RemotePlayer {
 	uint8_t  enterIntentSeat      = 0;
 	uint8_t  enterIntentDoor      = 0;
 	uint32_t enterIntentExpiresMs = 0;
+	// The intent came as S_JackingVehicle: the owner is pulling somebody out
+	// of that seat. It may then name a taken seat, and a traffic car.
+	bool     enterIntentJack      = false;
 
 	bool HasEnterIntent(uint32_t nowMs) const {
 		return enterIntentNetId != INVALID_NETID && nowMs < enterIntentExpiresMs;
@@ -187,7 +245,27 @@ struct RemotePlayer {
 	void ClearEnterIntent() {
 		enterIntentNetId     = INVALID_NETID;
 		enterIntentExpiresMs = 0;
+		enterIntentJack      = false;
 	}
+
+	// The entry in flight above is a jack (WorldBridge::BeginJackRemotePed),
+	// polled by pool handle because the car may be traffic.
+	bool     enteringJack = false;
+	// Until when the next seating skips the door and warps. Set when the
+	// traffic car a jack put this player in is dropped for the claim's new
+	// car: they have just got in once on this screen, and a second get-in
+	// into the same spot would be the jack played twice.
+	uint32_t warpSeatUntilMs = 0;
+
+	// The car a jack played on this machine pulled this player out of, and
+	// when the drag was last seen. The session still seats them there until
+	// their own exit arrives, and putting them back in meanwhile would undo
+	// the drag. PulledOutLatchFor.
+	uint16_t pulledOutOfNetId = INVALID_NETID;
+	uint32_t pulledOutAtMs    = 0;
+	// Since when the seat loop has been keeping its hands off this ped while
+	// our engine takes it out, 0 for not. KeepOutOfEnginesWay.
+	uint32_t engineHoldSinceMs = 0;
 
 	// The car this player's own engine is pulling them out of, or
 	// INVALID_NETID. While it is set the seat above is not given back, even
@@ -233,16 +311,41 @@ enum SeatProgress : uint8_t {
 constexpr int32_t SEAT_LOCAL_REFUSED = -1;   // no, and the client log says why
 constexpr int32_t SEAT_LOCAL_WALKING = -2;   // on the way, ask again next frame
 
+// Which free passenger seat the seat key asks for. `freeSeats` has bit n set
+// for each free seat n (1..8, wire numbering); `onRight` is which side of the
+// car the player is standing on.
+//
+// It used to be the lowest free slot wherever the player stood, and the lowest
+// is seat 1, the front passenger's door on the right. From the driver's side
+// that is a door on the far side of the car, and SetEnterCar lines the ped up
+// with it anyway - across the car, through it. So a door on the player's own
+// side first: seat 1 then 3 on the right, seat 2 on the left (the left front
+// is the driver's). Then the lowest free slot, as before, doors or not.
+constexpr int32_t PickPassengerSeat(uint16_t freeSeats, bool onRight) {
+	if (onRight) {
+		if (freeSeats & (1u << 1))
+			return 1;
+		if (freeSeats & (1u << 3))
+			return 3;
+	} else if (freeSeats & (1u << 2)) {
+		return 2;
+	}
+	for (int32_t s = 1; s <= 8; ++s)
+		if (freeSeats & (1u << s))
+			return s;
+	return -1;
+}
+
 // How long an entry animation is given before the seat is taken by force.
 //
-// A get-in is a four-animation chain - align, open, get in, shut - and the
-// slowest of them on the slowest door comes to a little over a second. This
-// is that with room to spare, and it is deliberately a wall-clock timeout
-// rather than a count of frames: the thing being waited on is an animation,
-// and animations advance on CTimer, which is a different clock from ours but
-// the same order of magnitude. Being generous costs a late warp; being mean
-// costs a warp that interrupts an animation that was about to finish.
-constexpr uint32_t SEAT_ANIM_TIMEOUT_MS = 2500;
+// The cap, not the usual way out. A get-in is a four-animation chain - align,
+// open, get in, shut - and EntryWatch above has what they really add up to:
+// 2.07 s for a front door and 3.53 s for a van's back one, before the frames a
+// background window loses. This used to be 2500 on the belief that the chain
+// came to "a little over a second", and every back seat of a van timed out and
+// was warped. A stuck entry is caught by the stall test well before this; what
+// is left for the cap is an animation that keeps moving and never ends.
+constexpr uint32_t SEAT_ANIM_TIMEOUT_MS = 6000;
 
 // How long a statement of intent stands before it is dropped.
 //
@@ -257,7 +360,9 @@ constexpr uint32_t SEAT_ANIM_TIMEOUT_MS = 2500;
 // and the claim comes after it, so an intent that expired at the same moment
 // the animation gave up would race the packet that confirms it. This is that
 // timeout plus room for the round trip and the interpolation delay.
-constexpr uint32_t ENTER_INTENT_TTL_MS = 4000;
+constexpr uint32_t ENTER_INTENT_TTL_MS = 7500;
+static_assert(ENTER_INTENT_TTL_MS >= SEAT_ANIM_TIMEOUT_MS + 1000,
+              "an intent must outlive the entry it started, plus the claim's trip");
 
 // What the local player's engine is doing about getting into a car.
 //
@@ -269,7 +374,54 @@ struct LocalCarEntry {
 	int32_t vehicleHandle = -1;   // CPools::GetVehicleRef of the car
 	uint8_t seat          = 0;    // where it ends; 0 is the driver
 	uint8_t door          = 0;    // which door it goes in through, as a seat
+	bool    jack          = false;   // pulling somebody out of that seat
 };
+
+// What our engine is doing to a ped sitting in a car, when it is taking it out
+// through a jack played on this machine. WorldBridge::RemoteBeingPulledOut and
+// its two siblings; addresses.h, EngineTakingPedOut.
+enum PullOut : uint8_t {
+	PULL_NONE    = 0,
+	PULL_COMING  = 1,   // still in the seat, a jack through its door is running
+	PULL_DRAGGED = 2,   // in PED_DRAG_FROM_CAR, the drag animation is playing
+};
+
+// How long the seat loop and the handover keep their hands off a ped our
+// engine is pulling out. Measured off anim\ped.ifp: CAR_align_LHS 0.03 s and
+// CAR_open_LHS 0.93 s before the drag, car_jackedLHS 3.80 s for it (CAR_Qjacked
+// 4.03 s from the align for the quick one), so under five seconds of game time.
+// This is the cap for a jack that never gets there, with room for a window
+// that loses frames and so plays the animation slower than the wall clock.
+constexpr uint32_t ENGINE_UNSEAT_WAIT_MS = 8000;
+
+// True while whoever calls it should leave the ped to the engine. `sinceMs` is
+// the caller's own record of when that started, 0 for not.
+inline bool KeepOutOfEnginesWay(bool engineBusy, uint32_t &sinceMs, uint32_t nowMs) {
+	if (!engineBusy) {
+		sinceMs = 0;
+		return false;
+	}
+	if (sinceMs == 0) {
+		sinceMs = nowMs != 0 ? nowMs : 1;
+		return true;
+	}
+	return nowMs - sinceMs < ENGINE_UNSEAT_WAIT_MS;
+}
+
+// How long a ped our own engine dragged out of a car is kept out of it while
+// the session still says it is sitting there. Its owner's exit, or its host's
+// next row, normally says so well inside this; if nothing ever does, the owner
+// got away on their own screen and the seat goes back.
+constexpr uint32_t PULLED_OUT_HOLD_MS = 5000;
+
+// The latch that goes with it. Returns the netId to keep the ped out of, or
+// INVALID_NETID. Dropped when the session names any other seat, or on time.
+inline uint16_t PulledOutLatchFor(uint16_t latch, uint32_t atMs,
+                                  uint16_t seatVehicleNetId, uint32_t nowMs) {
+	if (latch == INVALID_NETID || seatVehicleNetId != latch)
+		return INVALID_NETID;
+	return nowMs - atMs < PULLED_OUT_HOLD_MS ? latch : INVALID_NETID;
+}
 
 // How long to leave a refused vehicle claim alone before asking again.
 //
@@ -733,6 +885,10 @@ struct RemoteVehicle {
 	// surrender above. One call, not one per frame: it is a handover, and the
 	// engine only has to be told once.
 	bool surrenderDone = false;
+	// Since when the handover has been held back because our own engine is
+	// pulling us out of the seat (a jack played here), 0 for not held.
+	// KeepOutOfEnginesWay.
+	uint32_t surrenderHoldSinceMs = 0;
 
 	// Driven into the engine on change, not every frame.
 	uint8_t appliedFlags = 0xFF;   // not a flag set: "nothing applied yet"
@@ -1024,6 +1180,13 @@ struct RemoteAmbientPed {
 	uint16_t seatedVehicleNetId = INVALID_NETID;
 	uint8_t  seatIndex          = 0;
 
+	// A player's jack played here pulled this driver out: the same pair as
+	// RemotePlayer's, for the same reason. His host keeps naming the seat until
+	// its own engine has dragged him out too and a row says so.
+	uint16_t pulledOutOfNetId  = INVALID_NETID;
+	uint32_t pulledOutAtMs     = 0;
+	uint32_t engineHoldSinceMs = 0;
+
 	// A seated ped is positioned by CWorld::Process from the car's own
 	// matrix, every frame (docs/protocol.md §1.13.2). So nothing else may
 	// write its transform - exactly the rule ApplyRemotePose follows for a
@@ -1157,6 +1320,18 @@ struct WorldBridge {
 	// log.
 	bool (*SampleLocalPlayerModel)(uint16_t &modelId) = nullptr;
 
+	// The name the local player's model 0 is loaded under, cleaned the way
+	// the wire wants it (CleanPlayerLook). False with no player ped, or a
+	// name that doesn't clean.
+	bool (*SampleLocalPlayerLook)(char (&look)[PLAYER_LOOK_LEN]) = nullptr;
+
+	// Gets the model a remote Claude should be built from ready, in place of
+	// IsModelReady for that player: model 0 when their look is ours, or a
+	// special-character slot loaded with their look when it isn't. True once
+	// SpawnRemote may go ahead. Null means looks aren't handled and
+	// IsModelReady decides alone.
+	bool (*PrepareRemoteLook)(RemotePlayer &player) = nullptr;
+
 	// Read every one of the local player's thirteen weapon slots. Fills
 	// `out` with INVENTORY_SLOTS entries, one per slot, and sets `held` to
 	// the eWeaponType in their hands. Returns false when there is no player
@@ -1249,6 +1424,9 @@ struct WorldBridge {
 	// The pool handle of the traffic car this machine hosts under a netId, or
 	// -1 (population.cpp). Null means we never have one.
 	int32_t (*HostedCarHandle)(uint16_t netId) = nullptr;
+	// The other way round: the netId of the traffic car this machine hosts at
+	// that pool handle, or INVALID_NETID. For a jack of our own traffic.
+	uint16_t (*HostedCarNetId)(int32_t handle) = nullptr;
 	// Our crowd and traffic, un-named and queued to be announced again, for a
 	// new session (population.cpp, RestartHostedNames).
 	void (*RestartHostedNames)() = nullptr;
@@ -1365,12 +1543,11 @@ struct WorldBridge {
 	// Hand the driver's seat of this car over, because the session says it is
 	// somebody else's now. The losing half of a carjack.
 	//
-	// There is no such thing as a carjack an observer can replay - the engine
-	// needs a jacker ped to play the animation, and every replica CoopIII
-	// builds is a CCivilianPed, which CPed::SetCarJack refuses on a
-	// MISSION_VEHICLE (addresses.h). So the victim's machine does what the end
-	// of the engine's own jack does: takes its player out of the seat, leaves
-	// the car to its new owner's stream, and stops arguing.
+	// The jack itself is normally played here as well (S_JackingVehicle), and
+	// then our engine drags the player out and this is held back until it has.
+	// When it was not played, the victim's machine does what the end of the
+	// engine's own jack does: takes its player out of the seat, leaves the car
+	// to its new owner's stream, and stops arguing.
 	//
 	// This is NOT the same call as the seating loop's eviction, and the
 	// difference is the whole point of it. game/ped.cpp's EvictSeatOccupant
@@ -1419,10 +1596,11 @@ struct WorldBridge {
 	// True once per press of the seat key, never while it is held.
 	bool (*LocalWantsSeatToggle)() = nullptr;
 
-	// Start getting the local player into the first free passenger seat of
-	// the car this pool ref names. The engine walks them to the door and
-	// opens it, so the answer is usually SEAT_LOCAL_WALKING and the
-	// seat number arrives from PollLocalSeatEntry a second or two later.
+	// Start getting the local player into a free passenger seat of the car
+	// this pool ref names, one on his side of it first. The engine walks
+	// them to the door and opens it, so the answer is usually
+	// SEAT_LOCAL_WALKING and the seat number arrives from
+	// PollLocalSeatEntry a few seconds later.
 	// SEAT_LOCAL_REFUSED for no, and the client log says why.
 	//
 	// On SEAT_LOCAL_WALKING - and only then - `seatAsked` is the slot the
@@ -1502,6 +1680,29 @@ struct WorldBridge {
 	// Ask the engine to open the door and climb out. False means it refused,
 	// and the caller should take them out the plain way.
 	bool (*BeginUnseatRemotePed)(RemotePlayer &player) = nullptr;
+
+	// A jack, on this ped: the engine's own, from CPed::SetCarJack_AllClear on,
+	// through the door `doorSeat` names and into the driver's seat. The car is a
+	// pool reference because it may be a session car, a traffic replica or
+	// traffic this machine hosts. From there this machine's engine plays all of
+	// it - the door, the pull, the get-in - and drags out whoever is in that
+	// seat here, which is the victim's real ped on the victim's own machine.
+	//
+	// False means it would not start: nobody in that seat to pull, the door
+	// busy, the car moving, the ped too far off. Nothing is warped for it; the
+	// claim at the end of the owner's jack seats them the ordinary way.
+	bool (*BeginJackRemotePed)(RemotePlayer &player, int32_t carHandle,
+	                           uint8_t doorSeat) = nullptr;
+	// How that jack is getting on. SEAT_DONE is the ped at the wheel.
+	uint8_t (*PollJackRemotePed)(RemotePlayer &player, int32_t carHandle) = nullptr;
+
+	// Is our engine taking this ped out of its seat through a jack played here?
+	// A PullOut. For a remote player's ped, a traffic driver's replica, and the
+	// local player; the seat loops and the handover leave the ped alone while
+	// it is anything but PULL_NONE.
+	uint8_t (*RemoteBeingPulledOut)(RemotePlayer &player) = nullptr;
+	uint8_t (*AmbientBeingPulledOut)(const RemoteAmbientPed &ped) = nullptr;
+	uint8_t (*LocalBeingPulledOut)() = nullptr;
 
 	// Is the local player's own engine in the middle of getting into a car,
 	// and through which door? True for the second the entry lasts and false
@@ -1910,6 +2111,17 @@ struct WorldBridge {
 	// can never run the deleting destructor on one of the player's own cars.
 	void (*AdoptPromotedCar)(RemoteVehicle &vehicle, bool weHostedIt) = nullptr;
 
+	// ---- a leaver's crowd (protocol.h, S_AmbientAdopt) ---------------------
+	//
+	// The session has made this machine the host of a pedestrian or traffic
+	// car it holds a replica of. The engine seam turns the replica into an
+	// entity of ours, files it as hosted under the same netId and clears the
+	// row's pool handle, so the roster can drop the row without touching the
+	// object. False, having changed nothing, when it cannot: Client then lets
+	// go of it the way any owner lets go of its own.
+	bool (*AdoptAmbientPed)(RemoteAmbientPed &ped) = nullptr;
+	bool (*AdoptAmbientCar)(RemoteAmbientCar &car) = nullptr;
+
 	// ---- a hosted traffic car that was destroyed (roadmap.md 5.8) ---------
 	//
 	// The ambient half of "a car nobody is driving has nobody to report it",
@@ -2139,7 +2351,7 @@ public:
 
 	// How long a door-opening entry is given before the seat is taken by
 	// force. Settable so the timeout can be reached in a test without a test
-	// that takes two and a half seconds to run - the branch it guards is the
+	// that takes six seconds to run - the branch it guards is the
 	// one that decides whether a remote player can be left standing half
 	// inside a car, so it is worth being able to reach.
 	void SetSeatAnimTimeoutMs(uint32_t ms) { m_seatAnimTimeoutMs = ms; }
@@ -2259,9 +2471,14 @@ public:
 	bool DeathAnnouncedForTest() const { return m_deathAnnounced; }
 	bool ArrestNotedForTest() const { return m_arrestNoted; }
 	int32_t AnnouncedEntryHandleForTest() const { return m_enteringHandle; }
+	// And what it went out as: which netId, and whether as a jack.
+	uint16_t AnnouncedEntryNetIdForTest() const { return m_enteringNetId; }
+	bool     AnnouncedEntryWasJackForTest() const { return m_enteringJack; }
+	const char *SentLookForTest() const { return m_sentLook; }
+	void SendLocalLookForTest() { SendLocalLook(); }
 
 	// Test seam: make a standing statement of intent lapse, without waiting
-	// four seconds for it. What it exercises is the rule the timeout exists
+	// out ENTER_INTENT_TTL_MS for it. What it exercises is the rule the timeout exists
 	// for - an entry that never produced a claim has to be undone, including
 	// one that finished - and that rule is a decision, not a clock.
 	void LapseEnterIntentForTest(uint8_t id) {
@@ -2321,6 +2538,18 @@ public:
 	void RampageCarDestroyed(uint16_t model, const UnownedVehicleKey &key);
 	void RampageEnded(uint8_t outcome);
 
+	// The vote before a rampage. game/rampagevote.cpp reads the view once a
+	// frame and draws it, sends our Y or N, and carries out a move.
+	const RampageVoteView &VoteView() const { return m_rampageVote; }
+	// False if there is nothing to vote on, the vote is ours, or we have
+	// already voted.
+	bool CastRampageVote(bool yes);
+	// The move the server asked for, once.
+	bool TakeRampageTeleport(RampageTeleportBody &out);
+	void ReportRampageArrival(uint8_t voteId, uint8_t result);
+	// A player's nick, ours included, or null for nobody.
+	const char *NickFor(uint8_t playerId) const;
+
 	// The same question for a car, and it is asked in one place:
 	// game/object.cpp, from inside the CObject::ObjectDamage detour, about
 	// whatever CPhysical recorded as having hit the object. A replica's
@@ -2352,11 +2581,17 @@ private:
 	void OnWelcome(const S_Welcome &pkt);
 	void OnJoin(const S_PlayerJoin &pkt);
 	void OnLeave(const S_PlayerLeave &pkt);
+	void OnRampageVote(const S_RampageVote &pkt);
+	void OnRampageTeleport(const S_RampageTeleport &pkt);
 	// A line of chat, ours included: the server sends everybody's to everybody.
 	void OnChat(const S_Chat &pkt);
 	// What the player typed since the last frame, on its way out.
 	void SendTypedChat();
 	void OnPlayerModel(const S_PlayerModel &pkt);
+	void OnPlayerLook(const S_PlayerLook &pkt);
+	// Takes a remote player's ped down so the two-phase spawn builds it again
+	// in whatever they're wearing now. Shared by a model and a look change.
+	void RebuildRemoteBody(RemotePlayer &p);
 	void OnPlayerAmmo(const S_PlayerAmmo &pkt);
 	void OnPlayerState(const S_PlayerState &pkt);
 	void OnVehicleSpawn(const S_VehicleSpawn &pkt);
@@ -2379,6 +2614,7 @@ private:
 	void OnUnownedBlowUp(const S_UnownedBlowUp &pkt);
 	void OnEnterVehicle(const S_EnterVehicle &pkt);
 	void OnEnteringVehicle(const S_EnteringVehicle &pkt);
+	void OnJackingVehicle(const S_JackingVehicle &pkt);
 	void OnExitVehicle(const S_ExitVehicle &pkt);
 	// Who simulates a car nobody is driving, and a traffic car that has
 	// stopped being traffic. protocol.h, S_VehicleCustody / S_CarPromoted.
@@ -2464,6 +2700,12 @@ private:
 	RemoteVehicle *ObservedVehicleWeAreDriving();
 	RemoteVehicle *VehicleByPoolHandle(int32_t handle);
 	bool SeatIsTaken(uint16_t netId, uint8_t seat, uint8_t exceptPlayer) const;
+
+	// A traffic car by netId or by pool handle, whichever machine hosts it: a
+	// replica in m_cars, or one of our own engine's through the bridge. Only a
+	// jack names one of these; every other entry is into a session car.
+	int32_t  TrafficCarHandle(uint16_t netId);
+	uint16_t TrafficCarNetId(int32_t handle);
 
 	// The session has named a new driver for a car. Works out whether that
 	// means we have just lost one, and if so writes it down.
@@ -2611,6 +2853,8 @@ private:
 	// One reliable packet on change, not two bytes riding every snapshot: a
 	// model index only changes a handful of times in a playthrough at most.
 	void SendLocalModel();
+	// And which clothes model 0 is in, which the model index can't say.
+	void SendLocalLook();
 	// The same shape, for the twelve weapon slots that are not in the
 	// player's hands. The one that is rides the snapshot, because it changes
 	// every time a trigger is pulled and a reliable-ordered packet per
@@ -2709,6 +2953,16 @@ private:
 	RemoteAmbientCar *AmbientCarByNetId(uint16_t netId);
 	void ClearAmbientCars();
 
+	// A player left and the session has put somebody in charge of his crowd
+	// (protocol.h, S_AmbientAdopt). Named us: turn the replica into ours, or
+	// let it go as its owner. Named anybody else: the row changes owner and
+	// its buffer starts again on the new owner's clock.
+	void OnAmbientAdopt(const S_AmbientAdopt &pkt);
+	void AdoptPedHere(RemoteAmbientPed *ped, uint16_t netId, uint32_t &taken,
+	                  uint32_t &released);
+	void AdoptCarHere(RemoteAmbientCar *car, uint16_t netId, uint32_t &taken,
+	                  uint32_t &released);
+
 	NetThread   m_net;
 	WorldBridge m_bridge;
 
@@ -2787,6 +3041,12 @@ private:
 	// frame or two, so "the next frenzy" can be seconds away.
 	static constexpr uint16_t NO_FRENZY = 0xFFFF;
 	uint16_t m_frenzyId = NO_FRENZY;
+
+	// The vote before one, as the server last described it, and a move it
+	// asked for that the game half hasn't carried out yet.
+	RampageVoteView     m_rampageVote;
+	RampageTeleportBody m_teleport{};
+	bool                m_teleportWaiting = false;
 
 	// Our own report is in the air and has not been answered. Stops a start
 	// being announced twice while the round trip is open - the script calls
@@ -2934,6 +3194,13 @@ private:
 	int32_t  m_enteringHandle      = -1;
 	uint8_t  m_enteringSeat        = 0;
 	uint8_t  m_enteringDoor        = 0;
+	bool     m_enteringJack        = false;
+	uint16_t m_enteringNetId       = INVALID_NETID;   // what it went out as
+	bool     m_saidJackSent        = false;
+	bool     m_saidJackIntent      = false;
+	bool     m_saidJackPlayed      = false;
+	bool     m_saidPulledOut       = false;
+	bool     m_saidSurrenderHeld   = false;
 
 	uint16_t m_pendingSeatNetId    = INVALID_NETID;
 	uint8_t  m_pendingSeatIndex    = 0;
@@ -2967,6 +3234,8 @@ private:
 	// first sample always send. The hello carries a guess made before
 	// there's even a player ped to ask; this is the correction.
 	uint16_t m_sentModelId = 0xFFFF;
+	// Same for the look. Empty is "nothing announced yet".
+	char     m_sentLook[PLAYER_LOOK_LEN] = {};
 
 	// The last ammunition this client put on the wire for each of its own
 	// thirteen slots, so a slot only costs a packet when it actually

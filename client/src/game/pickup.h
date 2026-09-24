@@ -199,9 +199,37 @@ struct PickupSlot {
 
 	// Frame the claim went out on, so a claim that is never answered - a
 	// dropped connection, a server that has forgotten us - gets retried
-	// instead of leaving the slot blocked forever.
+	// instead of leaving the slot blocked forever. For a grant, the frame it
+	// arrived on.
 	uint32_t claimedFrame = 0;
+
+	// ---- the skull (game/rampagevote.h) ----
+	// No claim before this frame. Set when a claim on a skull is turned down,
+	// so a failed vote isn't opened again while the player is still standing
+	// on it.
+	uint32_t retryFrame = 0;
+	// The grant came out of a vote that passed. Taken even if the player has
+	// walked off it, and never given back for walking away.
+	bool     voted = false;
 };
+
+// A claim on a skull goes out on the touch, not at 4 m: it opens a vote
+// (protocol.h, PICKUP_F_RAMPAGE), and walking past one must not. The touch is
+// CPickup::Update's own - on foot, |dz| < 2.0 and dx * dx + dy * dy < 1.8 -
+// and the skull's own gate with it (addresses.h, "the skull's own gate").
+constexpr bool SkullTouched(bool inVehicle, float dx, float dy, float dz) {
+	return !inVehicle && (dz < 0.0f ? -dz : dz) < 2.0f && dx * dx + dy * dy < 1.8f;
+}
+
+// How long a skull claim may wait: a vote runs 15 s, and nothing comes back
+// until it ends.
+constexpr uint32_t kSkullClaimTimeoutFrames = 20 * 60;
+// How long after a no before the same skull can be asked for again.
+constexpr uint32_t kSkullRetryFrames = 4 * 60;
+// How long the engine gets to take a voted skull itself before CoopIII takes
+// it for it. CPickups::Update visits the first 320 slots a sixth at a time
+// (`imul edi,35h` at 0x00430409), so a slot can wait six frames for its turn.
+constexpr uint32_t kSkullEngineGraceFrames = 8;
 
 // Pickups CoopIII removed on somebody else's behalf that the engine will
 // never bring back by itself, and that the script may therefore re-create.

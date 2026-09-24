@@ -2,7 +2,7 @@
 
 #include "addresses.h"
 #include "pause.h"
-#include "population.h"
+#include "scoreboard.h"
 #include "../chatfeed.h"
 #include "../clock.h"
 #include "../log.h"
@@ -41,7 +41,6 @@ WNDPROC g_prevProc = nullptr;
 bool    g_wide     = false;
 
 ChatLine g_line;
-bool     g_listShown = false;
 // A finished line, until Client::SendTypedChat takes it.
 char     g_outbox[CHAT_LEN] = {};
 bool     g_outboxFull = false;
@@ -54,11 +53,11 @@ constexpr Rgba CHAT_INK   {233, 230, 222, 255};
 constexpr Rgba NOTICE_INK {170, 123, 87, 255};
 constexpr Rgba TYPING_INK {255, 255, 255, 255};
 constexpr Rgba TITLE_INK  {186, 101, 50, 255};
-constexpr Rgba MARK_INK   {160, 160, 160, 255};
+constexpr Rgba MARK_INK   {200, 200, 200, 255};
 constexpr Rgba SHADOW_INK {0, 0, 0, 255};
 
 // Grey and see-through: there to be read off a screenshot, not to be looked at.
-constexpr uint8_t MARK_ALPHA = 190;
+constexpr uint8_t MARK_ALPHA = 225;
 
 // The caret is on for this long and off for as long again.
 constexpr uint32_t CARET_BLINK_MS = 500;
@@ -191,7 +190,7 @@ LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			return 0;
 		}
 		if (static_cast<int>(wp) == g_listKey && InAGame())
-			g_listShown = !g_listShown;
+			ToggleScoreboardPin();
 	}
 	return g_wide ? CallWindowProcW(g_prevProc, hwnd, msg, wp, lp)
 	              : CallWindowProcA(g_prevProc, hwnd, msg, wp, lp);
@@ -367,75 +366,24 @@ void DrawFeed(const Client &client, const FeedLayout &l) {
 		DrawInput(l, nowMs);
 }
 
-void DrawPlayerList(const Client &client, float screenH, const FeedLayout &l) {
-	float y = screenH * 0.18f;
-	char  row[FEED_MESSAGE];
-
-	uint32_t others = 0;
-	for (uint8_t id = 0; id < MAX_PLAYERS; ++id)
-		if (id != client.LocalPlayerId() && client.PlayerSlot(id).active)
-			++others;
-	std::snprintf(row, sizeof row, "players - %u here with you", static_cast<unsigned>(others));
-	PrintLine(l.left, y, row, TITLE_INK, 255, l);
-	y += l.lineH;
-
-	const std::string &me = client.LocalNick();
-	char               mine[NICK_LEN + 8];
-	std::snprintf(mine, sizeof mine, "%s (you)", me.empty() ? "you" : me.c_str());
-	std::snprintf(row, sizeof row, "%s", mine);
-	if (client.LocalWanted() > 0) {
-		const size_t n = std::strlen(row);
-		std::snprintf(row + n, sizeof row - n, "  wanted %u",
-		              static_cast<unsigned>(client.LocalWanted()));
-	}
-	AppendPing(row, sizeof row, client.PingOf(client.LocalPlayerId()));
-	PrintLine(l.left, y, row, CHAT_INK, 255, l);
-	y += l.lineH;
-
-	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
-		if (id == client.LocalPlayerId())
-			continue;
-		const RemotePlayer &p = client.PlayerSlot(id);
-		if (!p.active)
-			continue;
-		const uint32_t quiet = p.haveState ? WallClock::NowMs() - p.heardAtMs : 0;
-		FormatPlayerRow(row, sizeof row, p.nick.c_str(), p.haveState ? p.last.health : 100.0f,
-		                WantedFromFlags(p.last.flags), p.dead,
-		                p.seatVehicleNetId != INVALID_NETID, client.PingOf(id), quiet,
-		                client.DesyncOf(id));
-		const NickColour c = ChatNickColour(id);
-		PrintLine(l.left, y, row, Rgba{c.r, c.g, c.b, 255}, 255, l);
-		y += l.lineH;
-	}
-
-	// What this machine is doing for the session, for the question "why is
-	// that car standing still on my screen": how much is going each way, and
-	// how much of the city this machine hosts and holds.
-	std::snprintf(row, sizeof row, "net  out %llu  in %llu  host %u peds %u cars  hold %u cars",
-	              static_cast<unsigned long long>(client.PacketsSent()),
-	              static_cast<unsigned long long>(client.PacketsReceived()),
-	              static_cast<unsigned>(HostedAmbientPedCount()),
-	              static_cast<unsigned>(HostedAmbientCarCount()),
-	              static_cast<unsigned>(AmbientCarReplicaCount()));
-	PrintLine(l.left, y + l.lineH * 0.5f, row, NOTICE_INK, 255, l);
-
-	// And the copy of anything else furthest from where its owner has it,
-	// when the server says one is somewhere else here.
-	uint16_t       copyNetId = INVALID_NETID;
-	const char    *copyKind  = "";
-	const uint16_t copyCm    = client.WorstCopyDesync(copyNetId, copyKind);
-	if (copyCm != DESYNC_UNKNOWN && copyCm >= DESYNC_SHOW_CM_ON_LIST) {
-		std::snprintf(row, sizeof row, "furthest copy  %s %u", copyKind,
-		              static_cast<unsigned>(copyNetId));
-		AppendDesync(row, sizeof row, copyCm);
-		PrintLine(l.left, y + l.lineH * 1.5f, row, NOTICE_INK, 255, l);
-	}
-}
-
 void DrawVersionMark(float screenW, float screenH) {
 	const MarkLayout m = MeasureVersionMark(screenW, screenH);
 	Func<FontScaleFn>(CFont__SetScale)(m.scaleX, m.scaleY);
-	PrintRun(m.x, m.y, VERSION_MARK, FEED_MESSAGE, MARK_INK, MARK_ALPHA, screenW, 1.0f);
+	const float w = PrintRun(m.x, m.y, VERSION_MARK, FEED_MESSAGE, MARK_INK, MARK_ALPHA, screenW,
+	                         1.0f);
+
+	// Once per screen size, so a log from any window says where it went. CFont
+	// prints no glyph whose top is at y >= screen width (chatfeed.h).
+	static float saidW = 0.0f, saidH = 0.0f;
+	if (screenW != saidW || screenH != saidH) {
+		saidW = screenW;
+		saidH = screenH;
+		Log("chat: version mark at (%.1f, %.1f) scale %.3f x %.3f on a %.0fx%.0f screen, "
+		    "%.1f px wide, %s, %s",
+		    m.x, m.y, m.scaleX, m.scaleY, screenW, screenH, w,
+		    w > 0.0f ? "text not empty" : "text came out EMPTY",
+		    m.y < screenW ? "above the cull line" : "PAST the cull line");
+	}
 }
 
 } // namespace
@@ -499,8 +447,6 @@ void DrawChatOverlay(const Client &client) {
 	FontStateFor(screenW, l.scaleX, l.scaleY);
 
 	DrawFeed(client, l);
-	if (g_listShown)
-		DrawPlayerList(client, screenH, l);
 	if (g_markShown)
 		DrawVersionMark(screenW, screenH);
 

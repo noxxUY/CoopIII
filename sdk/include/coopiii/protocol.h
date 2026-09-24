@@ -1246,12 +1246,60 @@ namespace coopiii {
 //    connection that never says hello is dropped after HELLO_WAIT_MS and is
 //    sent nothing meanwhile, and the server keeps two connections past the
 //    last slot so a ninth player hears REJECT_FULL.
+//
+// Not a version: Claude's outfit. One new opcode pair, C_PlayerLook /
+//    S_PlayerLook (0xCA/0xCB), carrying the name model 0 is loaded under on
+//    the sender's machine - "playerp" in the prison clothes, "player" after.
+//    The script swaps the look by renaming model 0 in place (UNDRESS_CHAR,
+//    CStreaming::RequestSpecialModel), so the model id on C_PlayerModel is 0
+//    either way and never said which one it was. The server keeps it for the
+//    backfill. An older server or client drops the opcode and every remote
+//    Claude looks like whatever that machine's own model 0 is, as before.
+//
+// 37: the vote before a rampage. Four new
+//    opcodes, C_RampageVote / S_RampageVote / C_RampageArrived /
+//    S_RampageTeleport (0xC4-0xC7), and two spare bits of PickupIdent::flags,
+//    PICKUP_F_RAMPAGE on a claim for a skull and PICKUP_F_VOTED on the grant
+//    that ends a vote that passed. No layout moves. A mix misbehaves, which
+//    is why it can't ride as an unnumbered entry: an older client never sets
+//    PICKUP_F_RAMPAGE, so the server grants it the skull at 4 m and it starts
+//    a rampage for the whole session with no vote, and it drops the vote
+//    opcodes, so it counts toward the 75% and can never say yes - with two
+//    players nothing would pass. Behind an older server a new client's claim
+//    is simply granted, the skull goes at the touch and nobody is moved.
+//
+// 38: a leaver's crowd is adopted. One new
+//    opcode, S_AmbientAdopt (0xD0), no layout moves. When a player leaves,
+//    each of his ambient peds and traffic cars that another player is near
+//    enough to keep is given to the nearest one (server/core/adopt.h), whose
+//    machine turns its replica into a ped or car of its own and streams it
+//    under the same netId; the rest are despawned as before. A mix
+//    misbehaves both ways round. An older client drops the opcode, so its
+//    rows keep the leaver as owner and it throws away every row the new owner
+//    streams (OnPedStates / OnCarStates check the owner): the adopted crowd
+//    freezes on its screen, locked cars in the road included, until the new
+//    owner's engine reaps each one. And an older client picked as the adopter
+//    never takes anything over, never streams it and never lets it go, so the
+//    same frozen crowd stands on every screen for as long as it is connected.
+//    Behind an older server nothing is adopted and everything goes as before.
+//
+// Not a version: a carjack is played on every screen. One new opcode pair,
+//    C_JackingVehicle / S_JackingVehicle (0xDA/0xDB), the entry intent's own
+//    body, sent in place of C_EnteringVehicle when the sender's entry is a
+//    jack and relayed for a traffic car as well as a session car. Every
+//    receiver plays the engine's jack on its copy of the jacker and its own
+//    engine drags out whoever is in the seat there. An older server drops the
+//    opcode and an older client ignores it; either way the jack looks the way
+//    it did before - the victim put beside the car and an ordinary get-in -
+//    because the claim and the seat handover are unchanged.
 
-constexpr uint16_t PROTOCOL_VERSION = 36;
+constexpr uint16_t PROTOCOL_VERSION = 38;
 constexpr uint16_t DEFAULT_PORT     = 2001;
 constexpr uint8_t  MAX_PLAYERS      = 8;
 constexpr uint8_t  SNAPSHOT_HZ      = 25;   // docs/protocol.md §1.2
 constexpr size_t   NICK_LEN         = 24;
+// CBaseModelInfo::m_name, 24 bytes at +0x04 (client/src/game/addresses.h).
+constexpr size_t   PLAYER_LOOK_LEN  = 24;
 // CPed::m_weapons is thirteen slots and the eWeaponType doubles as the index
 // into it, so an inventory weapon is a number in 0..12. Read out of the
 // retail binary rather than re3 - CPed::CPed array-constructs 13 elements of
@@ -1499,7 +1547,8 @@ enum Opcode : uint8_t {
 	OP_C_PASSWORD         = 0xB5,
 
 	// 0xC0..0xCF is the breakable-street-object block. docs/objects.md.
-	// Four of the sixteen are used and the rest stay reserved. 0xC0/0xC1 are
+	// Four of the sixteen are used here, 0xC4-0xC7 went to the rampage vote
+	// and 0xCA/0xCB to the player's look below, and the rest stay reserved. 0xC0/0xC1 are
 	// how broken it is; 0xC2/0xC3 are where it came to rest, which is the
 	// half that used to be missing and the reason the other twelve were
 	// held back rather than handed out.
@@ -1507,6 +1556,23 @@ enum Opcode : uint8_t {
 	OP_S_OBJECT_BROKEN    = 0xC1,
 	OP_C_OBJECT_SETTLED   = 0xC2,
 	OP_S_OBJECT_SETTLED   = 0xC3,
+
+	// The vote before a rampage, out of the middle of that block. 0xC4-0xC9
+	// are held for it; four are used. See RampageVoteBody.
+	OP_C_RAMPAGE_VOTE     = 0xC4,
+	OP_S_RAMPAGE_VOTE     = 0xC5,
+	OP_C_RAMPAGE_ARRIVED  = 0xC6,
+	OP_S_RAMPAGE_TELEPORT = 0xC7,
+
+	// Claude's outfit, out of the top of that block. See C_PlayerLook.
+	OP_C_PLAYER_LOOK      = 0xCA,
+	OP_S_PLAYER_LOOK      = 0xCB,
+
+	// A player left and somebody else hosts his crowd now. See S_AmbientAdopt.
+	// 0xD0-0xD5 is the block; one is used. Server to client only: a machine
+	// that cannot take a pedestrian it was given says so with the
+	// C_PedDespawn / C_CarDespawn it already has, as the new owner.
+	OP_S_AMBIENT_ADOPT    = 0xD0,
 
 	// An ambient pedestrian dying. 0xD8-0xDF is the block reserved for it;
 	// two of the eight are used and the other six stay free, because the
@@ -1518,6 +1584,9 @@ enum Opcode : uint8_t {
 	// death in between them would have renumbered the lot.
 	OP_C_PED_DEATH        = 0xD8,
 	OP_S_PED_DEATH        = 0xD9,
+	// A carjack, as it starts. See C_JackingVehicle.
+	OP_C_JACKING_VEHICLE  = 0xDA,
+	OP_S_JACKING_VEHICLE  = 0xDB,
 
 	// Money, behind the server's MoneyRule. 0xE0-0xE5 is the block; four of
 	// the six are used. Nothing here is sent in a session with money off.
@@ -2110,9 +2179,9 @@ struct S_PlayerLeave {
 // playthrough, so cramming it into the 25 Hz snapshot would burn two bytes
 // forty times a second for nothing.
 //
-// Stock GTA III never triggers this at all: one protagonist model, no
-// outfits (see MI_PLAYER in client/src/game/addresses.h for the evidence).
-// But that's a fact about the stock script data, not the engine. Nothing
+// Stock GTA III never triggers this at all: Claude is model 0 in every
+// outfit, and the outfit travels on C_PlayerLook below. But that's a fact
+// about the stock script data, not the engine. Nothing
 // stops a ped's model index from changing, some mod probably will change it,
 // and a remote player wearing the wrong body is exactly the kind of bug
 // that's obvious on screen and invisible in any log.
@@ -2128,6 +2197,49 @@ struct S_PlayerModel {
 	uint8_t  playerId;
 	uint16_t modelId;
 };
+
+// What model 0 is loaded as on the sender's machine, which is the one thing
+// C_PlayerModel can't say. The intro dresses Claude in 'PLAYERP' and
+// 8-Ball's mission puts him back in 'PLAYER', and both go through
+// UNDRESS_CHAR, which renames model 0 in place rather than moving the ped to
+// another index (addresses.h, MI_PLAYER).
+//
+// Reliable, change-only and on join, like the model. Lower case, NUL
+// padded, never empty on the wire (CleanPlayerLook).
+struct C_PlayerLook {
+	static constexpr uint8_t OPCODE = OP_C_PLAYER_LOOK;
+	PacketHeader hdr;
+	char look[PLAYER_LOOK_LEN];
+};
+
+struct S_PlayerLook {
+	static constexpr uint8_t OPCODE = OP_S_PLAYER_LOOK;
+	PacketHeader hdr;
+	uint8_t playerId;
+	char    look[PLAYER_LOOK_LEN];
+};
+
+// Puts a look into the one shape both ends accept: lower case, [a-z0-9_]
+// only, terminated, zero after the terminator. False, and the buffer
+// zeroed, for anything else or for an empty name. The engine compares these
+// names byte for byte (RequestSpecialModel's inlined strcmp), which is why
+// the case is settled here and not left to the receiver.
+inline bool CleanPlayerLook(char (&look)[PLAYER_LOOK_LEN]) {
+	size_t n = 0;
+	while (n < PLAYER_LOOK_LEN && look[n] != '\0')
+		++n;
+	bool ok = n > 0 && n < PLAYER_LOOK_LEN;
+	for (size_t i = 0; ok && i < n; ++i) {
+		char ch = look[i];
+		if (ch >= 'A' && ch <= 'Z')
+			ch = static_cast<char>(ch - 'A' + 'a');
+		ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_';
+		look[i] = ch;
+	}
+	for (size_t i = ok ? n : 0; i < PLAYER_LOOK_LEN; ++i)
+		look[i] = '\0';
+	return ok;
+}
 
 // ---- snapshots (CH_SNAPSHOT) ---------------------------------------------
 
@@ -2724,6 +2836,38 @@ struct C_EnteringVehicle {
 
 struct S_EnteringVehicle {
 	static constexpr uint8_t OPCODE = OP_S_ENTERING_VEHICLE;
+	PacketHeader hdr;
+	uint8_t             playerId;
+	EnteringVehicleBody body;
+};
+
+// "I have started pulling somebody out of that car, through that door." The
+// same three bytes as the intent above, sent in its place when the sender's
+// engine is in PED_CARJACK (or playing the quick jack), and just as weak: it
+// decides nothing, the server writes nothing down, and the claim at the end is
+// still what moves the seat.
+//
+// What it adds is that every other machine plays the jack instead of waiting
+// for the claim. Each one runs CPed::SetCarJack_AllClear on its copy of the
+// jacker, and its own engine then drags out whoever is in that seat THERE -
+// the victim's own machine drags the victim's real ped, a traffic driver's
+// host drags its real driver, and everybody else drags their replica. Nobody
+// moves a ped that is not theirs to move.
+//
+// Unlike the intent it may name a traffic car (an AmbientCar netId) as well as
+// a session car: a jack is how a player takes a traffic car, and the promotion
+// only happens at the claim.
+//
+// `seat` is always 0. A jack is only ever made for the wheel
+// (PedAnimPullPedOutCB quits anything without OBJECTIVE_ENTER_CAR_AS_DRIVER).
+struct C_JackingVehicle {
+	static constexpr uint8_t OPCODE = OP_C_JACKING_VEHICLE;
+	PacketHeader hdr;
+	EnteringVehicleBody body;
+};
+
+struct S_JackingVehicle {
+	static constexpr uint8_t OPCODE = OP_S_JACKING_VEHICLE;
 	PacketHeader hdr;
 	uint8_t             playerId;
 	EnteringVehicleBody body;
@@ -4039,6 +4183,69 @@ struct S_CarPromoted {
 };
 
 
+// ---------------------------------------------------------------------------
+// A player left, and his crowd stays (CH_EVENT)
+// ---------------------------------------------------------------------------
+//
+// Every ambient ped and traffic car is hosted by the machine whose engine made
+// it, and until this a player leaving took all of them with him: one despawn
+// each, and the whole street around him emptied at once on every other
+// screen. Every other machine already has a replica of each of them - a real
+// CCivilianPed or CAutomobile in its own world - so there is nothing to build,
+// only somebody to put in charge.
+//
+// The server picks, per entity, the remaining player nearest to it (server/
+// core/adopt.h has the rule and the distances), and names him here. That
+// machine turns its replica back into an ordinary engine-driven ped or car
+// and starts streaming it under the same netId; everybody else keeps the
+// replica they have and starts taking rows from the new owner. Anything no
+// remaining player is near enough to keep goes with an ordinary S_PedDespawn
+// or S_CarDespawn, as before.
+//
+// A car and the peds sitting in it always go to the same machine and always in
+// the same packet, which is what lets a receiver re-own them in one step: its
+// seat pass ties a ped to a car only when both have the same owner.
+//
+// A machine given something it cannot take - no replica here yet, a corpse -
+// lets go of it with C_PedDespawn / C_CarDespawn, which the server takes from
+// the owner and it now is.
+constexpr uint8_t AMBIENT_ADOPT_PED = 0;
+constexpr uint8_t AMBIENT_ADOPT_CAR = 1;
+
+struct AmbientAdoptRow {
+	uint16_t netId;
+	uint8_t  kind;               // AMBIENT_ADOPT_*
+	uint8_t  newOwnerPlayerId;
+};
+
+// Enough for a car with a full load of passengers several times over. A leaver
+// with more than this goes out in several packets, never splitting a car from
+// its occupants.
+constexpr uint8_t MAX_ADOPT_ROWS = 32;
+
+struct S_AmbientAdopt {
+	static constexpr uint8_t OPCODE = OP_S_AMBIENT_ADOPT;
+	PacketHeader    hdr;
+	uint8_t         wasOwnerPlayerId;
+	uint8_t         count;
+	uint8_t         pad[2];
+	AmbientAdoptRow rows[MAX_ADOPT_ROWS];
+};
+
+// Which pedestrians can be handed on at all. A replica is always built as a
+// CCivilianPed, and for anything but the two civilian types it is built as
+// CIVMALE (client/src/game/population.cpp, SpawnAmbientReplica): a cop's
+// replica is not a CCopPed, a gang member's is counted as a civilian. Turned
+// back into a hosted ped, those would be the wrong kind of pedestrian with the
+// wrong AI, so only the two whose replica is exactly what the original was
+// are adopted. Numbers are ePedType (client addresses.h, PEDTYPE_CIVMALE).
+constexpr uint8_t AMBIENT_PEDTYPE_CIVMALE   = 4;
+constexpr uint8_t AMBIENT_PEDTYPE_CIVFEMALE = 5;
+
+inline bool AmbientPedTypeAdoptable(uint8_t pedType) {
+	return pedType == AMBIENT_PEDTYPE_CIVMALE || pedType == AMBIENT_PEDTYPE_CIVFEMALE;
+}
+
 struct C_CarDespawn {
 	static constexpr uint8_t OPCODE = OP_C_CAR_DESPAWN;
 	PacketHeader hdr;
@@ -4224,6 +4431,16 @@ enum PickupIdentFlags : uint8_t {
 	// from it: a bribe's PICKUP_ON_STREET_SLOW window is 300 s and everything
 	// else's is 720 s.
 	PICKUP_F_BRIBE = 1 << 0,
+	// This model is MI_PICKUP_KILLFRENZY, the skull. Same reason as the bribe
+	// bit: only the game knows the number. A claim with it set opens a vote
+	// instead of being granted, when the session has a shared rampage and
+	// somebody to share it with (server/core/rampagevote.h).
+	PICKUP_F_RAMPAGE = 1 << 1,
+	// Set by the server on the one grant that ends a vote that passed. The
+	// starter's machine takes the pickup whether or not the player is still
+	// standing on it: the vote was the say, and the others are already being
+	// moved.
+	PICKUP_F_VOTED   = 1 << 2,
 };
 
 // "I am near this pickup and I want it."
@@ -4535,6 +4752,90 @@ struct S_RampageEnd {
 	static constexpr uint8_t OPCODE = OP_S_RAMPAGE_END;
 	PacketHeader   hdr;
 	RampageEndBody body;
+};
+
+// ---- the vote before a rampage ---------------------------------------------
+//
+// Under `shared` and `scaled` a rampage is everybody's, so it's everybody's to
+// start. Touching a skull no longer starts it: the claim (C_PickupClaim with
+// PICKUP_F_RAMPAGE) opens a vote on the server instead of being granted, and
+// the skull stays where it is on every machine until the vote passes. Then the
+// toucher is granted it (PICKUP_F_VOTED), takes it, and the ordinary pickup
+// path starts the frenzy everywhere, and everybody else is brought over to
+// the toucher. Solo, or with `rampages = off`, the claim is granted as before.
+//
+// The server holds the whole count (server/core/rampagevote.h): one vote at a
+// time, 75% of the players in it rounded up, 15 seconds, the toucher's own yes
+// counted from the start. A no ends it only once yes can't get there any more.
+
+enum RampageVoteState : uint8_t {
+	RAMPAGE_VOTE_OPEN      = 0,
+	RAMPAGE_VOTE_PASSED    = 1,
+	RAMPAGE_VOTE_FAILED    = 2,   // not enough yes, or out of time
+	RAMPAGE_VOTE_CANCELLED = 3,   // the toucher died or left
+};
+
+// Where a vote stands. Broadcast when it opens, on every vote cast, and once
+// when it ends. `msLeft` is from when the server sent it; a receiver counts it
+// down on its own clock.
+struct RampageVoteBody {
+	uint8_t  voteId;
+	uint8_t  starterId;
+	uint8_t  state;     // RampageVoteState
+	uint8_t  yes;
+	uint8_t  voters;    // who the 75% is taken over
+	uint8_t  needed;    // yes votes it takes
+	uint16_t msLeft;
+};
+
+struct C_RampageVote {
+	static constexpr uint8_t OPCODE = OP_C_RAMPAGE_VOTE;
+	PacketHeader hdr;
+	uint8_t      voteId;
+	uint8_t      yes;   // 1 yes, 0 no
+};
+
+struct S_RampageVote {
+	static constexpr uint8_t OPCODE = OP_S_RAMPAGE_VOTE;
+	PacketHeader    hdr;
+	RampageVoteBody body;
+};
+
+// To each player but the toucher, once a vote passes: stand next to them.
+// `pos` is where the server last had the toucher. `slot` of `count` is this
+// player's place in the ring around them, so two players never land on the
+// same spot; the spot itself is worked out by the receiver, on its own ground.
+struct RampageTeleportBody {
+	uint8_t voteId;
+	uint8_t starterId;
+	uint8_t slot;
+	uint8_t count;
+	Vec3    pos;
+};
+
+struct S_RampageTeleport {
+	static constexpr uint8_t OPCODE = OP_S_RAMPAGE_TELEPORT;
+	PacketHeader        hdr;
+	RampageTeleportBody body;
+};
+
+// What a receiver did with its S_RampageTeleport. For the server's log only;
+// nothing is decided on it.
+enum RampageArrival : uint8_t {
+	RAMPAGE_ARRIVED          = 0,
+	RAMPAGE_ARRIVED_LOCKED   = 1,   // moved, onto an island its story hasn't opened
+	RAMPAGE_SKIPPED_DEAD     = 2,
+	RAMPAGE_SKIPPED_ARRESTED = 3,
+	RAMPAGE_SKIPPED_CUTSCENE = 4,
+	RAMPAGE_SKIPPED_MISSION  = 5,
+	RAMPAGE_SKIPPED_NO_PED   = 6,
+};
+
+struct C_RampageArrived {
+	static constexpr uint8_t OPCODE = OP_C_RAMPAGE_ARRIVED;
+	PacketHeader hdr;
+	uint8_t      voteId;
+	uint8_t      result;   // RampageArrival
 };
 
 // One car wreck that counted toward the rampage on the machine that decided
@@ -5499,6 +5800,13 @@ static_assert(sizeof(S_CarSpawn)      == 48, "ambient car spawn layout");
 static_assert(sizeof(C_CarDespawn)    == 7,  "ambient car despawn layout");
 static_assert(sizeof(S_CarDespawn)    == 7,  "ambient car despawn layout");
 
+// 5 hdr + 1 was + 1 count + 2 pad, then 4 a row.
+static_assert(sizeof(AmbientAdoptRow) == 4, "adopt row layout");
+static_assert(sizeof(S_AmbientAdopt)  == 9 + 4 * MAX_ADOPT_ROWS, "adopt batch layout");
+static_assert(offsetof(S_AmbientAdopt, rows) == 9, "rows follow the four bytes");
+static_assert(OP_S_AMBIENT_ADOPT >= 0xD0 && OP_S_AMBIENT_ADOPT <= 0xD5,
+              "adoption stays inside its block");
+
 // 2 netId + 2 health + 12 pos + 16 rot + 12 velocity = 44. The health took
 // the old padding, so nothing moved.
 static_assert(sizeof(AmbientCarState) == 44, "ambient car state layout");
@@ -5534,6 +5842,8 @@ static_assert(sizeof(S_EnterVehicle)  == 44, "enter-vehicle layout");
 static_assert(sizeof(EnteringVehicleBody) == 4,  "entering-vehicle layout");
 static_assert(sizeof(C_EnteringVehicle)   == 9,  "entering-vehicle layout");
 static_assert(sizeof(S_EnteringVehicle)   == 10, "entering-vehicle layout");
+static_assert(sizeof(C_JackingVehicle)    == 9,  "jacking-vehicle layout");
+static_assert(sizeof(S_JackingVehicle)    == 10, "jacking-vehicle layout");
 
 // 5 hdr + 2 net + 2 model + 12 pos + 16 rot + 2 colour + 2 extras = 41
 // identity, then 4 health + 1 flags = 5 condition.
@@ -5557,6 +5867,9 @@ static_assert(sizeof(C_VehicleDamage)   == 13, "vehicle damage layout");
 static_assert(sizeof(S_VehicleDamage)   == 17, "vehicle damage layout");
 static_assert(sizeof(C_PlayerModel)   == 7,  "player model layout");
 static_assert(sizeof(S_PlayerModel)   == 8,  "player model layout");
+static_assert(sizeof(C_PlayerLook)    == 29, "player look layout");
+static_assert(sizeof(S_PlayerLook)    == 30, "player look layout");
+static_assert(OP_S_PLAYER_LOOK <= 0xCF, "the look stays inside the C0 block");
 
 // 1 weapon + 12 origin + 12 dir + 4 speed
 static_assert(sizeof(ShotBody)        == 29, "shot layout");
@@ -5609,6 +5922,17 @@ static_assert(sizeof(S_RampageEnd)      == 8,  "rampage end layout");
 // S_PedDamage use, so the body is byte-identical in both directions.
 static_assert(offsetof(S_RampageKill, byPlayer) == sizeof(PacketHeader),
               "rampage kill relay layout");
+static_assert(sizeof(RampageVoteBody)     == 8,  "rampage vote layout");
+static_assert(sizeof(C_RampageVote)       == 7,  "rampage vote cast layout");
+static_assert(sizeof(S_RampageVote)       == 13, "rampage vote layout");
+static_assert(sizeof(RampageTeleportBody) == 16, "rampage teleport layout");
+static_assert(sizeof(S_RampageTeleport)   == 21, "rampage teleport layout");
+static_assert(sizeof(C_RampageArrived)    == 7,  "rampage arrival layout");
+static_assert(OP_C_RAMPAGE_VOTE >= 0xC4 && OP_S_RAMPAGE_TELEPORT <= 0xC9,
+              "the vote stays inside the block held for it");
+static_assert((PICKUP_F_RAMPAGE | PICKUP_F_VOTED) != 0 &&
+                  ((PICKUP_F_RAMPAGE | PICKUP_F_VOTED) & PICKUP_F_BRIBE) == 0,
+              "the skull's bits stay clear of the bribe's");
 static_assert(sizeof(RampageCarBody)    == 8,  "rampage car layout");
 static_assert(sizeof(C_RampageCar)      == 13, "rampage car layout");
 static_assert(sizeof(S_RampageCar)      == 14, "rampage car relay layout");

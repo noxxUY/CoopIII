@@ -1,6 +1,7 @@
 #include "vehicle.h"
 
 #include "addresses.h"
+#include "adopt.h"
 #include "boat.h"
 #include "cardamage.h"
 #include "carlife.h"
@@ -1789,12 +1790,12 @@ void RestRemoteVehicle(RemoteVehicle &vehicle) {
 // state, and the server's arbitration means only one of them is being believed
 // by anybody else.
 //
-// The victim's engine cannot be shown the jack. SetCarJack needs a jacker ped,
-// every replica CoopIII builds is a CCivilianPed, and its MISSION_VEHICLE bail
-// at 0x004E032B does apply to a CCivilianPed (it is only the *player* that the
-// `jne` at 0x004E0319 carries over it) - so the animation is unavailable on
-// exactly the cars a session has. What is left is the end of the jack without
-// its animation, which is the same sequence
+// Normally the victim's engine is shown the jack now: S_JackingVehicle has the
+// jacker's replica play it here, from SetCarJack_AllClear, and our own engine
+// drags the player out (ped.cpp, BeginPedJackCar) - Client holds this back
+// while that is happening. This is what is left when it could not be played:
+// an older jacker or server, or a jack this machine refused to start. The end
+// of the jack without its animation, which is the same sequence
 // COMMAND_WARP_CHAR_FROM_CAR_TO_COORD's handler runs and which addresses.h has
 // transcribed: take the driver off the car, put the ped on foot, stand him
 // beside it.
@@ -1827,6 +1828,10 @@ bool SurrenderVehicleSeat(RemoteVehicle &vehicle) {
 	void *const ped = PlayerPed();
 	if (!ped || Field<void *>(v, offs::VEH_DRIVER) != ped)
 		return false;   // not at its wheel after all; nothing to hand over
+
+	// Jacked while already on the way out: the exit's door goes back before
+	// the state it is read from is overwritten below. ped.h, ReleaseExitDoor.
+	ReleaseExitDoor(ped, v);
 
 	// The car, first. CVehicle::RemoveDriver is five instructions and does two
 	// things, both of them checked against the image rather than assumed:
@@ -3593,6 +3598,64 @@ void CorrectAmbientCarReplica(RemoteAmbientCar &car, const VehicleTransform &at)
 	for (ReplicaRow &r : g_replicas)
 		if (r.handle == car.poolHandle && r.netId == car.netId)
 			r.driverSaid = car.sirenOn && car.driverSaid;
+}
+
+bool AdoptAmbientCarReplica(RemoteAmbientCar &car) {
+	using JoinFn = void(__cdecl *)(void *);
+
+	void *const v = VehicleFromRef(car.poolHandle);
+	if (!v || IsWrecked(v) || VehicleTypeOf(v) != VEHICLE_TYPE_CAR)
+		return false;
+
+	// First, so from here on the damage, blow-up, siren and car AI detours
+	// all see an ordinary car.
+	ForgetReplica(car.netId);
+
+	void *const    driver = Field<void *>(v, offs::VEH_DRIVER);
+	const bool     driven = AdoptedCarIsDriven(
+        driver != nullptr, driver ? Field<uint32_t>(driver, offs::PED_STATE) : 0);
+
+	uint8_t &flags = Field<uint8_t>(v, offs::ENTITY_FLAGS);
+	AdoptCarBytes b;
+	b.status     = static_cast<uint8_t>(flags >> ENTITY_STATUS_SHIFT);
+	b.flagsA     = Field<uint8_t>(v, offs::VEH_FLAGS_A);
+	b.flagsC     = Field<uint8_t>(v, offs::VEH_FLAGS_C);
+	b.entityC    = Field<uint8_t>(v, offs::ENTITY_FLAGS_C);
+	b.mission    = Field<uint8_t>(v, offs::AUTOPILOT_CAR_MISSION);
+	b.cruise     = Field<uint8_t>(v, offs::AUTOPILOT_CRUISE_SPEED);
+	b.maxTraffic = Field<float>(v, offs::AUTOPILOT_MAX_TRAFFIC_SPEED);
+	b.zone       = Field<int8_t>(v, offs::ZONE_LEVEL);
+
+	b = CarBytesAfterAdoption(b, driven);
+
+	flags = static_cast<uint8_t>((flags & 0x07u) | (b.status << ENTITY_STATUS_SHIFT));
+	Field<uint8_t>(v, offs::VEH_FLAGS_A)                = b.flagsA;
+	Field<uint8_t>(v, offs::VEH_FLAGS_C)                = b.flagsC;
+	Field<uint8_t>(v, offs::ENTITY_FLAGS_C)             = b.entityC;
+	Field<uint8_t>(v, offs::AUTOPILOT_CAR_MISSION)      = b.mission;
+	Field<uint8_t>(v, offs::AUTOPILOT_CRUISE_SPEED)     = b.cruise;
+	Field<float>(v, offs::AUTOPILOT_MAX_TRAFFIC_SPEED)  = b.maxTraffic;
+	Field<int8_t>(v, offs::ZONE_LEVEL)                  = b.zone;
+	// The horn the correction was counting down for its old host.
+	Field<uint8_t>(v, offs::VEH_HORN_TIMER) = 0;
+
+	if (driven) {
+		// COMMAND_CAR_WANDER_RANDOMLY's two calls-and-clocks, in its order:
+		// the road join first, the anti-reverse stamp last.
+		Func<JoinFn>(CCarCtrl__JoinCarWithRoadSystem)(v);
+		Field<uint32_t>(v, offs::AUTOPILOT_ANTI_REVERSE_TIMER) =
+		    Global<uint32_t>(CTimer__m_snTimeInMilliseconds);
+	}
+
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("population: took over traffic car %u from the replica we had - %s",
+		    car.netId,
+		    driven ? "its driver cruises on under our own car AI"
+		           : "nobody at the wheel, so it stays parked where it is");
+	}
+	return true;
 }
 
 // Is the local player at the wheel of this replica? (protocol.h, S_CarPromoted.)

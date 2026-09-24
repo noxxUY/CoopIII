@@ -20,6 +20,7 @@
 #include "game/heli.h"
 #include "game/heligun.h"
 #include "game/horn.h"
+#include "game/look.h"
 #include "game/melee.h"
 #include "game/movinglist.h"
 #include "game/nametag.h"
@@ -147,6 +148,10 @@ struct Recorder {
 	int                   poses     = 0;
 	Pose                  lastPose  = {};
 	bool                  modelReady = false;
+	// What SampleLocalPlayerLook reads back, and what PrepareRemoteLook says.
+	char                  localLook[PLAYER_LOOK_LEN] = {};
+	bool                  lookReady    = false;
+	int                   lookPrepares = 0;
 	int                   nextHandle = 1;
 	// Set to make the next pose write behave the way the real bridge does
 	// when the engine has destroyed the ped under us: drop the handle and
@@ -269,6 +274,20 @@ struct Recorder {
 	// 0xFF until one is. This is the byte the whole intent packet exists to
 	// carry, so a test that does not look at it is not testing the fix.
 	uint8_t  lastSeatDoor    = 0xFF;
+
+	// A jack played here (S_JackingVehicle). `jackStarts` is what
+	// BeginJackRemotePed says, `jackProgress` what polling it says.
+	bool     jackStarts      = true;
+	uint8_t  jackProgress    = SEAT_RUNNING;
+	int      jackBegins      = 0;
+	int      jackPolls       = 0;
+	int32_t  lastJackHandle  = -1;
+	uint8_t  lastJackDoor    = 0xFF;
+	// What our engine is doing to a seated ped: by player slot, to the ambient
+	// replicas, and to the local player. A PullOut.
+	uint8_t  remotePull[MAX_PLAYERS] = {};
+	uint8_t  ambientPull     = PULL_NONE;
+	uint8_t  localPull       = PULL_NONE;
 
 	// What our own engine says we are doing about a car right now, and how
 	// many times it was asked. The sampler is cheap and runs every tick; the
@@ -453,6 +472,17 @@ struct Recorder {
 	int      ambientCarDespawns = 0;
 	int      nextAmbientCarHandle = 1;
 
+	// A leaver's crowd handed to us (S_AmbientAdopt): how many replicas the
+	// engine seam turned into ours, and in what order - a stamp per call off
+	// one counter, so a test can tell peds went before cars. `refuseAdoption`
+	// makes the seam say no, as it does with its hosted table full.
+	int      pedAdoptions     = 0;
+	int      carAdoptions     = 0;
+	int      adoptionStamp    = 0;
+	int      lastPedAdoptedAt = 0;
+	int      lastCarAdoptedAt = 0;
+	bool     refuseAdoption   = false;
+
 	// A traffic replica made to wear its host's dents, and our own traffic's
 	// dents waiting to be drained.
 	int               ambientCarDents = 0;
@@ -622,6 +652,18 @@ void RecNoteVehicleHolders(uint16_t netId, uint8_t driverPlayerId,
 void RecRequestModel(uint16_t id) { g_rec.modelRequests.push_back(id); }
 bool RecIsModelReady(uint16_t)    { return g_rec.modelReady; }
 
+bool RecSampleLocalLook(char (&look)[PLAYER_LOOK_LEN]) {
+	if (g_rec.localLook[0] == '\0')
+		return false;
+	std::memcpy(look, g_rec.localLook, sizeof look);
+	return true;
+}
+
+bool RecPrepareLook(RemotePlayer &) {
+	++g_rec.lookPrepares;
+	return g_rec.lookReady;
+}
+
 bool RecSpawn(RemotePlayer &p) {
 	p.poolHandle = g_rec.nextHandle++;
 	++g_rec.spawns;
@@ -714,6 +756,26 @@ bool RecBeginUnseat(RemotePlayer &) {
 	++g_rec.exitAnimBegins;
 	return true;
 }
+
+bool RecBeginJack(RemotePlayer &, int32_t carHandle, uint8_t doorSeat) {
+	++g_rec.jackBegins;
+	g_rec.lastJackHandle = carHandle;
+	g_rec.lastJackDoor   = doorSeat;
+	return g_rec.jackStarts;
+}
+
+uint8_t RecPollJack(RemotePlayer &, int32_t) {
+	++g_rec.jackPolls;
+	return g_rec.jackProgress;
+}
+
+uint8_t RecRemotePull(RemotePlayer &p) {
+	return p.playerId < MAX_PLAYERS ? g_rec.remotePull[p.playerId] : uint8_t{PULL_NONE};
+}
+
+uint8_t RecAmbientPull(const RemoteAmbientPed &) { return g_rec.ambientPull; }
+
+uint8_t RecLocalPull() { return g_rec.localPull; }
 
 bool RecBlowUpVehicle(RemoteVehicle &v, const Vec3 &pos, const Quat &) {
 	++g_rec.blowUps;
@@ -1164,6 +1226,26 @@ bool RecSeatAmbientPed(RemoteAmbientPed &, RemoteAmbientCar &car, uint8_t seat) 
 
 void RecUnseatAmbientPed(RemoteAmbientPed &) { ++g_rec.ambientUnseats; }
 
+// The same write the real seam makes on success: the handle is cleared, so the
+// roster can drop the row without the object being destroyed.
+bool RecAdoptAmbientPed(RemoteAmbientPed &p) {
+	if (g_rec.refuseAdoption)
+		return false;
+	++g_rec.pedAdoptions;
+	g_rec.lastPedAdoptedAt = ++g_rec.adoptionStamp;
+	p.poolHandle = -1;
+	return true;
+}
+
+bool RecAdoptAmbientCar(RemoteAmbientCar &c) {
+	if (g_rec.refuseAdoption)
+		return false;
+	++g_rec.carAdoptions;
+	g_rec.lastCarAdoptedAt = ++g_rec.adoptionStamp;
+	c.poolHandle = -1;
+	return true;
+}
+
 bool RecKillAmbientReplica(RemoteAmbientPed &p, uint16_t animId) {
 	++g_rec.ambientKillAttempts;
 	if (g_rec.refuseAmbientKill)
@@ -1370,6 +1452,11 @@ WorldBridge RecordingBridge() {
 	b.AbandonSeatRemotePed       = &RecAbandonSeat;
 	b.BeginUnseatRemotePed       = &RecBeginUnseat;
 	b.SampleLocalCarEntry        = &RecSampleLocalCarEntry;
+	b.BeginJackRemotePed         = &RecBeginJack;
+	b.PollJackRemotePed          = &RecPollJack;
+	b.RemoteBeingPulledOut       = &RecRemotePull;
+	b.AmbientBeingPulledOut      = &RecAmbientPull;
+	b.LocalBeingPulledOut        = &RecLocalPull;
 	b.BlowUpRemoteVehicle        = &RecBlowUpVehicle;
 	b.DrainLocalVehicleBlasts    = &RecDrainLocalBlasts;
 	b.WreckUnownedVehicle        = &RecWreckUnowned;
@@ -1425,6 +1512,8 @@ WorldBridge RecordingBridge() {
 	b.CorrectAmbientCarReplica = &RecCorrectAmbientCar;
 	b.LocalDrivesAmbientCar    = &RecLocalDrivesAmbientCar;
 	b.AdoptPromotedCar         = &RecAdoptPromotedCar;
+	b.AdoptAmbientPed          = &RecAdoptAmbientPed;
+	b.AdoptAmbientCar          = &RecAdoptAmbientCar;
 	b.WreckAmbientCarReplica   = &RecWreckAmbientCar;
 	b.DrainAmbientWrecks       = &RecDrainAmbientWrecks;
 
@@ -2115,6 +2204,183 @@ void TestModelChangeWhileSeated() {
 	Check(c.PlayerSlot(1).Seated(), "and put back in the car");
 }
 
+S_PlayerLook MakeLook(uint8_t playerId, const char *look) {
+	S_PlayerLook l;
+	InitHeader(l, 2000);
+	l.playerId = playerId;
+	std::memset(l.look, 0, sizeof l.look);
+	std::strncpy(l.look, look, sizeof l.look - 1);
+	return l;
+}
+
+void TestCleanPlayerLook() {
+	std::printf("\ncleaning a look off the wire\n");
+	char a[PLAYER_LOOK_LEN] = "PLAYERP";
+	Check(CleanPlayerLook(a) && std::strcmp(a, "playerp") == 0, "lower-cased, the way the engine keeps it");
+
+	char b[PLAYER_LOOK_LEN] = "play er";
+	Check(!CleanPlayerLook(b) && b[0] == '\0', "a space is refused and the buffer zeroed");
+
+	char c[PLAYER_LOOK_LEN] = "";
+	Check(!CleanPlayerLook(c), "an empty name is not a look");
+
+	char d[PLAYER_LOOK_LEN];
+	std::memset(d, 'a', sizeof d);
+	Check(!CleanPlayerLook(d) && d[0] == '\0', "an unterminated one is refused");
+
+	char e[PLAYER_LOOK_LEN] = {};
+	std::memcpy(e, "player\0junk", 11);
+	Check(CleanPlayerLook(e) && e[7] == '\0' && e[8] == '\0',
+	      "whatever follows the terminator goes");
+}
+
+void TestLookSlotPicking() {
+	std::printf("\nwhich body a remote Claude is built from\n");
+	using namespace coopiii::game;
+
+	LookSlot slots[LOOK_SLOTS];
+	auto name = [&](int i, const char *n) {
+		std::memset(slots[i].name, 0, sizeof slots[i].name);
+		std::strncpy(slots[i].name, n, sizeof slots[i].name - 1);
+	};
+
+	LookChoice c = PickLookSlot("player", "player", slots);
+	Check(c.pick == LookPick::Model0, "the same clothes as ours is model 0");
+	c = PickLookSlot("", "playerp", slots);
+	Check(c.pick == LookPick::Model0, "a player who never said is model 0");
+	c = PickLookSlot("PLAYER", "player", slots);
+	Check(c.pick == LookPick::Model0, "and the case of the name doesn't matter");
+
+	c = PickLookSlot("playerp", "player", slots);
+	Check(c.pick == LookPick::Slot && c.slot == 3,
+	      "the other clothes go in special04, the one missions reach for last");
+
+	c = PickLookSlot("eight2", "player", slots);
+	Check(c.pick == LookPick::Refused, "8-Ball's clothes are not Claude's");
+
+	// A mission holding 04, and 03 built from by a ped somebody forgot.
+	slots[3].flags = 0x02;   // SCRIPTOWNED
+	slots[2].refs  = 1;
+	c = PickLookSlot("playerp", "player", slots);
+	Check(c.pick == LookPick::Slot && c.slot == 1, "a held or used slot is skipped");
+
+	slots[1].loadState = 2;   // INQUEUE for somebody else
+	slots[1].flags     = 0x02;
+	slots[0].flags     = 0x01;   // DONT_REMOVE
+	c = PickLookSlot("playerp", "player", slots);
+	Check(c.pick == LookPick::NoSlot, "with all four taken there is nowhere to go");
+
+	// Ours, loaded with this look, is shared rather than a second one taken.
+	slots[1]      = LookSlot{};
+	slots[1].ours = true;
+	slots[1].refs = 1;
+	name(1, "playerp");
+	c = PickLookSlot("playerp", "player", slots);
+	Check(c.pick == LookPick::Slot && c.slot == 1, "a slot we hold with this look is shared");
+	c = PickLookSlot("playerx", "player", slots);
+	Check(c.pick == LookPick::NoSlot, "but not handed out for a different one");
+
+	// A free slot that already holds the look is picked over a higher one.
+	LookSlot fresh[LOOK_SLOTS];
+	std::strcpy(fresh[0].name, "playerp");
+	fresh[0].loadState = 1;
+	c = PickLookSlot("playerp", "player", fresh);
+	Check(c.pick == LookPick::Slot && c.slot == 0, "a free slot already loaded with it saves a load");
+
+	LookSlot held;
+	held.ours = true;
+	Check(LookSlotReleasable(held, false), "a slot of ours nobody wants goes back");
+	Check(!LookSlotReleasable(held, true), "not while a player is waiting on it");
+	held.refs = 1;
+	Check(!LookSlotReleasable(held, false), "nor while a ped is built from it");
+	Check(!LookSlotFree(held), "and ours is never free to somebody else");
+}
+
+void TestLookChangeRebuildsThePed() {
+	std::printf("\na player who changes clothes\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice", 0), CH_EVENT));
+	g_rec.modelReady = true;
+	FeedPosition(c, 1);
+	c.Tick();
+	Check(g_rec.spawns == 1, "alice is built as Claude");
+
+	c.HandleMessage(Wrap(MakeLook(1, "PLAYERP"), CH_EVENT));
+	Check(std::strcmp(c.PlayerSlot(1).look, "playerp") == 0,
+	      "the roster takes her look, lower case");
+	Check(g_rec.despawns == 1, "and her ped comes down");
+	Check(c.PlayerSlot(1).spawnPending, "to be built again");
+
+	c.HandleMessage(Wrap(MakeLook(1, "playerp"), CH_EVENT));
+	Check(g_rec.despawns == 1, "the same look again changes nothing");
+
+	c.Tick();
+	Check(g_rec.spawns == 2, "the new body is built");
+
+	c.HandleMessage(Wrap(MakeLook(1, "play er"), CH_EVENT));
+	Check(std::strcmp(c.PlayerSlot(1).look, "playerp") == 0 && g_rec.despawns == 1,
+	      "a name that doesn't clean is dropped");
+}
+
+void TestLookOnAnotherModelKeepsThePed() {
+	std::printf("\na look for somebody who isn't Claude\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);   // model 7
+
+	c.HandleMessage(Wrap(MakeLook(1, "playerp"), CH_EVENT));
+	Check(std::strcmp(c.PlayerSlot(1).look, "playerp") == 0, "the look is kept");
+	Check(g_rec.despawns == 0, "but her ped is left alone");
+}
+
+void TestSpawnWaitsForTheLook() {
+	std::printf("\nClaude is built once his clothes are in\n");
+	WorldBridge b        = RecordingBridge();
+	b.PrepareRemoteLook  = &RecPrepareLook;
+	Client c;
+	c.SetBridge(b);
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice", 0), CH_EVENT));
+	g_rec.modelReady = true;
+	g_rec.lookReady  = false;
+	FeedPosition(c, 1);
+	c.Tick();
+	Check(g_rec.lookPrepares > 0, "the look is asked for");
+	Check(g_rec.spawns == 0, "and model 0 being ready isn't enough on its own");
+
+	g_rec.lookReady = true;
+	c.Tick();
+	Check(g_rec.spawns == 1, "built once the look is ready");
+	const int asked = g_rec.lookPrepares;
+	c.Tick();
+	Check(g_rec.lookPrepares == asked, "and not asked again once there is a ped");
+}
+
+void TestOurLookIsSentOnChange() {
+	std::printf("\ntelling the session what we're wearing\n");
+	WorldBridge b           = RecordingBridge();
+	b.SampleLocalPlayerLook = &RecSampleLocalLook;
+	Client c;
+	c.SetBridge(b);
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+
+	c.SendLocalLookForTest();
+	Check(c.SentLookForTest()[0] == '\0', "nothing without a player ped");
+
+	std::strcpy(g_rec.localLook, "playerp");
+	c.SendLocalLookForTest();
+	Check(std::strcmp(c.SentLookForTest(), "playerp") == 0, "the prison clothes go out");
+
+	std::strcpy(g_rec.localLook, "player");
+	c.SendLocalLookForTest();
+	Check(std::strcmp(c.SentLookForTest(), "player") == 0, "and the change after 8-Ball");
+
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	Check(c.SentLookForTest()[0] == '\0', "a new session hasn't heard it yet");
+}
+
 void TestSeatingWaitsForTheCar() {
 	std::printf("\nseating a remote driver\n");
 	Client c;
@@ -2462,7 +2728,7 @@ void TestAnAbandonedEntryDoesNotLeaveHerInTheCar() {
 	// everything it caused has to go with it.
 	Check(c.PlayerSlot(1).enterIntentNetId != INVALID_NETID,
 	      "the intent is still standing meanwhile");
-	c.LapseEnterIntentForTest(1);   // as if the four seconds had passed
+	c.LapseEnterIntentForTest(1);   // as if the intent's lifetime had passed
 	c.Tick();
 	Check(!c.PlayerSlot(1).Seated(),
 	      "she is taken back out of a car the session never said she was in");
@@ -2538,6 +2804,125 @@ void TestAnEntryThatNeverFinishesIsTimedOut() {
 	Check(g_rec.seatAnimAborts == 1, "and it is taken off her when time is up");
 	Check(c.PlayerSlot(1).Seated(), "she is in the seat");
 	Check(g_rec.seats == 1, "put there by the warp, which is what it is for");
+}
+
+// The seat key teleporting the player into the back of a Pony. The entry was
+// timed out at 2.5 s and the chain for a van's back door is 3.53 s long, so
+// it was warped every single time. What decides it now is whether the
+// animation is moving, and these are the numbers from anim\ped.ifp.
+void TestAnEntryIsJudgedByItsAnimation() {
+	std::printf("\nan entry is waited for as long as its animation moves\n");
+
+	constexpr uint32_t FRONT_DOOR_MS = 33 + 933 + 633 + 467;    // align, open, getin, close
+	constexpr uint32_t VAN_BACK_MS   = 33 + 533 + 1600 + 1367;  // VAN_openL, getinL, closeL
+	constexpr uint32_t SHUFFLE_MS    = FRONT_DOOR_MS + 633;     // driver by the other door
+	Check(SEAT_ANIM_TIMEOUT_MS > VAN_BACK_MS + VAN_BACK_MS / 2,
+	      "the cap covers a van's back door with half as much again to spare");
+	Check(SEAT_ANIM_TIMEOUT_MS > SHUFFLE_MS * 2,
+	      "and a driver who went in by the passenger door twice over");
+	Check(ENTER_INTENT_TTL_MS > SEAT_ANIM_TIMEOUT_MS,
+	      "an intent outlives the entry it started");
+
+	// A van's back door played at 25 Hz of looks, the mark moving every look.
+	EntryWatch w;
+	w.Begin(1000, 7);
+	bool stalled = false;
+	uint32_t t = 1000;
+	for (uint32_t mark = 8; t < 1000 + VAN_BACK_MS; ++mark) {
+		t += 40;
+		stalled = stalled || w.Stalled(t, mark);
+	}
+	Check(!stalled, "a van's back door, moving the whole time, is never a stall");
+
+	// Looks every 40 ms with the mark held, up to `until`; the last answer.
+	const auto hold = [](EntryWatch &e, uint32_t &now, uint32_t until, uint32_t mark) {
+		bool last = false;
+		while (now + 40 <= until) {
+			now += 40;
+			last = e.Stalled(now, mark);
+		}
+		return last;
+	};
+
+	// The same animation stuck on one frame.
+	EntryWatch s;
+	s.Begin(1000, 7);
+	uint32_t ts = 1000;
+	Check(!s.Stalled(ts += 40, 7), "one look without movement is not a stall");
+	Check(!hold(s, ts, 1000 + SEAT_ANIM_STALL_MS - 40, 7), "nor is most of a second");
+	Check(hold(s, ts, 1000 + SEAT_ANIM_STALL_MS, 7), "a second of nothing is");
+
+	// Moving again resets it.
+	EntryWatch r;
+	r.Begin(1000, 7);
+	uint32_t tr = 1000;
+	hold(r, tr, 1920, 7);
+	Check(!r.Stalled(tr += 40, 8), "movement starts the count again");
+	const uint32_t moved = tr;
+	Check(!hold(r, tr, moved + SEAT_ANIM_STALL_MS - 40, 8), "and counts from where it moved");
+	Check(hold(r, tr, moved + SEAT_ANIM_STALL_MS, 8), "to a full second");
+
+	// Frames that never ran - the window dragged, a debugger - do not count.
+	EntryWatch g;
+	g.Begin(1000, 7);
+	uint32_t tg = 1000;
+	hold(g, tg, 1400, 7);
+	tg += 5000;
+	Check(!g.Stalled(tg, 7),
+	      "five seconds with no frames at all is not the animation's fault");
+	const uint32_t back = tg;
+	Check(!hold(g, tg, back + SEAT_ANIM_STALL_MS - 400 - 40, 7),
+	      "and what was left of the second before the gap is all it has after it");
+	Check(hold(g, tg, back + SEAT_ANIM_STALL_MS - 400 + 40, 7),
+	      "so a real stall across the gap is still caught");
+}
+
+// The seat key picked seat 1 wherever the player stood, and seat 1's door is
+// on the right: from the driver's side the ped was lined up through the car.
+void TestTheSeatKeyPicksADoorOnOurSide() {
+	std::printf("\nthe seat key asks for a door on the player's own side\n");
+	constexpr uint16_t S1 = 1u << 1, S2 = 1u << 2, S3 = 1u << 3, S4 = 1u << 4;
+
+	Check(PickPassengerSeat(S1 | S2 | S3, /*onRight=*/false) == 2,
+	      "on the left of a four-door car: the back door on the left");
+	Check(PickPassengerSeat(S1 | S2 | S3, true) == 1,
+	      "on the right: the front passenger's door");
+	Check(PickPassengerSeat(S2 | S3, true) == 3,
+	      "on the right with the front taken: the back door on that side");
+	Check(PickPassengerSeat(S1, false) == 1,
+	      "a two-door car has one passenger door, whichever side we are on");
+	Check(PickPassengerSeat(S1 | S3, false) == 1,
+	      "nothing free on our side: the lowest free seat, as before");
+	Check(PickPassengerSeat(S4, true) == 4, "a seat with no door of its own still counts");
+	Check(PickPassengerSeat(0, true) == -1 && PickPassengerSeat(0, false) == -1,
+	      "and a full car is no seat at all");
+	Check(PickPassengerSeat(1u << 0, false) == -1,
+	      "bit 0 is the driver's seat and is never offered");
+}
+
+// The car the jacked player could never get back into. A replica taken out
+// of a seat while its get-out animation was still playing - its owner's exit
+// packet landing first - left the door's bit in m_nGettingOutFlags, and
+// SetEnterCar refuses that door for good.
+void TestAWarpedExitGivesTheDoorBack() {
+	std::printf("\na ped taken out mid-exit gives its door back\n");
+	using game::GettingOutFlagsAfterUnseat;
+	namespace o = game::offs;
+
+	const uint8_t lf = o::CAR_DOOR_FLAG_LF;
+	const uint8_t rf = o::CAR_DOOR_FLAG_RF;
+	Check(GettingOutFlagsAfterUnseat(lf, game::PEDSTATE_EXIT_CAR, lf) == 0,
+	      "halfway out of the driver's door: the door is free again");
+	Check(GettingOutFlagsAfterUnseat(lf | rf, game::PEDSTATE_EXIT_CAR, lf) == rf,
+	      "only that door - somebody else getting out the other side keeps theirs");
+	Check(GettingOutFlagsAfterUnseat(rf, game::PEDSTATE_DRAG_FROM_CAR, rf) == 0,
+	      "being dragged out is the same claim, and ~CPed clears it the same way");
+	Check(GettingOutFlagsAfterUnseat(lf, game::PEDSTATE_DRIVING, lf) == lf,
+	      "a ped just sitting there never claimed a door, so nothing is touched");
+	Check(GettingOutFlagsAfterUnseat(lf, game::PEDSTATE_IDLE, lf) == lf,
+	      "and neither did one already on foot");
+	Check(GettingOutFlagsAfterUnseat(lf, game::PEDSTATE_ENTER_CAR, lf) == lf,
+	      "getting in is the other byte, and QuitEnteringCar's job");
 }
 
 void TestOneAnimatedAttemptPerEnterEvent() {
@@ -7350,6 +7735,19 @@ void TestArrowColour() {
 	Check(lowByteIgnored.r == 0x11 && lowByteIgnored.g == 0x22 &&
 	          lowByteIgnored.b == 0x33,
 	      "and the low byte is ignored rather than becoming the alpha");
+
+	// What is drawn now: the player's chat colour, darker in a vehicle.
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+		const NickColour chat = ChatNickColour(id);
+		const ArrowRgb   foot = PlayerArrowRgb(id, false);
+		const ArrowRgb   car  = PlayerArrowRgb(id, true);
+		if (foot.r != chat.r || foot.g != chat.g || foot.b != chat.b ||
+		    !(car.r < foot.r && car.g < foot.g && car.b < foot.b)) {
+			Check(false, "every player's arrow is their chat colour, darker in a vehicle");
+			return;
+		}
+	}
+	Check(true, "every player's arrow is their chat colour, darker in a vehicle");
 }
 
 void TestArrowWanted() {
@@ -13987,6 +14385,233 @@ void TestOurTrafficsDentsGoOut() {
 	Check(c.DamageReportsSentForTest() == before + 2, "and nothing when it hands over none");
 }
 
+// ---------------------------------------------------------------------------
+// A leaver's crowd (protocol.h, S_AmbientAdopt)
+// ---------------------------------------------------------------------------
+
+S_AmbientAdopt MakeAdopt(uint8_t wasOwner) {
+	S_AmbientAdopt a{};
+	InitHeader(a, 1000);
+	a.wasOwnerPlayerId = wasOwner;
+	a.count            = 0;
+	return a;
+}
+
+void AddAdoptRow(S_AmbientAdopt &a, uint16_t netId, uint8_t kind, uint8_t newOwner) {
+	a.rows[a.count++] = AmbientAdoptRow{netId, kind, newOwner};
+}
+
+// A civilian, which is what can be handed on. The default spawn helper's
+// pedType 0 is PLAYER1, and nobody can adopt one of those.
+void GiveUsACivilian(Client &c, uint16_t netId, uint8_t owner = 1) {
+	S_PedSpawn s = MakeAmbientPedSpawn(netId, owner);
+	s.body.pedType = AMBIENT_PEDTYPE_CIVMALE;
+	c.HandleMessage(Wrap(s, CH_EVENT));
+}
+
+void TestALeaversPedIsAdoptedByUs() {
+	std::printf("\na leaver's pedestrian handed to us\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	GiveUsACivilian(c, 500);
+	c.Tick();
+	Check(g_rec.ambientPedSpawns == 1, "we hold a replica of alice's pedestrian");
+
+	S_AmbientAdopt a = MakeAdopt(1);
+	AddAdoptRow(a, 500, AMBIENT_ADOPT_PED, 0);
+	c.HandleMessage(Wrap(a, CH_EVENT));
+	Check(g_rec.pedAdoptions == 1, "the engine seam is asked to make him ours");
+	Check(c.AmbientPed(500) == nullptr, "and he is off the replica roster");
+	Check(g_rec.ambientPedDespawns == 0, "without the object being destroyed");
+
+	c.Tick();
+	Check(g_rec.ambientPedSpawns == 1, "and nothing builds him again");
+}
+
+void TestSomebodyElseAdoptsAndWeFollow() {
+	std::printf("\na leaver's pedestrian handed to somebody else\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	GiveUsACivilian(c, 500);
+	c.Tick();
+	c.HandleMessage(Wrap(MakePedStates(1, 500, 2000, 30.0f), CH_SNAPSHOT));
+
+	S_AmbientAdopt a = MakeAdopt(1);
+	AddAdoptRow(a, 500, AMBIENT_ADOPT_PED, 2);
+	c.HandleMessage(Wrap(a, CH_EVENT));
+	const RemoteAmbientPed *p = c.AmbientPed(500);
+	Check(p != nullptr && p->ownerPlayerId == 2 && p->poolHandle >= 0,
+	      "the replica stays and bob owns the row");
+	Check(g_rec.pedAdoptions == 0 && g_rec.ambientPedDespawns == 0,
+	      "nothing converted, nothing destroyed");
+
+	c.HandleMessage(Wrap(MakePedStates(1, 500, 2040, 99.0f), CH_SNAPSHOT));
+	Check(c.AmbientPed(500)->last.pos.x == 30.0f, "a late row from alice is not taken");
+	// Stamped on bob's clock, far behind anything alice sent.
+	c.HandleMessage(Wrap(MakePedStates(2, 500, 50, 44.0f), CH_SNAPSHOT));
+	Check(c.AmbientPed(500)->last.pos.x == 44.0f, "bob's are");
+	const int applies = g_rec.ambientApplies;
+	c.Tick();
+	Check(g_rec.ambientApplies == applies + 1 && g_rec.lastAmbientPose.pos.x == 44.0f,
+	      "and drive the replica, alice's rows gone from its buffer");
+}
+
+void TestWhatWeCannotTakeIsLetGo() {
+	std::printf("\nwhat we cannot take is let go of\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+
+	// A cop, whose replica here is a civilian and so not the same man.
+	g_rec.modelReady = true;
+	S_PedSpawn cop = MakeAmbientPedSpawn(502);
+	cop.body.pedType = 6;
+	c.HandleMessage(Wrap(cop, CH_EVENT));
+	c.Tick();
+	// And a civilian whose model has not come in, so no replica at all.
+	g_rec.modelReady = false;
+	GiveUsACivilian(c, 503);
+	c.Tick();
+	const int spawns    = g_rec.ambientPedSpawns;
+	const int despawns  = g_rec.ambientPedDespawns;
+
+	S_AmbientAdopt a = MakeAdopt(1);
+	AddAdoptRow(a, 503, AMBIENT_ADOPT_PED, 0);
+	AddAdoptRow(a, 502, AMBIENT_ADOPT_PED, 0);
+	AddAdoptRow(a, 777, AMBIENT_ADOPT_PED, 0);   // a row we never had
+	c.HandleMessage(Wrap(a, CH_EVENT));
+	Check(g_rec.pedAdoptions == 0, "none of the three is converted");
+	Check(c.AmbientPed(503) == nullptr && c.AmbientPed(502) == nullptr,
+	      "the rows go - we are their owner now and we let them go");
+	Check(g_rec.ambientPedDespawns == despawns + 1,
+	      "the one with a replica has it taken away, the one without has nothing to take");
+
+	g_rec.modelReady = true;
+	c.Tick();
+	Check(g_rec.ambientPedSpawns == spawns, "and neither is built again");
+
+	// The seam itself saying no - its table is full - ends the same way.
+	GiveUsACivilian(c, 504);
+	c.Tick();
+	g_rec.refuseAdoption = true;
+	S_AmbientAdopt b = MakeAdopt(1);
+	AddAdoptRow(b, 504, AMBIENT_ADOPT_PED, 0);
+	c.HandleMessage(Wrap(b, CH_EVENT));
+	Check(c.AmbientPed(504) == nullptr && g_rec.ambientPedDespawns == despawns + 2,
+	      "a refusal is a release");
+}
+
+void TestACarAndItsDriverAreTakenTogether() {
+	std::printf("\na car and its driver handed to us in one packet\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(700), CH_EVENT));
+	GiveUsACivilian(c, 500);
+	c.Tick();
+	c.HandleMessage(Wrap(MakePedStates(1, 500, 2000, 40.0f, 0, 700, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(c.AmbientPed(500) && c.AmbientPed(500)->Seated(), "alice's driver sits in her car");
+	const int unseats = g_rec.ambientUnseats;
+
+	// The car row first on the wire, the way the server packs a group.
+	S_AmbientAdopt a = MakeAdopt(1);
+	AddAdoptRow(a, 700, AMBIENT_ADOPT_CAR, 0);
+	AddAdoptRow(a, 500, AMBIENT_ADOPT_PED, 0);
+	c.HandleMessage(Wrap(a, CH_EVENT));
+	Check(g_rec.carAdoptions == 1 && g_rec.pedAdoptions == 1, "both are made ours");
+	Check(g_rec.lastPedAdoptedAt < g_rec.lastCarAdoptedAt,
+	      "the driver before the car, whatever order they came in");
+	Check(g_rec.ambientUnseats == unseats, "and nobody is taken out of a seat to do it");
+	Check(c.AmbientCar(700) == nullptr && c.AmbientPed(500) == nullptr &&
+	          g_rec.ambientCarDespawns == 0,
+	      "both rows gone, neither object destroyed");
+}
+
+void TestAnObserverKeepsTheDriverSeated() {
+	std::printf("\na car and its driver handed to somebody else\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(700), CH_EVENT));
+	GiveUsACivilian(c, 500);
+	c.Tick();
+	c.HandleMessage(Wrap(MakePedStates(1, 500, 2000, 40.0f, 0, 700, 0), CH_SNAPSHOT));
+	c.Tick();
+	const int unseats = g_rec.ambientUnseats;
+
+	S_AmbientAdopt a = MakeAdopt(1);
+	AddAdoptRow(a, 700, AMBIENT_ADOPT_CAR, 2);
+	AddAdoptRow(a, 500, AMBIENT_ADOPT_PED, 2);
+	c.HandleMessage(Wrap(a, CH_EVENT));
+	c.Tick();
+	Check(c.AmbientCar(700)->ownerPlayerId == 2 && c.AmbientPed(500)->ownerPlayerId == 2,
+	      "both rows are bob's");
+	Check(c.AmbientPed(500)->Seated() && g_rec.ambientUnseats == unseats,
+	      "and the driver never leaves his seat - the seat pass sees one owner");
+}
+
+void TestTheCarWeAreDrivingWaitsForItsClaim() {
+	std::printf("\nhanded the car we are at the wheel of\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(300), CH_EVENT));
+	c.Tick();
+	const int32_t handle = c.AmbientCar(300)->poolHandle;
+	g_rec.ambientDrivenHandle = handle;
+	c.TickAmbientClaims();
+
+	S_AmbientAdopt a = MakeAdopt(1);
+	AddAdoptRow(a, 300, AMBIENT_ADOPT_CAR, 0);
+	c.HandleMessage(Wrap(a, CH_EVENT));
+	const RemoteAmbientCar *car = c.AmbientCar(300);
+	Check(g_rec.carAdoptions == 0 && g_rec.ambientCarDespawns == 0,
+	      "neither converted nor destroyed with us in it");
+	Check(car && car->ownerPlayerId == 0 && car->poolHandle == handle,
+	      "the replica waits, filed as ours");
+
+	c.HandleMessage(Wrap(MakeCarPromoted(300, 0, 0), CH_EVENT));
+	Check(g_rec.promotedAdoptions == 1 && !g_rec.lastPromotionWasOurs,
+	      "the promotion treats it as the replica it is, not our engine's own car");
+	Check(c.AmbientCar(300) == nullptr, "and the traffic row is gone");
+}
+
+void TestAnAdoptPacketIsBounded() {
+	std::printf("\nan adoption packet is read within its own bounds\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	GiveUsACivilian(c, 500);
+	c.Tick();
+
+	S_AmbientAdopt a = MakeAdopt(1);
+	AddAdoptRow(a, 500, 9, 0);                       // a kind this build has never heard of
+	AddAdoptRow(a, 500, AMBIENT_ADOPT_PED, 200);     // nobody's slot
+	c.HandleMessage(Wrap(a, CH_EVENT));
+	Check(c.AmbientPed(500) && c.AmbientPed(500)->ownerPlayerId == 1 &&
+	          g_rec.pedAdoptions == 0,
+	      "an unknown kind and a slot that cannot exist change nothing");
+
+	a.count = 255;
+	c.HandleMessage(Wrap(a, CH_EVENT));
+	Check(c.AmbientPed(500) != nullptr, "and a count past the array reads only the array");
+}
+
+// tools/clienttest/adopt.cpp
+int RunAdoptTests();
+
+// tools/clienttest/rampagevote.cpp
+int RunRampageVoteTests();
+
 // tools/clienttest/aimpitch.cpp
 int RunAimPitchTests();
 
@@ -15431,6 +16056,378 @@ void TestCopiesNeverReactToMelee() {
 	      "a fight move is bounded before it indexes the table");
 }
 
+// ---- a carjack, played on every screen ------------------------------------
+//
+// "Cuando le robo el auto a alguien, en la otra pantalla se ve que me subo
+// normal y el otro aparece afuera." The jacker's engine played the jack and
+// nobody else's did: observers waited for the claim, took the victim out by
+// hand and then played an ordinary get-in. S_JackingVehicle carries the jack
+// at its start, and each machine plays it with its own engine, which drags out
+// whoever sits in that seat there.
+
+S_JackingVehicle MakeJacking(uint8_t playerId, uint16_t netId, uint8_t door) {
+	S_JackingVehicle j;
+	InitHeader(j, 1000);
+	j.playerId   = playerId;
+	j.body       = EnteringVehicleBody{};
+	j.body.netId = netId;
+	j.body.seat  = 0;
+	j.body.door  = door;
+	return j;
+}
+
+void TestTheJackRules() {
+	std::printf("\nwhen our engine is taking a ped out of its seat\n");
+	using namespace coopiii::game;
+	constexpr uint8_t LF = offs::CAR_DOOR_FLAG_LF;
+	constexpr uint8_t RF = offs::CAR_DOOR_FLAG_RF;
+	constexpr uint8_t JACKED = offs::VEH_IS_BEING_CARJACKED;
+
+	Check(EngineTakingPedOut(PEDSTATE_DRAG_FROM_CAR, 0, 0, 0),
+	      "a ped in PED_DRAG_FROM_CAR is being taken out, whatever else is true");
+	Check(EngineTakingPedOut(PEDSTATE_DRIVING, LF, LF, JACKED),
+	      "a driver whose door a jack has claimed is about to be");
+	Check(!EngineTakingPedOut(PEDSTATE_DRIVING, LF, LF, 0),
+	      "not by an ordinary get-in through that door");
+	Check(!EngineTakingPedOut(PEDSTATE_DRIVING, LF, RF, JACKED),
+	      "nor by a jack through somebody else's door");
+	Check(!EngineTakingPedOut(PEDSTATE_DRIVING, 0, 0xFF, 0xFF),
+	      "and a seat with no door of its own is never jacked through one");
+	Check(!EngineTakingPedOut(PEDSTATE_EXIT_CAR, LF, LF, JACKED),
+	      "a ped already getting out is getting out, not being pulled");
+
+	// SetCarJack's four arms, read out of the image: the door node to the
+	// eDoors value its door tests take.
+	Check(CarDoorEnumFor(offs::CAR_DOOR_LF) == 2 && CarDoorEnumFor(offs::CAR_DOOR_RF) == 3 &&
+	          CarDoorEnumFor(offs::CAR_DOOR_LR) == 4 && CarDoorEnumFor(offs::CAR_DOOR_RR) == 5,
+	      "the four doors are eDoors 2..5");
+	Check(CarDoorEnumFor(0) == 0 && CarDoorEnumFor(13) == 0,
+	      "and anything else is no door at all");
+
+	uint32_t since = 0;
+	Check(!KeepOutOfEnginesWay(false, since, 1000) && since == 0,
+	      "nothing to wait for, nothing held");
+	Check(KeepOutOfEnginesWay(true, since, 1000) && since == 1000,
+	      "the engine starts, the hold starts");
+	Check(KeepOutOfEnginesWay(true, since, 1000 + ENGINE_UNSEAT_WAIT_MS - 1),
+	      "and holds for the length of a drag");
+	Check(ENGINE_UNSEAT_WAIT_MS > 960 + 3800,
+	      "which is longer than the door and car_jackedLHS end to end");
+	Check(!KeepOutOfEnginesWay(true, since, 1000 + ENGINE_UNSEAT_WAIT_MS),
+	      "but not for ever");
+	Check(!KeepOutOfEnginesWay(false, since, 9000) && since == 0,
+	      "and it is forgotten the moment the engine lets go");
+
+	Check(PulledOutLatchFor(80, 1000, 80, 1000 + PULLED_OUT_HOLD_MS - 1) == 80,
+	      "a dragged-out player is kept out of the car the session still names");
+	Check(PulledOutLatchFor(80, 1000, 80, 1000 + PULLED_OUT_HOLD_MS) == INVALID_NETID,
+	      "until his own exit is too late to be coming");
+	Check(PulledOutLatchFor(80, 1000, INVALID_NETID, 1001) == INVALID_NETID,
+	      "the exit ends it");
+	Check(PulledOutLatchFor(80, 1000, 81, 1001) == INVALID_NETID,
+	      "and so does the session seating him anywhere else");
+}
+
+void TestAJackIsPlayedIntoATakenSeat() {
+	std::printf("\nalice jacks bob, and we watch\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+	FeedPosition(c, 2);
+	c.Tick();
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(2, 80, 0), CH_EVENT));
+	c.Tick();
+	Check(c.PlayerSlot(2).Seated(), "bob has the wheel");
+	const int32_t carHandle = c.VehicleByNetId(80)->poolHandle;
+	// Bob's own seating was offered the door and warped; count from here.
+	const int begins0 = g_rec.seatAnimBegins, warps0 = g_rec.seatAttempts;
+
+	// The intent into a taken seat still waits, as it always did...
+	g_rec.animEntry = true;
+	c.HandleMessage(Wrap(MakeEntering(1, 80, 0, 0), CH_EVENT));
+	c.Tick();
+	Check(g_rec.seatAnimBegins == begins0 && g_rec.jackBegins == 0,
+	      "an ordinary intent into bob's seat starts nothing");
+
+	// ...and the jack does not.
+	g_rec.jackProgress = SEAT_RUNNING;
+	c.HandleMessage(Wrap(MakeJacking(1, 80, 0), CH_EVENT));
+	c.Tick();
+	Check(g_rec.jackBegins == 1, "the jack is played on alice's replica");
+	Check(g_rec.lastJackHandle == carHandle && g_rec.lastJackDoor == 0,
+	      "on bob's car, through the driver's door");
+	Check(g_rec.seatAnimBegins == begins0, "not an ordinary get-in");
+	Check(c.PlayerSlot(1).Entering(), "alice is on her way in");
+	const int unseats = g_rec.unseats;
+	Check(c.PlayerSlot(2).Seated(), "and bob is left in the seat for our engine to pull");
+
+	// Our engine reaches bob: first the door, then the drag.
+	g_rec.remotePull[2] = PULL_COMING;
+	c.Tick();
+	Check(g_rec.unseats == unseats, "nothing takes bob out while the door opens");
+	g_rec.remotePull[2] = PULL_DRAGGED;
+	c.Tick();
+
+	// And the session catches up in the middle of it, loser first.
+	c.HandleMessage(Wrap(MakeExit(2, 80), CH_EVENT));
+	c.Tick();
+	c.Tick();
+	Check(g_rec.unseats == unseats,
+	      "bob's exit does not cut the drag off - that was the teleport");
+	Check(c.PlayerSlot(2).Seated(), "the engine still has him");
+
+	// The drag is over. Now he is out, through the ordinary way.
+	g_rec.remotePull[2] = PULL_NONE;
+	c.Tick();
+	Check(g_rec.unseats == unseats + 1, "bob is taken out once the drag lets go");
+	Check(!c.PlayerSlot(2).Seated(), "and the roster agrees");
+
+	// Alice's jack ends with her at the wheel, before her claim.
+	g_rec.jackProgress = SEAT_DONE;
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated() && !c.PlayerSlot(1).Entering(), "alice is in");
+	Check(g_rec.seatAttempts == warps0, "and nobody was warped anywhere");
+
+	c.HandleMessage(Wrap(MakeEnter(1, 80, 0), CH_EVENT));
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated(), "the claim confirms it");
+	Check(g_rec.jackBegins == 1 && g_rec.seatAnimBegins == begins0,
+	      "and nothing is played a second time");
+}
+
+void TestADraggedPlayerIsNotPutBack() {
+	std::printf("\nour engine pulled bob out before his exit came\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+	FeedPosition(c, 2);
+	c.Tick();
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(2, 80, 0), CH_EVENT));
+	c.Tick();
+
+	g_rec.remotePull[2] = PULL_DRAGGED;
+	c.Tick();
+	g_rec.remotePull[2] = PULL_NONE;
+	c.Tick();
+	Check(!c.PlayerSlot(2).Seated(), "out of the car when the drag ends");
+	Check(c.PlayerSlot(2).seatVehicleNetId == 80, "though the session still seats him");
+
+	const int seats = g_rec.seats, begins = g_rec.seatAnimBegins;
+	g_rec.animEntry = true;
+	c.Tick();
+	c.Tick();
+	Check(g_rec.seats == seats && g_rec.seatAnimBegins == begins,
+	      "and he is not put back in while his exit is on its way");
+}
+
+void TestAJackOfTrafficIsPlayed() {
+	std::printf("\nalice jacks a traffic driver somebody else hosts\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(300, /*owner=*/2), CH_EVENT));
+	c.Tick();
+	const RemoteAmbientCar *car = c.AmbientCar(300);
+	Check(car != nullptr && car->poolHandle >= 0, "we have a replica of the car");
+	const int32_t carHandle = car->poolHandle;
+
+	c.HandleMessage(Wrap(MakeJacking(1, 300, 0), CH_EVENT));
+	c.Tick();
+	Check(g_rec.jackBegins == 1 && g_rec.lastJackHandle == carHandle,
+	      "the jack is played on the traffic replica, which has no session row");
+
+	g_rec.jackProgress = SEAT_DONE;
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated(), "alice ends up at its wheel");
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated(), "and stays there while the claim is on its way");
+	Check(g_rec.unseats == 0, "without being taken out and put back");
+
+	// The claim: promoted, then the seat. Same CVehicle, same netId.
+	c.HandleMessage(Wrap(MakeCarPromoted(300, 1, 2), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 300, 0), CH_EVENT));
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated() && g_rec.unseats == 0,
+	      "the promotion changes the bookkeeping and not the seat");
+	Check(g_rec.seatAttempts == 0 && g_rec.seatAnimBegins == 0,
+	      "and she is not seated a second time");
+}
+
+void TestAJackOfTheJackersOwnTrafficIsNotPlayedTwice() {
+	std::printf("\nalice jacks a driver in traffic her own machine hosts\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	g_rec.nextAmbientCarHandle = 200;
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(300, /*owner=*/1), CH_EVENT));
+	c.Tick();
+
+	g_rec.jackProgress = SEAT_DONE;
+	c.HandleMessage(Wrap(MakeJacking(1, 300, 0), CH_EVENT));
+	c.Tick();
+	c.Tick();
+	Check(g_rec.jackBegins == 1 && c.PlayerSlot(1).Seated(), "we play her jack, and she is in");
+
+	// Her host's claim drops its traffic car and names a new one in the same
+	// place (population.cpp, SweepHostedCars): despawn, spawn, seat.
+	S_CarDespawn gone;
+	InitHeader(gone, 3000);
+	gone.netId = 300;
+	c.HandleMessage(Wrap(gone, CH_EVENT));
+	Check(g_rec.ambientCarDespawns == 1 && !c.PlayerSlot(1).Seated(),
+	      "she is out of the replica before it goes");
+	c.HandleMessage(Wrap(MakeVehicleSpawn(81), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 81, 0), CH_EVENT));
+	g_rec.animEntry = true;
+	const int begins = g_rec.seatAnimBegins, warps = g_rec.seats;
+	c.Tick();
+	Check(c.PlayerSlot(1).Seated() && g_rec.seats == warps + 1,
+	      "and straight into the new one");
+	Check(g_rec.seatAnimBegins == begins, "without climbing in a second time");
+}
+
+void TestTheTrafficDriverIsLeftToTheDrag() {
+	std::printf("\nthe driver of that traffic car, on our screen\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(c, 525);
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(610), CH_EVENT));
+	c.Tick();
+	c.HandleMessage(Wrap(MakePedStates(1, 525, 2000, 11.0f, 0, 610, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientSeats == 1, "he is driving");
+
+	// A jack played here reaches him. His host has not dragged its own copy
+	// out yet, so its rows go on naming the seat.
+	g_rec.ambientPull = PULL_DRAGGED;
+	c.Tick();
+	c.HandleMessage(Wrap(MakePedStates(1, 525, 2100, 12.0f, 0, 610, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientUnseats == 0, "he is not pulled out from under the drag");
+
+	g_rec.ambientPull = PULL_NONE;
+	c.HandleMessage(Wrap(MakePedStates(1, 525, 2200, 12.0f, 0, 610, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientUnseats == 1, "he is let go once it is over");
+	c.Tick();
+	Check(g_rec.ambientSeats == 1,
+	      "and the host's rows, a moment behind, do not sit him back down");
+
+	c.HandleMessage(Wrap(MakePedStates(1, 525, 2300, 13.0f), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientSeats == 1 && g_rec.ambientUnseats == 1,
+	      "and when the host has him out too, the two agree");
+}
+
+void TestADraggedDriverIsNotUnseatedByThePromotion() {
+	std::printf("\nthe promotion lands while our engine is still dragging him\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(c, 526);
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(611), CH_EVENT));
+	c.Tick();
+	c.HandleMessage(Wrap(MakePedStates(1, 526, 2000, 11.0f, 0, 611, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientSeats == 1, "he is driving");
+
+	g_rec.ambientPull = PULL_DRAGGED;
+	c.Tick();
+	c.HandleMessage(Wrap(MakeCarPromoted(611, 2, 1), CH_EVENT));
+	c.Tick();
+	Check(g_rec.ambientUnseats == 0, "the promotion leaves him to the drag");
+
+	g_rec.ambientPull = PULL_NONE;
+	c.Tick();
+	Check(g_rec.ambientUnseats == 1, "and the seat loop takes him out after it");
+	const RemoteAmbientPed *p = c.AmbientPed(526);
+	Check(p != nullptr && !p->Seated(), "on foot, in a car that is a session car now");
+}
+
+void TestOurOwnJackGoesOutAsAJack() {
+	std::printf("\ntelling the session we are jacking\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	// The engine hands out one pool's references; the stub's two counters
+	// would otherwise both start at 1.
+	g_rec.nextAmbientCarHandle = 200;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(300, /*owner=*/2), CH_EVENT));
+	c.Tick();
+	const int32_t sessionCar = c.VehicleByNetId(80)->poolHandle;
+	const int32_t trafficCar = c.AmbientCar(300)->poolHandle;
+	Check(sessionCar != trafficCar, "two cars, two references");
+
+	g_rec.localEntryActive = true;
+	g_rec.localEntry       = LocalCarEntry{sessionCar, 0, 0, true};
+	c.TickEnteringForTest();
+	Check(c.AnnouncedEntryNetIdForTest() == 80 && c.AnnouncedEntryWasJackForTest(),
+	      "a jack of a session car goes out as a jack of that car");
+
+	// The quick jack shows a moment after the entry did: the same entry, said
+	// again, as a jack.
+	g_rec.localEntry = LocalCarEntry{trafficCar, 0, 1, false};
+	c.TickEnteringForTest();
+	Check(c.AnnouncedEntryNetIdForTest() == INVALID_NETID,
+	      "an ordinary entry into traffic is still not announced");
+	g_rec.localEntry.jack = true;
+	c.TickEnteringForTest();
+	Check(c.AnnouncedEntryNetIdForTest() == 300 && c.AnnouncedEntryWasJackForTest(),
+	      "but a jack of it is, by its traffic netId");
+
+	// And our own traffic, which only the population seam can name.
+	WorldBridge b = RecordingBridge();
+	b.HostedCarNetId = [](int32_t handle) -> uint16_t {
+		return handle == 44 ? uint16_t{90} : INVALID_NETID;
+	};
+	c.SetBridge(b);
+	g_rec.localEntryActive = true;
+	g_rec.localEntry       = LocalCarEntry{44, 0, 0, true};
+	c.TickEnteringForTest();
+	Check(c.AnnouncedEntryNetIdForTest() == 90, "a jack of a car we host goes out as that car");
+}
+
+void TestOurSeatIsLeftToTheDrag() {
+	std::printf("\nalice jacks us, and our own engine plays it\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	const int32_t handle = GiveUsTheSessionsCar(c);
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	FeedPosition(c, 1);
+	c.Tick();
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 80, 0), CH_EVENT));
+	Check(c.LocalVehicleNetId() == 80, "we drive car 80");
+
+	// Her jack reaches us first. Our seat is the one it is for.
+	c.HandleMessage(Wrap(MakeJacking(1, 80, 0), CH_EVENT));
+	c.Tick();
+	Check(g_rec.jackBegins == 1 && g_rec.lastJackHandle == handle,
+	      "her replica starts the jack on the car we are sitting in");
+
+	// Our engine is dragging us out when the session hands her the car.
+	g_rec.localPull = PULL_DRAGGED;
+	c.HandleMessage(Wrap(MakeExit(0, 80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 80, 0), CH_EVENT));
+	c.Tick();
+	c.Tick();
+	Check(g_rec.vehicleSurrenders == 0, "the handover waits for the drag");
+
+	// The drag lets go of the wheel, and the handover has nothing left to do.
+	g_rec.localPull          = PULL_NONE;
+	g_rec.drivingLocally     = false;
+	g_rec.localVehicleHandle = -1;
+	c.Tick();
+	c.Tick();
+	Check(g_rec.vehicleSurrenders == 0, "we were never put beside the car by hand");
+	Check(!c.VehicleByNetId(80)->surrendered, "and the car is simply hers");
+}
+
 int main() {
 	TestWelcome();
 	TestRejectedWelcome();
@@ -15484,6 +16481,12 @@ int main() {
 	TestReplicaHornThroughTheClient();
 	TestModelChangeRebuildsThePed();
 	TestModelChangeWhileSeated();
+	TestCleanPlayerLook();
+	TestLookSlotPicking();
+	TestLookChangeRebuildsThePed();
+	TestLookOnAnotherModelKeepsThePed();
+	TestSpawnWaitsForTheLook();
+	TestOurLookIsSentOnChange();
 	TestSeatingWaitsForTheCar();
 	TestAnimatedEntryIsTriedBeforeTheWarp();
 	TestAnIntentOpensTheDoorTheOwnerUsed();
@@ -15494,6 +16497,9 @@ int main() {
 	TestARefusedAnimationWarpsOnTheSameFrame();
 	TestAnAnimationThatStopsFallsBackToTheWarp();
 	TestAnEntryThatNeverFinishesIsTimedOut();
+	TestAnEntryIsJudgedByItsAnimation();
+	TestTheSeatKeyPicksADoorOnOurSide();
+	TestAWarpedExitGivesTheDoorBack();
 	TestOneAnimatedAttemptPerEnterEvent();
 	TestAnEntryIsAbandonedWhenTheCarGoes();
 	TestAnEntryIsAbandonedWhenThePlayerDies();
@@ -15771,6 +16777,7 @@ int main() {
 	TestEveryCarCountsOnceOnEveryMachine();
 	TestARampageCarReachesTheSeam();
 
+	g_failures += RunRampageVoteTests();
 	g_failures += RunAimPitchTests();
 	g_failures += RunSirenTests();
 	g_failures += RunCheatTests();
@@ -15778,6 +16785,14 @@ int main() {
 	g_failures += RunMoneyTests();
 	g_failures += RunStreamPickTests();
 	g_failures += RunChatFeedTests();
+	g_failures += RunAdoptTests();
+	TestALeaversPedIsAdoptedByUs();
+	TestSomebodyElseAdoptsAndWeFollow();
+	TestWhatWeCannotTakeIsLetGo();
+	TestACarAndItsDriverAreTakenTogether();
+	TestAnObserverKeepsTheDriverSeated();
+	TestTheCarWeAreDrivingWaitsForItsClaim();
+	TestAnAdoptPacketIsBounded();
 	TestTheFeedHearsTheSession();
 	TestATypedLineIsTakenOnce();
 	TestThePingsAreTheServers();
@@ -15838,6 +16853,15 @@ int main() {
 	TestMeleeTagRidesTheRelay();
 	TestTheStruckSideIsTheEngines();
 	TestCopiesNeverReactToMelee();
+	TestTheJackRules();
+	TestAJackIsPlayedIntoATakenSeat();
+	TestADraggedPlayerIsNotPutBack();
+	TestAJackOfTrafficIsPlayed();
+	TestAJackOfTheJackersOwnTrafficIsNotPlayedTwice();
+	TestTheTrafficDriverIsLeftToTheDrag();
+	TestADraggedDriverIsNotUnseatedByThePromotion();
+	TestOurOwnJackGoesOutAsAJack();
+	TestOurSeatIsLeftToTheDrag();
 
 	std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL",
 	            g_failures, g_failures == 1 ? "" : "s");

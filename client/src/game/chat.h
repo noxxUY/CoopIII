@@ -1,5 +1,4 @@
-// Chat, the session's notices, the player list and the version mark, on the
-// HUD.
+// Chat, the session's notices and the version mark, on the HUD.
 //
 // The words live in Client (chatfeed.h); this is the half that touches the
 // game: the keys, the controls while a line is being typed, the clipboard, and
@@ -12,8 +11,8 @@
 // TranslateMessage. The chat key (T by default) opens a line, Enter sends it,
 // Escape drops it; the arrows move the caret, Up and Down go back through what
 // was sent, Ctrl+V or Shift+Insert pastes, Shift+Delete empties the line. The
-// list key (F9) shows or hides the player list. Nothing here is an engine
-// address.
+// list key (F9) pins the scoreboard up or lets it go (game/scoreboard.h).
+// Nothing here is an engine address.
 //
 // **While a line is open the game is kept off the keyboard** three ways, each
 // through something addresses.h already proves: CPad::DisablePlayerControls'

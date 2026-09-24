@@ -10,6 +10,9 @@
 
 #include <windows.h>
 
+#include <cmath>
+#include <cstdio>
+
 namespace coopiii::game {
 
 namespace {
@@ -75,33 +78,78 @@ bool HasFreePassengerSeat(void *vehicle) {
 	return false;
 }
 
-// The lowest free passenger slot, as a wire seat number, or -1.
+// A free passenger slot, as a wire seat number, or -1.
 //
 // WarpPedIntoCar picked this itself and never said which. The engine's
 // animated entry cannot: SetEnterCar switches on the door it is given, so the
 // seat has to be chosen before the walk starts rather than read back after.
-int32_t FirstFreePassengerSeat(void *vehicle) {
+//
+// One on the player's own side of the car if there is one: client.h,
+// PickPassengerSeat. The side is the player's position against the car's
+// right row, the same row UnseatLocalPlayer steps out along.
+int32_t ChooseFreePassengerSeat(void *vehicle, void *ped) {
 	const uint8_t maxPassengers = Field<uint8_t>(vehicle, offs::VEH_NUM_MAX_PASSENGERS);
 	const size_t  seats =
 	    maxPassengers < offs::VEH_MAX_PASSENGERS ? maxPassengers : offs::VEH_MAX_PASSENGERS;
+	uint16_t freeSeats = 0;
 	for (size_t i = 0; i < seats; ++i) {
 		const size_t at = offs::VEH_PASSENGERS + i * sizeof(void *);
 		if (Field<void *>(vehicle, at) == nullptr)
-			return static_cast<int32_t>(i) + 1;
+			freeSeats = static_cast<uint16_t>(freeSeats | (1u << (i + 1)));
 	}
-	return -1;
+
+	const float *const right = &Field<float>(vehicle, offs::MATRIX_RIGHT);
+	const float *const car   = &Field<float>(vehicle, offs::POSITION);
+	const float *const at    = &Field<float>(ped, offs::POSITION);
+	const float across = (at[0] - car[0]) * right[0] + (at[1] - car[1]) * right[1] +
+	                     (at[2] - car[2]) * right[2];
+	return PickPassengerSeat(freeSeats, across > 0.0f);
 }
 
 // An entry the engine is walking. The car is held as a pool handle and not as
 // a pointer: an entry takes a couple of seconds, and a car can be destroyed
 // inside one.
-int32_t  g_entryCarHandle = -1;
-uint8_t  g_entrySeat      = 0;
-uint32_t g_entryDeadline  = 0;
+int32_t    g_entryCarHandle = -1;
+uint8_t    g_entrySeat      = 0;
+uint32_t   g_entryStartMs   = 0;
+uint32_t   g_entryDeadline  = 0;
+EntryWatch g_entryWatch;
 
 bool g_saidWalking  = false;
-bool g_saidGaveUp   = false;
 bool g_saidNoSlot   = false;
+
+// The warp is meant to be the last resort, so each time it is taken instead
+// of the door says why - a handful of times rather than once, because the
+// first one is rarely the interesting one.
+constexpr int SEAT_WARP_REASONS_SAID = 6;
+int g_warpReasonsSaid = 0;
+int g_doorEntriesSaid = 0;
+
+// What the door the entry wanted looked like, for those lines. Everything
+// BeginPedEnterCar tests, read off the car and the ped as they are.
+void SayWhyNoDoor(const char *what, void *ped, void *vehicle, uint8_t seat) {
+	if (g_warpReasonsSaid >= SEAT_WARP_REASONS_SAID)
+		return;
+	++g_warpReasonsSaid;
+
+	const float *const cp = &Field<float>(vehicle, offs::POSITION);
+	const float *const pp = &Field<float>(ped, offs::POSITION);
+	const float *const cv = &Field<float>(vehicle, offs::MOVE_SPEED);
+	const float dx = cp[0] - pp[0], dy = cp[1] - pp[1], dz = cp[2] - pp[2];
+	const float dist  = std::sqrt(dx * dx + dy * dy + dz * dz);
+	const float speed = std::sqrt(cv[0] * cv[0] + cv[1] * cv[1] + cv[2] * cv[2]);
+
+	void *const anim = Field<void *>(ped, offs::PED_VEHICLE_ANIM);
+	Log("seat: %s, seat %u - so the seat was taken directly. Ped state %u, "
+	    "vehicle anim %d; car %.1f m away doing %.3f, getting in 0x%02X, out "
+	    "0x%02X, being jacked %d, status %u",
+	    what, seat, Field<uint32_t>(ped, offs::PED_STATE),
+	    anim ? Field<int32_t>(anim, ANIM_ID) : -1, dist, speed,
+	    Field<uint8_t>(vehicle, offs::VEH_GETTING_IN_FLAGS),
+	    Field<uint8_t>(vehicle, offs::VEH_GETTING_OUT_FLAGS),
+	    (Field<uint8_t>(vehicle, offs::VEH_FLAGS_C) & offs::VEH_IS_BEING_CARJACKED) ? 1 : 0,
+	    static_cast<unsigned>(Field<uint8_t>(vehicle, offs::ENTITY_FLAGS) >> ENTITY_STATUS_SHIFT));
+}
 
 // The old way in, kept as the fallback for every case where the engine
 // refuses to animate: a car on its roof, a car moving, a door that will not
@@ -182,18 +230,27 @@ bool LocalWantsSeatToggle() {
 	// whatever window has focus, and a co-op mod that seats you in a car
 	// because you typed a G in a chat window somewhere else is worse than one
 	// with no passenger seat at all.
+	//
+	// Asked of the foreground window's process, not of GetActiveWindow. That
+	// one is per thread and answers null whenever the tick is not on the
+	// thread that owns the window the player is looking at - a windowed-mode
+	// wrapper's window is the usual way to get there. The log had "foreground
+	// 000206D6, active 00000000" in both games, and null says nothing about
+	// whose window that was. Two copies of the game on one desktop are two
+	// processes, so the one the key was not meant for still says no.
 	if (edge) {
-		// GetActiveWindow is per calling thread, so this also quietly answers
-		// "is the tick even running on the window's thread". A gate that can
-		// swallow every press has to be able to say it did.
-		const HWND fg     = GetForegroundWindow();
-		const HWND active = GetActiveWindow();
-		if (fg != active) {
+		const HWND fg    = GetForegroundWindow();
+		DWORD      owner = 0;
+		if (fg)
+			GetWindowThreadProcessId(fg, &owner);
+		if (owner != GetCurrentProcessId()) {
 			if (!g_saidUnfocused) {
 				g_saidUnfocused = true;
-				Log("seat: the seat key was pressed while the game did not have "
-				    "the keyboard (foreground %p, active %p), so it was ignored",
-				    static_cast<void *>(fg), static_cast<void *>(active));
+				Log("seat: the seat key was pressed while another program had the "
+				    "keyboard (foreground %p belongs to pid %lu, we are %lu), so it "
+				    "was ignored",
+				    static_cast<void *>(fg), static_cast<unsigned long>(owner),
+				    static_cast<unsigned long>(GetCurrentProcessId()));
 			}
 			return false;
 		}
@@ -266,7 +323,7 @@ int32_t SeatLocalPlayerIn(int32_t vehicleHandle, uint8_t *seatAsked) {
 	// which is what the other machine has been drawing for a remote player
 	// ever since entercar landed. This key used to call WarpPedIntoCar, and a
 	// warp is a teleport on both screens at once.
-	const int32_t want = FirstFreePassengerSeat(vehicle);
+	const int32_t want = ChooseFreePassengerSeat(vehicle, ped);
 	if (want < 0) {
 		if (!g_saidNoSlot) {
 			g_saidNoSlot = true;
@@ -277,9 +334,12 @@ int32_t SeatLocalPlayerIn(int32_t vehicleHandle, uint8_t *seatAsked) {
 	}
 
 	if (StartCarEntry(ped, vehicle, static_cast<uint8_t>(want))) {
+		const uint32_t now = GetTickCount();
 		g_entryCarHandle = vehicleHandle;
 		g_entrySeat      = static_cast<uint8_t>(want);
-		g_entryDeadline  = GetTickCount() + SEAT_ANIM_TIMEOUT_MS;
+		g_entryStartMs   = now;
+		g_entryDeadline  = now + SEAT_ANIM_TIMEOUT_MS;
+		g_entryWatch.Begin(now, CarEntryMark(ped));
 		if (seatAsked)
 			*seatAsked = static_cast<uint8_t>(want);
 		if (!g_saidWalking) {
@@ -296,6 +356,7 @@ int32_t SeatLocalPlayerIn(int32_t vehicleHandle, uint8_t *seatAsked) {
 	// door that will not open. Fall back rather than refuse, because getting
 	// in instantly is worse than getting in with the door open and better
 	// than the key doing nothing.
+	SayWhyNoDoor("the door would not open for us", ped, vehicle, static_cast<uint8_t>(want));
 	return WarpIntoSeat(ped, vehicle);
 }
 
@@ -325,30 +386,43 @@ int32_t PollLocalSeatEntry() {
 		const int32_t seat = PassengerSeatOf(vehicle, ped);
 		if (seat < 0)
 			return SEAT_LOCAL_REFUSED;
-		if (!g_saidSeated) {
-			g_saidSeated = true;
+		// A few of these, with the time, so a session log shows the door
+		// working and not only the times it did not.
+		if (g_doorEntriesSaid < SEAT_WARP_REASONS_SAID) {
+			++g_doorEntriesSaid;
 			Log("seat: opened the door and got into somebody else's car as a "
-			    "passenger, seat %d. The driver owns the physics, so nothing "
-			    "about this car goes on the wire from here",
-			    seat);
+			    "passenger, seat %d, in %u ms. The driver owns the physics, so "
+			    "nothing about this car goes on the wire from here",
+			    seat, static_cast<unsigned>(GetTickCount() - g_entryStartMs));
 		}
 		return seat;
 	}
 
-	if (progress == SEAT_RUNNING && GetTickCount() < g_entryDeadline)
+	// Still going: wait for as long as the animation is moving, up to the cap.
+	// The cap is a wall clock and the chain is not - it runs on CTimer, which
+	// a window that has lost frames runs slow - so the stall test is what
+	// normally ends a bad entry, and this is only what ends a strange one.
+	const uint32_t now     = GetTickCount();
+	const bool     running = progress == SEAT_RUNNING;
+	const bool     stalled = running && g_entryWatch.Stalled(now, CarEntryMark(ped));
+	const bool     late    = running && now >= g_entryDeadline;
+	if (running && !stalled && !late)
 		return SEAT_LOCAL_WALKING;
 
-	// Refused, interrupted, or out of time. Take the half-played entry off the
-	// ped - that is what gives the door back to the car - and seat them the
-	// old way, so the key still does something.
-	g_entryCarHandle  = -1;
-	const int dropped = CancelCarEntry(ped);
-	if (!g_saidGaveUp) {
-		g_saidGaveUp = true;
-		Log("seat: the door-opening entry did not finish (%d partial "
-		    "animation(s) faded), so the seat was taken directly instead",
-		    dropped);
-	}
+	// Refused, interrupted, stuck or out of time. Take the half-played entry
+	// off the ped - that is what gives the door back to the car - and seat
+	// them the old way, so the key still does something. Said before the
+	// cancel, while the ped still shows where the entry had got to.
+	char what[96];
+	std::snprintf(what, sizeof what, "the door-opening entry %s after %u ms",
+	              !running ? "was dropped by the engine"
+	              : stalled ? "stopped moving"
+	                        : "ran past the cap",
+	              static_cast<unsigned>(now - g_entryStartMs));
+	SayWhyNoDoor(what, ped, vehicle, g_entrySeat);
+
+	g_entryCarHandle = -1;
+	CancelCarEntry(ped);
 	return WarpIntoSeat(ped, vehicle);
 }
 
@@ -381,6 +455,10 @@ bool UnseatLocalPlayer() {
 	// own business and its own key.
 	if (Field<void *>(car, offs::VEH_DRIVER) == ped)
 		return false;
+
+	// Pressed halfway through the game's own exit, the door that exit claimed
+	// would stay claimed. ped.h, ReleaseExitDoor.
+	ReleaseExitDoor(ped, car);
 
 	Func<void(__thiscall *)(void *, void *)>(CVehicle__RemovePassenger)(car, ped);
 

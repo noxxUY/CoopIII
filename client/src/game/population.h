@@ -88,6 +88,11 @@ void *ResolveHostedPed(uint16_t netId);
 // host's own car. docs/protocol.md §1.23.
 void *ResolveHostedCar(uint16_t netId);
 int32_t HostedCarHandle(uint16_t netId);
+// The other way round, for a jack of our own traffic: its netId, or
+// INVALID_NETID.
+uint16_t HostedCarNetId(int32_t handle);
+// Whether our engine is dragging this replica out of its seat, as a PullOut.
+uint8_t AmbientBeingPulledOut(const RemoteAmbientPed &ped);
 // A new session: every ped and car this machine hosts goes out again as new.
 void RestartHostedNames();
 

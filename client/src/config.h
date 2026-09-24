@@ -43,11 +43,20 @@ struct Config {
 	// the game - but plenty outside it, which is why it is settable.
 	int seatKey = 'G';
 
+	// Yes and no when somebody wants to start a rampage (game/rampagevote.h).
+	// Only read while a vote is up, so they are free the rest of the time.
+	int voteYesKey = 'Y';
+	int voteNoKey  = 'N';
+
 	// The chat: one key opens a line to type, Enter sends it and Escape drops
 	// it; the other shows or hides the list of who is in the session. Spelled
 	// the way seatKey is.
 	int chatKey = 'T';
 	int listKey = 0x78;   // F9
+
+	// Held to show the scoreboard; the list key above pins it. Tab, which GTA
+	// III has no default binding for (game/scoreboard.h).
+	int scoreboardKey = 0x09;   // VK_TAB
 
 	// The version in the bottom-left corner of the HUD. On by default, since
 	// the first thing anybody reporting a bug gets asked is which build.
@@ -58,7 +67,7 @@ struct Config {
 	std::string password;
 
 	// A key as the ini spells it, as a virtual-key code: one letter or digit,
-	// or F1 to F12. Zero for anything else. Exposed for tests.
+	// F1 to F12, or Tab. Zero for anything else. Exposed for tests.
 	static int ParseKey(const std::string &value);
 
 	// Parses INI text. Unknown keys are ignored, not fatal, so a config from

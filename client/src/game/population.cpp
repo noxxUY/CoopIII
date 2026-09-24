@@ -1,6 +1,7 @@
 #include "population.h"
 
 #include "addresses.h"
+#include "adopt.h"
 #include "ped.h"
 #include "pedanim.h"
 #include "streampick.h"
@@ -1525,6 +1526,16 @@ int32_t HostedCarHandle(uint16_t netId) {
 	return -1;
 }
 
+uint16_t HostedCarNetId(int32_t handle) {
+	if (handle < 0)
+		return INVALID_NETID;
+	for (const HostedCar &c : g_hostedCars)
+		if (c.active && c.named && c.poolHandle == handle &&
+		    AmbientCarFromRef(c.poolHandle) == c.vehicle)
+			return c.netId;
+	return INVALID_NETID;
+}
+
 void *ResolveHostedCar(uint16_t netId) {
 	if (netId == INVALID_NETID)
 		return nullptr;
@@ -1592,6 +1603,10 @@ void *AmbientReplicaPed(const RemoteAmbientPed &ped) {
 	if (!mem || Field<uintptr_t>(mem, offs::VTABLE) != CCivilianPed__vtable)
 		return nullptr;
 	return mem;
+}
+
+uint8_t AmbientBeingPulledOut(const RemoteAmbientPed &ped) {
+	return PullOutOf(AmbientReplicaPed(ped));
 }
 
 // Where our engine has a replica, for a desync probe (protocol.h,
@@ -2646,6 +2661,163 @@ void AdoptPromotedCarHere(RemoteVehicle &vehicle, bool weHostedIt) {
 	AdoptPromotedCar(vehicle, weHostedIt);
 }
 
+// ---- a leaver's crowd (protocol.h, S_AmbientAdopt) --------------------------
+//
+// The session has made this machine the host of a pedestrian or a car it only
+// had a replica of, because the player whose engine made it has gone. The
+// replica is already a real CCivilianPed or CAutomobile standing exactly where
+// everybody else has it, so nothing is built: it is taken off the replica
+// books, the replica-only flags go back to what a generated one has
+// (game/adopt.h), it is given the engine's own reason to move, and it is filed
+// here as hosted and named under the netId it already has. From the next
+// stream tick it goes out in our batches like any ped or car of ours, and our
+// own engine reaps it like any other.
+//
+// False, with nothing changed, when it cannot be done here; Client then lets
+// go of it as its new owner.
+
+namespace {
+
+bool g_saidPedAdopted = false;
+bool g_saidAdoptFull  = false;
+
+bool AdoptAmbientPed(RemoteAmbientPed &ped) {
+	void *const mem = AmbientReplicaPed(ped);
+	if (!mem)
+		return false;
+	const uint32_t state = Field<uint32_t>(mem, offs::PED_STATE);
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+		return false;
+
+	HostedPed *slot = nullptr;
+	for (HostedPed &h : g_hosted)
+		if (!h.active) {
+			slot = &h;
+			break;
+		}
+	if (!slot) {
+		if (!g_saidAdoptFull) {
+			g_saidAdoptFull = true;
+			Log("population: hosting %zu peds already; one we were handed is let go "
+			    "instead (and this will not be said again)", MAX_HOSTED);
+		}
+		return false;
+	}
+
+	// Our copy of his host's fire goes out. It was lit for the look of him on a
+	// fireproof ped; on one who can burn it would be this machine setting him
+	// alight.
+	if (ped.fireSlot >= 0) {
+		void *const fire = Field<void *>(mem, PED_FIRE);
+		if (fire && WatchedPedFireIsOurs(ped.fireSlot, mem, fire))
+			Func<void(__thiscall *)(void *)>(CFire__Extinguish)(fire);
+		ped.fireSlot = -1;
+	}
+
+	AdoptPedBytes b;
+	b.createdBy = Field<uint8_t>(mem, offs::PED_CHAR_CREATED_BY);
+	b.entityB   = Field<uint8_t>(mem, offs::ENTITY_FLAGS_B);
+	b.entityC   = Field<uint8_t>(mem, offs::ENTITY_FLAGS_C);
+	b.pedC      = Field<uint8_t>(mem, offs::PED_FLAGS_C);
+	b.pedG      = Field<uint8_t>(mem, offs::PED_FLAGS_G);
+	b.zone      = Field<int8_t>(mem, offs::ZONE_LEVEL);
+	b = PedBytesAfterAdoption(b);
+	Field<uint8_t>(mem, offs::PED_CHAR_CREATED_BY) = b.createdBy;
+	Field<uint8_t>(mem, offs::ENTITY_FLAGS_B)      = b.entityB;
+	Field<uint8_t>(mem, offs::ENTITY_FLAGS_C)      = b.entityC;
+	Field<uint8_t>(mem, offs::PED_FLAGS_C)         = b.pedC;
+	Field<uint8_t>(mem, offs::PED_FLAGS_G)         = b.pedG;
+	Field<int8_t>(mem, offs::ZONE_LEVEL)           = b.zone;
+
+	// SpawnAmbientReplica's ++ given back, as DespawnAmbientReplica does: he is
+	// not a mission ped any more, and nothing in the engine takes it off for us.
+	if (Global<uint32_t>(CPopulation__ms_nTotalMissionPeds) > 0)
+		--Global<uint32_t>(CPopulation__ms_nTotalMissionPeds);
+	ForgetReplica(ped.netId);
+	if (g_replicas > 0)
+		--g_replicas;
+	if (ped.Seated() && g_seatedReplicas > 0)
+		--g_seatedReplicas;
+
+	// Somewhere to walk, the way COMMAND_CHAR_WANDER_DIR gives it: ClearAll,
+	// then SetWanderPath. Only on foot - a driver is his car's business.
+	const bool inCar = Field<bool>(mem, offs::PED_IN_VEHICLE);
+	if (AdoptedPedWanders(inCar, state)) {
+		Func<void(__thiscall *)(void *)>(CPed__ClearAll)(mem);
+		Func<bool(__thiscall *)(void *, int)>(CPed__SetWanderPath)(
+		    mem, WanderDirForHeading(Field<float>(mem, offs::PED_ROT_CUR)));
+	}
+
+	*slot            = HostedPed{};
+	slot->active     = true;
+	slot->ped        = mem;
+	slot->poolHandle = ped.poolHandle;
+	slot->tempId     = g_nextTempId++;
+	if (g_nextTempId == 0)
+		g_nextTempId = 1;
+	slot->netId      = ped.netId;
+	slot->named      = true;
+	slot->modelId    = ped.body.modelId;
+	// The row is about to go; nothing may despawn what is ours now.
+	ped.poolHandle   = -1;
+
+	if (PopTrace())
+		Log("population/trace: adopted ped %p net %u model %u %s", mem, slot->netId,
+		    slot->modelId, inCar ? "in a car" : "on foot");
+	if (!g_saidPedAdopted) {
+		g_saidPedAdopted = true;
+		Log("population: took over pedestrian %u from the replica we had - %s",
+		    slot->netId,
+		    inCar ? "he stays in his seat" : "he walks on under our own engine");
+	}
+	return true;
+}
+
+bool AdoptAmbientCar(RemoteAmbientCar &car) {
+	if (car.poolHandle < 0)
+		return false;
+	void *const v = AmbientCarFromRef(car.poolHandle);
+	if (!v || IsWreckedCar(v))
+		return false;
+
+	HostedCar *slot = nullptr;
+	for (HostedCar &c : g_hostedCars)
+		if (!c.active) {
+			slot = &c;
+			break;
+		}
+	if (!slot) {
+		if (!g_saidAdoptFull) {
+			g_saidAdoptFull = true;
+			Log("population: hosting %zu cars already; one we were handed is let go "
+			    "instead (and this will not be said again)", MAX_HOSTED_CARS);
+		}
+		return false;
+	}
+	if (!AdoptAmbientCarReplica(car))
+		return false;
+
+	*slot            = HostedCar{};
+	slot->active     = true;
+	slot->vehicle    = v;
+	slot->poolHandle = car.poolHandle;
+	slot->tempId     = g_nextCarTempId++;
+	if (g_nextCarTempId == 0)
+		g_nextCarTempId = 1;
+	slot->netId      = car.netId;
+	slot->named      = true;
+	// The dents everybody already has, so only new ones go out.
+	slot->sentPanels = car.damagePanels;
+	slot->sentDoors  = car.damageDoors;
+
+	if (g_carReplicas > 0)
+		--g_carReplicas;
+	car.poolHandle = -1;
+	return true;
+}
+
+} // namespace
+
 void AddPopulationToBridge(WorldBridge &bridge) {
 	// Only if the door is actually hooked. Half of this seam - replicating
 	// other people's peds while never announcing our own - is worse than
@@ -2720,7 +2892,14 @@ void AddPopulationToBridge(WorldBridge &bridge) {
 	bridge.LocalDrivesAmbientCar    = &LocalDrivesAmbientCar;
 	bridge.AdoptPromotedCar         = &AdoptPromotedCarHere;
 	bridge.HostedCarHandle          = &HostedCarHandle;
+	bridge.HostedCarNetId           = &HostedCarNetId;
+	bridge.AmbientBeingPulledOut    = &AmbientBeingPulledOut;
 	bridge.RestartHostedNames       = &RestartHostedNames;
+
+	// A leaver's crowd (protocol.h, S_AmbientAdopt). Both or neither: a car
+	// taken over without its driver is one nobody here can drive away.
+	bridge.AdoptAmbientPed = &AdoptAmbientPed;
+	bridge.AdoptAmbientCar = &AdoptAmbientCar;
 
 	// And the wreck pair (docs/roadmap.md 5.8, the ambient half). Both or
 	// neither, like everything else here: a machine that applied other

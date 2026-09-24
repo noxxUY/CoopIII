@@ -1,5 +1,6 @@
 #include "client.h"
 
+#include "game/adopt.h"
 #include "game/horn.h"
 #include "game/streampick.h"
 #include "game/wanted.h"
@@ -95,6 +96,7 @@ void Client::UnseatPlayer(RemotePlayer &player) {
 		if (m_bridge.AbandonSeatRemotePed)
 			m_bridge.AbandonSeatRemotePed(player);
 		player.enteringVehicleNetId = INVALID_NETID;
+		player.enteringJack         = false;
 	}
 	if (!player.Seated())
 		return;
@@ -106,6 +108,9 @@ void Client::UnseatPlayer(RemotePlayer &player) {
 void Client::ClearRoster() {
 	m_localPlayerId       = 0xFF;
 	m_localNetId          = INVALID_NETID;
+	// A vote, or a move to somebody, from the old session means nothing here.
+	m_rampageVote.Clear();
+	m_teleportWaiting     = false;
 	for (uint16_t &ping : m_pings)
 		ping = PING_NONE;
 	m_lastProbeMs    = 0;
@@ -132,6 +137,7 @@ void Client::ClearRoster() {
 	m_claimRetryAtMs      = 0;
 	// A new session hasn't been told anything about us yet.
 	m_sentModelId         = 0xFFFF;
+	std::memset(m_sentLook, 0, sizeof m_sentLook);
 	// Nor has it been told we died. A death announced to the old session is
 	// not a death this one knows about, and leaving the flag set would mean
 	// the first respawn after a reconnect gets announced on its own.
@@ -433,6 +439,7 @@ void Client::PostFrame() {
 	if (!m_sendRate.Ready(WallClock::NowMs()))
 		return;
 	SendLocalModel();
+	SendLocalLook();
 	SendLocalState();
 	// After the snapshot, not before. The snapshot carries the held weapon's
 	// count, and sending the stored slots first would have a receiver apply
@@ -472,6 +479,8 @@ void Client::HandleMessage(const Message &msg) {
 		OnLeave(*p);
 	} else if (const S_PlayerModel *p = msg.as<S_PlayerModel>()) {
 		OnPlayerModel(*p);
+	} else if (const S_PlayerLook *p = msg.as<S_PlayerLook>()) {
+		OnPlayerLook(*p);
 	} else if (const S_PlayerAmmo *p = msg.as<S_PlayerAmmo>()) {
 		OnPlayerAmmo(*p);
 	} else if (const S_PlayerState *p = msg.as<S_PlayerState>()) {
@@ -501,6 +510,8 @@ void Client::HandleMessage(const Message &msg) {
 		OnEnterVehicle(*p);
 	} else if (const S_EnteringVehicle *p = msg.as<S_EnteringVehicle>()) {
 		OnEnteringVehicle(*p);
+	} else if (const S_JackingVehicle *p = msg.as<S_JackingVehicle>()) {
+		OnJackingVehicle(*p);
 	} else if (const S_ExitVehicle *p = msg.as<S_ExitVehicle>()) {
 		OnExitVehicle(*p);
 	} else if (const S_VehicleCustody *p = msg.as<S_VehicleCustody>()) {
@@ -539,6 +550,8 @@ void Client::HandleMessage(const Message &msg) {
 		OnCarSpawn(*p);
 	} else if (const S_CarDespawn *p = msg.as<S_CarDespawn>()) {
 		OnCarDespawn(*p);
+	} else if (const S_AmbientAdopt *p = msg.as<S_AmbientAdopt>()) {
+		OnAmbientAdopt(*p);
 	} else if (const S_CarStates *p = msg.as<S_CarStates>()) {
 		OnCarStates(*p);
 	} else if (const S_PedStates *p = msg.as<S_PedStates>()) {
@@ -565,6 +578,10 @@ void Client::HandleMessage(const Message &msg) {
 		OnRampageCar(*p);
 	} else if (const S_RampageEnd *p = msg.as<S_RampageEnd>()) {
 		OnRampageEnd(*p);
+	} else if (const S_RampageVote *p = msg.as<S_RampageVote>()) {
+		OnRampageVote(*p);
+	} else if (const S_RampageTeleport *p = msg.as<S_RampageTeleport>()) {
+		OnRampageTeleport(*p);
 	} else if (const S_ObjectSettled *p = msg.as<S_ObjectSettled>()) {
 		OnObjectSettled(*p);
 	} else if (const S_Cheat *p = msg.as<S_Cheat>()) {
@@ -850,7 +867,36 @@ void Client::OnPlayerModel(const S_PlayerModel &pkt) {
 
 	Log("client: %s is now model %u (was %u)", p.nick.c_str(), pkt.modelId, p.modelId);
 	p.modelId = pkt.modelId;
+	RebuildRemoteBody(p);
+}
 
+// Their model 0 is loaded under another name - the prison clothes on or off.
+// Same rebuild as a model change: the look is decided when the ped is built
+// (PrepareRemoteLook), so a new look needs a new ped.
+void Client::OnPlayerLook(const S_PlayerLook &pkt) {
+	if (pkt.playerId >= MAX_PLAYERS || pkt.playerId == m_localPlayerId)
+		return;
+
+	RemotePlayer &p = m_players[pkt.playerId];
+	if (!p.active)
+		return;
+
+	char look[PLAYER_LOOK_LEN];
+	std::memcpy(look, pkt.look, sizeof look);
+	if (!CleanPlayerLook(look) || std::memcmp(look, p.look, sizeof look) == 0)
+		return;
+
+	Log("client: %s is wearing '%s' (was '%s')", p.nick.c_str(), look,
+	    p.look[0] ? p.look : "unknown");
+	std::memcpy(p.look, look, sizeof look);
+
+	// Only Claude has looks. Somebody on another model keeps their ped, and
+	// the look is there for when they come back to model 0.
+	if (p.modelId == 0)
+		RebuildRemoteBody(p);
+}
+
+void Client::RebuildRemoteBody(RemotePlayer &p) {
 	if (p.poolHandle >= 0) {
 		UnseatPlayer(p);
 		if (m_bridge.DespawnRemote)
@@ -941,8 +987,17 @@ void Client::UpdateRemotes() {
 		// know where to put it.
 		if (p.poolHandle < 0 && p.spawnPending && havePose && m_bridge.IsModelReady &&
 		    m_bridge.SpawnRemote) {
-			if (m_bridge.IsModelReady(p.modelId) && m_bridge.SpawnRemote(p)) {
+			// For Claude the model alone isn't the answer: model 0 is only
+			// the right body when their look is the one ours is loaded as.
+			const bool ready = m_bridge.PrepareRemoteLook
+			                       ? m_bridge.PrepareRemoteLook(p)
+			                       : m_bridge.IsModelReady(p.modelId);
+			if (ready && m_bridge.SpawnRemote(p)) {
 				p.spawnPending = false;
+				// A new ped hasn't been killed, whatever happened to the last
+				// one. Without this a corpse the engine took back (or that a
+				// look change rebuilt) comes back standing.
+				p.deathApplied = false;
 				Log("client: spawned %s (handle %d)", p.nick.c_str(), p.poolHandle);
 				// A new ped starts with an empty inventory, and the packets
 				// that said what this player carries are long gone - they
@@ -1005,6 +1060,27 @@ void Client::SendLocalModel() {
 	m_net.Send(pkt, CH_EVENT);
 	m_sentModelId = model;
 	Log("client: telling the session we are model %u", model);
+}
+
+// Model 0's name, on change and once per session. Not gated on being model
+// 0 ourselves: the look is what model 0 is here, and a receiver only uses it
+// while we're on model 0 anyway.
+void Client::SendLocalLook() {
+	if (!m_bridge.SampleLocalPlayerLook)
+		return;
+
+	char look[PLAYER_LOOK_LEN] = {};
+	if (!m_bridge.SampleLocalPlayerLook(look) || !CleanPlayerLook(look))
+		return;
+	if (std::memcmp(look, m_sentLook, sizeof look) == 0)
+		return;
+
+	C_PlayerLook pkt;
+	InitHeader(pkt, WallClock::NowMs());
+	std::memcpy(pkt.look, look, sizeof pkt.look);
+	m_net.Send(pkt, CH_EVENT);
+	std::memcpy(m_sentLook, look, sizeof look);
+	Log("client: telling the session we are wearing '%s'", look);
 }
 
 // A weapon slot somebody is carrying but not holding.
@@ -2481,6 +2557,73 @@ void Client::OnRampageEnd(const S_RampageEnd &pkt) {
 		m_bridge.ApplyRampageVerdict(pkt.body.outcome);
 }
 
+// ---- the vote before a rampage (rampagevoteview.h, game/rampagevote.h) ------
+
+void Client::OnRampageVote(const S_RampageVote &pkt) {
+	const bool fresh = !m_rampageVote.seen || m_rampageVote.body.voteId != pkt.body.voteId ||
+	                   m_rampageVote.body.state != pkt.body.state;
+	m_rampageVote.OnVote(pkt.body, WallClock::NowMs());
+	if (!fresh)
+		return;
+
+	const char *nick = NickFor(pkt.body.starterId);
+	if (pkt.body.state == RAMPAGE_VOTE_OPEN)
+		Log("client: rampage vote %u open, %s touched a skull (%u/%u yes, %u needed, %u ms)",
+		    pkt.body.voteId, nick ? nick : "?", pkt.body.yes, pkt.body.voters, pkt.body.needed,
+		    pkt.body.msLeft);
+	else
+		Log("client: rampage vote %u %s (%u/%u yes)", pkt.body.voteId,
+		    pkt.body.state == RAMPAGE_VOTE_PASSED      ? "passed"
+		    : pkt.body.state == RAMPAGE_VOTE_CANCELLED ? "called off"
+		                                               : "failed",
+		    pkt.body.yes, pkt.body.voters);
+}
+
+void Client::OnRampageTeleport(const S_RampageTeleport &pkt) {
+	// Never the toucher: he is where everybody is going.
+	if (pkt.body.starterId == m_localPlayerId)
+		return;
+	m_teleport        = pkt.body;
+	m_teleportWaiting = true;
+}
+
+bool Client::CastRampageVote(bool yes) {
+	if (!m_rampageVote.MayCast(m_localPlayerId))
+		return false;
+	C_RampageVote out;
+	InitHeader(out, WallClock::NowMs());
+	out.voteId = m_rampageVote.body.voteId;
+	out.yes    = yes ? 1 : 0;
+	m_net.Send(out, CH_EVENT);
+	m_rampageVote.NoteCast(yes);
+	Log("client: voted %s in rampage vote %u", yes ? "yes" : "no", out.voteId);
+	return true;
+}
+
+bool Client::TakeRampageTeleport(RampageTeleportBody &out) {
+	if (!m_teleportWaiting)
+		return false;
+	m_teleportWaiting = false;
+	out               = m_teleport;
+	return true;
+}
+
+void Client::ReportRampageArrival(uint8_t voteId, uint8_t result) {
+	C_RampageArrived out;
+	InitHeader(out, WallClock::NowMs());
+	out.voteId = voteId;
+	out.result = result;
+	m_net.Send(out, CH_EVENT);
+}
+
+const char *Client::NickFor(uint8_t playerId) const {
+	if (playerId == m_localPlayerId)
+		return m_localNick.c_str();
+	if (playerId < MAX_PLAYERS && m_players[playerId].active)
+		return m_players[playerId].nick.c_str();
+	return nullptr;
+}
+
 void Client::OnPickupGrant(const S_PickupGrant &pkt) {
 	// A reservation, not a collection. The seam unblocks it and the engine
 	// decides on its own next pass, through its own touch test, its own
@@ -3548,19 +3691,37 @@ void Client::UpdateRemoteVehicles() {
 		// handover below lands, when the player gets out, or when the car goes
 		// away under him. None of those three is a packet.
 		if (v.surrendered && !engineSaysOurs) {
-			v.surrendered   = false;
-			v.surrenderDone = false;
+			v.surrendered          = false;
+			v.surrenderDone        = false;
+			v.surrenderHoldSinceMs = 0;
 		}
 
-		// The handover itself, once. There is no carjack an observer can
-		// replay (WorldBridge::SurrenderVehicleSeat says why), so this does
-		// what the end of the engine's own jack does: takes the local player
+		// The handover itself, once: what the end of the engine's own jack
+		// does, for a jack that was not played here - takes the local player
 		// out of the driver's seat and leaves the car to its new owner.
+		//
+		// Unless our own engine is already doing it the proper way: the jack
+		// was played here too (OnJackingVehicle) and has reached our seat, or
+		// is dragging us out of it. Then the handover is the drag, and doing it
+		// by hand on top would cut it off and stand us beside the door. When
+		// the drag lets go of the wheel `engineSaysOurs` goes false and the
+		// flag above clears itself.
 		if (v.surrendered && !v.surrenderDone && m_bridge.SurrenderVehicleSeat) {
-			v.surrenderDone = true;
-			if (m_bridge.SurrenderVehicleSeat(v))
-				Log("client: handed the wheel of vehicle %u over to player %u",
-				    v.netId, static_cast<unsigned>(v.driverPlayerId));
+			const bool dragging =
+			    m_bridge.LocalBeingPulledOut && m_bridge.LocalBeingPulledOut() != PULL_NONE;
+			if (KeepOutOfEnginesWay(dragging, v.surrenderHoldSinceMs, WallClock::NowMs())) {
+				if (!m_saidSurrenderHeld) {
+					m_saidSurrenderHeld = true;
+					Log("client: player %u has vehicle %u now and our engine is "
+					    "already dragging us out of it; letting the drag finish",
+					    static_cast<unsigned>(v.driverPlayerId), v.netId);
+				}
+			} else {
+				v.surrenderDone = true;
+				if (m_bridge.SurrenderVehicleSeat(v))
+					Log("client: handed the wheel of vehicle %u over to player %u",
+					    v.netId, static_cast<unsigned>(v.driverPlayerId));
+			}
 		}
 
 		if (engineSaysOurs && !DrivenLocally(v) && !v.surrendered) {
@@ -3928,33 +4089,10 @@ void Client::OnEnterVehicle(const S_EnterVehicle &pkt) {
 	// finish is retried forever.
 	p.seatAnimSpent    = false;
 
-	// The jack byte is read and deliberately not acted on. Getting into a
-	// car somebody is already in is a different animation in the engine -
-	// CPed::SetCarJack, which addresses.h records - and CoopIII does not
-	// play it, for two reasons that are both about this being an observer.
-	//
-	// The first is mechanical, and narrower than it was first written down
-	// as. SetCarJack returns without doing anything when the car's
-	// VehicleCreatedBy is MISSION_VEHICLE, which is what every car CoopIII
-	// creates is - but that bail sits *after* the CPed::IsPlayer call at
-	// 0x004E0310 and the `jne` at 0x004E0319 jumps over it, so it applies to
-	// a remote ped and not to the local player pressing F. Since the ped that
-	// would play this animation is always a CCivilianPed, the animation is
-	// indeed unavailable on exactly the cars a session has. addresses.h has
-	// the disassembly and the correction.
-	//
-	// The second matters more. SetCarJack's animation chain ends by dragging
-	// the ped in the seat out of it, which would be this machine deciding
-	// that some *other* player left a car. That is the host-authoritative
-	// rule backwards. What the seat actually needs is handled without the
-	// flag: UpdateRemoteSeats takes whoever is in the seat out of it before
-	// putting the named player in, because the session has already said who
-	// is sitting there and two peds cannot both be the driver. The loser's
-	// own machine sends their exit a moment later and the two agree.
-	//
-	// Nothing sets the byte on the way out either (SendLocalVehicle writes a
-	// zero into all three sites), so this is documenting a field that is
-	// currently always false rather than ignoring live information.
+	// The jack byte is still never set and never read. By the time this claim
+	// goes out the jack is over, so an animation started from it would be a
+	// whole jack late; the jack travels at its start instead, as
+	// S_JackingVehicle (OnJackingVehicle), and this packet only moves the seat.
 	(void)pkt.body.jack;
 }
 
@@ -4002,6 +4140,7 @@ void Client::OnEnteringVehicle(const S_EnteringVehicle &pkt) {
 	p.enterIntentSeat      = pkt.body.seat;
 	p.enterIntentDoor      = pkt.body.door;
 	p.enterIntentExpiresMs = WallClock::NowMs() + ENTER_INTENT_TTL_MS;
+	p.enterIntentJack      = false;
 	// A fresh statement about an entry earns a fresh animated attempt, the
 	// same way a fresh S_EnterVehicle does and for the same reason: without
 	// it one timed-out entry spends the rest of the session warping.
@@ -4014,6 +4153,63 @@ void Client::OnEnteringVehicle(const S_EnteringVehicle &pkt) {
 		    "entry is still what says they got in",
 		    p.nick.c_str(), pkt.body.netId, pkt.body.seat, pkt.body.door);
 	}
+}
+
+// Somebody has started pulling somebody out of a car. protocol.h,
+// C_JackingVehicle.
+//
+// Recorded as an intent like the one above, and flagged, and that flag is
+// what lets UpdateRemoteSeats go where an ordinary intent may not: into a seat
+// somebody is sitting in, and into a traffic car. It still decides nothing
+// here. Our engine plays the jack on the replica and drags out whoever it
+// finds in the seat - which, when that is us, is our own engine taking our own
+// player out, the only machine that may.
+void Client::OnJackingVehicle(const S_JackingVehicle &pkt) {
+	if (pkt.playerId == m_localPlayerId || pkt.playerId >= MAX_PLAYERS)
+		return;
+
+	RemotePlayer &p = m_players[pkt.playerId];
+	if (!p.active)
+		return;
+
+	// Always for the wheel, through one of the four doors. Anything else is a
+	// packet this build does not understand.
+	if (pkt.body.door > 3 || pkt.body.seat != 0)
+		return;
+
+	p.enterIntentNetId     = pkt.body.netId;
+	p.enterIntentSeat      = 0;
+	p.enterIntentDoor      = pkt.body.door;
+	p.enterIntentExpiresMs = WallClock::NowMs() + ENTER_INTENT_TTL_MS;
+	p.enterIntentJack      = true;
+	p.seatAnimSpent        = false;
+
+	if (!m_saidJackIntent) {
+		m_saidJackIntent = true;
+		Log("client: %s is pulling somebody out of vehicle %u through the door of "
+		    "seat %u; playing the jack here, and whoever sits in that seat on this "
+		    "screen gets dragged out by our own engine",
+		    p.nick.c_str(), pkt.body.netId, pkt.body.door);
+	}
+}
+
+// The traffic half of a car's name. A replica first, then our own hosted
+// traffic, which only the population seam can name.
+int32_t Client::TrafficCarHandle(uint16_t netId) {
+	if (netId == INVALID_NETID)
+		return -1;
+	if (const RemoteAmbientCar *car = AmbientCarByNetId(netId))
+		return car->destroyed ? -1 : car->poolHandle;
+	return m_bridge.HostedCarHandle ? m_bridge.HostedCarHandle(netId) : -1;
+}
+
+uint16_t Client::TrafficCarNetId(int32_t handle) {
+	if (handle < 0)
+		return INVALID_NETID;
+	for (const RemoteAmbientCar &car : m_cars)
+		if (car.active && !car.destroyed && car.poolHandle == handle)
+			return car.netId;
+	return m_bridge.HostedCarNetId ? m_bridge.HostedCarNetId(handle) : INVALID_NETID;
 }
 
 // And the sending half: tell the session the moment our own entry starts.
@@ -4036,24 +4232,50 @@ void Client::SendLocalEntering() {
 	LocalCarEntry entry;
 	if (!m_bridge.SampleLocalCarEntry(entry)) {
 		m_enteringHandle = -1;   // not entering anything; arm the next one
+		m_enteringJack   = false;
 		return;
 	}
 
 	if (entry.vehicleHandle == m_enteringHandle && entry.seat == m_enteringSeat &&
-	    entry.door == m_enteringDoor)
+	    entry.door == m_enteringDoor && entry.jack == m_enteringJack)
 		return;   // already said, and it has not changed
 
 	m_enteringHandle = entry.vehicleHandle;
 	m_enteringSeat   = entry.seat;
 	m_enteringDoor   = entry.door;
+	m_enteringJack   = entry.jack;
 
-	const RemoteVehicle *v = VehicleByPoolHandle(entry.vehicleHandle);
-	if (!v)
+	// A jack may be of a traffic car as well: taking one off its driver is
+	// how a player gets a traffic car at all, and it only becomes a session
+	// car at the claim.
+	uint16_t netId = INVALID_NETID;
+	if (const RemoteVehicle *v = VehicleByPoolHandle(entry.vehicleHandle))
+		netId = v->netId;
+	else if (entry.jack)
+		netId = TrafficCarNetId(entry.vehicleHandle);
+	m_enteringNetId = netId;
+	if (netId == INVALID_NETID)
 		return;
+
+	if (entry.jack) {
+		C_JackingVehicle out;
+		InitHeader(out, WallClock::NowMs());
+		out.body.netId = netId;
+		out.body.seat  = 0;
+		out.body.door  = entry.door;
+		m_net.Send(out, CH_EVENT);
+		if (!m_saidJackSent) {
+			m_saidJackSent = true;
+			Log("client: telling the session we are pulling somebody out of vehicle "
+			    "%u through the door of seat %u",
+			    netId, entry.door);
+		}
+		return;
+	}
 
 	C_EnteringVehicle out;
 	InitHeader(out, WallClock::NowMs());
-	out.body.netId = v->netId;
+	out.body.netId = netId;
 	out.body.seat  = entry.seat;
 	out.body.door  = entry.door;
 	m_net.Send(out, CH_EVENT);
@@ -4062,7 +4284,7 @@ void Client::SendLocalEntering() {
 		m_saidEnterSent = true;
 		Log("client: telling the session we are getting into vehicle %u, seat %u, "
 		    "through the door of seat %u",
-		    v->netId, entry.seat, entry.door);
+		    netId, entry.seat, entry.door);
 	}
 }
 
@@ -4259,12 +4481,18 @@ void Client::OnVehicleCustody(const S_VehicleCustody &pkt) {
 // build a replica of it - for a car that is very possibly right in front of
 // them, and quite possibly one they are about to be hit by.
 void Client::OnCarPromoted(const S_CarPromoted &pkt) {
-	const bool weHostedIt = pkt.wasOwnerPlayerId == m_localPlayerId;
+	bool weHostedIt = pkt.wasOwnerPlayerId == m_localPlayerId;
 
 	int32_t  handle     = -1;
 	uint32_t dentPanels = 0;
 	uint16_t dentDoors  = 0;
 	if (RemoteAmbientCar *car = AmbientCarByNetId(pkt.netId)) {
+		// A row filed under us is a replica all the same: one we were handed
+		// while at its wheel, which OnAmbientAdopt keeps as it is for this. It
+		// becomes a copy like any other replica, not one of our engine's own
+		// cars, or it would stay locked for good.
+		if (car->ownerPlayerId == m_localPlayerId)
+			weHostedIt = false;
 		// Anybody the ambient roster had sitting in it comes out first, and
 		// the ordering is the one OnCarDespawn keeps for the same reason: a
 		// seat left standing against a netId that now means a different kind
@@ -4272,7 +4500,13 @@ void Client::OnCarPromoted(const S_CarPromoted &pkt) {
 		for (RemoteAmbientPed &ped : m_peds) {
 			if (!ped.active)
 				continue;
-			if (ped.seatedVehicleNetId == pkt.netId) {
+			// Except a driver our engine is still dragging out of it, for the
+			// player whose jack is this promotion: the car stays, so the seat
+			// loop can wait for the drag and take him out afterwards.
+			const bool dragging = ped.seatedVehicleNetId == pkt.netId &&
+			                      m_bridge.AmbientBeingPulledOut &&
+			                      m_bridge.AmbientBeingPulledOut(ped) != PULL_NONE;
+			if (ped.seatedVehicleNetId == pkt.netId && !dragging) {
 				if (m_bridge.UnseatAmbientPed)
 					m_bridge.UnseatAmbientPed(ped);
 				ped.seatedVehicleNetId = INVALID_NETID;
@@ -4464,19 +4698,32 @@ void Client::UpdateRemoteSeats() {
 		// its own now: the server arbitrates, the loser is told first, and
 		// the S_EnterVehicle that follows is what moves the seat. So an
 		// intent aimed at a taken seat simply waits for it.
+		//
+		// Unless the intent is a jack (OnJackingVehicle). Then the taken seat
+		// is the point, and what empties it is not this loop but our engine's
+		// own jack, which drags out whoever it finds there - on the victim's
+		// machine the victim's own ped. The seat still moves only at the claim.
 		const bool provisional = want == INVALID_NETID && p.HasEnterIntent(now) &&
-		                         !SeatIsTaken(p.enterIntentNetId,
-		                                      p.enterIntentSeat, p.playerId);
+		                         (p.enterIntentJack ||
+		                          !SeatIsTaken(p.enterIntentNetId,
+		                                       p.enterIntentSeat, p.playerId));
+		const bool jackWanted = provisional && p.enterIntentJack;
 		if (provisional) {
 			want = p.enterIntentNetId;
 			seat = p.enterIntentSeat;
 			door = p.enterIntentDoor;
 		}
 
+		// By pool handle as well as by row, because a jack can name traffic -
+		// a replica, or a car our own engine made - which has no RemoteVehicle
+		// until the claim promotes it. Only a jack gets that far without one.
 		RemoteVehicle *v =
 		    want != INVALID_NETID ? VehicleSlot(want, /*createIfMissing=*/false)
 		                          : nullptr;
-		if (!v || v->poolHandle < 0)
+		int32_t carHandle = v ? v->poolHandle : -1;
+		if (!v && jackWanted)
+			carHandle = TrafficCarHandle(want);
+		if (carHandle < 0)
 			want = INVALID_NETID;
 		// And a corpse sits in nothing. OnDeath already drops the standing
 		// instruction, so this only catches a seating the session hands us
@@ -4508,6 +4755,41 @@ void Client::UpdateRemoteSeats() {
 				want = INVALID_NETID;
 		}
 
+		// ---- being pulled out by a jack played here -----------------------
+		//
+		// Somebody's jack, running on this machine (OnJackingVehicle), has
+		// reached this player's seat: our engine is dragging the replica out
+		// of the door, or is about to. Until that is over this loop keeps its
+		// hands off him. Taking him out by hand during the drag cuts it off
+		// and teleports him; taking him out just before it leaves the jacker's
+		// door-open callback an empty seat, and the jacker just climbs in.
+		//
+		// Once the drag has started he is latched out of that car, because the
+		// session goes on naming the seat until his own exit arrives, and that
+		// can be a while behind a drag this machine played first.
+		if (p.Seated() && !p.Entering() && m_bridge.RemoteBeingPulledOut) {
+			const uint8_t pull = m_bridge.RemoteBeingPulledOut(p);
+			if (pull == PULL_DRAGGED) {
+				if (p.pulledOutOfNetId != p.seatedVehicleNetId && !m_saidPulledOut) {
+					m_saidPulledOut = true;
+					Log("client: %s is being dragged out of vehicle %u by a jack "
+					    "our engine is playing; left to the engine until the drag "
+					    "is over",
+					    p.nick.c_str(), p.seatedVehicleNetId);
+				}
+				p.pulledOutOfNetId = p.seatedVehicleNetId;
+				p.pulledOutAtMs    = now;
+			}
+			if (KeepOutOfEnginesWay(pull != PULL_NONE, p.engineHoldSinceMs, now))
+				continue;
+		} else {
+			p.engineHoldSinceMs = 0;
+		}
+		p.pulledOutOfNetId =
+		    PulledOutLatchFor(p.pulledOutOfNetId, p.pulledOutAtMs, p.seatVehicleNetId, now);
+		if (p.pulledOutOfNetId != INVALID_NETID && want == p.pulledOutOfNetId)
+			want = INVALID_NETID;
+
 		// ---- getting out, on the snapshot rather than the event ----------
 		//
 		// The reliable S_ExitVehicle is not early enough to animate from:
@@ -4536,10 +4818,16 @@ void Client::UpdateRemoteSeats() {
 		// player is in neither of the other two states and the comparison
 		// below would read them as on foot and start again.
 		if (p.Entering()) {
-			const uint8_t progress =
-			    (p.enteringVehicleNetId == want && m_bridge.PollSeatRemotePed)
-			        ? m_bridge.PollSeatRemotePed(p, *v, seat)
-			        : SEAT_LOST;   // the session changed its mind, or no bridge
+			// The session changed its mind, or there is no bridge: lost.
+			uint8_t progress = SEAT_LOST;
+			if (p.enteringVehicleNetId == want) {
+				if (p.enteringJack) {
+					if (m_bridge.PollJackRemotePed)
+						progress = m_bridge.PollJackRemotePed(p, carHandle);
+				} else if (v && m_bridge.PollSeatRemotePed) {
+					progress = m_bridge.PollSeatRemotePed(p, *v, seat);
+				}
+			}
 
 			if (progress == SEAT_DONE) {
 				p.seatedVehicleNetId   = want;
@@ -4549,9 +4837,15 @@ void Client::UpdateRemoteSeats() {
 				// finishes before the claim does, and this is the field the
 				// exit path and the pose stream both read.
 				p.seatIndex            = seat;
-				Log("client: %s opened the door of vehicle %u and got in "
-				    "(seat %u)",
-				    p.nick.c_str(), want, seat);
+				if (p.enteringJack)
+					Log("client: %s pulled whoever was driving vehicle %u out and "
+					    "got in",
+					    p.nick.c_str(), want);
+				else
+					Log("client: %s opened the door of vehicle %u and got in "
+					    "(seat %u)",
+					    p.nick.c_str(), want, seat);
+				p.enteringJack = false;
 				continue;
 			}
 			if (progress == SEAT_RUNNING && now < p.enterDeadlineMs)
@@ -4565,6 +4859,7 @@ void Client::UpdateRemoteSeats() {
 			if (m_bridge.AbandonSeatRemotePed)
 				m_bridge.AbandonSeatRemotePed(p);
 			p.enteringVehicleNetId = INVALID_NETID;
+			p.enteringJack         = false;
 		}
 
 		if (p.seatedVehicleNetId == want)
@@ -4586,10 +4881,34 @@ void Client::UpdateRemoteSeats() {
 		// Nobody else has a seat taken away for this. The seat itself is
 		// still given on the same frame if the engine says no, because the
 		// bridge call returns false rather than starting something.
-		if (!p.seatAnimSpent && m_bridge.BeginSeatRemotePed) {
+		//
+		// A jack goes in by the jack, and only by it: an ordinary entry here
+		// would evict the driver the jack is meant to pull out.
+		if (!provisional && p.warpSeatUntilMs != 0 &&
+		    static_cast<int32_t>(p.warpSeatUntilMs - now) > 0) {
+			p.seatAnimSpent   = true;   // OnCarDespawn: in once already
+			p.warpSeatUntilMs = 0;
+		}
+		if (!p.seatAnimSpent && jackWanted && m_bridge.BeginJackRemotePed) {
+			p.seatAnimSpent = true;
+			if (m_bridge.BeginJackRemotePed(p, carHandle, door)) {
+				p.enteringVehicleNetId = want;
+				p.enteringJack         = true;
+				p.seatIndex            = seat;
+				p.enterDeadlineMs      = now + m_seatAnimTimeoutMs;
+				if (!m_saidJackPlayed) {
+					m_saidJackPlayed = true;
+					Log("client: playing %s's jack of vehicle %u through the door "
+					    "of seat %u",
+					    p.nick.c_str(), want, door);
+				}
+				continue;
+			}
+		} else if (!p.seatAnimSpent && !jackWanted && v && m_bridge.BeginSeatRemotePed) {
 			p.seatAnimSpent = true;
 			if (m_bridge.BeginSeatRemotePed(p, *v, seat, door)) {
 				p.enteringVehicleNetId = want;
+				p.enteringJack         = false;
 				p.seatIndex            = seat;
 				p.enterDeadlineMs      = now + m_seatAnimTimeoutMs;
 				continue;
@@ -5861,6 +6180,28 @@ void Client::UpdateAmbientPedSeats() {
 		if (!car || car->poolHandle < 0 || car->ownerPlayerId != ped.ownerPlayerId)
 			want = INVALID_NETID;
 
+		// A player's jack, played here, has reached this driver: our engine
+		// is dragging the replica out, or is about to. Hands off until it is
+		// done, and then keep him out of that car while his host's rows catch
+		// up - its own engine is dragging the real driver out too, a moment
+		// before or after ours. UpdateRemoteSeats does the same for a player.
+		if (ped.Seated() && m_bridge.AmbientBeingPulledOut) {
+			const uint8_t pull = m_bridge.AmbientBeingPulledOut(ped);
+			if (pull == PULL_DRAGGED) {
+				ped.pulledOutOfNetId = ped.seatedVehicleNetId;
+				ped.pulledOutAtMs    = WallClock::NowMs();
+			}
+			if (KeepOutOfEnginesWay(pull != PULL_NONE, ped.engineHoldSinceMs,
+			                        WallClock::NowMs()))
+				continue;
+		} else {
+			ped.engineHoldSinceMs = 0;
+		}
+		ped.pulledOutOfNetId = PulledOutLatchFor(ped.pulledOutOfNetId, ped.pulledOutAtMs,
+		                                         ped.seatVehicleNetId, WallClock::NowMs());
+		if (ped.pulledOutOfNetId != INVALID_NETID && want == ped.pulledOutOfNetId)
+			want = INVALID_NETID;
+
 		if (ped.seatedVehicleNetId == want)
 			continue;
 
@@ -6099,6 +6440,17 @@ void Client::OnCarDespawn(const S_CarDespawn &pkt) {
 		if (ped.seatVehicleNetId == pkt.netId)
 			ped.seatVehicleNetId = INVALID_NETID;
 	}
+	// And a player whose jack of it we played, sitting in it or halfway in,
+	// the same way. Only a jack ever seats a player in traffic, and the usual
+	// reason it goes now is that the jacker hosted it: its host's claim drops
+	// the traffic car and names a new one in the same place, a packet behind.
+	// They are already in on this screen, so that seating is a warp.
+	for (RemotePlayer &p : m_players)
+		if (p.active && p.InvolvedWith(pkt.netId)) {
+			if (p.Seated())
+				p.warpSeatUntilMs = WallClock::NowMs() + 2000;
+			UnseatPlayer(p);
+		}
 
 	if (car->poolHandle >= 0 && m_bridge.DespawnAmbientCarReplica)
 		m_bridge.DespawnAmbientCarReplica(*car);
@@ -6373,6 +6725,139 @@ void Client::OnAmbientCarDamage(RemoteAmbientCar &car, const S_VehicleDamage &pk
 		body.doors  = car.damageDoors;
 		m_bridge.ApplyAmbientCarDamage(car, body, /*flying=*/true);
 	}
+}
+
+// ---- a leaver's crowd (protocol.h, S_AmbientAdopt) --------------------------
+//
+// Sent just before the S_PlayerLeave, and it only ever names things the
+// leaver hosted. The server has already moved its own rows; this moves ours.
+//
+// Peds first, then cars. A ped we are given but cannot take is let go of here,
+// and letting go of a seated replica takes it out of its seat; done before the
+// car is converted, the car then sees an empty driver's seat and is parked
+// rather than set cruising with nobody in it.
+
+void Client::AdoptPedHere(RemoteAmbientPed *ped, uint16_t netId, uint32_t &taken,
+                          uint32_t &released) {
+	const game::AdoptPlan plan =
+	    game::PlanPedAdoption(ped != nullptr, ped && ped->poolHandle >= 0,
+	                          ped && ped->dead, ped ? ped->body.pedType : 0);
+	if (plan == game::AdoptPlan::Convert && m_bridge.AdoptAmbientPed &&
+	    m_bridge.AdoptAmbientPed(*ped)) {
+		// The object is population.cpp's now and the bridge has cleared the
+		// handle, so dropping the row touches nothing in the engine.
+		*ped = RemoteAmbientPed{};
+		++taken;
+		return;
+	}
+
+	// Ours to let go of: the server takes this from the owner, and tells
+	// everybody else.
+	C_PedDespawn out;
+	InitHeader(out, WallClock::NowMs());
+	out.netId = netId;
+	m_net.Send(out, CH_EVENT);
+	if (ped) {
+		S_PedDespawn gone{};
+		InitHeader(gone, WallClock::NowMs());
+		gone.netId = netId;
+		OnPedDespawn(gone);
+	}
+	++released;
+}
+
+void Client::AdoptCarHere(RemoteAmbientCar *car, uint16_t netId, uint32_t &taken,
+                          uint32_t &released) {
+	const bool atWheel =
+	    car && (car->claimPending ||
+	            (m_bridge.LocalDrivesAmbientCar && m_bridge.LocalDrivesAmbientCar(*car)));
+	const game::AdoptPlan plan = game::PlanCarAdoption(
+	    car != nullptr, car && car->poolHandle >= 0, car && car->destroyed, atWheel);
+
+	if (plan == game::AdoptPlan::KeepForClaim) {
+		// The promotion our own claim asked for is on its way and will make
+		// this a session car. Kept as the replica it is, with us as the owner
+		// the session now says we are, so OnCarPromoted finds the handle.
+		car->ownerPlayerId = m_localPlayerId;
+		car->interp.Clear();
+		++taken;
+		Log("client: we were given traffic car %u while at its wheel; it stays as it is "
+		    "until our claim on it lands", netId);
+		return;
+	}
+	if (plan == game::AdoptPlan::Convert && m_bridge.AdoptAmbientCar &&
+	    m_bridge.AdoptAmbientCar(*car)) {
+		*car = RemoteAmbientCar{};
+		++taken;
+		return;
+	}
+
+	C_CarDespawn out;
+	InitHeader(out, WallClock::NowMs());
+	out.netId = netId;
+	m_net.Send(out, CH_EVENT);
+	if (car) {
+		S_CarDespawn gone{};
+		InitHeader(gone, WallClock::NowMs());
+		gone.netId = netId;
+		OnCarDespawn(gone);
+	}
+	++released;
+}
+
+void Client::OnAmbientAdopt(const S_AmbientAdopt &pkt) {
+	const uint8_t n = pkt.count < MAX_ADOPT_ROWS ? pkt.count : MAX_ADOPT_ROWS;
+
+	uint32_t pedsTaken = 0, carsTaken = 0, pedsLetGo = 0, carsLetGo = 0;
+	uint32_t pedsMoved[MAX_PLAYERS] = {}, carsMoved[MAX_PLAYERS] = {};
+
+	for (int pass = 0; pass < 2; ++pass) {
+		const uint8_t kind = pass == 0 ? AMBIENT_ADOPT_PED : AMBIENT_ADOPT_CAR;
+		for (uint8_t i = 0; i < n; ++i) {
+			const AmbientAdoptRow &r = pkt.rows[i];
+			if (r.kind != kind || r.netId == INVALID_NETID)
+				continue;
+
+			if (r.newOwnerPlayerId == m_localPlayerId) {
+				if (kind == AMBIENT_ADOPT_PED)
+					AdoptPedHere(AmbientPedByNetId(r.netId), r.netId, pedsTaken, pedsLetGo);
+				else
+					AdoptCarHere(AmbientCarByNetId(r.netId), r.netId, carsTaken, carsLetGo);
+				continue;
+			}
+			if (r.newOwnerPlayerId >= MAX_PLAYERS)
+				continue;
+
+			// Somebody else's now. The replica stays exactly as it is; only
+			// whose rows it takes changes, and the rows already buffered are
+			// stamped on the leaver's clock, which the new owner does not share.
+			if (kind == AMBIENT_ADOPT_PED) {
+				if (RemoteAmbientPed *ped = AmbientPedByNetId(r.netId)) {
+					ped->ownerPlayerId = r.newOwnerPlayerId;
+					ped->interp.Clear();
+					++pedsMoved[r.newOwnerPlayerId];
+				}
+			} else if (RemoteAmbientCar *car = AmbientCarByNetId(r.netId)) {
+				car->ownerPlayerId = r.newOwnerPlayerId;
+				car->interp.Clear();
+				++carsMoved[r.newOwnerPlayerId];
+			}
+		}
+	}
+
+	const char *leaver = pkt.wasOwnerPlayerId < MAX_PLAYERS &&
+	                             m_players[pkt.wasOwnerPlayerId].active
+	                         ? m_players[pkt.wasOwnerPlayerId].nick.c_str()
+	                         : "a player who left";
+	if (pedsTaken != 0 || carsTaken != 0 || pedsLetGo != 0 || carsLetGo != 0)
+		Log("client: %s left and we host %u of their pedestrian(s) and %u of their "
+		    "car(s) now; %u ped(s) and %u car(s) we could not take are let go",
+		    leaver, pedsTaken, carsTaken, pedsLetGo, carsLetGo);
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id)
+		if (pedsMoved[id] != 0 || carsMoved[id] != 0)
+			Log("client: %u ped(s) and %u car(s) %s left behind are player %u's now; "
+			    "our replicas stay and take his rows",
+			    pedsMoved[id], carsMoved[id], leaver, static_cast<unsigned>(id));
 }
 
 } // namespace coopiii

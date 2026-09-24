@@ -433,40 +433,10 @@ inline FeedLayout MeasureFeed(float screenW, float screenH) {
 	return l;
 }
 
-// "  54 ms" on the end of `raw`, or nothing when the ping is not known. A
-// round trip past a second reads as that, not as a four-digit number nobody
-// can act on.
-inline void AppendPing(char *raw, size_t cap, uint16_t pingMs) {
-	if (pingMs == PING_NONE)
-		return;
-	const size_t n = std::strlen(raw);
-	if (n >= cap)
-		return;
-	if (pingMs >= 1000)
-		std::snprintf(raw + n, cap - n, "  1s+");
-	else
-		std::snprintf(raw + n, cap - n, "  %u ms", static_cast<unsigned>(pingMs));
-}
-
-// A player whose snapshots have stopped for this long is marked quiet in the
-// list. A few missed packets are not worth a word; a menu, a loading screen or
-// a game left in the background is.
+// A player whose snapshots have stopped for this long is marked away on the
+// scoreboard. A few missed packets are not worth a word; a menu, a loading
+// screen or a game left in the background is.
 constexpr uint32_t QUIET_AFTER_MS = 3000;
-
-// "  quiet 12s" for a player nothing has arrived from in a while, capped so a
-// long one does not push the rest of the row off the edge.
-inline void AppendQuiet(char *raw, size_t cap, uint32_t quietMs) {
-	if (quietMs < QUIET_AFTER_MS)
-		return;
-	const size_t n = std::strlen(raw);
-	if (n >= cap)
-		return;
-	const uint32_t s = quietMs / 1000;
-	if (s > 999)
-		std::snprintf(raw + n, cap - n, "  quiet 999s+");
-	else
-		std::snprintf(raw + n, cap - n, "  quiet %us", static_cast<unsigned>(s));
-}
 
 // "  off 7.4 m" for a copy the server says is that far from the real thing,
 // from DESYNC_SHOW_CM_ON_LIST; nothing under it or when nothing was compared.
@@ -487,38 +457,6 @@ inline void AppendDesync(char *raw, size_t cap, uint16_t offCm) {
 		std::snprintf(raw + n, cap - n, "  off %u m", static_cast<unsigned>(offCm / 100));
 }
 
-// One row of the player list: "nick  87 hp  wanted 3  54 ms", or "nick  dead".
-// The ping is left off while the server has not said, a player who has gone
-// quiet says for how long, and a copy of them that is somewhere else says how
-// far - unless they are quiet, which is already why.
-inline void FormatPlayerRow(char *out, size_t cap, const char *nick, float health,
-                            uint8_t stars, bool dead, bool inCar,
-                            uint16_t pingMs = PING_NONE, uint32_t quietMs = 0,
-                            uint16_t offCm = DESYNC_UNKNOWN) {
-	char raw[NICK_LEN + 80];
-	char name[NICK_LEN];
-	std::snprintf(name, sizeof name, "%s", nick && nick[0] ? nick : "?");
-	if (dead || !(health > 0.0f)) {
-		std::snprintf(raw, sizeof raw, "%s  dead", name);
-	} else {
-		int hp = static_cast<int>(health + 0.5f);
-		if (hp < 1)
-			hp = 1;
-		if (hp > 999)
-			hp = 999;
-		const int n = std::snprintf(raw, sizeof raw, "%s  %d hp%s", name, hp,
-		                            inCar ? "  in a car" : "");
-		if (stars > 0 && n > 0 && static_cast<size_t>(n) < sizeof raw)
-			std::snprintf(raw + n, sizeof raw - static_cast<size_t>(n), "  wanted %u",
-			              static_cast<unsigned>(stars > 6 ? 6 : stars));
-	}
-	AppendQuiet(raw, sizeof raw, quietMs);
-	if (quietMs < QUIET_AFTER_MS)
-		AppendDesync(raw, sizeof raw, offCm);
-	AppendPing(raw, sizeof raw, pingMs);
-	FeedCopy(out, cap, raw);
-}
-
 // ---- the version mark --------------------------------------------------------
 //
 // "CoopIII 0.0.1", small and grey in the bottom-left corner, under the radar:
@@ -535,21 +473,44 @@ struct MarkLayout {
 };
 
 // The radar's lowest edge is RADAR_BOTTOM, 47 HUD units above the bottom of
-// the screen (re3 Radar.h, and what the retail draws); the mark sits in the
-// strip under it.
+// the screen, and its top is 76 more (re3 Radar.h, and what the retail
+// draws); the mark sits in the strip under it.
 constexpr float MARK_SCALE_X      = 0.22f;
 constexpr float MARK_SCALE_Y      = 0.40f;
 constexpr float MARK_MARGIN_UNITS = 3.0f;
 constexpr float RADAR_BOTTOM_UNITS = 47.0f;
+constexpr float RADAR_TOP_UNITS    = 47.0f + 76.0f;
+// Scaled with the screen alone it was 10 px tall in a 960x540 window, which
+// is no mark at all. Never smaller than this many pixels.
+constexpr float MARK_MIN_TEXT_PX = 14.0f;
+// CFont::PrintChar drops a glyph whose top is at or past SCREEN_WIDTH, on the
+// y axis as well as the x one (addresses.h, CFont__PrintChar). A 958x1000
+// window has its whole strip under the radar past that line, so the mark
+// printed nothing there. It is kept this many pixels above it.
+constexpr float MARK_CULL_CLEARANCE_PX = 2.0f;
 
 inline MarkLayout MeasureVersionMark(float screenW, float screenH) {
 	MarkLayout m;
 	const float unit = screenH / 448.0f;
-	m.scaleX = MARK_SCALE_X * unit;
-	m.scaleY = MARK_SCALE_Y * unit;
-	(void)screenW;
+	float       grow = 1.0f;
+	if (FEED_CELL_HEIGHT * MARK_SCALE_Y * unit < MARK_MIN_TEXT_PX)
+		grow = MARK_MIN_TEXT_PX / (FEED_CELL_HEIGHT * MARK_SCALE_Y * unit);
+	m.scaleX = MARK_SCALE_X * unit * grow;
+	m.scaleY = MARK_SCALE_Y * unit * grow;
 	m.x      = MARK_MARGIN_UNITS * unit;
 	m.y      = screenH - FEED_CELL_HEIGHT * m.scaleY - MARK_MARGIN_UNITS * unit;
+
+	const float lowest = screenW - MARK_CULL_CLEARANCE_PX;
+	if (m.y > lowest) {
+		// Still under the radar if the line is below its bottom edge, and over
+		// the top of it otherwise, never across it.
+		const float underRadar = screenH - RADAR_BOTTOM_UNITS * unit;
+		const float overRadar  = screenH - RADAR_TOP_UNITS * unit - MARK_MARGIN_UNITS * unit -
+		                         FEED_CELL_HEIGHT * m.scaleY;
+		m.y = lowest >= underRadar ? lowest : (overRadar < lowest ? overRadar : lowest);
+		if (m.y < 1.0f)
+			m.y = 1.0f;
+	}
 	return m;
 }
 

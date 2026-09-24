@@ -1346,3 +1346,86 @@ Learned the hard way this far in; worth not relearning.
 - **Test what can be tested without the game.** Six suites cover the protocol,
   the roster, interpolation, patterns and hooks. What is left needing a live
   game is then small enough to reason about.
+
+---
+
+## 7. Not built yet
+
+What is still missing from free roam and from playing together, as of
+2026-09-24. Each item is one piece of work for one branch. Nothing here has a
+protocol number yet; each one decides whether it needs one when it lands.
+
+### Being built
+
+- [ ] **A leaving player's crowd and traffic are adopted, not dropped.** Today
+      `DropPedsOf` / `DropCarsOf` (`server/core/server.h`) take every ambient
+      ped and car the leaver hosted off every screen at once. A remaining
+      machine should take each one over under the same netId. Session cars
+      already change hands this way.
+- [ ] **A carjack plays as one on every screen.** Observers see an ordinary
+      entry and the victim teleported out, because the jack byte in the entry
+      is ignored (`client.cpp`, the remote entry replay). The victim's own
+      machine has to play the drag-out on its real ped.
+
+### Players and the session
+
+- [ ] **Alt-tab.** The ESC menu no longer stops the world (`game/pause.h`), but
+      losing focus is a different path: retail stops its loop while the window
+      is not in front. The windowed-mode mod on the test machine
+      (`autoPause=0`) hides it. Check on a game without that mod; if the
+      machine's player, car, traffic and helicopter freeze on everybody
+      else's screen, keep them alive or hand hosting over while unfocused.
+- [ ] **Saving in co-op** is untested. Session copies are kept out of
+      `CPools::SaveVehiclePool`; confirm a co-op save loads clean in single
+      player before telling anybody it is safe.
+- [ ] **A mid-session Load or New Game, and the instant replay**, are not
+      handled.
+- [ ] **Nametags vanish in the lower part of a window taller than it is
+      wide.** Same cause as the version mark had: `CFont::PrintChar`
+      (0x00500C30) culls a glyph whose top is past the screen *width*. The
+      mark is kept above that line; nametags and the chat input line are not.
+- [ ] **Landing after a jump wipes a remote player's overlay animations**
+      (the arm holding a weapon).
+
+### Vehicles
+
+- [ ] An explosion that damages a parked session car without destroying it
+      is undone the next frame.
+- [ ] A car another player drives does only small, fixed damage when it hits
+      you, so a teammate can barely be run over.
+- [ ] If the custodian of a burning car quits, or its 15 s cap runs out,
+      every machine goes back to its own fire timer and blows it up on its
+      own.
+- [ ] A wrecked car is held where the blast happened, a car sinking in water
+      can freeze mid-sink, and a late joiner sees no wrecks.
+- [ ] Car alarms and the tank turret's angle are not sent.
+- [ ] A police car stuck in traffic plays the fast wail on its host and the
+      normal one elsewhere (the horn bit would fix it, but old builds read it
+      as a honk).
+
+### Combat and the police
+
+- [ ] Shooting a cop hosted on another machine counts as shooting a
+      civilian, so it gives fewer stars.
+- [ ] A car bomb exists only on the buyer's machine, and a bomb on a car
+      somebody else drives explodes nowhere.
+- [ ] Pickup mines stay local.
+
+### Emergency services
+
+- [ ] A medic's revive happens only on the machine hosting the ambulance.
+- [ ] A fire truck's hose is local only.
+
+### Passengers
+
+- [ ] A passenger can start taxi and the other side jobs, collects unique
+      stunt jump payouts as if driving, and the camera runs a frame behind
+      the car.
+
+### Money and rampages
+
+- [ ] Under `money = own`, if the helicopter owner's take-back of the $250
+      fails in the same frame, both keep it. Under `money = shared`, a shared
+      rampage's reward lands once per player.
+- [ ] Rampage kills made by a teammate never reach the stats screen
+      (`rampage.md` §7).

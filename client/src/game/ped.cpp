@@ -8,10 +8,12 @@
 #include "driveby.h"
 #include "hook/hook.h"
 #include "log.h"
+#include "look.h"
 #include "pedaim.h"
 #include "pedanim.h"
 #include "vehicle.h"
 
+#include <cstring>
 
 namespace coopiii::game {
 
@@ -453,6 +455,22 @@ struct RemotePedIdentity {
 
 RemotePedIdentity g_remotePeds[MAX_PLAYERS];
 
+// Which model each remote Claude is built from, or waiting on: MI_PLAYER, or
+// a special slot holding their look (PrepareRemoteLook, further down).
+uint16_t g_lookModelOf[MAX_PLAYERS] = {};
+// Set when HookedRequestSpecialModel took a player's ped down, so the next
+// ResolveRemote says why the handle stopped resolving.
+bool     g_lookTakenDown[MAX_PLAYERS] = {};
+
+// CBaseModelInfo::m_name of a model, or null for one that isn't there.
+const char *ModelName(uint32_t modelId) {
+	if (modelId >= MODELINFO_SIZE)
+		return nullptr;
+	const uint8_t *const mi =
+	    reinterpret_cast<const uint8_t *const *>(CModelInfo__ms_modelInfoPtrs)[modelId];
+	return mi ? reinterpret_cast<const char *>(mi + offs::MODELINFO_NAME) : nullptr;
+}
+
 void RememberRemotePed(const RemotePlayer &player) {
 	if (player.playerId >= MAX_PLAYERS)
 		return;
@@ -461,8 +479,11 @@ void RememberRemotePed(const RemotePlayer &player) {
 }
 
 void ForgetRemotePed(const RemotePlayer &player) {
-	if (player.playerId < MAX_PLAYERS)
-		g_remotePeds[player.playerId] = RemotePedIdentity{};
+	if (player.playerId < MAX_PLAYERS) {
+		g_remotePeds[player.playerId]    = RemotePedIdentity{};
+		g_lookModelOf[player.playerId]   = MI_PLAYER;
+		g_lookTakenDown[player.playerId] = false;
+	}
 }
 
 // Eight comparisons, each one a CPools::GetPed. That's cheap enough for the
@@ -584,12 +605,18 @@ void *ResolveRemote(RemotePlayer &player) {
 	// §2.5. Clearing the handle also re-arms the two-phase spawn in
 	// Client::UpdateRemotes, so the player comes back eventually. Logged
 	// once and not once per frame, since the handle gets cleared right after.
-	Log("bridge: %s's ped is gone from under us (%s)", player.nick.c_str(),
-	    ped == nullptr
-	        ? "pool slot no longer matches the handle"
-	        : (Field<uintptr_t>(ped, offs::VTABLE) == CPlaceable__vtable
-	               ? "object has been through its destructor"
-	               : "object is no longer a CCivilianPed"));
+	if (player.playerId < MAX_PLAYERS && g_lookTakenDown[player.playerId]) {
+		Log("bridge: %s's ped was taken down while a script changed the model it "
+		    "was built from; building it again",
+		    player.nick.c_str());
+	} else {
+		Log("bridge: %s's ped is gone from under us (%s)", player.nick.c_str(),
+		    ped == nullptr
+		        ? "pool slot no longer matches the handle"
+		        : (Field<uintptr_t>(ped, offs::VTABLE) == CPlaceable__vtable
+		               ? "object has been through its destructor"
+		               : "object is no longer a CCivilianPed"));
+	}
 	player.poolHandle   = -1;
 	player.spawnPending = true;
 	ForgetRemotePed(player);
@@ -696,6 +723,22 @@ bool SpawnRemote(RemotePlayer &player) {
 	// player wears. Treating it as unset is exactly what put a random
 	// civilian in the other player's seat for the whole first two-client run.
 	uint16_t model = player.modelId;
+
+	// Claude in the other outfit is built from the special slot
+	// PrepareRemoteLook loaded for them. Checked again here rather than
+	// trusted: the slot has to still hold their look, or the ped comes out
+	// in whatever a mission put there.
+	const uint16_t lookModel =
+	    player.playerId < MAX_PLAYERS ? g_lookModelOf[player.playerId] : MI_PLAYER;
+	if (model == MI_PLAYER && lookModel != MI_PLAYER) {
+		const char *const name = ModelName(lookModel);
+		if (!HasModelLoaded(lookModel) || !SameLook(name, player.look))
+			return false;
+		model = lookModel;
+		Log("look: building %s from special slot %d ('%s')", player.nick.c_str(),
+		    lookModel - MI_SPECIAL01 + 1, name);
+	}
+
 	if (!HasModelLoaded(model)) {
 		// UpdateRemotes only calls us once IsModelReady says yes, but the
 		// streamer can evict in between, and constructing against an
@@ -1896,6 +1939,7 @@ void UnseatRemotePed(RemotePlayer &player);
 // that has never heard of him.
 bool SeatPedInCar(void *ped, void *car, uint8_t seat);
 int  UnseatPedFromCar(void *ped);
+bool GiveBackExitDoor(void *ped, void *car);
 
 int PassengerSlotOf(void *car, void *ped) {
 	void *const   *seats = &Field<void *>(car, offs::VEH_PASSENGERS);
@@ -2128,6 +2172,12 @@ int UnseatPedFromCar(void *ped) {
 	// valid on both. Leaving the boat out would skip RemoveDriver for a boat,
 	// and destroying it would then leave its pDriver pointing at our ped.
 	if (car && IsBuiltVehicleVtable(Field<uintptr_t>(car, offs::VTABLE))) {
+		// Before anything else, while the ped still says how it was leaving.
+		// A replica whose exit is still playing when its owner's exit packet
+		// lands is taken out right here, halfway through the animation, and
+		// the door it claimed has to be given back the way ~CPed would.
+		GiveBackExitDoor(ped, car);
+
 		if (Field<void *>(car, offs::VEH_DRIVER) == ped) {
 			Func<void(__thiscall *)(void *)>(CVehicle__RemoveDriver)(car);
 
@@ -2351,6 +2401,19 @@ bool PedIsEnteringCar(void *ped, void *car) {
 	return Field<void *>(ped, offs::PED_MY_VEHICLE) == car;
 }
 
+// Something that changes for as long as an entry's animation is playing, for
+// EntryWatch (client.h). Every link of the chain is m_pVehicleAnim in turn,
+// and a playing association's currentTime moves every frame; which one it is
+// and where it has got to is enough. 0 when there is none.
+uint32_t EntryProgressMark(void *ped) {
+	void *const anim = Field<void *>(ped, offs::PED_VEHICLE_ANIM);
+	if (!anim)
+		return 0;
+	const uint32_t time = Field<uint32_t>(anim, ANIM_CURRENT_TIME);   // the float's bits
+	const uint32_t id   = static_cast<uint32_t>(Field<int32_t>(anim, ANIM_ID));
+	return (time ^ (id << 20) ^ static_cast<uint32_t>(reinterpret_cast<uintptr_t>(anim))) | 1u;
+}
+
 // The objective triple, cleared. Written out rather than routed through
 // CPed::ClearObjective for the reason UnseatPedFromCar gives: what is wanted
 // is a flat "no objective", not whatever SetObjective would restore instead,
@@ -2394,6 +2457,46 @@ void ShutDoorAfterAbandonedEntry(void *car, uint16_t door) {
 	if (!fn)
 		return;
 	fn(car, door, ANIM_STD_CAR_CLOSE_DOOR_LHS, 1.0f);
+}
+
+// The exit's half of the same problem. A ped taken out of a seat while its
+// get-out animation is still playing never reaches PedSetOutCarCB, which is
+// what clears its door's bit in m_nGettingOutFlags - and
+// SetEnterCar refuses a door whose bit is set, silently, for as long as the
+// car lives. addresses.h, GettingOutFlagsAfterUnseat, has the three sites.
+//
+// The door is shut as well: the animation swung it open, and a few tests
+// after the flags SetEnterCar asks IsDoorReady || IsDoorFullyOpen (vtable
+// 0x60 and 0x64, at 0x004E09F1 and 0x004E0A00), which a door left hanging
+// halfway fails just as surely.
+//
+// Returns true if there was a door to give back. Only ever does anything for
+// a ped in PED_EXIT_CAR or PED_DRAG_FROM_CAR, so it is safe on any ped.
+bool GiveBackExitDoor(void *ped, void *car) {
+	if (!ped || !car)
+		return false;
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	const uint16_t door  = Field<uint16_t>(ped, offs::PED_VEH_DOOR);
+	const uint8_t  flag  = DoorFlag(door);
+	if (!flag)
+		return false;
+
+	uint8_t      &out    = Field<uint8_t>(car, offs::VEH_GETTING_OUT_FLAGS);
+	const uint8_t before = out;
+	out = GettingOutFlagsAfterUnseat(before, state, flag);
+	if (out == before)
+		return false;
+
+	ShutDoorAfterAbandonedEntry(car, door);
+
+	static int said = 0;
+	if (said < 3) {
+		++said;
+		Log("bridge: a ped left a car halfway through getting out (state %u, "
+		    "door %u); gave the door back, getting-out flags 0x%02X -> 0x%02X",
+		    state, door, before, out);
+	}
+	return true;
 }
 
 int AbandonPedEnterCar(void *ped) {
@@ -2565,6 +2668,155 @@ uint8_t PollPedEnterCar(void *ped, void *car, uint8_t seat) {
 	return PedIsEnteringCar(ped, car) ? SEAT_RUNNING : SEAT_LOST;
 }
 
+// ---- a jack, on a replica ---------------------------------------------------
+//
+// CPed::SetCarJack_AllClear on the replica of a player whose own engine is
+// jacking (S_JackingVehicle). From there this machine's engine plays the whole
+// thing by itself: align, open the door, PedAnimDoorOpenCB calls
+// SetBeingDraggedFromCar on whoever is in that seat HERE, the jacker pulls,
+// climbs in, shuts the door, and PedSetInCarCB seats him. addresses.h, "a jack,
+// played on a replica", has each step.
+//
+// Not SetCarJack itself: its MISSION_VEHICLE gate at 0x004E032B refuses a
+// CCivilianPed on every car a session has, and that gate is there to stop AI
+// peds stealing mission cars. This jack was already decided on the jacker's
+// machine. The other gates are asked below, in SetCarJack's order, so a jack
+// that would not start there does not start here either.
+//
+// **The seat this empties may be the local player's, and that is the point.**
+// SeatHeldByLocalPlayer refuses a replica any *seating* over him, and still
+// does. This is not a seating: it is the engine's own jack, and on the
+// victim's machine the victim's own engine is the one dragging him out - the
+// only machine that may. It is only ever started from S_JackingVehicle.
+
+// The door flag of the seat `ped` holds in `car`, or 0 for a seat without a
+// door of its own. DoorForSeat read for the seat the ped is in.
+uint8_t SeatDoorFlagOf(void *car, void *ped) {
+	if (Field<void *>(car, offs::VEH_DRIVER) == ped)
+		return DoorFlag(DoorForSeat(0));
+	const int slot = PassengerSlotOf(car, ped);
+	return slot >= 0 && slot < 3 ? DoorFlag(DoorForSeat(static_cast<uint8_t>(slot + 1)))
+	                             : uint8_t{0};
+}
+
+// Is our engine taking this ped out of its seat through a jack played here? A
+// PullOut (client.h), off addresses.h's EngineTakingPedOut.
+uint8_t PedPullOut(void *ped) {
+	if (!ped)
+		return PULL_NONE;
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	// Through the tail too: PedSetDraggedOutCarCB clears bInVehicle and the
+	// state stays 33h until the delete callback puts the ped down beside the
+	// car. Touched in between, that callback lands on top of whatever we did.
+	if (state == PEDSTATE_DRAG_FROM_CAR)
+		return PULL_DRAGGED;
+	if (!Field<bool>(ped, offs::PED_IN_VEHICLE))
+		return PULL_NONE;
+	void *const car = Field<void *>(ped, offs::PED_MY_VEHICLE);
+	if (!car || Field<uintptr_t>(car, offs::VTABLE) != CAutomobile__vtable)
+		return PULL_NONE;
+	return EngineTakingPedOut(state, SeatDoorFlagOf(car, ped),
+	                          Field<uint8_t>(car, offs::VEH_GETTING_IN_FLAGS),
+	                          Field<uint8_t>(car, offs::VEH_FLAGS_C))
+	           ? PULL_COMING
+	           : PULL_NONE;
+}
+
+bool BeginPedJackCar(void *ped, void *car, uint8_t doorSeat) {
+	if (!ped || !car || ped == PlayerPed())
+		return false;
+
+	// Doors that swing, so a CAutomobile, which also rules out a boat. Not a
+	// bus: SetCarJack's bus arm takes the driver whatever the door, and
+	// PedAnimDoorOpenCB then plays an ordinary get-in on it.
+	if (Field<uintptr_t>(car, offs::VTABLE) != CAutomobile__vtable)
+		return false;
+	if (Field<uint8_t>(car, offs::VEH_FLAGS_B_BUS) & offs::VEH_IS_BUS)
+		return false;
+
+	const uint16_t door     = DoorForSeat(doorSeat);
+	const uint8_t  flag     = DoorFlag(door);
+	const uint32_t doorEnum = CarDoorEnumFor(door);
+	if (!door || !flag || !doorEnum)
+		return false;
+
+	// The ped in that door's seat, and SetCarJack's three questions about it
+	// (0x004E0347, 0x004E038C, 0x004E0390): not doing a drive-by, there, and
+	// in PED_DRIVING. PedAnimDoorOpenCB asks the last again and adds
+	// bDontDragMeOutCar (0x004DE864); asked here so the refusal is ours.
+	void *const victim = SeatOccupant(car, doorSeat);
+	if (!victim || victim == ped)
+		return false;
+	if (Field<uint32_t>(victim, offs::PED_STATE) != PEDSTATE_DRIVING)
+		return false;
+	if (Field<uint8_t>(victim, offs::PED_FLAGS_F) & offs::PED_DONT_DRAG_ME_OUT)
+		return false;
+	if (Func<bool(__thiscall *)(void *)>(CPed__IsPedDoingDriveByShooting)(victim))
+		return false;
+
+	// The jacker: alive, on foot, not already entering (0x004E0360, 0x004E03B7).
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD || state == PEDSTATE_CARJACK)
+		return false;
+	if (Field<bool>(ped, offs::PED_IN_VEHICLE))
+		return false;
+	if (Field<void *>(ped, offs::PED_VEHICLE_ANIM))
+		return false;
+	if (!(Field<float>(ped, offs::PED_HEALTH) > 0.0f))
+		return false;
+	if (!ClumpOf(ped))
+		return false;
+
+	// The door: free on both sides, nobody else jacking this car, and ready or
+	// fully open (vtable 60h then 64h, 0x004E03A1 / 0x004E03B0).
+	if (Field<uint8_t>(car, offs::VEH_GETTING_IN_FLAGS) & flag)
+		return false;
+	if (Field<uint8_t>(car, offs::VEH_GETTING_OUT_FLAGS) & flag)
+		return false;
+	if (Field<uint8_t>(car, offs::VEH_FLAGS_C) & offs::VEH_IS_BEING_CARJACKED)
+		return false;
+	using DoorTestFn  = bool(__thiscall *)(void *, uint32_t);
+	const uintptr_t vt = Field<uintptr_t>(car, offs::VTABLE);
+	const auto ready   = *reinterpret_cast<DoorTestFn *>(vt + VEH_VT_IS_DOOR_READY);
+	const auto open    = *reinterpret_cast<DoorTestFn *>(vt + VEH_VT_IS_DOOR_FULLY_OPEN);
+	if (!ready(car, doorEnum) && !open(car, doorEnum))
+		return false;
+
+	// Ours, as for any entry: a car that is going anywhere, or a jacker who is
+	// across the street.
+	const float *const carPos   = &Field<float>(car, offs::POSITION);
+	const float *const pedPos   = &Field<float>(ped, offs::POSITION);
+	const float *const carSpeed = &Field<float>(car, offs::MOVE_SPEED);
+	const float        speedSq  = carSpeed[0] * carSpeed[0] +
+	                      carSpeed[1] * carSpeed[1] + carSpeed[2] * carSpeed[2];
+	if (!(speedSq <= ENTER_MAX_CAR_SPEED_SQ))
+		return false;
+	if (DistanceSq(pedPos, carPos) > ENTER_MAX_PED_DIST_SQ)
+		return false;
+
+	// The objective first, for two readers: PedAnimPullPedOutCB quits anything
+	// that is not ENTER_CAR_AS_DRIVER (0x004DEC03), and PedSetInCarCB picks
+	// SetDriver from it. A jack is always for the wheel. PedSetInCarCB's
+	// RestorePreviousObjective puts back the NONE the replica had, as for an
+	// ordinary entry.
+	using ObjectiveFn = void(__thiscall *)(void *, uint32_t, void *);
+	Func<ObjectiveFn>(CPed__SetObjective)(ped, OBJECTIVE_ENTER_CAR_AS_DRIVER, car);
+
+	// PedAnimAlignCB and PedAnimDoorOpenCB switch on m_vehDoor, not on the
+	// argument; SetCarJack would have left it set by SeekCar.
+	Field<uint16_t>(ped, offs::PED_VEH_DOOR) = door;
+
+	using AllClearFn = void(__thiscall *)(void *, void *, uint32_t, uint32_t);
+	Func<AllClearFn>(CPed__SetCarJack_AllClear)(ped, car, door, flag);
+
+	if (Field<uint32_t>(ped, offs::PED_STATE) != PEDSTATE_CARJACK ||
+	    !PedIsEnteringCar(ped, car)) {
+		ClearPedObjective(ped);
+		return false;
+	}
+	return true;
+}
+
 // The way out, animated. There is no guard list to mirror here because
 // SetExitCar does its own: CanPedExitCar covers the car being upside down or
 // moving too fast, and the PED_EXIT_CAR / PED_DRAG_FROM_CAR test covers
@@ -2598,8 +2850,13 @@ bool BeginSeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t se
 	void *const car = ResolveRemoteVehicle(vehicle);
 	if (!car)
 		return false;
-	return BeginPedEnterCar(ped, car, seat, doorSeat);
+	if (!BeginPedEnterCar(ped, car, seat, doorSeat))
+		return false;
+	player.enterWatch.Begin(WallClock::NowMs(), EntryProgressMark(ped));
+	return true;
 }
+
+uint8_t PollRemoteEntry(RemotePlayer &player, void *ped, void *car, uint8_t seat);
 
 uint8_t PollSeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t seat) {
 	void *const ped = ResolveRemote(player);
@@ -2608,7 +2865,88 @@ uint8_t PollSeatRemotePed(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t 
 	void *const car = ResolveRemoteVehicle(vehicle);
 	if (!car)
 		return SEAT_LOST;
-	return PollPedEnterCar(ped, car, seat);
+	return PollRemoteEntry(player, ped, car, seat);
+}
+
+// The car of a jack is named by pool handle, because it may be traffic. Same
+// vtable test as everywhere a handle is turned back into a car: a slot the
+// engine has reused resolves, and is not the car.
+void *JackCar(int32_t carHandle) {
+	void *const car = carHandle >= 0 ? AmbientCarFromRef(carHandle) : nullptr;
+	return car && Field<uintptr_t>(car, offs::VTABLE) == CAutomobile__vtable ? car : nullptr;
+}
+
+bool BeginJackRemotePed(RemotePlayer &player, int32_t carHandle, uint8_t doorSeat) {
+	void *const ped = ResolveRemote(player);
+	if (!ped)
+		return false;
+	void *const car = JackCar(carHandle);
+	if (!car)
+		return false;
+
+	// Who is in that seat here, for the log: the local player on the victim's
+	// own machine, a replica or a traffic driver anywhere else.
+	void *const victim = SeatOccupant(car, doorSeat);
+	if (!BeginPedJackCar(ped, car, doorSeat)) {
+		static int said = 0;
+		if (said < 3) {
+			++said;
+			Log("bridge: %s's jack would not start here (seat of door %u holds %s, "
+			    "state %u); they get in at the claim instead",
+			    player.nick.c_str(), doorSeat,
+			    !victim ? "nobody" : victim == PlayerPed() ? "us" : "a ped",
+			    victim ? Field<uint32_t>(victim, offs::PED_STATE) : 0u);
+		}
+		return false;
+	}
+	player.enterWatch.Begin(WallClock::NowMs(), EntryProgressMark(ped));
+
+	static int said = 0;
+	if (said < 3) {
+		++said;
+		Log("bridge: %s is jacking a car through the door of seat %u; our engine "
+		    "drags out %s",
+		    player.nick.c_str(), doorSeat,
+		    victim == PlayerPed() ? "the local player" : "the ped in that seat");
+	}
+	return true;
+}
+
+uint8_t PollJackRemotePed(RemotePlayer &player, int32_t carHandle) {
+	void *const ped = ResolveRemote(player);
+	if (!ped)
+		return SEAT_LOST;
+	void *const car = JackCar(carHandle);
+	if (!car)
+		return SEAT_LOST;
+	return PollRemoteEntry(player, ped, car, 0);
+}
+
+uint8_t RemoteBeingPulledOut(RemotePlayer &player) {
+	return PedPullOut(ResolveRemote(player));
+}
+
+uint8_t LocalBeingPulledOut() { return PedPullOut(PlayerPed()); }
+
+uint8_t PollRemoteEntry(RemotePlayer &player, void *ped, void *car, uint8_t seat) {
+	const uint8_t progress = PollPedEnterCar(ped, car, seat);
+	if (progress != SEAT_RUNNING)
+		return progress;
+
+	// Still in PED_ENTER_CAR, but is the animation going anywhere? A stuck one
+	// is handed back as lost now rather than left to the deadline, which is
+	// long enough for the slowest door there is. client.h, EntryWatch.
+	if (player.enterWatch.Stalled(WallClock::NowMs(), EntryProgressMark(ped))) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			Log("bridge: %s's door-opening animation stopped moving for %u ms, so "
+			    "the entry is given up on",
+			    player.nick.c_str(), SEAT_ANIM_STALL_MS);
+		}
+		return SEAT_LOST;
+	}
+	return SEAT_RUNNING;
 }
 
 void AbandonSeatRemotePed(RemotePlayer &player) {
@@ -2751,9 +3089,13 @@ void EndSeatedDriveBy(RemotePlayer &player, void *ped) {
 	}
 }
 
+bool RebuildForFreedLookSlot(RemotePlayer &player, void *ped);
+
 void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	void *ped = ResolveRemote(player);
 	if (!ped)
+		return;
+	if (RebuildForFreedLookSlot(player, ped))
 		return;
 
 	// Before anything else, and before every early return below, because it
@@ -2802,10 +3144,15 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	// exit event arrives; and an entry that the engine abandoned without
 	// anybody noticing. In all three the ped is back on the pose stream on
 	// the very next frame instead of standing frozen until a packet says so.
+	//
+	// PED_DRAG_FROM_CAR too, for the frame between the drag's finish callback
+	// clearing bInVehicle and its delete callback putting the ped down beside
+	// the door: a jack played here is still carrying the ped out.
 	const uint32_t pedState      = Field<uint32_t>(ped, offs::PED_STATE);
 	const bool     engineHasThem = Field<bool>(ped, offs::PED_IN_VEHICLE) ||
 	                           pedState == PEDSTATE_ENTER_CAR ||
-	                           pedState == PEDSTATE_CARJACK;
+	                           pedState == PEDSTATE_CARJACK ||
+	                           pedState == PEDSTATE_DRAG_FROM_CAR;
 	if ((player.Seated() || player.Entering()) && engineHasThem) {
 		Field<float>(ped, offs::PED_HEALTH) = player.last.health;
 		Field<float>(ped, offs::PED_ARMOUR) = player.last.armour;
@@ -2868,6 +3215,248 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 	ApplyAnimation(player, ped);
 }
 
+// ---- Claude's clothes on a remote player ----------------------------------
+//
+// look.h has the why. This is the engine half: read the four special slots,
+// load a look into one, and get out of the way when a script wants one - or
+// wants model 0 renamed under a remote ped built from it.
+
+using RequestSpecialModelFn = void(__cdecl *)(int32_t, const char *, int32_t);
+
+static_assert(LOOK_SLOTS == NUM_SPECIAL_CHARS, "one LookSlot per special char");
+static_assert(LOOK_HELD_FLAGS == (STREAMFLAGS_DONT_REMOVE | STREAMFLAGS_SCRIPTOWNED),
+              "look.h's idea of a held model is the streamer's");
+
+Detour g_specialModelHook;
+bool   g_lookHooked               = false;
+bool   g_lookSlotOurs[LOOK_SLOTS] = {};
+// Our own RequestSpecialModel calls go through the detour too.
+bool   g_requestingLook  = false;
+bool   g_saidLookRefused = false;
+bool   g_saidNoLookSlot  = false;
+bool   g_saidLookMissing = false;
+
+uint8_t StreamingByte(uint32_t modelId, size_t field) {
+	return *reinterpret_cast<const uint8_t *>(CStreaming__ms_aInfoForModel +
+	                                          modelId * STREAMING_INFO_STRIDE + field);
+}
+
+LookSlot ReadLookSlot(int i) {
+	const uint16_t id = static_cast<uint16_t>(MI_SPECIAL01 + i);
+	LookSlot       s;
+	if (const char *const name = ModelName(id)) {
+		std::memcpy(s.name, name, sizeof s.name);
+		s.name[sizeof s.name - 1] = '\0';
+		s.refs = *reinterpret_cast<const uint16_t *>(name - offs::MODELINFO_NAME +
+		                                             offs::MODELINFO_REFCOUNT);
+	}
+	s.loadState = StreamingByte(id, STREAMING_LOADSTATE_OFFS);
+	s.flags     = StreamingByte(id, STREAMING_FLAGS_OFFS);
+	s.ours      = g_lookSlotOurs[i];
+	return s;
+}
+
+bool LookModelWanted(uint16_t model) {
+	for (uint16_t m : g_lookModelOf)
+		if (m == model)
+			return true;
+	return false;
+}
+
+// Hands back every slot we hold that nothing is built from and nobody is
+// waiting on, the way UNLOAD_SPECIAL_CHARACTER does it.
+void ReleaseLookSlots() {
+	for (int i = 0; i < LOOK_SLOTS; ++i) {
+		const uint16_t model = static_cast<uint16_t>(MI_SPECIAL01 + i);
+		const LookSlot s     = ReadLookSlot(i);
+		if (!LookSlotReleasable(s, LookModelWanted(model)))
+			continue;
+		Func<void(__cdecl *)(int32_t)>(CStreaming__SetMissionDoesntRequireModel)(model);
+		g_lookSlotOurs[i] = false;
+		Log("look: special slot %d ('%s') is free again", i + 1, s.name);
+	}
+}
+
+// RequestSpecialModel never checks FindItem's answer (addresses.h), so a
+// name that isn't in gta3.img is checked here instead.
+bool LookInImage(const char *look) {
+	void *const dir = Global<void *>(CStreaming__ms_pExtraObjectsDir);
+	if (!dir)
+		return false;
+	using FindFn    = bool(__thiscall *)(void *, const char *, uint32_t *, uint32_t *);
+	uint32_t offset = 0, size = 0;
+	return Func<FindFn>(CDirectory__FindItem)(dir, look, &offset, &size);
+}
+
+bool PrepareRemoteLook(RemotePlayer &player) {
+	if (!g_lookHooked || player.playerId >= MAX_PLAYERS)
+		return IsModelReady(player.modelId);
+
+	uint16_t &chosen = g_lookModelOf[player.playerId];
+	if (player.modelId != MI_PLAYER) {
+		chosen = MI_PLAYER;
+		return IsModelReady(player.modelId);
+	}
+	// Our model 0 is what their look is measured against, and it's the old
+	// gate as well: no local player yet, no remote ones. It's also unloaded
+	// for the few frames UNDRESS_CHAR takes to swap it.
+	if (!HasModelLoaded(MI_PLAYER))
+		return false;
+
+	const char *const ours = ModelName(MI_PLAYER);
+	LookSlot          slots[LOOK_SLOTS];
+	for (int i = 0; i < LOOK_SLOTS; ++i)
+		slots[i] = ReadLookSlot(i);
+
+	chosen                = MI_PLAYER;
+	const LookChoice pick = PickLookSlot(player.look, ours, slots);
+	switch (pick.pick) {
+	case LookPick::Model0:
+		break;
+	case LookPick::Refused:
+		if (!g_saidLookRefused) {
+			g_saidLookRefused = true;
+			Log("look: %s is wearing '%s', which isn't one of Claude's; building "
+			    "them from our model 0 ('%s')",
+			    player.nick.c_str(), player.look, ours);
+		}
+		break;
+	case LookPick::NoSlot:
+		if (!g_saidNoLookSlot) {
+			g_saidNoLookSlot = true;
+			Log("look: all four special slots are in use by the script; %s gets our "
+			    "model 0 ('%s') instead of '%s' until one is free",
+			    player.nick.c_str(), ours, player.look);
+		}
+		break;
+	case LookPick::Slot: {
+		const int      i     = pick.slot;
+		const uint16_t model = static_cast<uint16_t>(MI_SPECIAL01 + i);
+		if (!slots[i].ours || !SameLook(slots[i].name, player.look) ||
+		    slots[i].loadState == STREAMING_NOTLOADED) {
+			if (!LookInImage(player.look)) {
+				if (!g_saidLookMissing) {
+					g_saidLookMissing = true;
+					Log("look: '%s' (%s) isn't in gta3.img here; building them from "
+					    "our model 0 ('%s')",
+					    player.look, player.nick.c_str(), ours);
+				}
+				break;
+			}
+			if (!slots[i].ours)
+				Log("look: loading '%s' into special slot %d for %s", player.look, i + 1,
+				    player.nick.c_str());
+			g_requestingLook = true;
+			Func<RequestSpecialModelFn>(CStreaming__RequestSpecialModel)(
+			    model, player.look, STREAMFLAGS_SCRIPTOWNED | STREAMFLAGS_PRIORITY);
+			g_requestingLook  = false;
+			g_lookSlotOurs[i] = true;
+		}
+		chosen = model;
+		break;
+	}
+	}
+
+	ReleaseLookSlots();
+	return chosen == MI_PLAYER || HasModelLoaded(chosen);
+}
+
+// Before a script renames model 0 or a special slot, any remote ped built
+// from it comes down - the same thing UNDRESS_CHAR does to the one ped it
+// knows about (addresses.h, CStreaming__RequestSpecialModel). ResolveRemote
+// notices the handle has gone and the two-phase spawn builds the ped again
+// once the model has streamed back in, in whichever model its look now
+// needs.
+//
+// A special slot a script asks for stops being ours even when the name
+// doesn't change: from here on it is the mission's to unload.
+void MakeRoomForSpecialModel(int32_t modelId, const char *name) {
+	const bool slot = modelId >= MI_SPECIAL01 && modelId < MI_SPECIAL01 + LOOK_SLOTS;
+	if (modelId != MI_PLAYER && !slot)
+		return;
+
+	if (slot && g_lookSlotOurs[modelId - MI_SPECIAL01]) {
+		g_lookSlotOurs[modelId - MI_SPECIAL01] = false;
+		Log("look: the script wants special slot %d for '%s'; giving it back",
+		    modelId - MI_SPECIAL01 + 1, name);
+	}
+
+	// The engine's own test: the same name is only a RequestModel and
+	// touches nothing built from the model.
+	const char *const current = ModelName(static_cast<uint32_t>(modelId));
+	if (!current || std::strncmp(current, name, offs::MODELINFO_NAME_LEN) == 0)
+		return;
+
+	using GetPedFn = void *(__cdecl *)(int32_t);
+	for (uint8_t i = 0; i < MAX_PLAYERS; ++i) {
+		if (g_remotePeds[i].poolHandle < 0)
+			continue;
+		void *const ped = Func<GetPedFn>(CPools__GetPed)(g_remotePeds[i].poolHandle);
+		if (!ped || Field<uintptr_t>(ped, offs::VTABLE) != CCivilianPed__vtable ||
+		    Field<uint16_t>(ped, offs::MODEL_INDEX) != modelId)
+			continue;
+
+		Log("look: '%s' is replacing '%s' in model %d; taking player %u's ped down "
+		    "first",
+		    name, current, modelId, i);
+		EndRemoteProjectilesOf(i);
+		// Out of any car first: WarpPedIntoCar registered a pointer into this
+		// ped on the car, and nothing else would take it back.
+		UnseatPedFromCar(ped);
+		DestroyRemotePed(ped);
+		g_remotePeds[i]    = RemotePedIdentity{};
+		g_lookTakenDown[i] = true;
+	}
+}
+
+// A remote Claude who got our model 0 because every slot was a mission's,
+// checked every 64 frames: once one is free again, the ped is taken back and
+// the two-phase spawn builds it in the right clothes. Left alone while
+// seated or dying, where a rebuild costs more than the wrong shirt does.
+bool RebuildForFreedLookSlot(RemotePlayer &player, void *ped) {
+	if (!g_lookHooked || (FrameNow() & 63) != 0 || player.modelId != MI_PLAYER ||
+	    player.playerId >= MAX_PLAYERS ||
+	    Field<uint16_t>(ped, offs::MODEL_INDEX) != MI_PLAYER || player.Seated() ||
+	    Field<bool>(ped, offs::PED_IN_VEHICLE))
+		return false;
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+		return false;
+
+	LookSlot slots[LOOK_SLOTS];
+	for (int i = 0; i < LOOK_SLOTS; ++i)
+		slots[i] = ReadLookSlot(i);
+	if (PickLookSlot(player.look, ModelName(MI_PLAYER), slots).pick != LookPick::Slot ||
+	    !LookInImage(player.look))
+		return false;
+
+	Log("look: a special slot is free now; rebuilding %s in '%s'", player.nick.c_str(),
+	    player.look);
+	EndRemoteProjectilesOf(player.playerId);
+	DestroyRemotePed(ped);
+	player.poolHandle   = -1;
+	player.spawnPending = true;
+	ForgetRemotePed(player);
+	return true;
+}
+
+void __cdecl HookedRequestSpecialModel(int32_t modelId, const char *name, int32_t flags) {
+	if (!g_requestingLook && name)
+		MakeRoomForSpecialModel(modelId, name);
+	g_specialModelHook.Original<RequestSpecialModelFn>()(modelId, name, flags);
+}
+
+// Model 0's name, which is which clothes the local player is in.
+bool SampleLocalPlayerLook(char (&look)[PLAYER_LOOK_LEN]) {
+	if (!PlayerPed())
+		return false;
+	const char *const name = ModelName(MI_PLAYER);
+	if (!name)
+		return false;
+	std::memcpy(look, name, PLAYER_LOOK_LEN);
+	return CleanPlayerLook(look);
+}
+
 } // namespace
 
 void *LightWatchedPedFire(void *ped) { return ped ? LightRemoteFire(ped) : nullptr; }
@@ -2886,7 +3475,7 @@ bool SampleRemotePedPosition(const RemotePlayer &player, Vec3 &out) {
 		return false;
 	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
 	if (Field<bool>(ped, offs::PED_IN_VEHICLE) || state == PEDSTATE_ENTER_CAR ||
-	    state == PEDSTATE_CARJACK)
+	    state == PEDSTATE_CARJACK || state == PEDSTATE_DRAG_FROM_CAR)
 		return false;
 	out = Vec3{Field<float>(ped, offs::POSITION + 0), Field<float>(ped, offs::POSITION + 4),
 	           Field<float>(ped, offs::POSITION + 8)};
@@ -2958,6 +3547,14 @@ bool SampleLocalCarEntry(LocalCarEntry &out) {
 	                        ? 0
 	                        : static_cast<uint8_t>(doorSeat);
 	out.door          = static_cast<uint8_t>(doorSeat);
+
+	// A jack: SetCarJack's state, or the quick jack PedAnimAlignCB can turn an
+	// ordinary SetEnterCar into when there is a driver behind that door
+	// (addresses.h, ANIM_STD_CAR_QJACK). The second only shows once the align
+	// animation is over, so it goes out a moment after the plain intent.
+	void *const anim = Field<void *>(ped, offs::PED_VEHICLE_ANIM);
+	out.jack = state == PEDSTATE_CARJACK ||
+	           (anim && Field<int32_t>(anim, ANIM_ID) == ANIM_STD_CAR_QJACK);
 	return true;
 }
 
@@ -2979,6 +3576,12 @@ int CancelCarEntry(void *ped) {
 		return 0;
 	return AbandonPedEnterCar(ped);
 }
+
+bool ReleaseExitDoor(void *ped, void *car) { return GiveBackExitDoor(ped, car); }
+
+uint32_t CarEntryMark(void *ped) { return ped ? EntryProgressMark(ped) : 0; }
+
+uint8_t PullOutOf(void *ped) { return PedPullOut(ped); }
 
 // The two things game/combat.cpp needs from in here, nothing else.
 //
@@ -3040,6 +3643,33 @@ void RemoveAimPitchHook() {
 	g_pointGunHook.Remove();
 	g_replicaPitch.Clear();
 	g_localAim = LocalAimRecord{};
+}
+
+bool InstallLookHook() {
+	if (!g_specialModelHook.Install("CStreaming::RequestSpecialModel",
+	                                reinterpret_cast<void *>(CStreaming__RequestSpecialModel),
+	                                reinterpret_cast<void *>(&HookedRequestSpecialModel))) {
+		Log("look: FAILED to hook CStreaming::RequestSpecialModel at 0x%08X; every "
+		    "remote Claude wears whatever our model 0 is",
+		    CStreaming__RequestSpecialModel);
+		for (const auto &f : HookFailures())
+			Log("look:   %s: %s", f.name.c_str(), f.reason.c_str());
+		return false;
+	}
+	g_lookHooked = true;
+	Log("look: hooked CStreaming::RequestSpecialModel at 0x%08X",
+	    CStreaming__RequestSpecialModel);
+	return true;
+}
+
+// After Client::Stop, so no remote ped is built from a slot any more and
+// every one we hold can go back.
+void RemoveLookHook() {
+	g_specialModelHook.Remove();
+	g_lookHooked = false;
+	for (uint16_t &m : g_lookModelOf)
+		m = MI_PLAYER;
+	ReleaseLookSlots();
 }
 
 int32_t StdAnimGroupCount() { return AnimGroupCount(ASSOCGRP_STD); }
@@ -3190,6 +3820,8 @@ WorldBridge MakeWorldBridge() {
 	b.RequestModel      = &RequestModel;
 	b.IsModelReady      = &IsModelReady;
 	b.SampleLocalPlayerModel = &SampleLocalPlayerModel;
+	b.SampleLocalPlayerLook  = &SampleLocalPlayerLook;
+	b.PrepareRemoteLook      = &PrepareRemoteLook;
 	b.SampleLocalAmmo        = &SampleLocalAmmo;
 	b.ApplyRemoteAmmo        = &ApplyRemoteAmmoSlot;
 	b.ApplyRemotePose   = &ApplyRemotePose;
@@ -3227,6 +3859,10 @@ WorldBridge MakeWorldBridge() {
 	b.AbandonSeatRemotePed = &AbandonSeatRemotePed;
 	b.BeginUnseatRemotePed = &BeginUnseatRemotePed;
 	b.SampleLocalCarEntry  = &SampleLocalCarEntry;
+	b.BeginJackRemotePed   = &BeginJackRemotePed;
+	b.PollJackRemotePed    = &PollJackRemotePed;
+	b.RemoteBeingPulledOut = &RemoteBeingPulledOut;
+	b.LocalBeingPulledOut  = &LocalBeingPulledOut;
 
 	// Combat. These three live in game/combat.cpp because they're driven by
 	// detours rather than the frame pump, and because every address they use

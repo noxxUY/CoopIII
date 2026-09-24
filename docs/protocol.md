@@ -3492,6 +3492,32 @@ on what it hears: for another version or a wrong password it stops asking until
 the game restarts, for a full server it asks every 15 s, and the HUD says which
 it was.
 
+### 1.28 Claude's clothes are a name, not a model
+
+The opening puts Claude in prison clothes and 8-Ball's mission takes them off
+again, and every remote Claude looked like whatever the watching machine's own
+Claude was wearing. The model id could not say otherwise: it is 0 in both.
+`UNDRESS_CHAR` (handler `0x0044AAFC`) does not move the ped to another model,
+it renames model 0 through `CStreaming::RequestSpecialModel` (`0x0040A890`) -
+`"playerp"`, then `"player"` - and `DRESS_CHAR` rebuilds the ped around it.
+
+So the name travels: `C_PlayerLook` on change and once per session, stored by
+the server for joiners. The receiver can't build a remote Claude in the other
+clothes from model 0, because every ped of model 0 on its machine wears its
+own Claude's. A remote player whose look differs is built from one of the four
+special-character slots (26-29) instead, loaded with their look the way
+`LOAD_SPECIAL_CHARACTER` loads 8-Ball (`client/src/game/look.h`).
+
+The slots belong to the missions. One is only taken when nothing is built
+from it and nothing holds it, special04 first because missions fill special01
+first. A detour on `RequestSpecialModel` sees every script request before it
+lands: a slot the script asks for is handed back, and any remote ped built
+from a model about to be renamed - the slot, or model 0 while our own Claude
+changes - is taken down first, which is what `UNDRESS_CHAR` does to the one
+ped it knows about. The two-phase spawn builds it again once the model has
+streamed. With all four slots in use the remote player is built from model 0
+in our clothes, as before, and the log says so once.
+
 ## 2. Design decisions
 
 ### 2.1 Topology: dedicated server, client-authoritative players
@@ -3875,7 +3901,9 @@ model that doesn't exist yet.
 | 0xC0 | `C_OBJECT_BROKEN` | 1 | `ObjectBreakBody`: `ObjectIdent` (pos `float[3]` = `m_objectMatrix`'s position, model index `i16`, 2 pad), `amount` `float`, `state` `u8`, 3 pad (§1.17) |
 | 0xC1 | `S_OBJECT_BROKEN` | 1 | `playerId` + `ObjectBreakBody`. To everyone but the reporter |
 | 0xC2 | `C_OBJECT_SETTLED` / 0xC3 `S_OBJECT_SETTLED` | 1 | where a knocked-over object came to rest: its `ObjectIdent` and the whole matrix, sent when the engine's own sleep test says it stopped; `S_` also carries `playerId` ([objects.md](objects.md)) |
-| 0xC4-0xCF | - | - | Free for breakable objects |
+| 0xC4-0xC9 | - | - | Free for breakable objects |
+| 0xCA | `C_PLAYER_LOOK` / 0xCB `S_PLAYER_LOOK` | 1 | the name model 0 is loaded under, `char[24]`, lower case; `S_` also carries `playerId`. Claude's clothes (§1.28). Change-only, kept by the server and backfilled right after the joins |
+| 0xCC-0xCF | - | - | Free for breakable objects |
 | 0xD8 | `C_PED_DEATH` / 0xD9 `S_PED_DEATH` | 1 | an ambient pedestrian his host's engine killed: `netId` `u16`, anim `u16`. Host-only, like the despawn and the limb, and the one of the three the server **keeps** - a joiner is handed the corpse (`population.md` §5) |
 | 0xDA-0xDF | - | - | Reserved beside it, for whatever else only a ped's host can witness |
 | 0xE0 | `C_MONEY_CHANGE` / 0xE1 `S_MONEY` | 1 | the sender's cash moving, and the session's answer: the rule, the pool and whose change it was. Nothing is sent with `money = off` |

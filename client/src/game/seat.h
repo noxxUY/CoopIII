@@ -40,10 +40,10 @@ void SetSeatKey(int virtualKey);
 // frames of one tick is still one request.
 bool LocalWantsSeatToggle();
 
-// Put the local player in the first free passenger seat of the car this pool
-// ref names. Returns the seat index the engine gave it (1..8), or -1 if it
-// could not: no such car, no free seat, or the player is not in a state to
-// be seated.
+// Put the local player in a free passenger seat of the car this pool ref
+// names, on his own side of it if one is free (PickPassengerSeat, client.h).
+// Returns the seat index the engine gave it (1..8), or -1 if it could not: no
+// such car, no free seat, or the player is not in a state to be seated.
 //
 // Never seats anyone in the driver's seat. Taking the wheel is the enter key
 // and the engine's business; this is only ever the seat beside it.

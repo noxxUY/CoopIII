@@ -129,7 +129,27 @@ PickupIdent IdentOf(size_t slot) {
 	id.flags      = ModelOf(slot) == ModelIndexGlobal(MI_PICKUP_BRIBE)
 	                    ? PICKUP_F_BRIBE
 	                    : 0;
+	// And the skull, whose claim opens a vote rather than taking it.
+	if (ModelOf(slot) == ModelIndexGlobal(MI_PICKUP_KILLFRENZY))
+		id.flags |= PICKUP_F_RAMPAGE;
 	return id;
+}
+
+bool IsSkull(size_t slot) {
+	return ModelOf(slot) == ModelIndexGlobal(MI_PICKUP_KILLFRENZY);
+}
+
+// The skull's own gate out of CPickup::Update, asked with the engine's own
+// functions: no mission, no frenzy running, and a game with blood in it.
+bool SkullAllowed() {
+	using BoolFn = bool(__cdecl *)();
+	return !Func<BoolFn>(CTheScripts__IsPlayerOnAMission)() &&
+	       !Func<BoolFn>(CDarkel__FrenzyOnGoing)() && Global<uint8_t>(CGame__nastyGame) != 0;
+}
+
+bool OnFoot() {
+	using FindPlayerVehicleFn = void *(__cdecl *)();
+	return Func<FindPlayerVehicleFn>(FindPlayerVehicle)() == nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +270,20 @@ void CountPackageForUs() {
 	    CWorld__Players + focus * offs::PLAYERINFO_STRIDE);
 	*reinterpret_cast<int32_t *>(info + offs::PLAYERINFO_COLLECTED_PACKAGES) += 1;
 	*reinterpret_cast<int32_t *>(info + offs::PLAYERINFO_MONEY) += 1000;
+}
+
+// A voted skull the player has walked off, taken for him. What CPickup::Update
+// does once the touch and the gate have passed, for a ONCE pickup:
+// GivePlayerGoodiesWithPickUpMI, which for the skull is its sound
+// (0x00433B30), then the removal tail at 0x00431231, then CPickups::Update's
+// AddToCollectedPickupsArray - which is what rampage.sc polls. Not the pad
+// shake; he isn't standing on anything.
+void TakeSkullForUs(size_t slot) {
+	using GoodiesFn = bool(__cdecl *)(uint32_t modelIndex, int32_t playerIndex);
+	Func<GoodiesFn>(CPickups__GivePlayerGoodiesWithPickUpMI)(
+	    static_cast<uint32_t>(static_cast<uint16_t>(ModelOf(slot))), 0);
+	ReplayEngineRemoval(slot);
+	TellTheScript(slot);
 }
 
 // ---------------------------------------------------------------------------
@@ -589,9 +623,10 @@ void __cdecl HookedPickupsUpdate() {
 
 		// A claim that was never answered. Reliable and ordered, so this only
 		// fires on a real fault - but a pickup that silently stops working
-		// forever is worse than a retry.
-		if (slot.gate == PickupGate::CLAIMED &&
-		    g_frame - slot.claimedFrame > kClaimTimeoutFrames) {
+		// forever is worse than a retry. A skull's answer waits for a vote.
+		const bool     skull   = IsSkull(i);
+		const uint32_t timeout = skull ? kSkullClaimTimeoutFrames : kClaimTimeoutFrames;
+		if (slot.gate == PickupGate::CLAIMED && g_frame - slot.claimedFrame > timeout) {
 			slot.gate = PickupGate::BLOCKED;
 			++g_stats.claimTimeouts;
 			if (!g_saidTimeout) {
@@ -603,14 +638,28 @@ void __cdecl HookedPickupsUpdate() {
 			}
 		}
 
-		if (slot.gate == PickupGate::BLOCKED && havePlayer && IsLive(i) &&
-		    Dist2(PosOf(i), player) <= kClaimRadiusSq) {
+		// A skull is asked for on the touch and only when the engine would
+		// have let us have it, since the asking starts a vote. pickup.h,
+		// SkullTouched.
+		bool wanted = havePlayer && IsLive(i) && Dist2(PosOf(i), player) <= kClaimRadiusSq;
+		if (wanted && skull) {
+			const float *at = PosOf(i);
+			wanted = static_cast<int32_t>(g_frame - slot.retryFrame) >= 0 &&
+			         SkullTouched(!OnFoot(), player[0] - at[0], player[1] - at[1],
+			                      player[2] - at[2]) &&
+			         SkullAllowed();
+		}
+		if (slot.gate == PickupGate::BLOCKED && wanted) {
 			const PickupIdent ident = IdentOf(i);
 			if (FindSlot(ident, true) == i) {   // refuses an ambiguous ident
 				slot.ident        = ident;
 				slot.gate         = PickupGate::CLAIMED;
 				slot.claimedFrame = g_frame;
 				++g_stats.claimsSent;
+				if (skull)
+					Log("pickup: touched a skull at (%.0f %.0f %.0f), asking the session "
+					    "before anything starts",
+					    ident.pos.x, ident.pos.y, ident.pos.z);
 				g_cb.Claim(ident);
 			}
 		}
@@ -652,7 +701,10 @@ void __cdecl HookedPickupsUpdate() {
 			// Taken. (Or, far more rarely, removed by the script in the same
 			// frame - in which case the session records a collection nobody
 			// made, which costs one pickup and no correctness.)
-			slot.gate = PickupGate::BLOCKED;
+			if (slot.voted)
+				Log("pickup: the voted skull was taken by the engine itself, slot %zu", i);
+			slot.gate  = PickupGate::BLOCKED;
+			slot.voted = false;
 			++g_stats.collected;
 
 			// Once, and then never again. Every other seam in this project
@@ -671,6 +723,36 @@ void __cdecl HookedPickupsUpdate() {
 				    slot.ident.pos.x, slot.ident.pos.y, slot.ident.pos.z);
 			}
 
+			if (g_cb.Collected)
+				g_cb.Collected(slot.ident);
+			continue;
+		}
+
+		// A skull the session voted for. The engine gets a few frames to take
+		// it the ordinary way, if the player is still on it; after that it is
+		// taken for him, through the same steps the engine's ONCE arm ends
+		// in, because by now everybody else is on their way here.
+		if (slot.voted) {
+			if (g_frame - slot.claimedFrame < kSkullEngineGraceFrames)
+				continue;
+			slot.gate  = PickupGate::BLOCKED;
+			slot.voted = false;
+			if (!SkullAllowed()) {
+				// A mission started, or a frenzy did, since the touch. The
+				// engine wouldn't hand it over now, and neither do we.
+				Log("pickup: the voted skull can't be taken any more (a mission or a "
+				    "frenzy is running here), so it was given back");
+				if (g_cb.Release) {
+					++g_stats.releases;
+					g_cb.Release(slot.ident);
+				}
+				continue;
+			}
+			TakeSkullForUs(i);
+			++g_stats.collected;
+			Log("pickup: took the voted skull at (%.0f %.0f %.0f) for the player, who had "
+			    "moved off it; the session was told and the rampage starts everywhere",
+			    slot.ident.pos.x, slot.ident.pos.y, slot.ident.pos.z);
 			if (g_cb.Collected)
 				g_cb.Collected(slot.ident);
 			continue;
@@ -812,8 +894,16 @@ bool OnPickupGrantedToUs(const PickupIdent &ident) {
 	}
 
 	++g_stats.grants;
-	g_slots[slot].gate  = PickupGate::GRANTED;
-	g_slots[slot].ident = ident;
+	PickupSlot &s  = g_slots[slot];
+	s.gate         = PickupGate::GRANTED;
+	s.ident        = ident;
+	s.voted        = (ident.flags & PICKUP_F_VOTED) != 0;
+	s.ident.flags  = static_cast<uint8_t>(s.ident.flags & ~PICKUP_F_VOTED);
+	s.claimedFrame = g_frame;
+	if (s.voted)
+		Log("pickup: the session voted for our skull at (%.0f %.0f %.0f); it's ours to "
+		    "take now",
+		    ident.pos.x, ident.pos.y, ident.pos.z);
 	return true;
 }
 
@@ -909,6 +999,14 @@ void OnPickupDenied(const PickupIdent &ident) {
 		if (g_slots[i].gate == PickupGate::CLAIMED &&
 		    SameIdent(g_slots[i].ident, ident)) {
 			g_slots[i].gate = PickupGate::BLOCKED;
+			// A skull: the vote failed, or another one is running. It stays
+			// where it is, and can be touched again in a moment.
+			if ((g_slots[i].ident.flags & PICKUP_F_RAMPAGE) != 0) {
+				g_slots[i].retryFrame = g_frame + kSkullRetryFrames;
+				Log("pickup: the skull at (%.0f %.0f %.0f) wasn't given to us; it stays "
+				    "put and can be touched again in %u s",
+				    ident.pos.x, ident.pos.y, ident.pos.z, kSkullRetryFrames / 60);
+			}
 			return;
 		}
 	}

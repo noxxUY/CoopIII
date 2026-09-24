@@ -206,6 +206,38 @@ void TestABackfilledPlayerCarriesTheirCondition() {
 	Check((j->flags & PJF_DEAD) == 0, "and alive");
 }
 
+// Claude's clothes are sent on change, so a joiner is only told them if the
+// session wrote them down.
+void TestAJoinerIsToldWhatEverybodyIsWearing() {
+	std::printf("\nwhat a player is wearing, for whoever joins later\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+
+	char look[PLAYER_LOOK_LEN] = "PLAYERP";
+	Check(s.NotePlayerLook(*alice, look), "a new look is worth relaying");
+	Check(std::string(alice->look) == "playerp", "and is kept cleaned");
+	Check(!s.NotePlayerLook(*alice, look), "the same one again is not");
+	char junk[PLAYER_LOOK_LEN] = "bad name";
+	Check(!s.NotePlayerLook(*alice, junk) && std::string(alice->look) == "playerp",
+	      "a name no engine would take is dropped");
+
+	Player *bob = Join(s, 2, "bob");
+	const Backfill back = s.BuildBackfill(bob->id, 77);
+	Check(back.looks.size() == 1, "bob is told alice's look");
+	if (!back.looks.empty())
+		Check(back.looks[0].hdr.opcode == OP_S_PLAYER_LOOK &&
+		          back.looks[0].hdr.sendTimeMs == 77 &&
+		          back.looks[0].playerId == alice->id &&
+		          std::string(back.looks[0].look) == "playerp",
+		      "as a real S_PlayerLook, tagged with whose it is");
+	Check(s.BuildBackfill(alice->id, 1).looks.empty(),
+	      "and nobody is told a look that was never said");
+
+	s.RemovePeer(1);
+	Player *carl = Join(s, 3, "carl");
+	Check(carl->look[0] == '\0', "a reused slot starts with no look");
+}
+
 // A joiner has to be told which doors are currently open for somebody.
 //
 // The garage mask is a *level* and it is only sent when it changes, so
@@ -1929,8 +1961,8 @@ void TestTrafficThatIsGoneTakesNoHits() {
 	          s.CarHitRecipient(taken, alice->id) == nullptr,
 	      "and it's no longer traffic, so this exchange has nobody to tell");
 
-	// The host left. The server drops their cars too (Server::DropCarsOf),
-	// but the lookup mustn't depend on that having run first.
+	// The host left. The server hands their cars on or drops them first
+	// (Session::HandOverAmbientOf), but the lookup mustn't depend on that.
 	const uint16_t orphan = s.AddCar(alice->id, CarBody(93, 3.0f))->netId;
 	s.RemovePeer(1);
 	Check(s.CarHitRecipient(orphan, bob->id) == nullptr,
@@ -3823,7 +3855,14 @@ void TestAnAwardIsDeliveredOncePerCar() {
 	      "traffic has one host and is never keyed, so it is not deduped");
 }
 
+// tools/sessiontest/rampagevote.cpp
+int RunRampageVoteTests();
+int RunAdoptTests();
+
 int main() {
+	g_failures += RunRampageVoteTests();
+	g_failures += RunAdoptTests();
+	TestAJoinerIsToldWhatEverybodyIsWearing();
 	TestHostIsTheFirstPlayerIn();
 	TestAJoinerNeverTakesTheHostFromSomeoneStillHere();
 	TestTheLastPlayerOutTakesItWithThem();

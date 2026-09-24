@@ -322,8 +322,7 @@ void DrawArrows() {
 		                                     ArrowAngle(arrow.heading, cameraHeading),
 		                                     halfX, halfY);
 
-		const ArrowRgb rgb =
-		    UnpackTraceColour(GetRadarTraceColour(ArrowTraceColour(arrow.inVehicle)));
+		const ArrowRgb rgb = PlayerArrowRgb(id, arrow.inVehicle);
 		const Rgba colour{rgb.r, rgb.g, rgb.b, alpha};
 
 		const int *o = ARROW_DRAW_ORDER;
@@ -336,7 +335,8 @@ void DrawArrows() {
 			Log("radar: player %u (\"%s\") is an arrow on the minimap - %s, %s, "
 			    "%.0fx%.0f px, alpha %u",
 			    id, player.nick.c_str(),
-			    arrow.inVehicle ? "red (in a vehicle)" : "green (on foot)",
+			    arrow.inVehicle ? "their chat colour, darker (in a vehicle)"
+			                    : "their chat colour (on foot)",
 			    arrow.fromPed ? "from their ped" : "from the wire",
 			    halfX * 2.0f, halfY * 2.0f, unsigned(alpha));
 		}

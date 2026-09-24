@@ -1,9 +1,12 @@
-// The chat feed, the line being typed and the version mark: client/src/chatfeed.h.
+// The chat feed, the line being typed, the scoreboard and the version mark:
+// client/src/chatfeed.h and client/src/boardlayout.h.
 // The drawing and the keys are game/chat.cpp and need the game; what they draw
 // and what they send is all here.
 
+#include "boardlayout.h"
 #include "chatfeed.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -326,61 +329,158 @@ void TestTheColours() {
 	Check(none.r == none.g && none.g == none.b, "and nobody's is a plain grey");
 }
 
-void TestThePlayerList() {
-	std::printf("\nthe player list\n");
-	char row[FEED_MESSAGE];
-	FormatPlayerRow(row, sizeof row, "alice", 87.4f, 0, false, false);
-	Check(std::strcmp(row, "alice  87 hp") == 0, "a name and what is left of her");
-	FormatPlayerRow(row, sizeof row, "alice", 0.3f, 2, false, true);
-	Check(std::strcmp(row, "alice  1 hp  in a car  wanted 2") == 0,
-	      "alive is never 0 hp, and the car and the stars follow");
-	FormatPlayerRow(row, sizeof row, "bob", 50.0f, 3, true, false);
-	Check(std::strcmp(row, "bob  dead") == 0, "the dead are dead whatever else was said");
-	FormatPlayerRow(row, sizeof row, "", 100.0f, 9, false, false);
-	Check(std::strcmp(row, "?  100 hp  wanted 6") == 0,
-	      "no nick is a question mark, and six stars is the most");
-	FormatPlayerRow(row, sizeof row, "tank", 5000.0f, 0, false, false);
-	Check(std::strcmp(row, "tank  999 hp") == 0, "health a script set sky-high stays readable");
-	FormatPlayerRow(row, sizeof row, "~x", 10.0f, 0, false, false);
-	Check(row[0] == '-', "and a nick cannot carry a token into the list either");
-	FormatPlayerRow(row, sizeof row, "carol", 64.0f, 0, false, false, 54);
-	Check(std::strcmp(row, "carol  64 hp  54 ms") == 0, "and her round trip on the end");
-	FormatPlayerRow(row, sizeof row, "dave", 64.0f, 0, true, false, 1400);
-	Check(std::strcmp(row, "dave  dead  1s+") == 0, "a slow one past a second, dead or alive");
-	FormatPlayerRow(row, sizeof row, "erin", 64.0f, 0, false, false, PING_NONE);
-	Check(std::strcmp(row, "erin  64 hp") == 0, "and none while the server has not said");
-	FormatPlayerRow(row, sizeof row, "finn", 64.0f, 0, false, false, 40, QUIET_AFTER_MS - 1);
-	Check(std::strcmp(row, "finn  64 hp  40 ms") == 0, "a couple of missed packets say nothing");
-	FormatPlayerRow(row, sizeof row, "finn", 64.0f, 0, false, false, 40, 12500);
-	Check(std::strcmp(row, "finn  64 hp  quiet 12s  40 ms") == 0,
-	      "but a player nothing has come from for a while is marked, and for how long");
-	FormatPlayerRow(row, sizeof row, "finn", 64.0f, 0, false, false, PING_NONE, 5000000);
-	Check(std::strcmp(row, "finn  64 hp  quiet 999s+") == 0, "without running off the row");
-	FormatPlayerRow(row, sizeof row, "gus", 64.0f, 0, false, false, 40, 0, 740);
-	Check(std::strcmp(row, "gus  64 hp  off 7.4 m  40 ms") == 0,
-	      "a copy of them somewhere else says how far");
-	FormatPlayerRow(row, sizeof row, "gus", 64.0f, 0, false, false, 40, 0, 99);
-	Check(std::strcmp(row, "gus  64 hp  40 ms") == 0, "under a metre is not worth a word");
-	FormatPlayerRow(row, sizeof row, "gus", 64.0f, 0, false, false, PING_NONE, 0, 4210);
-	Check(std::strcmp(row, "gus  64 hp  off 42 m") == 0, "past ten metres, whole metres");
-	FormatPlayerRow(row, sizeof row, "gus", 64.0f, 0, false, false, PING_NONE, 0, DESYNC_MAX_CM);
-	Check(std::strcmp(row, "gus  64 hp  off 655 m+") == 0, "and the cap says it is the cap");
-	FormatPlayerRow(row, sizeof row, "gus", 64.0f, 0, false, false, PING_NONE, 0, DESYNC_UNKNOWN);
-	Check(std::strcmp(row, "gus  64 hp") == 0, "nothing when nothing was compared");
-	FormatPlayerRow(row, sizeof row, "gus", 64.0f, 0, false, false, PING_NONE, 12500, 740);
-	Check(std::strcmp(row, "gus  64 hp  quiet 12s") == 0,
-	      "and nothing for somebody quiet, which already says why");
+bool Inside(const BoardLayout &b, float screenW, float screenH) {
+	return b.left >= 0.0f && b.top >= 0.0f && b.left + b.width <= screenW &&
+	       b.top + b.height <= PrintableHeight(screenW, screenH);
+}
 
-	const std::string longest(NICK_LEN - 1, 'n');
-	const FeedLayout wide = MeasureFeed(1280.0f, 720.0f);
-	FormatPlayerRow(row, sizeof row, longest.c_str(), 100.0f, 6, false, true, 999, 999000,
-	                DESYNC_MAX_CM);
-	Check(std::strlen(row) * 32.0f * wide.scaleX * 0.6f < wide.maxWidth,
-	      "the longest row there can be fits across a 16:9 screen");
-	FormatPlayerRow(row, sizeof row, longest.c_str(), 100.0f, 6, false, true, 999, 0,
-	                DESYNC_MAX_CM);
-	Check(std::strlen(row) * 32.0f * wide.scaleX * 0.6f < wide.maxWidth,
-	      "and so does the longest with a distance in it");
+void TestWhereTheScoreboardGoes() {
+	std::printf("\nwhere the scoreboard goes\n");
+
+	const BoardLayout full = MeasureBoard(1920.0f, 1080.0f, MAX_PLAYERS);
+	Check(Inside(full, 1920.0f, 1080.0f), "a full session fits a 1080p screen");
+	Check(std::fabs(full.unit - 1080.0f / BOARD_REF_HEIGHT) < 1e-4f,
+	      "at the HUD's own scale, by height on a wide screen");
+	Check(std::fabs(full.left + full.width * 0.5f - 960.0f) < 0.01f, "centred across");
+	Check(full.top + full.height * 0.5f < 540.0f, "and a little above the middle, clear of subtitles");
+
+	const BoardLayout wider = MeasureBoard(2560.0f, 1080.0f, MAX_PLAYERS);
+	Check(wider.unit == full.unit && wider.width == full.width,
+	      "a wider screen does not stretch it");
+
+	const BoardLayout four3 = MeasureBoard(640.0f, 480.0f, 2);
+	Check(four3.unit > 1.0f &&
+	          FEED_CELL_HEIGHT * BOARD_SMALL_SY * four3.unit >= BOARD_MIN_SMALL_PX - 0.01f,
+	      "640x480 raises it until the smallest text is readable");
+	Check(Inside(four3, 640.0f, 480.0f), "and it still fits");
+	const BoardLayout four3Full = MeasureBoard(640.0f, 480.0f, MAX_PLAYERS);
+	Check(Inside(four3Full, 640.0f, 480.0f), "a full session too");
+
+	// The window the version mark went missing in: taller than it is wide.
+	const BoardLayout tall = MeasureBoard(958.0f, 1000.0f, MAX_PLAYERS, 2);
+	Check(std::fabs(tall.unit - 958.0f / BOARD_REF_WIDTH) < 1e-4f, "a tall window scales it by width");
+	Check(Inside(tall, 958.0f, 1000.0f) && tall.top + tall.height < 958.0f,
+	      "and keeps every glyph above y = width, where CFont stops printing");
+
+	const BoardLayout tiny = MeasureBoard(320.0f, 240.0f, MAX_PLAYERS, 2);
+	Check(tiny.unit > 0.0f && Inside(tiny, 320.0f, 240.0f),
+	      "a window too small for readable text gets it small rather than off the edge");
+
+	const BoardLayout none = MeasureBoard(1280.0f, 720.0f, 0, 0);
+	Check(none.rows == 1 && none.footLines == 1, "never fewer than one row and one footer line");
+	const BoardLayout lots = MeasureBoard(1280.0f, 720.0f, 40, 9);
+	Check(lots.rows == MAX_PLAYERS && lots.footLines == 2, "nor more than the session and two lines");
+
+	const BoardLayout two = MeasureBoard(1280.0f, 720.0f, 2);
+	const BoardLayout three = MeasureBoard(1280.0f, 720.0f, 3);
+	Check(std::fabs(three.height - two.height - BOARD_ROW_H * two.unit) < 0.01f,
+	      "each player is one row taller");
+}
+
+void TestTheScoreboardBands() {
+	std::printf("\nthe scoreboard, band by band\n");
+	const BoardLayout b = MeasureBoard(1600.0f, 900.0f, 5, 2);
+	Check(b.titleTop == b.top && b.titleTop < b.accentTop && b.accentTop < b.subTop &&
+	          b.subTop < b.headTop && b.headTop < b.rowsTop && b.rowsTop < b.footTop,
+	      "title, accent, session line, headings, rows, footer, top to bottom");
+	Check(b.RowTop(4) + b.U(BOARD_ROW_H) <= b.footTop, "the last row ends above the footer rule");
+	Check(b.FootLineTop(1) + b.U(BOARD_FOOT_H) <= b.top + b.height + 0.01f,
+	      "and the second footer line inside the panel");
+
+	const float rowTop = b.RowTop(2);
+	const float textY  = b.TextTop(rowTop, BOARD_ROW_H, BOARD_TEXT_SY);
+	Check(std::fabs((textY - rowTop) * 2.0f + FEED_CELL_HEIGHT * BOARD_TEXT_SY * b.unit -
+	                BOARD_ROW_H * b.unit) < 0.01f,
+	      "row text is centred in its row");
+
+	Check(FEED_CELL_HEIGHT * BOARD_TITLE_SY <= BOARD_TITLE_H &&
+	          FEED_CELL_HEIGHT * BOARD_TEXT_SY <= BOARD_ROW_H &&
+	          FEED_CELL_HEIGHT * BOARD_SMALL_SY <= BOARD_HEAD_H &&
+	          FEED_CELL_HEIGHT * BOARD_SMALL_SY <= BOARD_FOOT_H &&
+	          FEED_CELL_HEIGHT * BOARD_STAR_SY <= BOARD_ROW_H,
+	      "every line of text is no taller than its band");
+	Check(BOARD_HEALTH_BAR_H + BOARD_BAR_GAP + BOARD_ARMOUR_BAR_H < BOARD_ROW_H &&
+	          BOARD_PING_BAR_H0 + 2.0f * (BOARD_PING_BARS - 1) < BOARD_ROW_H,
+	      "the bars fit in a row");
+
+	Check(BOARD_CHIP_X + BOARD_CHIP_W < BOARD_NICK_X && BOARD_NICK_X + BOARD_NICK_W <= BOARD_HOST_X &&
+	          BOARD_HOST_X + BOARD_HOST_W < BOARD_HEALTH_X &&
+	          BOARD_HEALTH_X + BOARD_HEALTH_W < BOARD_STARS_X &&
+	          BOARD_STARS_X + 6 * BOARD_STAR_STEP <= BOARD_STATE_X &&
+	          BOARD_STATE_X + BOARD_STATE_W < BOARD_PING_X,
+	      "the columns do not overlap");
+	const float barsEnd = BOARD_PING_X + BOARD_PING_BARS * (BOARD_PING_BAR_W + BOARD_PING_BAR_GAP);
+	Check(barsEnd <= BOARD_PING_TEXT_X && BOARD_PING_TEXT_X < BOARD_WIDTH - BOARD_PAD,
+	      "the ping number sits after its bars and inside the panel");
+}
+
+void TestTheScoreboardRows() {
+	std::printf("\nthe scoreboard, row by row\n");
+	bool    active[MAX_PLAYERS] = {};
+	uint8_t order[MAX_PLAYERS];
+	active[1] = active[4] = active[6] = true;
+	int n = BoardOrder(4, active, order);
+	Check(n == 3 && order[0] == 4 && order[1] == 1 && order[2] == 6,
+	      "you first, then everybody else in slot order");
+	active[4] = false;
+	n = BoardOrder(4, active, order);
+	Check(n == 3 && order[0] == 4, "you whether the roster lists you or not");
+	n = BoardOrder(INVALID_PLAYER, active, order);
+	Check(n == 2 && order[0] == 1 && order[1] == 6, "and only the others before you have a slot");
+	for (bool &a : active)
+		a = true;
+	n = BoardOrder(0, active, order);
+	Check(n == MAX_PLAYERS, "a full session is a full board, you counted once");
+
+	Check(StateOf(false, 80.0f, false, 0, 0) == BoardState::OnFoot, "on foot");
+	Check(StateOf(false, 80.0f, true, 0, 0) == BoardState::Driving, "the driver's seat is driving");
+	Check(StateOf(false, 80.0f, true, 2, 0) == BoardState::Passenger, "any other is a passenger");
+	Check(StateOf(true, 80.0f, true, 0, 0) == BoardState::Wasted &&
+	          StateOf(false, 0.0f, false, 0, 0) == BoardState::Wasted,
+	      "dead, or out of health, is wasted");
+	Check(StateOf(true, 0.0f, true, 0, QUIET_AFTER_MS) == BoardState::Away,
+	      "somebody gone quiet is away, whatever the last snapshot said");
+	Check(StateOf(false, 80.0f, false, 0, QUIET_AFTER_MS - 1) == BoardState::OnFoot,
+	      "a couple of missed packets are not");
+
+	char s[24];
+	StateLabel(s, sizeof s, BoardState::Passenger);
+	Check(std::strcmp(s, "PASSENGER") == 0, "the labels are the HUD's capitals");
+	StateLabel(s, sizeof s, BoardState::Away, 12500);
+	Check(std::strcmp(s, "AWAY 12s") == 0, "away says for how long");
+	StateLabel(s, sizeof s, BoardState::Away, 5000000);
+	Check(std::strcmp(s, "AWAY 999s+") == 0, "without running out of its column");
+
+	Check(BarFill(50.0f) == 0.5f && BarFill(250.0f) == 1.0f && BarFill(-4.0f) == 0.0f &&
+	          BarFill(std::nanf("")) == 0.0f,
+	      "a bar is never more than full nor less than empty");
+	Check(StarsLit(9) == 6 && StarsLit(3) == 3, "six stars is the most");
+
+	char count[8];
+	FormatCount(count, sizeof count, 2);
+	Check(std::strcmp(count, "2/8") == 0, "the title counts who is here of how many");
+}
+
+void TestThePingBars() {
+	std::printf("\nthe ping bars\n");
+	const PingSignal none = SignalOf(PING_NONE);
+	Check(none.bars == 0 && none.tone == PingTone::None, "nothing lit while the server has not said");
+	const PingSignal fast = SignalOf(38);
+	Check(fast.bars == 4 && fast.tone == PingTone::Good, "a LAN ping is four green bars");
+	const PingSignal fine = SignalOf(95);
+	Check(fine.bars == 3 && fine.tone == PingTone::Good, "under a tenth of a second is still good");
+	const PingSignal ok = SignalOf(PING_GOOD_UNDER_MS);
+	Check(ok.bars == 2 && ok.tone == PingTone::Ok, "from there it is only ok");
+	const PingSignal bad = SignalOf(PING_OK_UNDER_MS);
+	Check(bad.bars == 1 && bad.tone == PingTone::Bad, "and from twice that it is bad");
+
+	char s[8];
+	PingLabel(s, sizeof s, 38);
+	Check(std::strcmp(s, "38") == 0, "the number beside it");
+	PingLabel(s, sizeof s, 1400);
+	Check(std::strcmp(s, "1s+") == 0, "a second or more says so");
+	PingLabel(s, sizeof s, PING_NONE);
+	Check(s[0] == '\0', "and none is blank");
 }
 
 void TestTheVersionMark() {
@@ -401,6 +501,31 @@ void TestTheVersionMark() {
 	const MarkLayout a = MeasureVersionMark(1280.0f, 720.0f);
 	const MarkLayout b = MeasureVersionMark(1920.0f, 720.0f);
 	Check(a.scaleY == b.scaleY && a.x == b.x && a.y == b.y, "and a wider screen does not move it");
+	const MarkLayout small = MeasureVersionMark(960.0f, 540.0f);
+	Check(FEED_CELL_HEIGHT * small.scaleY >= MARK_MIN_TEXT_PX - 0.01f &&
+	          small.scaleX / small.scaleY == MARK_SCALE_X / MARK_SCALE_Y,
+	      "a 960x540 window still gets it at a readable size, in proportion");
+	const MarkLayout big = MeasureVersionMark(1920.0f, 1080.0f);
+	Check(std::fabs(big.scaleY - MARK_SCALE_Y * (1080.0f / 448.0f)) < 1e-5f,
+	      "and a big screen is left as it was");
+	Check(big.y == 1080.0f - FEED_CELL_HEIGHT * big.scaleY - MARK_MARGIN_UNITS * (1080.0f / 448.0f),
+	      "at the very bottom, where it always was, on a screen wider than it is tall");
+
+	// CFont::PrintChar drops a glyph whose top is at y >= SCREEN_WIDTH.
+	const MarkLayout tall = MeasureVersionMark(958.0f, 1000.0f);
+	const float      tallUnit = 1000.0f / 448.0f;
+	Check(tall.y < 958.0f && tall.y > 0.0f, "a 958x1000 window gets it above y = width");
+	Check(tall.y >= 1000.0f - RADAR_BOTTOM_UNITS * tallUnit &&
+	          tall.y + FEED_CELL_HEIGHT * tall.scaleY < 1000.0f,
+	      "and still in the strip under the radar, all of it on the screen");
+	const MarkLayout narrow = MeasureVersionMark(600.0f, 1000.0f);
+	const float      radarTop = 1000.0f - RADAR_TOP_UNITS * tallUnit;
+	const float      radarBot = 1000.0f - RADAR_BOTTOM_UNITS * tallUnit;
+	Check(narrow.y < 600.0f &&
+	          (narrow.y + FEED_CELL_HEIGHT * narrow.scaleY <= radarTop || narrow.y >= radarBot),
+	      "a narrower one moves it above the radar, never across it");
+	const MarkLayout square = MeasureVersionMark(1000.0f, 1000.0f);
+	Check(square.y < 1000.0f, "and a square one keeps it above the line too");
 }
 
 } // namespace
@@ -417,7 +542,10 @@ int RunChatFeedTests() {
 	TestUpAndDown();
 	TestWhereItGoes();
 	TestTheColours();
-	TestThePlayerList();
+	TestWhereTheScoreboardGoes();
+	TestTheScoreboardBands();
+	TestTheScoreboardRows();
+	TestThePingBars();
 	TestTheVersionMark();
 	return g_chatFailures;
 }

@@ -99,6 +99,12 @@ bool SampleRemotePedPosition(const RemotePlayer &player, Vec3 &out);
 bool InstallAimPitchHook();
 void RemoveAimPitchHook();
 
+// The detour on CStreaming::RequestSpecialModel that lets a remote Claude
+// wear his own clothes (game/look.h). Without it every remote Claude is
+// built from our model 0, in whatever we're wearing, as before.
+bool InstallLookHook();
+void RemoveLookHook();
+
 // How many animations ASSOCGRP_STD actually holds in this build, or 0 before
 // the anim files have loaded. The bound every id off the wire gets measured
 // against, read from the engine rather than taken from re3 - the retail 1.0
@@ -171,5 +177,18 @@ bool    SampleLocalCarEntry(LocalCarEntry &out);
 // Take an unfinished entry off a ped and fade what it blended. Returns how
 // many partial animations went, for the caller to report.
 int     CancelCarEntry(void *ped);
+
+// Give back the door a ped claimed for getting out, when it is being taken out
+// of the car by hand rather than by the end of its own exit. Call before the
+// ped's state is overwritten; does nothing unless it was mid-exit. addresses.h,
+// GettingOutFlagsAfterUnseat.
+bool    ReleaseExitDoor(void *ped, void *car);
+
+// Changes while an entry's animation is playing, for EntryWatch (client.h).
+uint32_t CarEntryMark(void *ped);
+
+// Whether our engine is taking this ped out of its seat through a jack played
+// here, as a PullOut (client.h). For population.cpp's traffic drivers.
+uint8_t PullOutOf(void *ped);
 
 } // namespace coopiii::game

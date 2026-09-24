@@ -3,6 +3,7 @@
 // what should be sent. Makes it testable without a game or a socket.
 #pragma once
 
+#include "adopt.h"
 #include "coopiii/protocol.h"
 #include "desync.h"
 
@@ -85,6 +86,13 @@ struct Player {
 	// The server arbitrates nothing here; a garage belongs to the map and
 	// there is no owner to check a report against.
 	uint32_t    garageMask = 0;
+
+	// The name their model 0 is loaded under, "player" or "playerp" in the
+	// stock game (protocol.h, C_PlayerLook). Empty until they say, which a
+	// receiver reads as "whatever my own model 0 is". Kept for the same
+	// reason as the mask above: it is sent on change, and a joiner has to
+	// hear the prison clothes somebody put on twenty minutes ago.
+	char        look[PLAYER_LOOK_LEN] = {};
 
 	// Whether `pos`/`heading` mean anything yet.
 	//
@@ -255,18 +263,23 @@ constexpr float VEHICLE_HANDOVER_RADIUS_M = 80.0f;
 // Unlike a Vehicle, this row is owned: an ambient ped exists because one
 // machine's CPopulation made it, that machine runs its AI, and when that
 // machine's engine takes it away it is gone everywhere. So `ownerPlayerId`
-// is not "who was last in it" - it is who decides, and it never changes.
-// docs/population.md §1.1. There is no handoff, deliberately: the design
-// says not to promise one on the strength of somebody else's example.
+// is not "who was last in it" - it is who decides. docs/population.md §1.1.
 //
-// Which means a player leaving takes their peds with them. That is a real
-// flicker in the street and it is the honest behaviour - the alternative is
-// every observer keeping a ped nobody is simulating.
+// It changes hands in exactly one place: its owner leaving. Then the nearest
+// remaining player's machine turns its replica into a ped of its own and
+// hosts it from there (HandOverAmbientOf, server/core/adopt.h), and only a
+// ped nobody is near enough to keep goes with the leaver.
 struct AmbientPed {
 	bool     active  = false;
 	uint16_t netId   = INVALID_NETID;
 	uint8_t  ownerPlayerId = INVALID_PLAYER;
 	AmbientPedBody body{};
+
+	// The car his host last said he sits in (AmbientPedState::vehicleNetId),
+	// or INVALID_NETID. Read by the handover alone, so a driver goes to the
+	// same machine as his car; the backfill does not use it, see
+	// NotePedState.
+	uint16_t vehicleNetId = INVALID_NETID;
 
 	// Dead, and the animation his host's engine chose for it. Kept rather
 	// than relayed and forgotten - which is what a limb is - for one reason:
@@ -298,11 +311,11 @@ constexpr size_t MAX_AMBIENT_PEDS = 256;
 
 // A traffic car one player's engine made, that the whole session now shares.
 //
-// The same row as an AmbientPed, owned the same way and for the same reasons,
-// with one member a ped has no use for: `pos`/`rot` are kept current from the
-// owner's C_CarStates stream, because a traffic car is going somewhere and a
-// joiner who is handed the position it was *born* at gets a car in the middle
-// of a junction it drove out of two minutes ago.
+// The same row as an AmbientPed, owned and handed on the same way and for the
+// same reasons, with one member a ped has no use for: `pos`/`rot` are kept
+// current from the owner's C_CarStates stream, because a traffic car is going
+// somewhere and a joiner who is handed the position it was *born* at gets a
+// car in the middle of a junction it drove out of two minutes ago.
 //
 // Kept on the server rather than only relayed for exactly that: the backfill
 // is the only reader. Nothing here arbitrates a car's movement - the owner
@@ -384,6 +397,10 @@ constexpr uint32_t WRECK_BACKFILL_MS = 60000;
 
 struct Backfill {
 	std::vector<S_PlayerJoin>   players;
+	// What each of them is wearing, for everybody who has said. Right behind
+	// the joins, so the look is known before the ped is first built and the
+	// joiner doesn't build it twice.
+	std::vector<S_PlayerLook>   looks;
 	std::vector<S_VehicleSpawn> vehicles;
 	std::vector<S_EnterVehicle> seats;
 	// Who is settling which car nobody drives, after the seats. Not told, a
@@ -808,9 +825,16 @@ public:
 	// it (a player left), and that is always allowed.
 	bool RemovePed(uint16_t netId, uint8_t byPlayerId);
 
-	// Every netId `playerId` owns. Used when they disconnect: their peds go
-	// with them, since nothing is left to simulate any of them.
+	// Every netId `playerId` owns.
 	std::vector<uint16_t> PedsOwnedBy(uint8_t playerId) const;
+
+	// Before RemovePeer: every ped and traffic car `playerId` hosted is either
+	// given to the remaining player nearest it or forgotten, by
+	// PlanAmbientHandover's rule (server/core/adopt.h). Applied here - an
+	// adopted row changes owner and starts a fresh history, a released one is
+	// cleared - and returned so the server can say so: S_AmbientAdopt for the
+	// first kind, S_PedDespawn / S_CarDespawn for the second.
+	std::vector<AdoptVerdict> HandOverAmbientOf(uint8_t playerId);
 
 	// Writes one streamed pose into the session's copy, so a joiner is
 	// handed a pedestrian where he is now rather than where he was born two
@@ -818,11 +842,11 @@ public:
 	// same host-authoritative refusal: a snapshot about somebody else's ped
 	// is a statement about the sender, not about the ped.
 	//
-	// The seat is deliberately *not* recorded. A backfilled ped arrives with
-	// a position and nothing else; his driver link comes on his owner's very
-	// next batch, 100 ms later, through the same reconciliation loop that
-	// heals every other race. Storing it would mean the session keeping a
-	// pairing whose other half it may already have removed.
+	// The car he sits in is recorded, for HandOverAmbientOf and nothing else.
+	// A backfilled ped still arrives with a position and nothing more; his
+	// driver link comes on his owner's very next batch, 100 ms later, through
+	// the same reconciliation loop that heals every other race, rather than
+	// from a pairing whose other half the session may already have removed.
 	bool NotePedState(const AmbientPedState &state, uint8_t byPlayerId);
 
 	// The host says one of its pedestrians died. Records it so the backfill
@@ -1142,6 +1166,11 @@ public:
 	// session has to agree or the next joiner gets told to put them back in.
 	void NotePlayerDied(Player &p, uint16_t deathAnimId);
 	void NotePlayerRespawned(Player &p, const Vec3 &pos, float heading);
+
+	// A player's look, cleaned (CleanPlayerLook). True when it is new and
+	// worth relaying; false for a repeat or a name nobody's engine would take.
+	bool NotePlayerLook(Player &p, const char (&look)[PLAYER_LOOK_LEN]);
+	S_PlayerLook MakeLook(const Player &p, uint32_t sendTimeMs) const;
 
 	// The announcement for one player: who they are, and what condition
 	// they're in. Used both for the live "someone joined" fan-out and for

@@ -62,6 +62,7 @@
 
 #include "chat.h"
 #include "client.h"
+#include "scoreboard.h"
 #include "hook/hook.h"
 #include "log.h"
 
@@ -544,6 +545,19 @@ void __cdecl HookedHudDraw() {
 	}
 
 	g_hud.Original<HudDrawFn>()();
+
+	// The scoreboard goes over the HUD rather than under it; game/scoreboard.h
+	// has why it is the one thing drawn after the original.
+	try {
+		if (g_client)
+			DrawScoreboard(*g_client);
+	} catch (...) {
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			Log("scoreboard: draw threw; the scoreboard may be missing from here on");
+		}
+	}
 }
 
 } // namespace

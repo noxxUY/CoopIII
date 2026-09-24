@@ -125,6 +125,17 @@ void TestConfigKeys() {
 	bad.ParseIni("chatKey = Enter\nlistKey = F99\n");
 	Check(bad.chatKey == 'T' && bad.listKey == 0x78, "a key it cannot read keeps the default");
 
+	Check(d.scoreboardKey == 0x09, "the scoreboard is on Tab unless the file says otherwise");
+	Check(Config::ParseKey("TAB") == 0x09 && Config::ParseKey("tab") == 0x09,
+	      "Tab is spelled Tab, any case");
+	Config board;
+	board.ParseIni("scoreboardKey = F4\n");
+	Check(board.scoreboardKey == 0x73 && board.listKey == 0x78,
+	      "the scoreboard key is read on its own, and leaves the list key alone");
+	Config boardBad;
+	boardBad.ParseIni("scoreboardKey = Space\n");
+	Check(boardBad.scoreboardKey == 0x09, "and one it cannot read stays on Tab");
+
 	Check(d.showVersion, "the version mark is on by default");
 	Config quiet;
 	quiet.ParseIni("showVersion = off\n");
@@ -492,7 +503,32 @@ void TestQuatRobustness() {
 
 } // namespace
 
+// Yes and no for the vote before a rampage (game/rampagevote.h).
+void TestVoteKeys() {
+	std::printf("\nthe rampage vote keys\n");
+	const Config d;
+	Check(d.voteYesKey == 'Y' && d.voteNoKey == 'N', "Y and N unless the file says otherwise");
+	Config c;
+	c.ParseIni("voteYesKey = j\nvoteNoKey = F6\n");
+	Check(c.voteYesKey == 'J' && c.voteNoKey == 0x75, "a letter and an F-key");
+	Config bad;
+	bad.ParseIni("voteYesKey = Space\nvoteNoKey = \n");
+	Check(bad.voteYesKey == 'Y' && bad.voteNoKey == 'N', "one it can't read keeps the default");
+
+	const std::string ini = ReadFileNear(__FILE__, "CoopIII.ini");
+	if (ini.empty()) {
+		std::printf("  [skip] CoopIII.ini isn't beside the source\n");
+		return;
+	}
+	Config shipped;
+	shipped.ParseIni(ini);
+	Check(ini.find("voteYesKey") != std::string::npos && ini.find("voteNoKey") != std::string::npos &&
+	          shipped.voteYesKey == 'Y' && shipped.voteNoKey == 'N',
+	      "the ini that ships names both and says Y and N");
+}
+
 int main() {
+	TestVoteKeys();
 	TestConfigDefaults();
 	TestConfigParsing();
 	TestConfigKeys();

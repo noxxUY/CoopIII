@@ -31,6 +31,8 @@
 #include "game/planes.h"
 #include "game/population.h"
 #include "game/radar.h"
+#include "game/rampagevote.h"
+#include "game/scoreboard.h"
 #include "game/seat.h"
 #include "game/sessionclock.h"
 #include "game/trains.h"
@@ -90,6 +92,11 @@ void PreFrame() {
 	// the frame is still better than no sweep at all if the detour failed.
 	if (!game::WorldProcessGuardInstalled())
 		game::GuardMovingList();
+
+	// The vote before a rampage: the help box, Y and N, and a move to the
+	// player who touched the skull. Before CGame::Process, so a move to
+	// another island is seen by this frame's CCollision::Update.
+	game::TickRampageVote();
 }
 
 void PostFrame() {
@@ -270,6 +277,10 @@ DWORD WINAPI Boot(LPVOID) {
 	// itself is aimed off C_Shot's direction whether this installs or not.
 	game::InstallAimPitchHook();
 
+	// Which clothes a remote Claude has on. Cosmetic as well: without it they
+	// all wear whatever our model 0 is, which is how it always was.
+	game::InstallLookHook();
+
 	// Same story for a car blowing up, and the same reason it is a detour
 	// rather than a field: nothing in the engine watches a car's health for
 	// zero, so an observer handed a health of zero gets an undamaged-looking
@@ -339,11 +350,14 @@ DWORD WINAPI Boot(LPVOID) {
 	game::InstallWantedBridge(bridge);
 	// Rampages. Four entries and three detours; game/darkel.h is the design.
 	game::InstallRampageBridge(bridge);
+	game::SetRampageVoteKeys(g_config.voteYesKey, g_config.voteNoKey);
 	game::AddHeliToBridge(bridge);
 	game::AddHeliGunToBridge(bridge);
 	game::AddCheatsToBridge(bridge);
 	game::AddMoneyToBridge(bridge);
 	game::SetChatKeys(g_config.chatKey, g_config.listKey);
+	game::SetScoreboardKey(g_config.scoreboardKey);
+	game::SetScoreboardServer(g_config.host, g_config.port);
 	game::SetVersionMarkShown(g_config.showVersion);
 	game::AddChatToBridge(bridge);
 
@@ -513,6 +527,9 @@ DWORD WINAPI Boot(LPVOID) {
 	// hooking over whatever else has patched it.
 	game::InstallRadarArrows(g_client);
 
+	// The vote before a rampage. Nothing hooked; ticked from PreFrame.
+	game::InstallRampageVote(g_client);
+
 	Log("CoopIII ready");
 	return 0;
 }
@@ -543,6 +560,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			// Same reason: the arrow draw reads the roster every frame the
 			// radar is on screen, so the detour goes before the client does.
 			game::RemoveRadarArrows();
+			game::RemoveRampageVote();
 			g_client.Stop();
 			game::RemovePausePolicy();
 			game::RemoveTrainClock();
@@ -555,6 +573,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			// keeping them from exploding is still installed.
 			game::RemoveCombatHooks();
 			game::RemoveAimPitchHook();
+			game::RemoveLookHook();
 			// Same reason, and it also puts CVehicleModelInfo::ms_compsToUse
 			// back to { -2, -2 }. Leaving a component override behind would
 			// have the game fit it to the next car it creates by itself, for

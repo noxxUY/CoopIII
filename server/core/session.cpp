@@ -607,6 +607,23 @@ S_PlayerJoin Session::MakeJoin(const Player &p, uint32_t sendTimeMs) const {
 	return join;
 }
 
+bool Session::NotePlayerLook(Player &p, const char (&look)[PLAYER_LOOK_LEN]) {
+	char clean[PLAYER_LOOK_LEN];
+	std::memcpy(clean, look, sizeof clean);
+	if (!CleanPlayerLook(clean) || std::memcmp(clean, p.look, sizeof clean) == 0)
+		return false;
+	std::memcpy(p.look, clean, sizeof clean);
+	return true;
+}
+
+S_PlayerLook Session::MakeLook(const Player &p, uint32_t sendTimeMs) const {
+	S_PlayerLook out;
+	InitHeader(out, sendTimeMs);
+	out.playerId = p.id;
+	std::memcpy(out.look, p.look, sizeof out.look);
+	return out;
+}
+
 Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 	Backfill out;
 
@@ -614,6 +631,8 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 		if (!p.active || p.id == joinerId)
 			continue;
 		out.players.push_back(MakeJoin(p, sendTimeMs));
+		if (p.look[0] != '\0')
+			out.looks.push_back(MakeLook(p, sendTimeMs));
 
 		// Their doors, if any are off their resting position right now.
 		// Nothing for the overwhelmingly common case, which is why this is a
@@ -1641,6 +1660,7 @@ bool Session::NotePedState(const AmbientPedState &state, uint8_t byPlayerId) {
 		return false;
 	ped->body.pos     = state.pos;
 	ped->body.heading = state.heading;
+	ped->vehicleNetId = state.vehicleNetId;
 	return true;
 }
 
@@ -1671,9 +1691,9 @@ Player *Session::PedDamageRecipient(uint16_t pedNetId, uint8_t byPlayerId) {
 		return nullptr;
 	if (!ped->alive)
 		return nullptr;
-	// And somebody has to be there to be told. An owner who left took their
-	// pedestrians with them (Server::DropPedsOf), so this is belt and braces
-	// rather than a race anyone has seen.
+	// And somebody has to be there to be told. An owner who left handed his
+	// pedestrians on or let them go (Session::HandOverAmbientOf), so this is
+	// belt and braces rather than a race anyone has seen.
 	return FindById(ped->ownerPlayerId);
 }
 
@@ -1766,6 +1786,52 @@ std::vector<uint16_t> Session::CarsOwnedBy(uint8_t playerId) const {
 		if (car.active && car.ownerPlayerId == playerId)
 			out.push_back(car.netId);
 	return out;
+}
+
+std::vector<AdoptVerdict> Session::HandOverAmbientOf(uint8_t playerId) {
+	if (playerId == INVALID_PLAYER)
+		return {};
+
+	std::vector<AdoptViewer> viewers;
+	for (const Player &p : m_players)
+		if (p.active && p.id != playerId && p.havePos && p.alive)
+			viewers.push_back(AdoptViewer{p.id, p.pos});
+
+	std::vector<AdoptCar> cars;
+	for (const AmbientCar &c : m_cars)
+		if (c.active && c.ownerPlayerId == playerId)
+			cars.push_back(AdoptCar{c.netId, c.body.pos, c.destroyed});
+	std::vector<AdoptPed> peds;
+	for (const AmbientPed &p : m_peds)
+		if (p.active && p.ownerPlayerId == playerId)
+			peds.push_back(AdoptPed{p.netId, p.body.pos, p.alive, p.body.pedType, p.vehicleNetId});
+
+	const std::vector<AdoptVerdict> verdicts = PlanAmbientHandover(cars, peds, viewers);
+	for (const AdoptVerdict &v : verdicts) {
+		if (v.kind == AMBIENT_ADOPT_CAR) {
+			AmbientCar *car = FindCar(v.netId);
+			if (!car)
+				continue;
+			if (v.adopter == INVALID_PLAYER) {
+				*car = AmbientCar{};
+				continue;
+			}
+			car->ownerPlayerId = v.adopter;
+			// The leaver's samples are on the leaver's clock.
+			car->history.Clear();
+		} else {
+			AmbientPed *ped = FindPed(v.netId);
+			if (!ped)
+				continue;
+			if (v.adopter == INVALID_PLAYER) {
+				*ped = AmbientPed{};
+				continue;
+			}
+			ped->ownerPlayerId = v.adopter;
+			ped->history.Clear();
+		}
+	}
+	return verdicts;
 }
 
 bool Session::NoteCarState(const AmbientCarState &state, uint8_t byPlayerId) {

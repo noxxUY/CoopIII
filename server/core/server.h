@@ -10,6 +10,7 @@
 // is where the log lines go.
 #pragma once
 
+#include "rampagevote.h"
 #include "session.h"
 
 #include "coopiii/net.h"
@@ -125,6 +126,7 @@ public:
 		// record, was dropped as a duplicate and never welcomed, and all they
 		// sent went to the ghost.
 		m_session     = Session{};
+		m_vote        = RampageVote{};
 		m_events.clear();
 		for (uint32_t &at : m_connectedAtMs)
 			at = 0;
@@ -175,6 +177,8 @@ public:
 				BroadcastRampageEnd(ended);
 			}
 		}
+		// And the vote before one, which runs out on this clock.
+		TickRampageVote(now);
 
 		m_events.clear();
 		m_net.Service(m_events, waitMs);
@@ -302,9 +306,9 @@ private:
 		m_session.ReleaseReservationsOf(p->id);
 
 		const uint8_t wasHost = m_session.HostId();
-		// Before RemovePeer, while the ped rows still say whose they are.
-		DropPedsOf(p->id);
-		DropCarsOf(p->id);
+		// Before RemovePeer, while the ped rows still say whose they are and
+		// the leaver is still here to be left out of who takes them.
+		HandOverAmbientOf(*p);
 		// And the car they were in, to somebody standing next to it. After the
 		// leave on the wire, so every machine has taken their ped out of the
 		// seat before it hears who settles the car.
@@ -313,6 +317,9 @@ private:
 		m_session.RemovePeer(peer);
 		m_net.SetMember(peer, false);
 		m_net.Broadcast(out, CH_EVENT, peer);
+		// A vote they started is off; one they were voting in is recounted
+		// without them.
+		TickRampageVote(NowMs());
 		for (uint16_t netId : handed) {
 			AnnounceCustody(netId, NowMs());
 			const Player *heir = m_session.FindById(m_session.CustodianOf(netId));
@@ -352,6 +359,10 @@ private:
 			if (const auto *pkt = msg.as<C_PlayerModel>())
 				OnPlayerModel(peer, *pkt);
 			break;
+		case OP_C_PLAYER_LOOK:
+			if (const auto *pkt = msg.as<C_PlayerLook>())
+				OnPlayerLook(peer, *pkt);
+			break;
 		case OP_C_PLAYER_AMMO:
 			if (const auto *pkt = msg.as<C_PlayerAmmo>())
 				OnPlayerAmmo(peer, *pkt);
@@ -363,6 +374,10 @@ private:
 		case OP_C_ENTERING_VEHICLE:
 			if (const auto *pkt = msg.as<C_EnteringVehicle>())
 				OnEnteringVehicle(peer, *pkt);
+			break;
+		case OP_C_JACKING_VEHICLE:
+			if (const auto *pkt = msg.as<C_JackingVehicle>())
+				OnJackingVehicle(peer, *pkt);
 			break;
 		case OP_C_SHOT:
 			if (const auto *pkt = msg.as<C_Shot>())
@@ -519,6 +534,14 @@ private:
 		case OP_C_RAMPAGE_END:
 			if (const auto *pkt = msg.as<C_RampageEnd>())
 				OnRampageEnd(peer, *pkt);
+			break;
+		case OP_C_RAMPAGE_VOTE:
+			if (const auto *pkt = msg.as<C_RampageVote>())
+				OnRampageVote(peer, *pkt);
+			break;
+		case OP_C_RAMPAGE_ARRIVED:
+			if (const auto *pkt = msg.as<C_RampageArrived>())
+				OnRampageArrived(peer, *pkt);
 			break;
 		case OP_C_OBJECT_SETTLED:
 			if (const auto *pkt = msg.as<C_ObjectSettled>())
@@ -810,20 +833,67 @@ private:
 		m_net.Broadcast(out, CH_SNAPSHOT, peer);
 	}
 
-	// Everything `playerId` was hosting goes with them. Called before
-	// Session::RemovePeer, while the rows still say whose they are.
-	void DropPedsOf(uint8_t playerId) {
-		const std::vector<uint16_t> owned = m_session.PedsOwnedBy(playerId);
-		for (uint16_t netId : owned) {
-			m_session.RemovePed(netId, INVALID_PLAYER);
-			S_PedDespawn out;
-			InitHeader(out, NowMs());
-			out.netId = netId;
+	// A leaver's crowd: what somebody is near enough to keep goes to the
+	// nearest player, the rest goes with him. Session::HandOverAmbientOf has
+	// already moved the rows; this tells everybody, the adopter included,
+	// before the S_PlayerLeave. A car and its occupants always share a
+	// verdict and a packet (server/core/adopt.h).
+	void HandOverAmbientOf(const Player &leaver) {
+		const uint32_t now = NowMs();
+		const std::vector<AdoptVerdict> verdicts = m_session.HandOverAmbientOf(leaver.id);
+
+		size_t goneP = 0, goneC = 0, keptP = 0, keptC = 0;
+		size_t perP[MAX_PLAYERS] = {}, perC[MAX_PLAYERS] = {};
+		for (const AdoptVerdict &v : verdicts) {
+			const bool car = v.kind == AMBIENT_ADOPT_CAR;
+			if (v.adopter != INVALID_PLAYER) {
+				size_t *per = car ? perC : perP;
+				if (car)
+					++keptC;
+				else
+					++keptP;
+				if (v.adopter < MAX_PLAYERS)
+					++per[v.adopter];
+				continue;
+			}
+			if (car) {
+				++goneC;
+				S_CarDespawn out;
+				InitHeader(out, now);
+				out.netId = v.netId;
+				m_net.Broadcast(out, CH_EVENT);
+			} else {
+				++goneP;
+				S_PedDespawn out;
+				InitHeader(out, now);
+				out.netId = v.netId;
+				m_net.Broadcast(out, CH_EVENT);
+			}
+		}
+
+		for (const std::vector<AmbientAdoptRow> &batch : PackAdoptRows(verdicts)) {
+			S_AmbientAdopt out;
+			InitHeader(out, now);
+			out.wasOwnerPlayerId = leaver.id;
+			out.count            = static_cast<uint8_t>(batch.size());
+			for (size_t i = 0; i < batch.size(); ++i)
+				out.rows[i] = batch[i];
 			m_net.Broadcast(out, CH_EVENT);
 		}
-		if (!owned.empty())
-			Log(LogKind::Detail, "slot %u took %zu ambient ped(s) with them",
-			            playerId, owned.size());
+
+		if (verdicts.empty())
+			return;
+		Log(LogKind::Detail,
+		    "%s's crowd: %zu ped(s) and %zu car(s) handed on, %zu ped(s) and %zu "
+		    "car(s) nobody was near enough to keep", leaver.nick.c_str(), keptP, keptC,
+		    goneP, goneC);
+		for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+			if (perP[id] == 0 && perC[id] == 0)
+				continue;
+			const Player *heir = m_session.FindById(id);
+			Log(LogKind::Detail, "  %s takes %zu ped(s) and %zu car(s)",
+			    heir ? heir->nick.c_str() : "?", perP[id], perC[id]);
+		}
 	}
 
 	// ---- ambient traffic ---------------------------------------------------
@@ -923,21 +993,6 @@ private:
 		if (out.count == 0)
 			return;
 		m_net.Broadcast(out, CH_SNAPSHOT, peer);
-	}
-
-	// Everything `playerId` was hosting goes with them, cars as well as peds.
-	void DropCarsOf(uint8_t playerId) {
-		const std::vector<uint16_t> owned = m_session.CarsOwnedBy(playerId);
-		for (uint16_t netId : owned) {
-			m_session.RemoveCar(netId, INVALID_PLAYER);
-			S_CarDespawn out;
-			InitHeader(out, NowMs());
-			out.netId = netId;
-			m_net.Broadcast(out, CH_EVENT);
-		}
-		if (!owned.empty())
-			Log(LogKind::Detail, "slot %u took %zu ambient car(s) with them", playerId,
-			    owned.size());
 	}
 
 	// A hello waiting on its password (protocol.h, C_Password).
@@ -1073,6 +1128,8 @@ private:
 		const Backfill back = m_session.BuildBackfill(p->id, NowMs());
 		for (const S_PlayerJoin &join : back.players)
 			m_net.SendTo(peer, join, CH_EVENT);
+		for (const S_PlayerLook &look : back.looks)
+			m_net.SendTo(peer, look, CH_EVENT);
 		for (const S_PlayerAmmo &ammo : back.ammo)
 			m_net.SendTo(peer, ammo, CH_EVENT);
 		for (const S_VehicleSpawn &spawn : back.vehicles)
@@ -1155,6 +1212,16 @@ private:
 		out.playerId = p->id;
 		out.modelId  = in.modelId;
 		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// What their model 0 is loaded as. Stored for joiners, same as the model.
+	void OnPlayerLook(PeerId peer, const C_PlayerLook &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.NotePlayerLook(*p, in.look))
+			return;
+
+		Log(LogKind::Detail, "%s is wearing '%s'", p->nick.c_str(), p->look);
+		m_net.Broadcast(m_session.MakeLook(*p, in.hdr.sendTimeMs), CH_EVENT, peer);
 	}
 
 	// A weapon slot this player is not holding changed. Stored as well as
@@ -1293,6 +1360,10 @@ private:
 		out.killerNetId = in.killerNetId;
 		out.animId      = in.animId;
 		m_net.Broadcast(out, CH_EVENT, peer);
+
+		// Dead, they can't start anything.
+		m_vote.CancelFor(p->id);
+		TickRampageVote(NowMs());
 	}
 
 	// And back again. The position is theirs to decide too: GTA III picks the
@@ -1885,6 +1956,27 @@ private:
 		m_net.Broadcast(out, CH_EVENT, peer);
 	}
 
+	// The same for a jack, and relayed on the same terms: it decides nothing,
+	// so there is nothing to arbitrate. The one difference is that a traffic
+	// car counts as a car the session has - a jack is how a player takes one,
+	// and it only becomes a session car at the claim.
+	void OnJackingVehicle(PeerId peer, const C_JackingVehicle &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		if (!m_session.FindVehicle(in.body.netId) && !m_session.FindCar(in.body.netId))
+			return;
+
+		S_JackingVehicle out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.body     = in.body;
+		m_net.Broadcast(out, CH_EVENT, peer);
+		Log(LogKind::Detail, "%s is pulling somebody out of %s %u", p->nick.c_str(),
+		    m_session.FindVehicle(in.body.netId) ? "vehicle" : "traffic car",
+		    in.body.netId);
+	}
+
 	// A car nobody owns was destroyed. docs/roadmap.md 5.8.
 	//
 	// There is no authority test here and its absence is the design, not an
@@ -2107,6 +2199,11 @@ private:
 		if (!p)
 			return;
 
+		// A skull, in a session that shares its rampage, is put to a vote
+		// rather than handed over. rampagevote.h.
+		if (ClaimGoesToAVote(peer, *p, in.ident))
+			return;
+
 		if (m_session.ClaimPickup(p->id, in.ident, NowMs()) ==
 		    Session::PickupVerdict::DENIED) {
 			S_PickupDenied out;
@@ -2245,6 +2342,178 @@ private:
 		InitHeader(out, NowMs());
 		out.body = body;
 		m_net.Broadcast(out, CH_EVENT);
+	}
+
+	// ---- the vote before a rampage (rampagevote.h) ---------------------------
+
+	uint32_t ActiveMask() const {
+		uint32_t mask = 0;
+		for (uint8_t id = 0; id < MAX_PLAYERS; ++id)
+			if (m_session.PlayerIdActive(id))
+				mask |= 1u << id;
+		return mask;
+	}
+
+	void DenyPickup(PeerId peer, const PickupIdent &ident) {
+		S_PickupDenied out;
+		InitHeader(out, NowMs());
+		out.ident = ident;
+		m_net.SendTo(peer, out, CH_EVENT);
+	}
+
+	void BroadcastVote(uint8_t state, uint32_t now) {
+		S_RampageVote out;
+		InitHeader(out, now);
+		out.body = m_vote.Body(state, now);
+		m_net.Broadcast(out, CH_EVENT);
+	}
+
+	// True when the claim was dealt with here: a vote opened, or the claim
+	// was turned down because one is running, or ignored because it is the
+	// toucher asking again while his own vote runs. False lets it through to
+	// the ordinary grant.
+	bool ClaimGoesToAVote(PeerId peer, const Player &p, const PickupIdent &ident) {
+		if ((ident.flags & PICKUP_F_RAMPAGE) == 0 ||
+		    !RampageNeedsVote(m_session.RampageRuleValue(), m_session.Count()))
+			return false;
+
+		const uint32_t now = NowMs();
+		if (m_vote.IsOpen()) {
+			if (m_vote.Starter() == p.id && Session::SameIdent(m_vote.Ident(), ident))
+				return true;
+			DenyPickup(peer, ident);
+			return true;
+		}
+		// One running already. Its machine's engine refuses a second skull
+		// anyway (CDarkel::FrenzyOnGoing in the pickup's gate); this is for the
+		// machine whose own frenzy ended before the session's did.
+		if (m_session.CurrentRampage().open) {
+			DenyPickup(peer, ident);
+			return true;
+		}
+		// Held for the toucher while everybody decides, so nobody else can
+		// take it in the meantime. Denied here means somebody already has.
+		if (m_session.ClaimPickup(p.id, ident, now) == Session::PickupVerdict::DENIED) {
+			DenyPickup(peer, ident);
+			return true;
+		}
+
+		m_vote.Start(p.id, ident, ActiveMask(), now);
+		Log(LogKind::Info,
+		    "rampage vote %u open: %s wants to start a rampage at (%.0f %.0f %.0f), "
+		    "%u of %u have to say yes, %u s",
+		    m_vote.Id(), p.nick.c_str(), ident.pos.x, ident.pos.y, ident.pos.z,
+		    m_vote.Needed(), m_vote.Voters(), static_cast<unsigned>(RAMPAGE_VOTE_MS / 1000));
+		BroadcastVote(RAMPAGE_VOTE_OPEN, now);
+		m_vote.TakeDirty();
+		// Two players and a skull: the toucher's yes may be all it takes if
+		// the other one is gone by now. Decided here rather than a tick late.
+		TickRampageVote(now);
+		return true;
+	}
+
+	void OnRampageVote(PeerId peer, const C_RampageVote &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		if (!m_vote.Cast(p->id, in.voteId, in.yes != 0))
+			return;
+		Log(LogKind::Detail, "rampage vote %u: %s says %s (%u yes, %u no, %u needed)",
+		    m_vote.Id(), p->nick.c_str(), in.yes ? "yes" : "no", m_vote.Yes(), m_vote.No(),
+		    m_vote.Needed());
+		TickRampageVote(NowMs());
+	}
+
+	void OnRampageArrived(PeerId peer, const C_RampageArrived &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const char *what = "stayed where they were";
+		switch (in.result) {
+		case RAMPAGE_ARRIVED:          what = "was brought over"; break;
+		case RAMPAGE_ARRIVED_LOCKED:   what = "was brought over, onto an island their story hasn't opened"; break;
+		case RAMPAGE_SKIPPED_DEAD:     what = "stayed where they were: dead"; break;
+		case RAMPAGE_SKIPPED_ARRESTED: what = "stayed where they were: being arrested"; break;
+		case RAMPAGE_SKIPPED_CUTSCENE: what = "stayed where they were: in a cutscene"; break;
+		case RAMPAGE_SKIPPED_MISSION:  what = "stayed where they were: on a mission"; break;
+		case RAMPAGE_SKIPPED_NO_PED:   what = "stayed where they were: no player in the world"; break;
+		default: break;
+		}
+		Log(LogKind::Detail, "rampage vote %u: %s %s", in.voteId, p->nick.c_str(), what);
+	}
+
+	// Decides the vote if it can, and says so. Called on every tick and on
+	// anything that changes the count - a vote, a death, a leave.
+	void TickRampageVote(uint32_t now) {
+		const RampageVote::Outcome outcome = m_vote.Evaluate(ActiveMask(), now);
+		if (outcome == RampageVote::Outcome::NONE)
+			return;
+		if (outcome == RampageVote::Outcome::OPEN) {
+			if (m_vote.TakeDirty())
+				BroadcastVote(RAMPAGE_VOTE_OPEN, now);
+			return;
+		}
+
+		const uint8_t      state   = RampageVoteStateOf(outcome);
+		const PickupIdent &ident   = m_vote.Ident();
+		Player            *starter = m_session.FindById(m_vote.Starter());
+		const RampageVoteBody end  = m_vote.Body(state, now);
+
+		BroadcastVote(state, now);
+
+		if (outcome != RampageVote::Outcome::PASSED) {
+			Log(LogKind::Info, "rampage vote %u %s (%u of %u said yes, %u needed)", end.voteId,
+			    outcome == RampageVote::Outcome::CANCELLED ? "called off, the one who started it is dead or gone"
+			    : outcome == RampageVote::Outcome::FAILED_TIME ? "ran out of time"
+			                                                   : "failed, yes can't get there any more",
+			    end.yes, end.voters, end.needed);
+			// The skull is back to how it was. The toucher's claim ends with
+			// a denial, and his machine waits a moment before it asks again.
+			m_session.ReleasePickup(ident, m_vote.Starter());
+			if (starter)
+				DenyPickup(starter->peer, ident);
+			return;
+		}
+
+		if (!starter)
+			return;   // can't happen: PASSED needs the starter present
+
+		// The toucher takes it. The grant says it came out of a vote, which is
+		// what lets his machine take it even if he has wandered off it.
+		S_PickupGrant grant;
+		InitHeader(grant, now);
+		grant.ident = ident;
+		grant.ident.flags |= PICKUP_F_VOTED;
+		m_net.SendTo(starter->peer, grant, CH_EVENT);
+
+		// And everybody else comes to him. Each machine moves its own player,
+		// or doesn't and says why.
+		const Vec3 at    = starter->havePos ? starter->pos : ident.pos;
+		uint8_t    count = 0;
+		for (uint8_t id = 0; id < MAX_PLAYERS; ++id)
+			if (id != starter->id && m_session.PlayerIdActive(id))
+				++count;
+		uint8_t slot = 0;
+		for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+			if (id == starter->id)
+				continue;
+			const Player *other = m_session.FindById(id);
+			if (!other)
+				continue;
+			S_RampageTeleport out;
+			InitHeader(out, now);
+			out.body.voteId    = end.voteId;
+			out.body.starterId = starter->id;
+			out.body.slot      = slot++;
+			out.body.count     = count;
+			out.body.pos       = at;
+			m_net.SendTo(other->peer, out, CH_EVENT);
+		}
+
+		Log(LogKind::Info,
+		    "rampage vote %u passed (%u of %u said yes) - %s takes the skull, %u player(s) "
+		    "sent to (%.0f %.0f %.0f)",
+		    end.voteId, end.yes, end.voters, starter->nick.c_str(), count, at.x, at.y, at.z);
 	}
 
 	// A pedestrian somebody hosts has died and left something behind.
@@ -2626,6 +2895,9 @@ private:
 	uint32_t                 m_lastTickMs  = 0;
 	uint32_t                 m_lastWorldMs = 0;
 	uint32_t                 m_lastPingsMs = 0;
+
+	// The vote before a rampage. rampagevote.h has the rules.
+	RampageVote m_vote;
 
 	std::string               m_password;
 	std::vector<PendingHello> m_pendingHellos;
