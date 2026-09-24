@@ -10,6 +10,9 @@
 #include "../quat.h"
 
 #include <cmath>
+#include <cstring>
+
+#include <windows.h>
 
 namespace coopiii::game {
 
@@ -27,7 +30,7 @@ Detour g_update;      // CHeli::UpdateHelis
 Detour g_process;     // CHeli::ProcessControl
 Detour g_bullet;      // CHeli::TestBulletCollision
 Detour g_rocket;      // CHeli::TestRocketCollision
-Detour g_preRender;   // CHeli::SpecialHeliPreRender
+bool   g_preRender;   // CRenderer::PreRender's call to CHeli::SpecialHeliPreRender
 Detour g_crime;       // CWanted::RegisterCrime_Immediately
 Detour g_planeRocket; // CPlane::TestRocketCollision, a lead (heli.h)
 
@@ -522,7 +525,7 @@ void InstallPlaneRocketHook() {
 using PreRenderFn = void(__cdecl *)();
 
 void __cdecl HookedSpecialHeliPreRender() {
-	g_preRender.Original<PreRenderFn>()();
+	Func<PreRenderFn>(CHeli__SpecialHeliPreRender)();
 	// PreRenderAlways calls FindPlayerCoors, which does not check for a
 	// player ped (addresses.h). The engine's own helicopters never exist
 	// without one; a replica can, for a frame, during a load.
@@ -843,6 +846,48 @@ bool InstallOne(Detour &d, const char *name, uintptr_t at, F *fn, const char *co
 	return false;
 }
 
+// Points the `call` at `site` at `to`, only while it still calls `from`.
+bool RedirectCall(uintptr_t site, uintptr_t from, uintptr_t to) {
+	if (!RelCallAt(Ptr<uint8_t>(site), site, from))
+		return false;
+	DWORD old = 0;
+	if (!VirtualProtect(reinterpret_cast<void *>(site), 5, PAGE_EXECUTE_READWRITE, &old))
+		return false;
+	const int32_t rel = static_cast<int32_t>(to - (site + 5));
+	std::memcpy(reinterpret_cast<void *>(site + 1), &rel, sizeof rel);
+	VirtualProtect(reinterpret_cast<void *>(site), 5, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void *>(site), 5);
+	return true;
+}
+
+// SpecialHeliPreRender's loop jumps back into its own first five bytes
+// (addresses.h), so it is its one call site that is redirected, not the function.
+bool InstallPreRenderCall() {
+	if (g_preRender)
+		return true;
+	const uintptr_t ours = reinterpret_cast<uintptr_t>(&HookedSpecialHeliPreRender);
+	if (RedirectCall(CRenderer__PreRender_SpecialHeliCall, CHeli__SpecialHeliPreRender, ours)) {
+		g_preRender = true;
+		Log("heli: CRenderer::PreRender's call to CHeli::SpecialHeliPreRender at 0x%08X "
+		    "now comes to us first",
+		    static_cast<unsigned>(CRenderer__PreRender_SpecialHeliCall));
+		return true;
+	}
+	Log("heli: FAILED to redirect the call to CHeli::SpecialHeliPreRender at 0x%08X; a "
+	    "replica has no searchlight and no tail light",
+	    static_cast<unsigned>(CRenderer__PreRender_SpecialHeliCall));
+	return false;
+}
+
+void RemovePreRenderCall() {
+	if (!g_preRender)
+		return;
+	RedirectCall(CRenderer__PreRender_SpecialHeliCall,
+	             reinterpret_cast<uintptr_t>(&HookedSpecialHeliPreRender),
+	             CHeli__SpecialHeliPreRender);
+	g_preRender = false;
+}
+
 } // namespace
 
 bool InstallHeliHooks() {
@@ -862,9 +907,7 @@ bool InstallHeliHooks() {
 	                 &HookedTestRocketCollision,
 	                 "rockets can't hit anybody else's helicopter, and replayed "
 	                 "ones still hit ours");
-	ok &= InstallOne(g_preRender, "CHeli::SpecialHeliPreRender",
-	                 CHeli__SpecialHeliPreRender, &HookedSpecialHeliPreRender,
-	                 "a replica has no searchlight and no tail light");
+	ok &= InstallPreRenderCall();
 	ok &= InstallOne(g_crime, "CWanted::RegisterCrime_Immediately",
 	                 CWanted__RegisterCrime_Immediately, &HookedRegisterCrime,
 	                 "shooting down somebody else's helicopter here puts the crime on "
@@ -880,10 +923,10 @@ bool InstallHeliHooks() {
 }
 
 void RemoveHeliHooks() {
-	for (Detour *d : {&g_planeRocket, &g_crime, &g_preRender, &g_rocket, &g_bullet, &g_update,
-	                  &g_process})
+	for (Detour *d : {&g_planeRocket, &g_crime, &g_rocket, &g_bullet, &g_update, &g_process})
 		if (d->IsInstalled())
 			d->Remove();
+	RemovePreRenderCall();
 	g_withheldCrimeSlots = 0;
 }
 

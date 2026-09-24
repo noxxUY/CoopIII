@@ -639,6 +639,12 @@ constexpr uintptr_t CBridge__LinksY2                         = 0x005EC67C;   // 
 // call 0x005477F0`, CHeli::PreRenderAlways (__thiscall), which draws the
 // searchlight from +0x2AC/+0x2B0/+0x2C4 and the tail light.
 //
+// It can't take an inline detour: the loop's `jl` at 0x0054AE27 goes back to
+// 0x0054AE13, inside the five bytes a jmp would overwrite, so the second slot
+// runs the middle of the jmp (`push ds / popad / popfd`) and the game dies on
+// the first frame. Its one caller is CRenderer::PreRender, `call 0054AE10` at
+// 0x004A78A0, so that call is what gets redirected.
+//
 // **SpawnFlyingComponent** (0x0054AE50, __thiscall(int node) -> CObject*,
 // `ret 4`) clones the node's atomic from m_aHeliNodes (+0x288 + node * 4) into
 // a new CObject and CWorld::Adds it; a null node returns at once.
@@ -651,6 +657,7 @@ constexpr uintptr_t CHeli__GenerateHeli         = 0x0054A640;
 constexpr uintptr_t CHeli__TestRocketCollision  = 0x0054AA30;
 constexpr uintptr_t CHeli__TestBulletCollision  = 0x0054AB30;
 constexpr uintptr_t CHeli__SpecialHeliPreRender = 0x0054AE10;
+constexpr uintptr_t CRenderer__PreRender_SpecialHeliCall = 0x004A78A0;
 constexpr uintptr_t CHeli__SpawnFlyingComponent = 0x0054AE50;
 constexpr uintptr_t CHeli__pHelis               = 0x0072CF50;   // CHeli *[4]
 constexpr uintptr_t CWanted__NumOfHelisRequired = 0x004ADC00;
