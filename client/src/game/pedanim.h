@@ -293,9 +293,10 @@ constexpr uint32_t REMOTE_FIRE_MS = 1000;
 // The wantBurning above, for a pedestrian somebody else hosts.
 //
 // A player restates PF_ON_FIRE 25 times a second for as long as they are
-// connected. A pedestrian's row only comes while he is one of the twelve his
-// host streams (protocol.h, MAX_PED_STATES), so the last thing said about him
-// can be old news. It counts for REMOTE_FIRE_MS and then the replica stops
+// connected. A pedestrian's rows come when it is his turn in his host's batch
+// (protocol.h, MAX_PED_STATES), so the last thing said about him can be old
+// news. A burning one gets a turn at least every STREAM_FIRE_DEADLINE ticks
+// (game/streampick.h). It counts for REMOTE_FIRE_MS and then the replica stops
 // burning, which is the same cap the fire itself carries. Unsigned, so a
 // WallClock wrap still reads as a short gap.
 inline bool AmbientPedShouldBurn(bool saidBurning, uint32_t saidAtMs, uint32_t nowMs) {

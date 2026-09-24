@@ -29,6 +29,7 @@ Detour g_bullet;      // CHeli::TestBulletCollision
 Detour g_rocket;      // CHeli::TestRocketCollision
 Detour g_preRender;   // CHeli::SpecialHeliPreRender
 Detour g_crime;       // CWanted::RegisterCrime_Immediately
+Detour g_planeRocket; // CPlane::TestRocketCollision, a lead (heli.h)
 
 void *PlayerPed() { return Func<void *(__cdecl *)()>(FindPlayerPed)(); }
 
@@ -115,6 +116,7 @@ void WriteRewards(const HeliRewards &r) {
 }
 
 bool g_saidWithheld      = false;
+bool g_saidPlaneRocket   = false;
 bool g_saidWithholdMiss  = false;
 bool g_saidReplayShield  = false;
 bool g_saidCredited      = false;
@@ -256,6 +258,7 @@ void __cdecl HookedUpdateHelis() {
 	g_update.Original<UpdateFn>()();
 	g_withheldCrimeSlots     = 0;
 
+	bool kept = false;
 	if (notOurs) {
 		HeliRewards fixed;
 		if (WithholdHeliRewards(before, ReadRewards(), exploding, notOurs, fixed)) {
@@ -266,11 +269,15 @@ void __cdecl HookedUpdateHelis() {
 				    "crime and the statistics our engine gives for it were taken "
 				    "back. Their machine records the crime and the statistics");
 			}
-		} else if (!g_saidWithholdMiss) {
-			g_saidWithholdMiss = true;
-			Log("heli: a helicopter somebody else shot down exploded here, and "
-			    "the money or the statistics moved by something other than "
-			    "UpdateHelis's reward in the same call; left as they are");
+		} else {
+			kept = true;
+			if (!g_saidWithholdMiss) {
+				g_saidWithholdMiss = true;
+				Log("heli: a helicopter somebody else shot down exploded here, and "
+				    "the money or the statistics moved by something other than "
+				    "UpdateHelis's reward in the same call; left as they are, and "
+				    "the shooter is told so it does not pay itself as well");
+			}
 		}
 	}
 
@@ -282,6 +289,7 @@ void __cdecl HookedUpdateHelis() {
 		g.handle         = b[slot].handle;
 		g.reason         = b[slot].explodes ? HELI_GONE_SHOT_DOWN : HELI_GONE_FLEW_AWAY;
 		g.creditPlayerId = b[slot].explodes ? b[slot].credit : INVALID_PLAYER;
+		g.ownerKept      = kept && g.creditPlayerId != INVALID_PLAYER;
 		g.pos            = b[slot].pos;
 		PushGone(g);
 		g_own[slot] = OwnSlot{};
@@ -461,6 +469,56 @@ bool __cdecl HookedTestRocketCollision(float *pos) {
 	return hit;
 }
 
+// Somebody else's rocket passes a plane by here: the machine that fired it
+// decides whether it hit, and its explosion is what ends our copy.
+bool __cdecl HookedPlaneTestRocketCollision(float *pos) {
+	const void *info = RocketAt(pos);
+	if (info && IsRemotePlayersProjectile(info)) {
+		if (!g_saidPlaneRocket) {
+			g_saidPlaneRocket = true;
+			Log("heli: refused our copy of somebody else's rocket a plane here - its "
+			    "own machine decides whether it hit, so no crash and no stars here");
+		}
+		return false;
+	}
+	return g_planeRocket.Original<RocketFn>()(pos);
+}
+
+// Both of CProjectileInfo::Update's calls to the helicopter's rocket test,
+// with a one-argument call to the lead beside each.
+bool PlaneRocketTestIsWhereTheLeadSays() {
+	for (const uintptr_t site : HELI_ROCKET_CALL_SITES) {
+		if (!RelCallAt(Ptr<uint8_t>(site), site, CHeli__TestRocketCollision))
+			return false;
+		const uintptr_t from = site - PLANE_CALL_WINDOW;
+		if (!CdeclCallIn(Ptr<uint8_t>(from), from, 2 * PLANE_CALL_WINDOW + 5,
+		                 PLANE_ROCKET_TEST_LEAD))
+			return false;
+	}
+	return true;
+}
+
+void InstallPlaneRocketHook() {
+	if (g_planeRocket.IsInstalled())
+		return;
+	if (!PlaneRocketTestIsWhereTheLeadSays()) {
+		Log("heli: CProjectileInfo::Update does not call 0x%08X beside the helicopter's "
+		    "rocket test, so it is not taken for CPlane::TestRocketCollision; somebody "
+		    "else's rocket can still crash a plane here and give us the stars",
+		    static_cast<unsigned>(PLANE_ROCKET_TEST_LEAD));
+		return;
+	}
+	if (g_planeRocket.Install("CPlane::TestRocketCollision",
+	                          reinterpret_cast<void *>(PLANE_ROCKET_TEST_LEAD),
+	                          reinterpret_cast<void *>(&HookedPlaneTestRocketCollision)))
+		Log("heli: hooked CPlane::TestRocketCollision at 0x%08X, found beside both of "
+		    "the helicopter's rocket tests", static_cast<unsigned>(PLANE_ROCKET_TEST_LEAD));
+	else
+		Log("heli: FAILED to hook CPlane::TestRocketCollision at 0x%08X; somebody "
+		    "else's rocket can still crash a plane here and give us the stars",
+		    static_cast<unsigned>(PLANE_ROCKET_TEST_LEAD));
+}
+
 using PreRenderFn = void(__cdecl *)();
 
 void __cdecl HookedSpecialHeliPreRender() {
@@ -597,15 +655,17 @@ uint8_t DrainLocalHeliHits(LocalHeliHit *out, uint8_t max) {
 // Our hit brought somebody else's helicopter down. What UpdateHelis does for
 // the local player after an explosion, minus what the owner's machine does
 // for itself (the blast, the debris, CDarkel) and minus the $250.
-void CreditHeliShootDown(uint8_t slot, const Vec3 & /*where*/) {
+void CreditHeliShootDown(uint8_t slot, const Vec3 & /*where*/, bool statistics) {
 	void *const ped = PlayerPed();
 	if (!ped || !IsPoliceHeliSlot(slot))
 		return;
 	void *const wanted = Field<void *>(ped, offs::PLAYER_PED_WANTED);
 
-	Global<int32_t>(CStats__HelisDestroyed) += HELI_REWARD_EACH.helisDestroyed;
-	Global<int32_t>(CStats__PeopleKilledByPlayer) += HELI_REWARD_EACH.peopleKilled;
-	Global<int32_t>(CStats__CopsKilled) += HELI_REWARD_EACH.copsKilled;
+	if (statistics) {
+		Global<int32_t>(CStats__HelisDestroyed) += HELI_REWARD_EACH.helisDestroyed;
+		Global<int32_t>(CStats__PeopleKilledByPlayer) += HELI_REWARD_EACH.peopleKilled;
+		Global<int32_t>(CStats__CopsKilled) += HELI_REWARD_EACH.copsKilled;
+	}
 
 	// The engine reports the crime at the player's own position
 	// (0x0054A0FB..0x0054A104), so that is where it goes here too.
@@ -812,11 +872,16 @@ bool InstallHeliHooks() {
 	if (!ok)
 		for (const auto &f : HookFailures())
 			Log("heli:   %s: %s", f.name.c_str(), f.reason.c_str());
+	// Only with the helicopter's rocket test in, for RocketAt and for the
+	// projectile table it reads. Not counted in `ok`: its address is a lead.
+	if (g_rocket.IsInstalled())
+		InstallPlaneRocketHook();
 	return ok;
 }
 
 void RemoveHeliHooks() {
-	for (Detour *d : {&g_crime, &g_preRender, &g_rocket, &g_bullet, &g_update, &g_process})
+	for (Detour *d : {&g_planeRocket, &g_crime, &g_preRender, &g_rocket, &g_bullet, &g_update,
+	                  &g_process})
 		if (d->IsInstalled())
 			d->Remove();
 	g_withheldCrimeSlots = 0;

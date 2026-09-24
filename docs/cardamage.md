@@ -553,10 +553,31 @@ per-car damage word in three places that do not have one yet
 needs a table keyed by car generator index, about 160 rows × 6 bytes). They are
 named work in the sense §5.8 means it, not a gap nobody looked at.
 
-`game/vehicle.h` currently says of an unowned car that its "doors, panels and
+**The traffic row is built since, 2026-09-23.** The host of a traffic car
+samples its dents at the traffic stream's 10 Hz (`game/population.cpp`,
+`DrainHostedCarDamage`, a cursor over the hosted table) and sends them on the
+same `C_VehicleDamage`, change-only and absolute. netIds are one space, so the
+server tells a traffic netId from a session one by looking:
+`Session::NoteCarDamage` takes the report from the car's host and nobody else,
+merges it into a word on `AmbientCar`, and refuses a repair marker, since a
+traffic car is a session car by the time anybody drives it into a spray shop.
+A joiner is handed the word after the car's spawn, and a promotion carries it
+into the `Vehicle` row. A replica is collision-proof (§5.3), so before this it
+stayed pristine on every screen but its host's; it now wears what its host
+said, through the same appliers, with its parts flying if it is in front of
+you and without if it is being built. No layout moved and nothing was
+renumbered: an older server drops the report at `MayReportVehicle`, and an
+older client ignores a damage packet for a netId it has no session car for.
+
+The session-car row somebody walked away from was built before that, as the
+custodian's report (`Client::SendCustodyVehicleDamage`). A car generator's car
+is the one row left: nobody's engine simulates it, so each machine keeps its
+own.
+
+`game/vehicle.h` used to say of an unowned car that its "doors, panels and
 dents" are deliberately not carried "because the cause already travels and the
-divergence is a dent". Half of that is now measured to be wrong and the comment
-should be corrected when the second phase lands: the cause travels for an
+divergence is a dent". Half of that was measured to be wrong, and the comment
+was corrected when the traffic row landed: the cause travels for an
 explosion and for gunfire, and it does not travel for a shunt, which is the only
 thing that dents anything at all (§2.6). The remaining reason to leave parked
 cars out is the bookkeeping, not the convergence.
@@ -722,18 +743,20 @@ note as §4's phase two.
 
 ## 6. Two things that are not damage and will look like it
 
-### 6.1 A remote player's door never opens
+### 6.1 A remote player's door, which used to never open
 
-A remote player is put into a seat with `CPed::WarpPedIntoCar` rather than the
-enter animation (AGENTS.md, "Seating the remote driver"), so none of the eight
-`CPed` writers of `SetDoorStatus(door, SWINGING)` ever runs on an observer. The
-door is shut, then the player is in the car.
+When this was written a remote player was put into a seat with
+`CPed::WarpPedIntoCar` rather than the enter animation, so none of the eight
+`CPed` writers of `SetDoorStatus(door, SWINGING)` ever ran on an observer. The
+door was shut, then the player was in the car.
 
-Carrying the swing would be two more bits and it is deliberately out of scope
-here: it is part of the enter/exit animation work that the inventory already
-flags with "a remote player appears in the seat instead of opening the door",
-and doing it from the damage packet would put a cosmetic, high-churn field on a
-packet designed to be sent a handful of times a session.
+That was closed by the enter/exit work, not here: the entry is now played
+through `CPed::SetEnterCar` and `SetExitCar`, announced when it starts with the
+door it goes in through (`protocol.md` §1.14.7), so the engine's own writers
+swing the door on the observer as well, with the warp kept behind it as the
+guarantee. The damage packet still carries no swing, and should not: it would
+put a cosmetic, high-churn field on a packet designed to be sent a handful of
+times a session.
 
 ### 6.2 A respray un-dents a car, and that has to travel too
 

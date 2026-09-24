@@ -9,9 +9,7 @@ Investigated 2026-09-22 against the retail `gta3.exe` (v1.0, MD5
 `client/src/game/addresses.h` under `---- pickups ----` with the disassembly
 that proves it. Nothing in this document was taken from `reference/re3` as a
 fact; re3 was used as a map to know which function to disassemble next, and
-where it disagreed with the binary the binary won. `reference/coopandreas` was
-not read for this work at all - it is San Andreas, where none of this survives
-the trip, and it is GPL-3.0 while CoopIII is MIT.
+where it disagreed with the binary the binary won.
 
 ---
 
@@ -421,9 +419,13 @@ mechanism. Both are recorded as settled decisions in `roadmap.md` §5.10 and
 ### Hidden packages - shared
 
 **A package collected by one player counts for everybody, and is gone from
-everybody's world.** Server option `HiddenPackages = shared | perplayer`,
-default `shared`; `perplayer` is named so the option exists, and is not
-implemented in M4.
+everybody's world.** Server option `hiddenPackages = shared | perplayer`,
+default `shared`. `perplayer` was only named in M4 and is built since
+2026-09-23, entirely on the server: a package's lock is kept per player, a
+collection is told to nobody else and a joiner is handed nobody else's, so
+every machine's own engine keeps its own player's count and `rewards.sc` reads
+that. The reward weapons then appear at the hideout on each machine when its
+own player has earned them, which is the per-player version of the same thing.
 
 Why:
 

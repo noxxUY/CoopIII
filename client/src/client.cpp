@@ -1,6 +1,7 @@
 #include "client.h"
 
 #include "game/horn.h"
+#include "game/streampick.h"
 #include "game/wanted.h"
 #include "log.h"
 
@@ -15,6 +16,7 @@ bool Client::Start(const std::string &host, uint16_t port, const std::string &ni
 	BindHelis();
 	BindMoney();
 	ClearRoster();
+	m_localNick = nick;
 	return m_net.Start(host, port, nick);
 }
 
@@ -51,6 +53,7 @@ void Client::BindHelis() {
 void Client::Stop() {
 	m_net.Stop();
 	ClearRoster();
+	ForgetRejoin();
 }
 
 uint8_t Client::RemoteCount() const {
@@ -58,6 +61,20 @@ uint8_t Client::RemoteCount() const {
 	for (const RemotePlayer &p : m_players)
 		if (p.active)
 			++n;
+	return n;
+}
+
+// The newest position each of them sent, or the one the session gave us at
+// the join or the respawn. A player we have never been told a position for
+// counts for nothing rather than for the world origin.
+uint32_t Client::ViewerPositions(Vec3 *out, uint32_t max) const {
+	uint32_t n = 0;
+	for (const RemotePlayer &p : m_players) {
+		if (n >= max)
+			break;
+		if (p.active && p.haveState && p.playerId != m_localPlayerId)
+			out[n++] = p.last.pos;
+	}
 	return n;
 }
 
@@ -89,6 +106,17 @@ void Client::UnseatPlayer(RemotePlayer &player) {
 void Client::ClearRoster() {
 	m_localPlayerId       = 0xFF;
 	m_localNetId          = INVALID_NETID;
+	for (uint16_t &ping : m_pings)
+		ping = PING_NONE;
+	m_lastProbeMs    = 0;
+	m_probeCarCursor = 0;
+	// Limbs that came off with no session to tell. Left queued they would go
+	// out under whatever netId the next welcome gives us.
+	if (m_bridge.DrainAmbientBodyParts) {
+		PedBodyPartBody stale[16];
+		while (m_bridge.DrainAmbientBodyParts(stale, 16) != 0) {
+		}
+	}
 	// Nobody's clock is ours to follow once the session is gone. The sky
 	// stays pinned where the last host left it, deliberately: unpinning it
 	// here would change the weather on a player who has just been
@@ -182,6 +210,27 @@ void Client::ClearRoster() {
 	// Same for vehicles: a car created for a session that's already ended
 	// becomes a mission vehicle nothing will ever clean up, since both of
 	// its deletion gates stay shut on purpose.
+	// The car we are sitting in, if the session had one for it. The network
+	// thread reconnects by itself, and the same session will hand that netId
+	// back in the backfill: without this the roster builds a second car on
+	// top of the one we are in and our claim then names the one we are in as
+	// a new car. OnVehicleSpawn takes it up again instead.
+	if (m_bridge.SampleLocalVehicleHandle) {
+		const int32_t aboard = m_bridge.SampleLocalVehicleHandle();
+		// At its wheel only. A passenger's car is its driver's to claim
+		// back; adopted as ours, the let-go later built a copy of it on top
+		// of the one we were still sitting in.
+		for (const RemoteVehicle &v : m_vehicles)
+			if (v.active && aboard >= 0 && v.poolHandle == aboard &&
+			    (!m_bridge.LocalDrivesVehicle || m_bridge.LocalDrivesVehicle(v))) {
+				m_rejoinNetId  = v.netId;
+				m_rejoinModel  = v.modelId;
+				m_rejoinHandle = aboard;
+			}
+	}
+	// A passenger seat we told the old session about is news to the new one.
+	m_localSeatNetId   = INVALID_NETID;
+	m_pendingSeatNetId = INVALID_NETID;
 	for (RemoteVehicle &v : m_vehicles) {
 		// Not the car we claimed. That one is this engine's own traffic car,
 		// very possibly with the local player sitting in it; the session
@@ -216,7 +265,10 @@ void Client::PreFrame() {
 	if (m_wasConnected && !connected) {
 		// Everything in the roster now refers to a session that's gone.
 		Log("client: connection lost, clearing %u remote player(s)", RemoteCount());
+		ForgetRejoin();
 		ClearRoster();
+		m_feed.Push(FeedKind::Notice, "lost the connection to the server",
+		            WallClock::NowMs());
 	}
 	m_wasConnected = connected;
 
@@ -267,6 +319,7 @@ void Client::PreFrame() {
 	// transform. WorldBridge::ApplyAmbientPedState is where that difference
 	// is argued.
 	ApplyAmbientPedPoses();
+	ReportAmbientFreshness();
 
 	// Doors, before CGame::Process rather than after it. CGarages::Update is
 	// called from inside CGame::Process, so the union has to be in place
@@ -286,8 +339,16 @@ void Client::PreFrame() {
 }
 
 void Client::PostFrame() {
-	if (!m_net.IsConnected())
+	// Nothing of ours goes out until the session has welcomed us: the server
+	// takes it from the moment our hello lands, and a claim sent now is
+	// answered after the welcome's ClearRoster has emptied the table that
+	// would recognise the answer. What the player did meanwhile is dropped,
+	// not held - a death or a blast from while we were away would be played
+	// on everybody else's screen after the fact.
+	if (!m_net.IsConnected() || m_localPlayerId == 0xFF) {
+		DiscardLocalCombat();
 		return;
+	}
 	// Wall clock, not frames - the target install runs at 60 FPS and 60/25
 	// isn't an integer (docs/compat.md §2.4). This runs every frame, not at
 	// the send rate: it happens after CGame::Process and before the frame
@@ -300,11 +361,21 @@ void Client::PostFrame() {
 	// suspension and a handbrake the engine is free to work on.
 	CorrectAmbientCars();
 
+	// Our own car's blast, first of all the events. The server takes it only
+	// from the player it believes is driving that car, and BlowUpCar kills
+	// the driver in the same frame: a death that went out first took us out
+	// of the seat on the server, and the blast behind it was thrown away as
+	// coming from nobody, so the car never blew up on anybody else's screen.
+	// Still ahead of the exit, which goes on the send tick below.
+	SendLocalVehicleBlasts();
+
 	// Above the rate limiter on purpose. A shot is an event, and the limiter
 	// is there to thin out a *stream* - holding a muzzle flash back for up
 	// to 40ms would let a second shot overtake it on a reliable-ordered
 	// channel, and a burst would arrive as one clump.
 	SendLocalCombat();
+	// And a line the player typed, on the same reliable channel.
+	SendTypedChat();
 
 	// Above the limiter too, and for the same reason: a pedestrian born and
 	// reaped between two 25 Hz ticks would otherwise be announced after it had
@@ -312,11 +383,8 @@ void Client::PostFrame() {
 	SendLocalAmbientPeds();
 	SendLocalAmbientCars();
 
-	// And the unowned cars our own engine just destroyed. Above the limiter
-	// with the rest of the reliable events, and NOT beside
-	// SendLocalVehicleBlasts below it: that one is held back until the send
-	// tick because the server checks it against who it thinks is driving, and
-	// this one has nothing to be checked against.
+	// And the unowned cars our own engine just destroyed, above the limiter
+	// with the rest of the reliable events.
 	SendUnownedBlasts();
 
 	// Hits on other people's cars, and they go here rather than down with the
@@ -370,11 +438,6 @@ void Client::PostFrame() {
 	// count, and sending the stored slots first would have a receiver apply
 	// a stale hand before the current one arrived.
 	SendLocalAmmo();
-	// Blasts before the exit, and the order is load-bearing. Both are
-	// reliable and ordered, and the server only takes a blast from the player
-	// it believes is driving that car - so an exit that overtook it would
-	// have the server throw the blast away as coming from nobody.
-	SendLocalVehicleBlasts();
 	// Before SendLocalVehicle, and that is the point of it: the claim below
 	// goes out when our own entry has *finished*, and this goes out when it
 	// started. Both are reliable and ordered, so an observer is told we are
@@ -395,6 +458,9 @@ void Client::PostFrame() {
 	// the car has nothing to name it with.
 	SendLocalVehicleDamage();
 	TickPassengerSeat();
+	// Last: every car's correction for this frame is in, so what the probe
+	// reads is what the frame draws.
+	SendDesyncProbe(WallClock::NowMs());
 }
 
 void Client::HandleMessage(const Message &msg) {
@@ -420,6 +486,11 @@ void Client::HandleMessage(const Message &msg) {
 		OnVehicleBlowUp(*p);
 	} else if (const S_VehicleDamage *p = msg.as<S_VehicleDamage>()) {
 		OnVehicleDamage(*p);
+	} else if (const S_PlayerPings *p = msg.as<S_PlayerPings>()) {
+		for (uint8_t id = 0; id < MAX_PLAYERS; ++id)
+			m_pings[id] = p->rttMs[id];
+	} else if (const S_DesyncReport *p = msg.as<S_DesyncReport>()) {
+		OnDesyncReport(*p);
 	} else if (const S_VehicleHit *p = msg.as<S_VehicleHit>()) {
 		OnVehicleHit(*p);
 	} else if (const S_CarHit *p = msg.as<S_CarHit>()) {
@@ -458,6 +529,12 @@ void Client::HandleMessage(const Message &msg) {
 		OnPedDeath(*p);
 	} else if (const S_PedDamage *p = msg.as<S_PedDamage>()) {
 		OnPedDamage(*p);
+	} else if (const S_NpcShot *p = msg.as<S_NpcShot>()) {
+		OnNpcShot(*p);
+	} else if (const S_NpcDamage *p = msg.as<S_NpcDamage>()) {
+		OnNpcDamage(*p);
+	} else if (const S_NpcVehicleHit *p = msg.as<S_NpcVehicleHit>()) {
+		OnNpcVehicleHit(*p);
 	} else if (const S_CarSpawn *p = msg.as<S_CarSpawn>()) {
 		OnCarSpawn(*p);
 	} else if (const S_CarDespawn *p = msg.as<S_CarDespawn>()) {
@@ -512,15 +589,26 @@ void Client::HandleMessage(const Message &msg) {
 		m_helis.SetShootDownPaid(m_money.Rule() != MONEY_RULE_OFF);
 	} else if (const S_MoneyAward *p = msg.as<S_MoneyAward>()) {
 		m_money.OnAward(*p, m_localPlayerId);
+	} else if (const S_Chat *p = msg.as<S_Chat>()) {
+		OnChat(*p);
 	}
 	// Anything else isn't handled yet, and stays silently ignored rather
-	// than logged - the server already sends chat, and a per-packet log line
-	// at 25 Hz would drown out the one message that actually matters.
+	// than logged: a per-packet log line at 25 Hz would drown out the one
+	// message that actually matters.
 }
 
 void Client::OnWelcome(const S_Welcome &pkt) {
 	if (pkt.reject != 0) {
-		Log("client: server rejected the connection (reason %u)", pkt.reject);
+		// On the HUD too: a player who pressed nothing and got no session wants
+		// to know which of the three it was, and only one of them is theirs to
+		// fix. The socket thread stops asking for the other two.
+		const char *why = pkt.reject == REJECT_BAD_VERSION ? "the server runs another CoopIII version"
+		                  : pkt.reject == REJECT_FULL      ? "the server is full; asking again in a while"
+		                  : pkt.reject == REJECT_BAD_PASSWORD
+		                      ? "the server wants a password (CoopIII.ini, password)"
+		                      : "the server turned us away";
+		Log("client: server rejected the connection (reason %u): %s", pkt.reject, why);
+		m_feed.Push(FeedKind::Notice, why, WallClock::NowMs());
 		return;
 	}
 	m_friendlyFire     = (pkt.flags & SESSION_FRIENDLY_FIRE) != 0;
@@ -535,8 +623,23 @@ void Client::OnWelcome(const S_Welcome &pkt) {
 
 	// A welcome starts a session, so anything left from a previous one is stale.
 	ClearRoster();
+	// Everything our engine hosts is news to this session, whatever the last
+	// one called it. On the game thread, which is why it is here and not in
+	// ClearRoster (Client::Start runs that one on the boot thread).
+	if (m_bridge.RestartHostedNames)
+		m_bridge.RestartHostedNames();
 	m_localPlayerId = pkt.playerId;
 	m_localNetId    = pkt.netId;
+	if (m_rejoinNetId != INVALID_NETID)
+		m_rejoinUntilMs = WallClock::NowMs() + REJOIN_WAIT_MS;
+
+	// On the HUD too, and differently the second time: the network thread
+	// reconnects by itself after a loss, and a player who saw "lost the
+	// connection" wants to see that it came back.
+	m_feed.Push(FeedKind::Notice,
+	            m_welcomes == 0 ? "connected to the session" : "back in the session",
+	            WallClock::NowMs());
+	++m_welcomes;
 	// After ClearRoster, not before. It puts the wanted rule back to the
 	// default, which is what a client with no session wants and would quietly
 	// undo the line above if this were assigned first - the whole feature
@@ -639,6 +742,7 @@ void Client::OnJoin(const S_PlayerJoin &pkt) {
 		p.last.animId     = ANIM_NONE;
 		p.last.animId2    = ANIM_NONE;
 		p.haveState       = true;
+		p.heardAtMs       = WallClock::NowMs();
 		p.seedPose.pos     = pkt.pos;
 		p.seedPose.heading = pkt.heading;
 		p.haveSeedPose     = true;
@@ -647,6 +751,14 @@ void Client::OnJoin(const S_PlayerJoin &pkt) {
 	Log("client: %s joined as player %u (%.0f hp, weapon %u%s%s)", p.nick.c_str(),
 	    p.playerId, pkt.health, pkt.weapon, p.dead ? ", dead" : "",
 	    (pkt.flags & PJF_POS_VALID) ? "" : ", position unknown");
+
+	// Only somebody arriving now. Everybody we are told about on our own way
+	// in was here already.
+	if (pkt.flags & PJF_ARRIVED) {
+		char line[FEED_MESSAGE];
+		FormatJoined(line, sizeof line, p.nick.c_str());
+		m_feed.Push(FeedKind::Notice, line, WallClock::NowMs());
+	}
 
 	// Two-phase spawn (docs/protocol.md §1.6): ask now, create later.
 	if (m_bridge.RequestModel) {
@@ -663,6 +775,11 @@ void Client::OnLeave(const S_PlayerLeave &pkt) {
 		return;
 
 	Log("client: %s left (reason %u)", p.nick.c_str(), pkt.reason);
+	{
+		char line[FEED_MESSAGE];
+		FormatLeft(line, sizeof line, p.nick.c_str(), pkt.reason);
+		m_feed.Push(FeedKind::Notice, line, WallClock::NowMs());
+	}
 	// Their doors go with them. A player who quits while standing in their
 	// safehouse would otherwise hold that garage open on every other machine
 	// for the rest of the session - the mask is a level and nothing else
@@ -695,6 +812,14 @@ void Client::OnLeave(const S_PlayerLeave &pkt) {
 			continue;
 		if (v.driverPlayerId == pkt.playerId)
 			v.driverPlayerId = 0xFF;
+		// Their clock goes too. Whoever takes the slot next has a clock of
+		// their own, and a buffer still on the leaver's would drop every
+		// sample of theirs older than the leaver's last. The car is held at
+		// its last snapshot until somebody reports it again.
+		if (v.reporterPlayerId == pkt.playerId) {
+			v.interp           = VehicleInterpBuffer{};
+			v.reporterPlayerId = 0xFF;
+		}
 		if (v.custodianPlayerId == pkt.playerId) {
 			v.custodianPlayerId = INVALID_PLAYER;
 			v.restFrames        = 0;
@@ -756,6 +881,7 @@ void Client::OnPlayerState(const S_PlayerState &pkt) {
 
 	p.last      = pkt.body;
 	p.haveState = true;
+	p.heardAtMs = WallClock::NowMs();
 	// The held weapon's count arrives here rather than on a C_PlayerAmmo, so
 	// this is where the slot table learns about it. Keeps the table complete
 	// whichever hand the number came in, which is what lets a replayed shot
@@ -1179,6 +1305,7 @@ void Client::OnDeath(const S_Death &pkt) {
 	// a standing instruction it can still carry out and puts the corpse back
 	// behind the wheel on the very next frame.
 	p.seatVehicleNetId = INVALID_NETID;
+	LeaveDriversSeats(pkt.playerId);
 
 	// Recorded, not carried out. UpdateRemotes does the killing, on the first
 	// frame there is a ped to kill - which is this one when their ped is
@@ -1188,6 +1315,17 @@ void Client::OnDeath(const S_Death &pkt) {
 	p.dead         = true;
 	p.deathAnimId  = pkt.animId;
 	p.deathApplied = false;
+}
+
+// Out of the driver's seat of every car, the way the session took them out
+// of it (Session::NotePlayerDied, NotePlayerRespawned). No S_ExitVehicle is
+// sent for either, and a row still naming them at the wheel outranks the
+// custody their machine was just given for the car: every observer went on
+// treating a corpse as its driver until the respawn.
+void Client::LeaveDriversSeats(uint8_t playerId) {
+	for (RemoteVehicle &v : m_vehicles)
+		if (v.active && v.driverPlayerId == playerId)
+			v.driverPlayerId = 0xFF;
 }
 
 // And they're back. The corpse is destroyed and a fresh ped built the same
@@ -1205,6 +1343,7 @@ void Client::OnRespawn(const S_Respawn &pkt) {
 
 	UnseatPlayer(p);
 	p.seatVehicleNetId = INVALID_NETID;
+	LeaveDriversSeats(pkt.playerId);
 	if (p.poolHandle >= 0 && m_bridge.DespawnRemote)
 		m_bridge.DespawnRemote(p);
 	p.poolHandle = -1;
@@ -1650,6 +1789,24 @@ void Client::SendLocalVehicleHits() {
 			    static_cast<unsigned>(hits[i].weapon));
 		}
 	}
+
+	// And our pedestrians' rounds on those cars. Only a car somebody holds is
+	// ever queued (game/vehicle.h, DecideCarDamage), and the server refuses
+	// the rest.
+	if (!m_bridge.DrainNpcVehicleHits)
+		return;
+	NpcVehicleHit npcHits[MAX_PER_FRAME];
+	const uint8_t m = m_bridge.DrainNpcVehicleHits(npcHits, MAX_PER_FRAME);
+	for (uint8_t i = 0; i < m; ++i) {
+		const RemoteVehicle *v = VehicleSlot(npcHits[i].body.netId, /*createIfMissing=*/false);
+		if (!v || !VehicleHitIsWorthSending(*v, m_localVehicleNetId))
+			continue;
+		C_NpcVehicleHit out;
+		InitHeader(out, WallClock::NowMs());
+		out.attackerPedNetId = npcHits[i].pedNetId;
+		out.body             = npcHits[i].body;
+		m_net.Send(out, CH_EVENT);
+	}
 }
 
 // Somebody shot the car we are driving, or the one we are settling - which
@@ -1681,29 +1838,10 @@ void Client::OnVehicleHit(const S_VehicleHit &pkt) {
 		return;
 	}
 
-	RemoteVehicle *v = VehicleSlot(pkt.body.netId, /*createIfMissing=*/false);
-	if (!v || !v->active)
+	bool           driving = false;
+	RemoteVehicle *v       = CarForReportedHit(pkt.body.netId, driving);
+	if (!v)
 		return;
-
-	// Our car, as the roster has it. The engine seam asks the same question of
-	// CVehicle::m_pDriver before it calls anything, and both asks are wanted:
-	// this one stops a packet for somebody else's car reaching the seam at all,
-	// and that one is the answer that counts, because a jack moves the engine's
-	// idea of the driver before the session's catches up.
-	//
-	// A car the session has already written off is refused here too. Nothing
-	// arrives after that which is worth applying, and BlowUpRemoteVehicle has
-	// by now either run or been told to.
-	const bool driving = DrivenLocally(*v);
-	if (!TakeReportedVehicleHit(*v, driving, m_localPlayerId)) {
-		if (!driving && HaveCustodyOf(*v) && !m_saidLateCustodyHit) {
-			m_saidLateCustodyHit = true;
-			Log("client: a hit on vehicle %u arrived after we told the session "
-			    "we were finished settling it. Dropped - we have stopped "
-			    "reporting that car", v->netId);
-		}
-		return;
-	}
 
 	// Blame, where it resolves. A null attacker still damages the car: the
 	// shooter's ped may not have streamed in here, and the shot happened
@@ -1719,6 +1857,59 @@ void Client::OnVehicleHit(const S_VehicleHit &pkt) {
 
 	// Kept a moment longer than the car takes to stop, so the rest of a burst
 	// lands in the same custody (CUSTODY_HIT_HOLD_MS).
+	if (!driving)
+		v->holdUntilMs = WallClock::NowMs() + CUSTODY_HIT_HOLD_MS;
+}
+
+RemoteVehicle *Client::CarForReportedHit(uint16_t netId, bool &driving) {
+	RemoteVehicle *v = VehicleSlot(netId, /*createIfMissing=*/false);
+	if (!v || !v->active)
+		return nullptr;
+
+	// Our car, as the roster has it. The engine seam asks the same question of
+	// CVehicle::m_pDriver before it calls anything, and both asks are wanted:
+	// this one stops a packet for somebody else's car reaching the seam at all,
+	// and that one is the answer that counts, because a jack moves the engine's
+	// idea of the driver before the session's catches up.
+	//
+	// A car the session has already written off is refused here too. Nothing
+	// arrives after that which is worth applying, and BlowUpRemoteVehicle has
+	// by now either run or been told to.
+	driving = DrivenLocally(*v);
+	if (!TakeReportedVehicleHit(*v, driving, m_localPlayerId)) {
+		if (!driving && HaveCustodyOf(*v) && !m_saidLateCustodyHit) {
+			m_saidLateCustodyHit = true;
+			Log("client: a hit on vehicle %u arrived after we told the session "
+			    "we were finished settling it. Dropped - we have stopped "
+			    "reporting that car", v->netId);
+		}
+		return nullptr;
+	}
+	return v;
+}
+
+// One of somebody else's pedestrians shot the car we drive or settle. The
+// same car and the same custody hold as a player's hit on it.
+void Client::OnNpcVehicleHit(const S_NpcVehicleHit &pkt) {
+	if (!m_bridge.ApplyNpcVehicleHit)
+		return;
+	bool           driving = false;
+	RemoteVehicle *v       = CarForReportedHit(pkt.body.netId, driving);
+	if (!v)
+		return;
+
+	RemoteAmbientPed *attacker = AmbientPedByNetId(pkt.attackerPedNetId);
+	if (attacker && attacker->ownerPlayerId != pkt.ownerPlayerId)
+		attacker = nullptr;
+
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("client: somebody else's pedestrian shot our car - net %u, hosted by player "
+		    "%u, car %u, %.0f with cause %u", pkt.attackerPedNetId, pkt.ownerPlayerId,
+		    pkt.body.netId, pkt.body.amount, pkt.body.weapon);
+	}
+	m_bridge.ApplyNpcVehicleHit(*v, attacker, pkt.body, /*settling=*/!driving);
 	if (!driving)
 		v->holdUntilMs = WallClock::NowMs() + CUSTODY_HIT_HOLD_MS;
 }
@@ -1959,6 +2150,14 @@ void Client::UpdateUnownedWrecks() {
 	}
 }
 
+void Client::DiscardLocalCombat() {
+	if (!m_bridge.DrainLocalCombat)
+		return;
+	CombatEvent stale[16];
+	while (m_bridge.DrainLocalCombat(stale, 16) != 0) {
+	}
+}
+
 void Client::SendLocalCombat() {
 	if (!m_bridge.DrainLocalCombat)
 		return;
@@ -1971,6 +2170,10 @@ void Client::SendLocalCombat() {
 	constexpr uint8_t MAX_PER_FRAME = 8;
 	CombatEvent       events[MAX_PER_FRAME];
 	const uint8_t     n = m_bridge.DrainLocalCombat(events, MAX_PER_FRAME);
+
+	Vec3     viewers[MAX_PLAYERS];
+	uint32_t viewerCount = 0;
+	bool     placed      = false;
 
 	for (uint8_t i = 0; i < n; ++i) {
 		switch (events[i].kind) {
@@ -2007,6 +2210,32 @@ void Client::SendLocalCombat() {
 			C_PedDamage out;
 			InitHeader(out, WallClock::NowMs());
 			out.body = events[i].pedDamage;
+			m_net.Send(out, CH_EVENT);
+			break;
+		}
+		case CombatEvent::NPC_SHOT: {
+			// One of our pedestrians fired. Unreliable: it is only drawn, and
+			// only for somebody near enough to see it.
+			if (!placed) {
+				viewerCount = ViewerPositions(viewers, MAX_PLAYERS);
+				placed      = true;
+			}
+			if (!game::NpcShotWorthSending(events[i].shot.origin, viewers, viewerCount))
+				break;
+			C_NpcShot out;
+			InitHeader(out, WallClock::NowMs());
+			out.pedNetId = events[i].npcNetId;
+			out.body     = events[i].shot;
+			m_net.Send(out, CH_SNAPSHOT);
+			break;
+		}
+		case CombatEvent::NPC_DAMAGE: {
+			// One of our pedestrians hit another player's copy here. The victim
+			// applies it, the same way a hit of our own player's does.
+			C_NpcDamage out;
+			InitHeader(out, WallClock::NowMs());
+			out.attackerPedNetId = events[i].npcNetId;
+			out.body             = events[i].damage;
 			m_net.Send(out, CH_EVENT);
 			break;
 		}
@@ -2818,12 +3047,290 @@ void Client::OnVehicleSpawn(const S_VehicleSpawn &pkt) {
 	v->haveState   = true;
 	v->spawnPending = true;
 
+	// The car we were in when the last session ended, and are still in: the
+	// same CVehicle, which the ended session handed to our engine, so it is
+	// ours now and there is nothing to build. The claim that follows names it
+	// by this netId, and the session makes us its driver again.
+	// Not if another row already has that car: a claim that went out first
+	// has given it a number of its own.
+	if (pkt.netId == m_rejoinNetId && pkt.modelId == m_rejoinModel && v->poolHandle < 0 &&
+	    WaitingForRejoin() && !VehicleByPoolHandle(m_rejoinHandle) &&
+	    m_bridge.SampleLocalVehicleHandle &&
+	    m_bridge.SampleLocalVehicleHandle() == m_rejoinHandle) {
+		v->poolHandle   = m_rejoinHandle;
+		v->ours         = true;
+		v->spawnPending = false;
+		if (m_bridge.AdoptClaimedVehicle)
+			m_bridge.AdoptClaimedVehicle(*v);
+		Log("client: back in the session in the car we were in (vehicle %u); taking "
+		    "it up again rather than building a second one", pkt.netId);
+		m_rejoinAdoptedNetId = pkt.netId;
+		m_rejoinNetId        = INVALID_NETID;
+		m_rejoinHandle       = -1;
+		return;
+	}
+	if (pkt.netId == m_rejoinNetId) {
+		// Out of it since, or a different car under the same number: built
+		// the ordinary way, and nothing more to wait for.
+		ForgetRejoin();
+	}
+
 	if (m_bridge.RequestModel)
 		m_bridge.RequestModel(pkt.modelId);
 
 	Log("client: vehicle %u joined (model %u, %.0f hp%s, extras %d/%d)", pkt.netId,
 	    pkt.modelId, pkt.health, (pkt.flags & VEH_WRECKED) ? ", wrecked" : "",
 	    static_cast<int>(pkt.extra1), static_cast<int>(pkt.extra2));
+}
+
+// The buffer is ordered on send times, and two machines' send times have
+// nothing to do with each other. Kept across a change of hands, a car taken
+// over by a machine whose game started later had every new snapshot older
+// than the last one its previous driver sent, and Push dropped them all: the
+// car stood still here for as long as the two games' start times were apart.
+//
+// The whole buffer, playback clock included: a clock left running would go on
+// easing in the old timebase and play the new driver's first samples out of
+// step with them.
+void Client::OnReportersClock(RemoteVehicle &vehicle, uint8_t reporterId) {
+	if (vehicle.reporterPlayerId == reporterId)
+		return;
+	if (vehicle.reporterPlayerId != 0xFF)
+		vehicle.interp = VehicleInterpBuffer{};
+	vehicle.reporterPlayerId = reporterId;
+}
+
+bool Client::WaitingForRejoin() {
+	if (m_rejoinUntilMs == 0)
+		return false;
+	if (static_cast<int32_t>(WallClock::NowMs() - m_rejoinUntilMs) >= 0) {
+		ForgetRejoin();
+		return false;
+	}
+	return true;
+}
+
+void Client::ForgetRejoin() {
+	m_rejoinNetId        = INVALID_NETID;
+	m_rejoinModel        = 0;
+	m_rejoinHandle       = -1;
+	m_rejoinUntilMs      = 0;
+	m_rejoinAdoptedNetId = INVALID_NETID;
+}
+
+// Somebody else has been driving the car we were in since we dropped, or our
+// old connection still is. It is theirs; the car we are sitting in is only our
+// copy of it, so the row goes back to being one to build and ours gets claimed
+// as a new car.
+void Client::LetGoOfRejoinedCar(RemoteVehicle &vehicle, uint8_t driverPlayerId) {
+	m_rejoinAdoptedNetId = INVALID_NETID;
+	if (!vehicle.ours || vehicle.poolHandle < 0 || DrivenLocally(vehicle))
+		return;
+	if (m_bridge.ReleaseOwnVehicle)
+		m_bridge.ReleaseOwnVehicle(vehicle);
+	vehicle.poolHandle    = -1;
+	vehicle.ours          = false;
+	vehicle.spawnPending  = true;
+	vehicle.surrendered   = false;
+	vehicle.surrenderDone = false;
+	vehicle.interp.Clear();
+	if (m_bridge.RequestModel)
+		m_bridge.RequestModel(vehicle.modelId);
+	Log("client: player %u has vehicle %u in the session now; the car we are in "
+	    "stays ours and gets a number of its own",
+	    static_cast<unsigned>(driverPlayerId), vehicle.netId);
+}
+
+// Every remote player on foot whose ped we have, then as many of the session
+// cars we only watch as still fit, taking turns when there are more.
+uint8_t Client::BuildDesyncProbe(C_DesyncProbe &out) {
+	InitHeader(out, WallClock::NowMs());
+	uint8_t n = 0;
+
+	if (m_bridge.SampleRemotePedPosition)
+		for (const RemotePlayer &p : m_players) {
+			if (n >= DESYNC_PROBE_ROWS)
+				break;
+			if (!p.active || p.poolHandle < 0 || p.playerId == m_localPlayerId)
+				continue;
+			uint32_t at = 0;
+			Vec3     pos{};
+			if (!p.interp.RenderedAt(at) || !m_bridge.SampleRemotePedPosition(p, pos))
+				continue;
+			out.rows[n].netId = p.netId;
+			out.rows[n].atMs  = at;
+			out.rows[n].pos   = pos;
+			++n;
+		}
+
+	// Then everything else, one index space over the three rosters so they
+	// share what is left of the packet fairly: session cars, traffic, peds.
+	const uint32_t total = static_cast<uint32_t>(MAX_REMOTE_VEHICLES + MAX_REMOTE_CARS +
+	                                             MAX_REMOTE_PEDS);
+	uint32_t next = m_probeCarCursor % total;
+	for (uint32_t k = 0; k < total && n < DESYNC_PROBE_ROWS; ++k) {
+		const uint32_t i  = (m_probeCarCursor + k) % total;
+		uint16_t       id = INVALID_NETID;
+		uint32_t       at = 0;
+		Vec3           pos{};
+		if (i < MAX_REMOTE_VEHICLES) {
+			RemoteVehicle &v = m_vehicles[i];
+			if (!v.active || v.poolHandle < 0 || v.destroyed || !m_bridge.SampleObservedVehicle)
+				continue;
+			if (VehicleIsOursToDrive(v) || HaveCustodyOf(v))
+				continue;
+			VehicleStateBody body{};
+			if (!v.interp.RenderedAt(at) || !m_bridge.SampleObservedVehicle(v, body))
+				continue;
+			id  = v.netId;
+			pos = body.pos;
+		} else if (i < MAX_REMOTE_VEHICLES + MAX_REMOTE_CARS) {
+			const RemoteAmbientCar &car = m_cars[i - MAX_REMOTE_VEHICLES];
+			if (!car.active || car.poolHandle < 0 || car.destroyed || !m_bridge.SampleReplicaPosition)
+				continue;
+			// Ours to drive until the promotion lands, and not a copy then.
+			if (m_bridge.LocalDrivesAmbientCar && m_bridge.LocalDrivesAmbientCar(car))
+				continue;
+			if (!car.interp.RenderedAt(at) ||
+			    !m_bridge.SampleReplicaPosition(car.poolHandle, true, pos))
+				continue;
+			id = car.netId;
+		} else {
+			const RemoteAmbientPed &ped = m_peds[i - MAX_REMOTE_VEHICLES - MAX_REMOTE_CARS];
+			if (!ped.active || ped.poolHandle < 0 || ped.dead || ped.Seated() ||
+			    !m_bridge.SampleReplicaPosition)
+				continue;
+			if (!ped.interp.RenderedAt(at) ||
+			    !m_bridge.SampleReplicaPosition(ped.poolHandle, false, pos))
+				continue;
+			id = ped.netId;
+		}
+		out.rows[n].netId = id;
+		out.rows[n].atMs  = at;
+		out.rows[n].pos   = pos;
+		++n;
+		next = (i + 1) % total;
+	}
+	m_probeCarCursor = next;
+
+	out.count = n;
+	return n;
+}
+
+void Client::SendDesyncProbe(uint32_t nowMs) {
+	if (m_localPlayerId >= MAX_PLAYERS)
+		return;
+	if (m_lastProbeMs != 0 && nowMs - m_lastProbeMs < DESYNC_PROBE_MS)
+		return;
+	m_lastProbeMs = nowMs ? nowMs : 1;
+
+	C_DesyncProbe out;
+	if (BuildDesyncProbe(out) == 0)
+		return;
+	m_net.Send(out, CH_SNAPSHOT);
+}
+
+void Client::OnDesyncReport(const S_DesyncReport &pkt) {
+	const uint32_t now   = WallClock::NowMs();
+	const uint8_t  count = pkt.count < DESYNC_PROBE_ROWS ? pkt.count : DESYNC_PROBE_ROWS;
+
+	uint8_t  compared = 0;
+	uint16_t worstCm = 0, worstNetId = INVALID_NETID;
+	for (uint8_t i = 0; i < count; ++i) {
+		const DesyncReportRow &row = pkt.rows[i];
+		if (row.offCm == DESYNC_UNKNOWN || row.netId == INVALID_NETID)
+			continue;
+		bool found = false;
+		for (RemotePlayer &p : m_players)
+			if (p.active && p.netId == row.netId && p.playerId != m_localPlayerId) {
+				p.offCm   = row.offCm;
+				p.offAtMs = now;
+				found     = true;
+				break;
+			}
+		if (!found)
+			if (RemoteVehicle *v = VehicleSlot(row.netId, false)) {
+				v->offCm   = row.offCm;
+				v->offAtMs = now;
+				found      = true;
+			}
+		if (!found)
+			if (RemoteAmbientCar *car = AmbientCarByNetId(row.netId)) {
+				car->offCm   = row.offCm;
+				car->offAtMs = now;
+				found        = true;
+			}
+		if (!found)
+			if (RemoteAmbientPed *ped = AmbientPedByNetId(row.netId)) {
+				ped->offCm   = row.offCm;
+				ped->offAtMs = now;
+				found        = true;
+			}
+		if (!found)
+			continue;
+		++compared;
+		if (worstNetId == INVALID_NETID || row.offCm > worstCm) {
+			worstCm    = row.offCm;
+			worstNetId = row.netId;
+		}
+	}
+	if (compared == 0)
+		return;
+
+	if (!m_saidDesyncReport) {
+		m_saidDesyncReport = true;
+		Log("client: took our first desync report: %u of our copies compared, the "
+		    "furthest %.1f m from its owner", compared, worstCm / 100.0f);
+	}
+	if (worstCm < DESYNC_NOTE_CM)
+		return;
+	if (m_desyncSaidAtMs != 0 && now - m_desyncSaidAtMs < DESYNC_NOTE_EVERY_MS)
+		return;
+	m_desyncSaidAtMs = now ? now : 1;
+	for (const RemotePlayer &p : m_players)
+		if (p.active && p.netId == worstNetId) {
+			Log("client: the server says our copy of %s is %.1f m from where they "
+			    "were at that instant", p.nick.c_str(), worstCm / 100.0f);
+			return;
+		}
+	const char *what = AmbientPedByNetId(worstNetId)   ? "pedestrian"
+	                   : AmbientCarByNetId(worstNetId) ? "traffic car"
+	                                                   : "vehicle";
+	Log("client: the server says our copy of %s %u is %.1f m from where its owner "
+	    "had it at that instant", what, worstNetId, worstCm / 100.0f);
+}
+
+uint16_t Client::DesyncOf(uint8_t playerId) const {
+	if (playerId >= MAX_PLAYERS)
+		return DESYNC_UNKNOWN;
+	const RemotePlayer &p = m_players[playerId];
+	if (!p.active || p.offCm == DESYNC_UNKNOWN || WallClock::NowMs() - p.offAtMs > DESYNC_FRESH_MS)
+		return DESYNC_UNKNOWN;
+	return p.offCm;
+}
+
+uint16_t Client::WorstCopyDesync(uint16_t &netId, const char *&what) const {
+	const uint32_t now   = WallClock::NowMs();
+	uint16_t       worst = DESYNC_UNKNOWN;
+	netId                = INVALID_NETID;
+	what                 = "";
+	auto consider = [&](bool active, uint16_t offCm, uint32_t offAtMs, uint16_t id,
+	                    const char *kind) {
+		if (!active || offCm == DESYNC_UNKNOWN || now - offAtMs > DESYNC_FRESH_MS)
+			return;
+		if (worst == DESYNC_UNKNOWN || offCm > worst) {
+			worst = offCm;
+			netId = id;
+			what  = kind;
+		}
+	};
+	for (const RemoteVehicle &v : m_vehicles)
+		consider(v.active, v.offCm, v.offAtMs, v.netId, "vehicle");
+	for (const RemoteAmbientCar &car : m_cars)
+		consider(car.active, car.offCm, car.offAtMs, car.netId, "traffic car");
+	for (const RemoteAmbientPed &ped : m_peds)
+		consider(ped.active, ped.offCm, ped.offAtMs, ped.netId, "pedestrian");
+	return worst;
 }
 
 void Client::OnVehicleDespawn(const S_VehicleDespawn &pkt) {
@@ -2894,8 +3401,19 @@ void Client::OnVehicleState(const S_VehicleState &pkt) {
 	if (v->destroyed)
 		return;
 
+	// Late, from whoever had it before it changed hands: snapshots are
+	// unsequenced and the seat that moved it is not, so one can arrive after
+	// the other. Taken, it would put the car back on the old driver's clock
+	// and throw away the new driver's samples, twice.
+	if (pkt.playerId != v->reporterPlayerId && v->reporterPlayerId != 0xFF &&
+	    pkt.playerId != v->driverPlayerId && pkt.playerId != v->custodianPlayerId)
+		return;
+
 	v->last      = pkt.body;
 	v->haveState = true;
+	OnReportersClock(*v, pkt.playerId);
+	if (pkt.playerId == VehicleHolder(*v))
+		v->heardHolder = pkt.playerId;
 	v->interp.Push(pkt.hdr.sendTimeMs, pkt.body.pos, pkt.body.rot,
 	               MoveSpeedToMps(pkt.body.moveSpeed));
 
@@ -2988,7 +3506,10 @@ void Client::UpdateRemoteVehicles() {
 			}
 		}
 
-		if (v.poolHandle < 0 || !v.haveState)
+		// No snapshot is needed for the handover below: a car we claimed from
+		// our own world has none until its new driver's first, a round trip
+		// after the jack, and the jacker was left unseated here until then.
+		if (v.poolHandle < 0)
 			continue;
 
 		// Not onto a car we are driving ourselves. The row is still here
@@ -3074,9 +3595,12 @@ void Client::UpdateRemoteVehicles() {
 		if (HaveCustodyOf(v))
 			continue;
 
-		// Controls, health and flags only. Transform isn't written here -
-		// anything written before CGame::Process is just what local physics
-		// starts from, not what actually gets drawn. See CorrectRemoteVehicles.
+		// Controls, health and flags only, and only once somebody has said
+		// what they are. Transform isn't written here - anything written
+		// before CGame::Process is just what local physics starts from, not
+		// what actually gets drawn. See CorrectRemoteVehicles.
+		if (!v.haveState)
+			continue;
 		if (m_bridge.ApplyRemoteVehicle)
 			m_bridge.ApplyRemoteVehicle(v, v.last);
 
@@ -3159,14 +3683,28 @@ void Client::UpdateRemoteVehicleDamage() {
 // took over inside someone else's settle, and our own custody car was refused
 // damage and blow-up on the word of a player who no longer had it.
 void Client::NoteVehicleHolders() {
-	if (!m_bridge.NoteVehicleHolders)
-		return;
-	for (const RemoteVehicle &v : m_vehicles) {
-		if (!v.active || v.poolHandle < 0)
+	for (RemoteVehicle &v : m_vehicles) {
+		if (!v.active)
+			continue;
+		// A hold that has ended is over: whoever takes the car next, the same
+		// player included, has to be heard from again.
+		if (VehicleHolder(v) == INVALID_PLAYER)
+			v.heardHolder = INVALID_PLAYER;
+		if (v.poolHandle < 0 || !m_bridge.NoteVehicleHolders)
 			continue;
 		const VehicleHolders h = OtherVehicleHolders(v, m_localPlayerId);
-		m_bridge.NoteVehicleHolders(v.netId, h.driver, h.custodian, h.weSettle);
+		m_bridge.NoteVehicleHolders(v.netId, h.driver, h.custodian, h.weSettle,
+		                            BlastFloorEnds(v, m_localPlayerId));
 	}
+}
+
+// A car this machine drives or settles is this engine's to dent and to crash.
+// The correction below is the only thing that used to take the
+// collision-proof bit back off a copy, and it is skipped for exactly these
+// cars, so a car taken over from somebody else never dented again.
+void Client::TakeVehicleBack(RemoteVehicle &vehicle) {
+	if (m_bridge.TakeVehicleBack)
+		m_bridge.TakeVehicleBack(vehicle);
 }
 
 void Client::CorrectRemoteVehicles() {
@@ -3203,8 +3741,10 @@ void Client::CorrectRemoteVehicles() {
 		// One predicate, so that the two halves of the frame cannot drift
 		// apart in what they think ownership is - including the carjack case,
 		// where the engine's answer is the stale one. VehicleIsOursToDrive.
-		if (VehicleIsOursToDrive(v))
+		if (VehicleIsOursToDrive(v)) {
+			TakeVehicleBack(v);
 			continue;
+		}
 
 		// The car we are settling is not a car we are watching either, and
 		// this is the line that actually frees a wedged one. The correction
@@ -3213,8 +3753,34 @@ void Client::CorrectRemoteVehicles() {
 		// against a wall is put back against the wall sixty times a second,
 		// and one frame of gravity never gets to finish. Stop correcting it
 		// for two seconds and the engine does the rest by itself.
-		if (HaveCustodyOf(v))
+		if (HaveCustodyOf(v)) {
+			TakeVehicleBack(v);
 			continue;
+		}
+
+		// Nobody's, and our car is shoving it. Pinned, it would not budge on
+		// any screen, ours included; settled, our engine moves it and the rest
+		// of the session watches it move. Corrected this frame all the same:
+		// the custody is a round trip away.
+		if (v.driverPlayerId == 0xFF && v.custodianPlayerId == INVALID_PLAYER &&
+		    !v.destroyed && m_bridge.VehiclePushedByUs &&
+		    (v.pushAskedAtMs == 0 || nowMs - v.pushAskedAtMs >= PUSH_ASK_EVERY_MS) &&
+		    m_bridge.VehiclePushedByUs(v)) {
+			v.pushAskedAtMs = nowMs ? nowMs : 1;
+			C_VehicleHit ask;
+			InitHeader(ask, nowMs);
+			ask.body.netId  = v.netId;
+			ask.body.weapon = VEHICLE_HIT_PUSH;
+			ask.body.amount = 0.0f;
+			m_net.Send(ask, CH_EVENT);
+			++m_pushAsks;
+			if (!m_saidPushAsk) {
+				m_saidPushAsk = true;
+				Log("client: our car is pushing vehicle %u, which nobody holds; "
+				    "asking to settle it so it moves instead of standing like a wall",
+				    v.netId);
+			}
+		}
 
 		// Decided here, every frame, and carried out by the seam in the call
 		// below. Every frame because the engine undoes it every frame: a
@@ -3292,6 +3858,10 @@ void Client::OnEnterVehicle(const S_EnterVehicle &pkt) {
 		if (pkt.body.netId == INVALID_NETID) {
 			m_localVehicleNetId = INVALID_NETID;
 			m_claimRetryAtMs    = WallClock::NowMs() + CLAIM_RETRY_MS;
+			// A traffic car's promotion is refused on the same packet. Left
+			// pending, it was never asked for again.
+			for (RemoteAmbientCar &car : m_cars)
+				car.claimPending = false;
 			if (!m_saidClaimRefused) {
 				m_saidClaimRefused = true;
 				Log("client: the session refused to name the car we are "
@@ -3304,6 +3874,7 @@ void Client::OnEnterVehicle(const S_EnterVehicle &pkt) {
 		}
 
 		m_localVehicleNetId = pkt.body.netId;
+		ForgetRejoin();
 		Log("client: our vehicle is net %u", pkt.body.netId);
 		// Only the driver's seat. A passenger's ride is somebody else's car
 		// and it already has a row of its own.
@@ -3321,6 +3892,8 @@ void Client::OnEnterVehicle(const S_EnterVehicle &pkt) {
 
 	if (pkt.body.seat == 0)
 		if (RemoteVehicle *v = VehicleSlot(pkt.body.netId, false)) {
+			if (v->netId == m_rejoinAdoptedNetId)
+				LetGoOfRejoinedCar(*v, pkt.playerId);
 			v->driverPlayerId = pkt.playerId;
 			// A driver ends a custody, here and on the server, and no packet
 			// is spent saying so. "The driver, or the custodian when there is
@@ -3568,6 +4141,12 @@ void Client::OnExitVehicle(const S_ExitVehicle &pkt) {
 		// silent on both ends, which is why the 2026-09-22 session's logs
 		// read as "one player recorded in two cars at once" when what had
 		// actually happened was an exit nobody wrote down.
+		// For the car it names. The echo of an exit can land after we have
+		// got into the next car and been told its name, and taken as ours it
+		// dropped that name: the next send claimed the car again under a
+		// second netId.
+		if (pkt.netId != m_localVehicleNetId && m_localVehicleNetId != INVALID_NETID)
+			return;
 		Log("client: we got out of vehicle %u", m_localVehicleNetId);
 		m_localVehicleNetId   = INVALID_NETID;
 		m_vehicleClaimPending = false;
@@ -3634,6 +4213,7 @@ void Client::OnVehicleCustody(const S_VehicleCustody &pkt) {
 		v->settleReported = false;
 		v->holdUntilMs    = 0;
 		v->burnSinceMs    = 0;
+		v->sinkSinceMs    = 0;
 		if (hadIt)
 			Log("client: we have handed vehicle %u back to the session; every "
 			    "machine holds it where it stands now", pkt.netId);
@@ -3645,6 +4225,7 @@ void Client::OnVehicleCustody(const S_VehicleCustody &pkt) {
 	v->settleEndsAtMs = WallClock::NowMs() + VEHICLE_SETTLE_MS;
 	v->holdUntilMs    = 0;
 	v->burnSinceMs    = 0;
+	v->sinkSinceMs    = 0;
 
 	// A fresh high-water mark for the dents, every time. Whatever the last
 	// custody of this car left in it may be above what the car wears now - a
@@ -3680,7 +4261,9 @@ void Client::OnVehicleCustody(const S_VehicleCustody &pkt) {
 void Client::OnCarPromoted(const S_CarPromoted &pkt) {
 	const bool weHostedIt = pkt.wasOwnerPlayerId == m_localPlayerId;
 
-	int32_t handle = -1;
+	int32_t  handle     = -1;
+	uint32_t dentPanels = 0;
+	uint16_t dentDoors  = 0;
 	if (RemoteAmbientCar *car = AmbientCarByNetId(pkt.netId)) {
 		// Anybody the ambient roster had sitting in it comes out first, and
 		// the ordering is the one OnCarDespawn keeps for the same reason: a
@@ -3698,9 +4281,16 @@ void Client::OnCarPromoted(const S_CarPromoted &pkt) {
 				ped.seatVehicleNetId = INVALID_NETID;
 		}
 
-		handle = car->poolHandle;
-		*car   = RemoteAmbientCar{};
+		handle      = car->poolHandle;
+		dentPanels  = car->damagePanels;
+		dentDoors   = car->damageDoors;
+		*car        = RemoteAmbientCar{};
 	}
+	// The machine whose engine made the car has no replica row for it: its
+	// own traffic is population.cpp's. Without this it built a second car
+	// under the same netId and went on driving the first as traffic.
+	if (handle < 0 && weHostedIt && m_bridge.HostedCarHandle)
+		handle = m_bridge.HostedCarHandle(pkt.netId);
 
 	RemoteVehicle *v = VehicleSlot(pkt.netId, /*createIfMissing=*/true);
 	if (!v) {
@@ -3727,6 +4317,11 @@ void Client::OnCarPromoted(const S_CarPromoted &pkt) {
 	// and it builds it the ordinary way. The point of the promotion is that
 	// nobody else does.
 	v->spawnPending = handle < 0;
+	// Its dents come with it. A replica already wears them; a car still to be
+	// built puts them on after the spawn, the way the row's own would.
+	MergeDamage(v->damagePanels, v->damageDoors, dentPanels, dentDoors);
+	if (handle < 0 && (v->damagePanels != 0 || v->damageDoors != 0))
+		v->damagePending = true;
 	if (v->spawnPending && m_bridge.RequestModel)
 		m_bridge.RequestModel(pkt.body.modelId);
 
@@ -4051,7 +4646,8 @@ void Client::SendLocalVehicle() {
 		return;
 
 	VehicleIdentity id{};
-	const bool      driving = m_bridge.SampleLocalVehicleIdentity(id);
+	const bool      driving   = m_bridge.SampleLocalVehicleIdentity(id);
+	const bool      rejoining = WaitingForRejoin();
 
 	if (!driving) {
 		if (m_localVehicleNetId != INVALID_NETID) {
@@ -4122,6 +4718,11 @@ void Client::SendLocalVehicle() {
 			// is the duplicate every machine then holds two cars for.
 			if (ours->surrendered)
 				return;
+			// Taken back from the backfill a moment ago. The seats behind it
+			// may yet say somebody else has had it since, and claimed now it
+			// would be taken off them.
+			if (rejoining && ours->netId == m_rejoinAdoptedNetId)
+				return;
 
 			C_EnterVehicle out;
 			InitHeader(out, WallClock::NowMs());
@@ -4161,6 +4762,12 @@ void Client::SendLocalVehicle() {
 		// ClaimDrivenAmbientCars is what asks for it, under the number the
 		// session already has. protocol.h, S_CarPromoted.
 		if (AmbientCarWeAreDriving())
+			return;
+
+		// The car we were in, before the backfill has had the chance to hand
+		// it back under its old number.
+		if (rejoining && m_rejoinNetId != INVALID_NETID && m_bridge.SampleLocalVehicleHandle &&
+		    m_bridge.SampleLocalVehicleHandle() == m_rejoinHandle)
 			return;
 
 		// No match, and no way to look for one. Say so, once, and only when
@@ -4219,9 +4826,11 @@ void Client::SendLocalVehicle() {
 	// which is the same place every other machine in the session has it. Skip
 	// this and a car handed back to observation has an empty buffer and
 	// drifts on local physics alone, on this screen and no other.
-	if (RemoteVehicle *ours = VehicleSlot(m_localVehicleNetId, /*createIfMissing=*/false))
+	if (RemoteVehicle *ours = VehicleSlot(m_localVehicleNetId, /*createIfMissing=*/false)) {
+		OnReportersClock(*ours, m_localPlayerId);
 		ours->interp.Push(pkt.hdr.sendTimeMs, body.pos, body.rot,
 		                  MoveSpeedToMps(body.moveSpeed));
+	}
 }
 
 // The cars nobody is driving that this machine has been asked to settle.
@@ -4278,6 +4887,7 @@ void Client::SendCustodyVehicles() {
 			// it again, and an empty buffer there would put the car back
 			// where its last driver parked it - which is the pose we have
 			// just spent two seconds getting it out of.
+			OnReportersClock(v, m_localPlayerId);
 			v.interp.Push(pkt.hdr.sendTimeMs, body.pos, body.rot,
 			              MoveSpeedToMps(body.moveSpeed));
 			v.last      = body;
@@ -4291,6 +4901,16 @@ void Client::SendCustodyVehicles() {
 		// the check at the top of the loop stops this, which is right: the
 		// server has ended the custody by the time it reads anything after it.
 		SendCustodyVehicleDamage(v, nowMs);
+
+		// Still being pushed: kept, the way a burst of shots keeps it, so a
+		// car shoved down the street is not handed back halfway and pinned.
+		// And the settle starts again from here, so one shoved for longer
+		// than the window still gets the whole of it to roll to a stop after
+		// the last push, rather than being given up on while it rolls.
+		if (m_bridge.VehiclePushedByUs && m_bridge.VehiclePushedByUs(v)) {
+			v.holdUntilMs    = nowMs + CUSTODY_HIT_HOLD_MS;
+			v.settleEndsAtMs = nowMs + VEHICLE_SETTLE_MS;
+		}
 
 		const bool atRest = m_bridge.VehicleAtRest && m_bridge.VehicleAtRest(v);
 		if (atRest) {
@@ -4316,6 +4936,16 @@ void Client::SendCustodyVehicles() {
 			    "until it goes up - our engine runs its fire timer and every other "
 			    "machine holds theirs", v.netId);
 		}
+
+		// Going down in water, the same way: until it lies on the bottom, and
+		// no longer than CUSTODY_SINK_CAP_MS from the first frame it was seen
+		// going down in this custody. Not restarted when it stops for a frame,
+		// so a car that bobs in and out of the test cannot hold on for ever.
+		const bool sinking = m_bridge.VehicleSinking && m_bridge.VehicleSinking(v);
+		if (sinking && v.sinkSinceMs == 0)
+			v.sinkSinceMs = nowMs != 0 ? nowMs : 1;
+		if (sinking && nowMs - v.sinkSinceMs < CUSTODY_SINK_CAP_MS)
+			v.holdUntilMs = nowMs + CUSTODY_HIT_HOLD_MS;
 
 		const bool settled = v.restFrames >= VEHICLE_REST_FRAMES;
 		if (!CustodyMayEnd(settled, burning, nowMs, v.settleEndsAtMs, v.holdUntilMs,
@@ -4414,7 +5044,7 @@ void Client::ClaimDrivenAmbientCars() {
 			car.claimPending = false;
 			continue;
 		}
-		if (car.claimPending)
+		if (car.claimPending || WallClock::NowMs() < m_claimRetryAtMs)
 			continue;
 
 		C_EnterVehicle out;
@@ -4507,6 +5137,12 @@ void Client::SendLocalVehicleDamage() {
 void Client::OnVehicleDamage(const S_VehicleDamage &pkt) {
 	RemoteVehicle *v = VehicleSlot(pkt.body.netId, /*createIfMissing=*/false);
 	if (!v || !v->active) {
+		// Traffic, from the machine hosting it. netIds are one space, so the
+		// number cannot mean a session car as well.
+		if (RemoteAmbientCar *car = AmbientCarByNetId(pkt.body.netId)) {
+			OnAmbientCarDamage(*car, pkt);
+			return;
+		}
 		// Never heard of it. Not created from: the packet carries no model,
 		// and a dent is not a reason to invent a car. The backfill is what
 		// covers a joiner.
@@ -4706,11 +5342,22 @@ void Client::OnPedBodyPart(const S_PedBodyPart &pkt) {
 	if (!IsRemovableBodyPart(pkt.body.node))
 		return;
 	RemoteAmbientPed *ped = AmbientPedByNetId(pkt.body.netId);
+	if (!ped) {
+		// A player's own limb, from their own machine. Ours never comes back:
+		// the server does not send it to us, and our own engine took it off.
+		for (RemotePlayer &p : m_players)
+			if (p.active && p.playerId != m_localPlayerId && p.netId == pkt.body.netId) {
+				if (p.poolHandle >= 0 && m_bridge.RemovePlayerBodyPart)
+					m_bridge.RemovePlayerBodyPart(p, pkt.body.node, pkt.body.direction);
+				return;
+			}
+		return;
+	}
 	// Not ours to show if we never built it: a replica still waiting on its
 	// model, or a ped this machine hosts itself, whose limb our own engine
 	// took off already. The server does not send that one back, and this is
 	// the guard for when it does.
-	if (!ped || ped->poolHandle < 0 || !m_bridge.RemoveAmbientBodyPart)
+	if (ped->poolHandle < 0 || !m_bridge.RemoveAmbientBodyPart)
 		return;
 	m_bridge.RemoveAmbientBodyPart(*ped, pkt.body.node, pkt.body.direction);
 }
@@ -4787,6 +5434,104 @@ void Client::OnPedDamage(const S_PedDamage &pkt) {
 		attacker = &m_players[pkt.attackerId];
 
 	m_bridge.ApplyRemotePedDamage(attacker, pkt.body);
+}
+
+// ---- chat --------------------------------------------------------------------
+
+void Client::OnChat(const S_Chat &pkt) {
+	char text[CHAT_LEN];
+	std::memcpy(text, pkt.text, sizeof text);
+	text[CHAT_LEN - 1] = '\0';   // the wire field isn't guaranteed to end
+
+	// Chat and joins share the ordered channel, so a line from somebody we
+	// have not been told about is not something the server sends.
+	const char *nick = "?";
+	if (pkt.playerId == m_localPlayerId)
+		nick = m_localNick.empty() ? "you" : m_localNick.c_str();
+	else if (pkt.playerId < MAX_PLAYERS && m_players[pkt.playerId].active)
+		nick = m_players[pkt.playerId].nick.c_str();
+
+	const bool known = pkt.playerId == m_localPlayerId ||
+	                   (pkt.playerId < MAX_PLAYERS && m_players[pkt.playerId].active);
+	char   line[FEED_MESSAGE];
+	size_t nickLen = 0;
+	FormatChatLine(line, sizeof line, nick, text, &nickLen);
+	m_feed.Push(FeedKind::Chat, line, WallClock::NowMs(),
+	            known ? pkt.playerId : INVALID_PLAYER, nickLen);
+
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("client: chat is arriving - the first line was from %s", nick);
+	}
+}
+
+void Client::SendTypedChat() {
+	if (!m_bridge.TakeTypedChat)
+		return;
+	char text[CHAT_LEN];
+	if (!m_bridge.TakeTypedChat(text))
+		return;
+	C_Chat out;
+	InitHeader(out, WallClock::NowMs());
+	std::memcpy(out.text, text, sizeof out.text);
+	out.text[CHAT_LEN - 1] = '\0';
+	m_net.Send(out, CH_EVENT);
+
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("client: sent our first line of chat");
+	}
+}
+
+// ---- somebody else's pedestrians fighting (protocol.h, C_NpcShot) -----------
+
+// A round one of their pedestrians fired. Drawn on our copy of him if we have
+// one and dropped otherwise, the way a remote player's round is: a streak only
+// means anything at the instant it was fired.
+void Client::OnNpcShot(const S_NpcShot &pkt) {
+	if (pkt.ownerPlayerId == m_localPlayerId || !m_bridge.ReplayAmbientShot)
+		return;
+	RemoteAmbientPed *ped = AmbientPedByNetId(pkt.pedNetId);
+	if (!ped || ped->ownerPlayerId != pkt.ownerPlayerId || ped->poolHandle < 0 || ped->dead)
+		return;
+	m_bridge.ReplayAmbientShot(*ped, pkt.body);
+}
+
+// A hit one of their pedestrians landed on our copy on their machine, which is
+// the only place it could be found. Applied here like any other hit on us.
+void Client::OnNpcDamage(const S_NpcDamage &pkt) {
+	if (m_localNetId == INVALID_NETID || pkt.body.victimNetId != m_localNetId) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			Log("client: an NPC's hit arrived for net %u and we are net %u, so it is "
+			    "not ours to apply", pkt.body.victimNetId, m_localNetId);
+		}
+		return;
+	}
+	if (!m_bridge.ApplyNpcDamage)
+		return;
+
+	RemoteAmbientPed *attacker = AmbientPedByNetId(pkt.attackerPedNetId);
+	if (attacker && attacker->ownerPlayerId != pkt.ownerPlayerId)
+		attacker = nullptr;
+
+	// Whoever hurt us last is no longer a player, so a death from here on is
+	// not theirs to be credited with.
+	m_lastAttackerNetId = INVALID_NETID;
+	m_lastAttackerMs    = 0;
+
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("client: our first hit from somebody else's NPC arrived - pedestrian net "
+		    "%u, hosted by player %u, cause %u, %.0f (%s)", pkt.attackerPedNetId,
+		    pkt.ownerPlayerId, pkt.body.weapon, pkt.body.amount,
+		    attacker ? "we have his replica for the blame" : "we have no replica of him");
+	}
+	m_bridge.ApplyNpcDamage(attacker, pkt.body);
 }
 
 void Client::UpdateRemoteAmbientPeds() {
@@ -4877,6 +5622,18 @@ void Client::SendLocalAmbientPeds() {
 			C_PedBodyPart out;
 			InitHeader(out, WallClock::NowMs());
 			out.body = limbs[i];
+			// Our own player's, under the netId the session gave us, which
+			// the server takes from us and nobody else.
+			if (out.body.netId == INVALID_NETID) {
+				if (m_localNetId == INVALID_NETID)
+					continue;
+				out.body.netId = m_localNetId;
+				if (!m_saidOwnLimbSent) {
+					m_saidOwnLimbSent = true;
+					Log("client: our player lost a limb (node %u); telling the session "
+					    "so it comes off on every screen", out.body.node);
+				}
+			}
 			m_net.Send(out, CH_EVENT);
 		}
 	}
@@ -4991,13 +5748,17 @@ void Client::OnPedStates(const S_PedStates &pkt) {
 		ped->animId       = in.animId;
 		// On WallClock, not the sender's timestamp: what matters is how long
 		// ago anybody vouched for the fire, here.
-		ped->fireSaid   = (in.flags & AMBIENT_PED_ON_FIRE) != 0;
-		ped->fireSaidMs = WallClock::NowMs();
+		const uint32_t at = WallClock::NowMs();
+		ped->fireSaid    = (in.flags & AMBIENT_PED_ON_FIRE) != 0;
+		ped->fireSaidMs  = at;
+		ped->lastRowAtMs = at != 0 ? at : 1;
 
 		// The standing instruction, not the act. UpdateAmbientPedSeats is
 		// what carries it out, on whatever frame both halves exist.
 		ped->seatVehicleNetId = in.vehicleNetId;
 		ped->seatIndex        = in.seat;
+		// And the same for what is in his hand. ApplyAmbientPedPoses arms him.
+		ped->weapon = AmbientPedWeapon(in.flags);
 		++applied;
 	}
 
@@ -5038,8 +5799,16 @@ void Client::ApplyAmbientPedPoses() {
 		if (ped.Seated())
 			continue;
 
-		// A ped that drops out of the twelve its owner streams (protocol.h,
-		// MAX_PED_STATES) does not empty this buffer; its rows just stop.
+		// The weapon his host has him holding, on a change. Not while seated:
+		// the warp into a seat is the engine's and so is what it does to the
+		// hand, and a gun that goes back in on the way out is ours to put
+		// there again (UnseatAmbientPed clears appliedWeapon).
+		if (ped.weapon != ped.appliedWeapon && !ped.dead && m_bridge.ArmAmbientReplica &&
+		    m_bridge.ArmAmbientReplica(ped, ped.weapon))
+			ped.appliedWeapon = ped.weapon;
+
+		// A ped waiting for its turn in its owner's batch (protocol.h,
+		// MAX_PED_STATES) does not empty this buffer; its rows just pause.
 		// SampleDelayed then holds it on the newest one, because OnPedStates
 		// pushes a zero velocity and there is nothing to extrapolate along -
 		// a person standing still, the far band of §2.1's rate-by-distance.
@@ -5125,6 +5894,41 @@ void Client::UpdateAmbientPedSeats() {
 	}
 }
 
+// The observer's half of docs/population.md §2.1: of the replicas we hold,
+// how many have heard from their host lately. A replica its host's batches
+// never get round to stands where it was last heard of, and on this screen
+// that looks exactly like one that is working until somebody walks up to it.
+// Corpses and wrecks are left out, since nothing moves them.
+void Client::ReportAmbientFreshness() {
+	constexpr uint32_t REPORT_MS = 5000;
+	constexpr uint32_t FRESH_MS  = 3000;
+	const uint32_t nowMs = WallClock::NowMs();
+	if (nowMs - m_lastFreshnessReportMs < REPORT_MS)
+		return;
+	m_lastFreshnessReportMs = nowMs;
+
+	uint32_t peds = 0, pedsFresh = 0, cars = 0, carsFresh = 0;
+	for (const RemoteAmbientPed &ped : m_peds) {
+		if (!ped.active || ped.poolHandle < 0 || ped.dead)
+			continue;
+		++peds;
+		if (ped.lastRowAtMs != 0 && nowMs - ped.lastRowAtMs <= FRESH_MS)
+			++pedsFresh;
+	}
+	for (const RemoteAmbientCar &car : m_cars) {
+		if (!car.active || car.poolHandle < 0 || car.destroyed)
+			continue;
+		++cars;
+		if (car.lastRowAtMs != 0 && nowMs - car.lastRowAtMs <= FRESH_MS)
+			++carsFresh;
+	}
+	if (peds == 0 && cars == 0)
+		return;
+	Log("client: other machines' crowd here - %u of %u ped replica(s) and %u of "
+	    "%u car replica(s) had a row in the last %u s", pedsFresh, peds, carsFresh,
+	    cars, FRESH_MS / 1000);
+}
+
 bool Client::AmbientDriverSaid(const RemoteAmbientCar &car) const {
 	for (const RemoteAmbientPed &ped : m_peds)
 		if (ped.active && ped.ownerPlayerId == car.ownerPlayerId &&
@@ -5142,16 +5946,20 @@ void Client::SendHostedPedStates() {
 	// enough that 10 Hz is already coarse, and a pedestrian is slow enough
 	// that 10 Hz is generous. What buys the ped stream its place in the
 	// budget is the row being 24 bytes rather than 44, not the clock.
-	constexpr uint32_t PED_STATE_INTERVAL_MS = 100;
+	// game/streampick.h counts its deadlines in these ticks.
+	constexpr uint32_t PED_STATE_INTERVAL_MS = game::STREAM_TICK_MS;
 	const uint32_t nowMs = WallClock::NowMs();
 	if (nowMs - m_lastPedStateMs < PED_STATE_INTERVAL_MS)
 		return;
 	m_lastPedStateMs = nowMs;
 
+	Vec3 viewers[MAX_PLAYERS];
+	const uint32_t viewerCount = ViewerPositions(viewers, MAX_PLAYERS);
+
 	C_PedStates out;
 	InitHeader(out, nowMs);
 	out.count = static_cast<uint8_t>(
-	    m_bridge.SampleHostedPeds(out.peds, MAX_PED_STATES));
+	    m_bridge.SampleHostedPeds(out.peds, MAX_PED_STATES, viewers, viewerCount));
 	if (out.count == 0)
 		return;
 	m_net.Send(out, CH_SNAPSHOT);
@@ -5364,8 +6172,20 @@ void Client::UpdateRemoteAmbientCars() {
 			m_bridge.RequestModel(car.body.modelId);
 		if (!m_bridge.IsModelReady(car.body.modelId))
 			continue;
-		if (m_bridge.SpawnAmbientCarReplica(car))
-			car.spawnPending = false;
+		if (!m_bridge.SpawnAmbientCarReplica(car))
+			continue;
+		car.spawnPending = false;
+
+		// Arrives already dented, without a shower of parts: this is a spawn
+		// or a rebuild, not a crash in front of anybody.
+		if ((car.damagePanels != 0 || car.damageDoors != 0) &&
+		    m_bridge.ApplyAmbientCarDamage) {
+			VehicleDamageBody body{};
+			body.netId  = car.netId;
+			body.panels = car.damagePanels;
+			body.doors  = car.damageDoors;
+			m_bridge.ApplyAmbientCarDamage(car, body, /*flying=*/false);
+		}
 	}
 }
 
@@ -5394,11 +6214,12 @@ void Client::CorrectAmbientCars() {
 
 		// Held, not extrapolated, when the rows stop.
 		//
-		// They stop all the time without the car going anywhere: its host
-		// only streams the eight nearest its own player (protocol.h,
-		// MAX_CAR_STATES), and a car that drops out of that set simply stops
-		// appearing in the batch. No despawn, nothing said, and the buffer
-		// keeps its samples - it never empties while the replica lives. With
+		// They pause all the time without the car going anywhere: its host's
+		// batch holds MAX_CAR_STATES and its cars take turns at it
+		// (game/streampick.h), so a car far from everybody can miss a few
+		// batches in a row, and one lost packet is a missed row too. No
+		// despawn, nothing said, and the buffer keeps its samples - it never
+		// empties while the replica lives. With
 		// plain SampleDelayed that left the car coasting along its last
 		// velocity until the playback clock settled, some 220 ms past the
 		// last row, and standing there: over 5 m further down the road at
@@ -5406,8 +6227,8 @@ void Client::CorrectAmbientCars() {
 		// for a light really stopped - and when the rows came back, dragged
 		// backwards to meet them. SampleDelayedHeld stops it on the last row,
 		// which is what population.md §2.1 always said this did. When the
-		// car comes back into the eight, its rows land in the same buffer and
-		// it drives on from there - the same replica, forwards.
+		// car's turn comes, its rows land in the same buffer and it drives on
+		// from there - the same replica, forwards.
 		//
 		// Not handed to the local physics either, which would keep it moving:
 		// its autopilot is zeroed, so it would roll to a stop wherever this
@@ -5477,26 +6298,81 @@ void Client::SendHostedCarStates() {
 	//
 	// docs/population.md §2.1 is the whole argument: a dozen ambient cars at
 	// the player rate is most of a session's budget on its own, and it says
-	// the rate has to fall off with distance rather than be flat. This is the
-	// crude version of that - a slower clock for everything ambient, and only
-	// the eight nearest cars inside each tick. Measuring it properly against
-	// a real session is step 5.
-	constexpr uint32_t CAR_STATE_INTERVAL_MS = 100;
+	// the rate has to fall off with distance rather than be flat. So there is
+	// a slower clock for everything ambient, eight cars inside each tick, and
+	// the cars take turns at those eight by how near they are to the players
+	// who will see them (game/streampick.h).
+	constexpr uint32_t CAR_STATE_INTERVAL_MS = game::STREAM_TICK_MS;
 	const uint32_t nowMs = WallClock::NowMs();
 	if (nowMs - m_lastCarStateMs < CAR_STATE_INTERVAL_MS)
 		return;
 	m_lastCarStateMs = nowMs;
 
+	// On the same clock: a dent is rare, and ten reads a second of the
+	// cars we host is plenty to catch one.
+	SendHostedCarDamage(nowMs);
+
+	Vec3 viewers[MAX_PLAYERS];
+	const uint32_t viewerCount = ViewerPositions(viewers, MAX_PLAYERS);
+
 	C_CarStates out;
 	InitHeader(out, nowMs);
 	uint8_t horns = 0, sirens = 0;
-	out.count = static_cast<uint8_t>(
-	    m_bridge.SampleHostedCars(out.cars, MAX_CAR_STATES, horns, sirens));
+	out.count = static_cast<uint8_t>(m_bridge.SampleHostedCars(
+	    out.cars, MAX_CAR_STATES, viewers, viewerCount, horns, sirens));
 	out.hornMask  = horns;
 	out.sirenMask = sirens;
 	if (out.count == 0)
 		return;
 	m_net.Send(out, CH_SNAPSHOT);
+}
+
+// Our own traffic's dents, on the packet a driver's go on. The server takes it
+// from a car's host as it takes it from a car's driver (Session::NoteCarDamage).
+void Client::SendHostedCarDamage(uint32_t nowMs) {
+	if (!m_bridge.DrainHostedCarDamage)
+		return;
+	VehicleDamageBody dents[MAX_CAR_STATES];
+	const uint32_t n = m_bridge.DrainHostedCarDamage(dents, MAX_CAR_STATES);
+	for (uint32_t i = 0; i < n; ++i) {
+		C_VehicleDamage out;
+		InitHeader(out, nowMs);
+		out.body = dents[i];
+		m_net.Send(out, CH_EVENT);
+		++m_damageReportsSent;
+	}
+}
+
+// Somebody else's traffic car got worse, as its host's engine says. The
+// session car's rules: merged as a maximum, worn straight away when the
+// replica is here, and held on the row until it is when it is not.
+void Client::OnAmbientCarDamage(RemoteAmbientCar &car, const S_VehicleDamage &pkt) {
+	if (car.destroyed || car.ownerPlayerId == m_localPlayerId)
+		return;
+	if (IsDamageReset(pkt.body.panels))
+		return;   // traffic is never resprayed; a session car would be
+
+	const uint32_t wasPanels = car.damagePanels;
+	const uint16_t wasDoors  = car.damageDoors;
+	MergeDamage(car.damagePanels, car.damageDoors, pkt.body.panels, pkt.body.doors);
+	if (car.damagePanels == wasPanels && car.damageDoors == wasDoors)
+		return;
+
+	if (!m_saidCarDamageReceived) {
+		m_saidCarDamageReceived = true;
+		Log("client: took our first traffic dent off the wire, for car %u from "
+		    "player %u (panels %08X doors %04X)",
+		    car.netId, pkt.playerId, static_cast<unsigned>(car.damagePanels),
+		    static_cast<unsigned>(car.damageDoors));
+	}
+
+	if (car.poolHandle >= 0 && m_bridge.ApplyAmbientCarDamage) {
+		VehicleDamageBody body{};
+		body.netId  = car.netId;
+		body.panels = car.damagePanels;
+		body.doors  = car.damageDoors;
+		m_bridge.ApplyAmbientCarDamage(car, body, /*flying=*/true);
+	}
 }
 
 } // namespace coopiii

@@ -27,6 +27,7 @@
 #pragma once
 
 #include "addresses.h"
+#include "leadcheck.h"
 
 #include <coopiii/protocol.h>
 
@@ -34,6 +35,37 @@
 #include <cstdint>
 
 namespace coopiii::game {
+
+// A drive-by round that ends on anything but a ped or a car goes to
+// CGlass::WasGlassHitByBullet in FireInstantHitFromCar's `other` arm, as a
+// round on foot does in DoBulletImpact, and that is the whole of how a drive-by
+// breaks a window. An observer draws somebody else's round and never runs the
+// engine's function, so the window used to break on the shooter's screen
+// alone; DriveByImpact makes the same call now.
+//
+// The address is a lead (docs/addresses-unverified.md): both listings in
+// addresses.h show the call and neither reads the function. It is used only
+// when both of those functions, which addresses.h does prove, call it.
+// `(CEntity *, CVector)`: an entity and three floats, cdecl.
+constexpr uintptr_t GLASS_HIT_BY_BULLET_LEAD = 0x00504670;
+// FireInstantHitFromCar runs up to DoDoomAiming, the function after it; the
+// call in DoBulletImpact is among its first instructions.
+constexpr size_t DRIVEBY_FIRE_LEN          = CWeapon__DoDoomAiming - CWeapon__FireInstantHitFromCar;
+constexpr size_t BULLET_IMPACT_GLASS_BYTES = 0x100;
+
+// Both witnesses, over the bytes the caller read from them.
+inline bool GlassLeadChecksOut(const uint8_t *fromCar, const uint8_t *bulletImpact) {
+	return CallIn(fromCar, CWeapon__FireInstantHitFromCar, DRIVEBY_FIRE_LEN,
+	              GLASS_HIT_BY_BULLET_LEAD) &&
+	       CallIn(bulletImpact, CWeapon__DoBulletImpact, BULLET_IMPACT_GLASS_BYTES,
+	              GLASS_HIT_BY_BULLET_LEAD);
+}
+
+// FireInstantHitFromCar's arms by the victim's CEntity type: a ped (3) and a
+// car (2) have their own, everything else is `other`.
+inline bool DriveByReachesGlass(uint8_t entityType) {
+	return entityType != 2 && entityType != 3;
+}
 
 inline bool IsDriveByAnim(uint16_t id) {
 	return id == ANIM_STD_CAR_DRIVEBY_LEFT || id == ANIM_STD_CAR_DRIVEBY_RIGHT;

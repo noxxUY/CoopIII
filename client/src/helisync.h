@@ -102,6 +102,9 @@ struct OwnHeliGone {
 	int32_t handle         = -1;
 	uint8_t reason         = HELI_GONE_VANISHED;
 	uint8_t creditPlayerId = INVALID_PLAYER;
+	// Somebody else brought it down and our engine's reward for it could not
+	// be taken back (HELI_GONE_OWNER_KEPT).
+	bool    ownerKept      = false;
 	Vec3    pos            = {};
 };
 
@@ -167,9 +170,10 @@ struct HeliBridge {
 
 	// ---- the shooter --------------------------------------------------------
 	uint8_t (*DrainLocalHeliHits)(LocalHeliHit *out, uint8_t max) = nullptr;
-	// Our hit brought somebody else's helicopter down. The crime and the
-	// statistics the owner's engine would have given itself.
-	void (*CreditHeliShootDown)(uint8_t slot, const Vec3 &pos) = nullptr;
+	// Our hit brought somebody else's helicopter down. The crime, and the
+	// statistics the owner's engine would have given itself unless it kept
+	// them (`statistics` false).
+	void (*CreditHeliShootDown)(uint8_t slot, const Vec3 &pos, bool statistics) = nullptr;
 	// And the $250 its engine took back, when the session's money rule says
 	// an award goes to whoever earned it (protocol.h, MoneyRule).
 	void (*PayHeliShootDown)() = nullptr;
@@ -305,7 +309,7 @@ private:
 	void SendOwnShots(uint32_t nowMs);
 	void Orphan(RemoteHeli &heli, uint32_t nowMs);
 	void SendGone(const OwnHeli &own, uint8_t slot, uint8_t reason,
-	              uint8_t credit, const Vec3 &pos, uint32_t nowMs);
+	              uint8_t credit, const Vec3 &pos, uint32_t nowMs, bool ownerKept = false);
 	uint16_t NextSerial();
 
 	template <class T>

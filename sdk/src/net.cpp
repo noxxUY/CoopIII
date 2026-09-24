@@ -117,8 +117,9 @@ void NetClient::Service(std::vector<Message> &out) {
 			enet_packet_destroy(ev.packet);
 			break;
 		case ENET_EVENT_TYPE_DISCONNECT:
-			m_state = DISCONNECTED;
-			m_peer  = nullptr;
+			m_state      = DISCONNECTED;
+			m_peer       = nullptr;
+			m_lastReason = ev.data;
 			break;
 		default:
 			break;
@@ -153,14 +154,21 @@ bool NetServer::Listen(uint16_t port, uint8_t maxPeers) {
 	addr.port = port;
 
 	m_host = enet_host_create(&addr, maxPeers, CH_COUNT, 0, 0);
+	m_members.assign(maxPeers, 0);
 	return m_host != nullptr;
 }
 
 void NetServer::Shutdown() {
 	if (!m_host)
 		return;
+	// Told, rather than left to time out: a client nobody tells sits in a
+	// frozen world for half a minute before it notices.
+	for (size_t i = 0; i < m_host->peerCount; ++i)
+		if (m_host->peers[i].state == ENET_PEER_STATE_CONNECTED)
+			enet_peer_disconnect_now(&m_host->peers[i], 0);
 	enet_host_destroy(m_host);
 	m_host = nullptr;
+	m_members.clear();
 }
 
 bool NetServer::SendToRaw(PeerId peer, const void *bytes, size_t len, Channel ch) {
@@ -184,10 +192,15 @@ void NetServer::BroadcastRaw(const void *bytes, size_t len, Channel ch, PeerId e
 	if (!m_host)
 		return;
 	for (PeerId i = 0; i < m_host->peerCount; ++i) {
-		if (i == except)
+		if (i == except || i >= m_members.size() || !m_members[i])
 			continue;
 		SendToRaw(i, bytes, len, ch);
 	}
+}
+
+void NetServer::SetMember(PeerId peer, bool member) {
+	if (peer < m_members.size())
+		m_members[peer] = member ? 1 : 0;
 }
 
 uint32_t NetServer::RoundTripMs(PeerId peer) const {
@@ -199,7 +212,12 @@ uint32_t NetServer::RoundTripMs(PeerId peer) const {
 void NetServer::Disconnect(PeerId peer, uint8_t reason) {
 	if (!m_host || peer >= m_host->peerCount)
 		return;
-	enet_peer_disconnect(&m_host->peers[peer], reason);
+	// Later, not now: enet_peer_disconnect throws away whatever is still
+	// queued for the peer, and the thing queued in front of every disconnect
+	// here is the packet saying why - a refused welcome, or the kick. Sent
+	// the other way it never arrived, and a client turned away had no idea
+	// what for.
+	enet_peer_disconnect_later(&m_host->peers[peer], reason);
 }
 
 void NetServer::Service(std::vector<ServerEvent> &out, uint32_t timeoutMs) {
@@ -226,6 +244,7 @@ void NetServer::Service(std::vector<ServerEvent> &out, uint32_t timeoutMs) {
 			break;
 		case ENET_EVENT_TYPE_DISCONNECT:
 			se.type = ServerEvent::DISCONNECT;
+			SetMember(se.peer, false);
 			out.push_back(std::move(se));
 			break;
 		default:

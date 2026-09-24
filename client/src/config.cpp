@@ -57,6 +57,29 @@ std::string Config::SanitizeNick(const std::string &raw) {
 	return out.empty() ? std::string("Player") : out;
 }
 
+// For A-Z and 0-9 the virtual-key code is the uppercase character itself, and
+// F1 to F12 run from 0x70. Any other name is one we have no table for, so it is
+// left alone rather than guessed at.
+int Config::ParseKey(const std::string &value) {
+	if (value.size() == 1) {
+		const char c = value[0];
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+			return std::toupper(static_cast<unsigned char>(c));
+		return 0;
+	}
+	if ((value.size() == 2 || value.size() == 3) && (value[0] == 'F' || value[0] == 'f')) {
+		int n = 0;
+		for (size_t i = 1; i < value.size(); ++i) {
+			if (value[i] < '0' || value[i] > '9')
+				return 0;
+			n = n * 10 + (value[i] - '0');
+		}
+		if (n >= 1 && n <= 12 && value[1] != '0')
+			return 0x70 + n - 1;
+	}
+	return 0;
+}
+
 bool Config::ParseIni(const std::string &text) {
 	if (text.empty())
 		return false;
@@ -98,15 +121,26 @@ bool Config::ParseIni(const std::string &text) {
 			if (s >= 0.25 && s <= 4.0)
 				nametagScale = static_cast<float>(s);
 		} else if (IEquals(key, "seatkey")) {
-			// One letter or digit, taken as its virtual-key code, which for
-			// A-Z and 0-9 is the uppercase character itself. Anything longer is
-			// a name we have no table for, so it is left alone rather than
-			// guessed at.
-			if (value.size() == 1) {
-				const char c = value[0];
-				if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-				    (c >= '0' && c <= '9'))
-					seatKey = std::toupper(static_cast<unsigned char>(c));
+			if (const int vk = ParseKey(value))
+				seatKey = vk;
+		} else if (IEquals(key, "chatkey")) {
+			if (const int vk = ParseKey(value))
+				chatKey = vk;
+		} else if (IEquals(key, "listkey")) {
+			if (const int vk = ParseKey(value))
+				listKey = vk;
+		} else if (IEquals(key, "showversion")) {
+			showVersion = ParseBool(value, showVersion);
+		} else if (IEquals(key, "password")) {
+			// Control characters out and no longer than the packet carries,
+			// the way the server cleans its own.
+			password.clear();
+			for (const char c : value) {
+				if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F)
+					continue;
+				if (password.size() + 1 >= PASSWORD_LEN)
+					break;
+				password.push_back(c);
 			}
 		}
 		// Unknown keys: ignored on purpose (see config.h).

@@ -155,8 +155,10 @@ petrol pump into a `CExplosion` - and §2.1 has already dealt with explosions.
 
 **It does not even nudge a lamp post**, and that half was written down wrong
 the first time. The arm above is shared by three functions - `DoBulletImpact`
-(0x0055F950, arm at 0x00560481), `FireShotgun` (0x005616A2) and `FireMelee`
-(0x00558A64) - and every one of them is the same instructions:
+(0x0055F950, arm at 0x00560481), `FireShotgun` (0x005616A2) and
+`CBulletInfo::Update`, the sniper round (0x00558A64; first read as
+`FireMelee`, which has no object arm, and `addresses.h` keeps the constant
+under that name) - and every one of them is the same instructions:
 
 ```
 mov al,[X+50h] / and al,7 / cmp al,4          ENTITY_TYPE_OBJECT
@@ -597,20 +599,31 @@ They end up lying in slightly different places. That is the one difference
 this deliberately leaves standing, and it is a far smaller one than
 standing-versus-lying.
 
-**A drive-by does not uproot anything on anybody else's screen.**
-`ReplayRemoteShot` refuses a seated ped, because drive-bys go through
-`CWeapon::FireFromCar` and that is not synced - so §8.1's free bullet answer
-does not cover `FireInstantHitFromCar`. A crate a passenger shoots from a car
-stays put on the other screens. Nothing breaks; it is simply not carried.
+**A drive-by moves nothing, on anybody's screen, and breaks glass.** Drive-bys
+travel now (`game/driveby.h`): each round goes out as a shot and every other
+machine draws it without running the engine's fire path, whose every culprit
+is `FindPlayerPed()`. That leaves §8.1's free bullet answer out of it, and what
+it would have carried turns out to be one thing. `FireInstantHitFromCar` has an
+arm for a ped, one for a car and one for everything else, and the last one is
+`CGlass::WasGlassHitByBullet` and nothing more: no `ObjectDamage`, no uproot
+(`addresses.h`, "the drive-by"). So a crate shot from a car stays put on the
+shooter's screen too, and a window broke there alone. `DriveByImpact` now hands
+the same entity and point to the same function for somebody else's round, so
+the window breaks on every screen; its address is a lead, checked against both
+of the engine's calls to it before it is used (`addresses-unverified.md`).
 
 **The watch table is 24 deep and the newest entry is dropped past that.** A
 car ploughing a row of lamp posts is nowhere near it and a rocket is excluded
 by the paragraph above, but the number is in the heartbeat line so it stops
 being a guess.
 
-**Glass is untouched.** `CGlass` is its own system with its own arrays
+**Glass is not carried.** `CGlass` is its own system with its own arrays
 (`WindowRespondsToCollision`, `WindowRespondsToExplosion`) and it never goes
-through `ObjectDamage`. Separate job.
+through `ObjectDamage`, so nothing here reports it. Every machine breaks its own
+windows from the same causes instead: a round on foot is replayed through
+`CWeapon::Fire` and reaches `DoBulletImpact`'s call, a drive-by round reaches
+the same call from `DriveByImpact` (above), and an explosion or a car is the
+same event everywhere.
 
 **Script objects are untouched.** `MISSION_OBJECT` exists on the machine
 running the script, which is Area D's problem and `campaign.md`'s.

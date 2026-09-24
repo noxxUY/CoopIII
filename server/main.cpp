@@ -32,7 +32,7 @@ bool OpenConsole() { return ui::OpenConsole(L"CoopIII Server"); }
 
 void Usage() {
 	std::printf("usage: server [port] [-friendlyfire] [-ammosync] [-money off|own|shared]\n"
-	            "              [--nogui]\n"
+	            "              [-password PW] [--nogui]\n"
 	            "\n"
 	            "  port           listen on this UDP port instead of the one in the ini\n"
 	            "  -friendlyfire  players can hurt each other (also -ff)\n"
@@ -42,6 +42,7 @@ void Usage() {
 	            "                 own: rewards go to whoever earned them\n"
 	            "                 shared: one wallet for the whole session\n"
 	            "                 (also -money=RULE)\n"
+	            "  -password PW   players have to give PW to join (also -password=PW)\n"
 	            "  --nogui        no window: log to this console, Ctrl-C to stop\n");
 }
 
@@ -89,6 +90,14 @@ int main(int argc, char **argv) {
 			std::printf("server: -money takes off, own or shared, not \"%s\"\n\n", value);
 			Usage();
 			return 2;
+		}
+		// `-password secret` or `-password=secret`, over the ini's.
+		if (Matches(argv[i], "-password") || std::strncmp(argv[i], "-password=", 10) == 0) {
+			const char *value = argv[i][9] == '=' ? argv[i] + 10
+			                    : i + 1 < argc    ? argv[++i]
+			                                      : "";
+			startup.config.password = ServerConfig::CleanPassword(value);
+			continue;
 		}
 		// Both spellings: the options this already had use one dash, and
 		// turning somebody away over a dash they did not type is not worth

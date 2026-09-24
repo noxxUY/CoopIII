@@ -38,6 +38,10 @@ public:
 	// thread or ENet failed to start. A failed connection is a different
 	// thing - that's async, and shows up through State() instead.
 	bool Start(std::string host, uint16_t port, std::string nick);
+
+	// Sent right behind every hello when not empty (protocol.h, C_Password).
+	// Before Start.
+	void SetPassword(std::string password) { m_password = std::move(password); }
 	void Stop();
 
 	NetClient::State State() const { return m_state.load(std::memory_order_relaxed); }
@@ -88,6 +92,12 @@ private:
 	std::string m_host;
 	uint16_t    m_port = DEFAULT_PORT;
 	std::string m_nick;
+	std::string m_password;
+
+	// Why the server last turned us away, REJECT_NONE while it has not, or
+	// REJECT_KICKED after a kick. Written and read on the socket thread only.
+	static constexpr uint8_t REJECT_KICKED = 0xFE;
+	uint8_t m_rejected = REJECT_NONE;
 };
 
 } // namespace coopiii

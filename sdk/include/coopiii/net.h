@@ -61,10 +61,15 @@ public:
 	// and moves state on connect/disconnect/timeout.
 	void Service(std::vector<Message> &out);
 
+	// What the server gave as its reason the last time it hung up on us (its
+	// NetServer::Disconnect `reason`), 0 for a timeout or none yet.
+	uint32_t LastDisconnectReason() const { return m_lastReason; }
+
 private:
 	_ENetHost *m_host = nullptr;
 	_ENetPeer *m_peer = nullptr;
 	State      m_state = DISCONNECTED;
+	uint32_t   m_lastReason = 0;
 };
 
 // Server side. `peerId` is an ENet-level connection id, distinct from the
@@ -103,6 +108,11 @@ public:
 
 	void Disconnect(PeerId peer, uint8_t reason);
 
+	// Whether a peer is one of the session's players. Broadcast reaches those
+	// alone: a connection that never said hello, or is still waiting on its
+	// password, was sent every chat line and every snapshot.
+	void SetMember(PeerId peer, bool member);
+
 	// ENet's own estimate of the round trip to this peer, in ms. The server
 	// GUI shows it per player; nothing in the protocol depends on it.
 	uint32_t RoundTripMs(PeerId peer) const;
@@ -111,7 +121,8 @@ public:
 	void Service(std::vector<ServerEvent> &out, uint32_t timeoutMs = 0);
 
 private:
-	_ENetHost *m_host = nullptr;
+	_ENetHost           *m_host = nullptr;
+	std::vector<uint8_t> m_members;
 };
 
 template <class T>

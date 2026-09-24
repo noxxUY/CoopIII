@@ -189,10 +189,12 @@ inline constexpr uint8_t VehicleFlagsWrittenOnChange(uint8_t flags) {
 // too. The detour opens the gate only for the time between a ped row naming
 // a driver and his replica sitting down.
 //
-// Held, not timed out, unlike the horn: the rows stop whenever the car drops
-// out of its host's eight, and the car is held where it was last seen. Its
-// light bar stays as it was last seen too. A wreck never keeps one: BlowUpCar
-// clears the byte on the host (0x0053BE8D) and the session says it's a wreck.
+// Held, not timed out, unlike the horn: the rows pause whenever the car waits
+// for its turn in its host's batch, and the car is held where it was last
+// seen. Its light bar stays as it was last seen too, and a change of siren
+// goes out in the next batch whatever the car's turn (game/streampick.h). A
+// wreck never keeps one: BlowUpCar clears the byte on the host (0x0053BE8D)
+// and the session says it's a wreck.
 inline constexpr bool ReplicaTrafficSirenOn(bool onWire, bool destroyed) {
 	return onWire && !destroyed;
 }

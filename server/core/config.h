@@ -102,6 +102,23 @@ const char *Name(MoneyMode rule);                  // "off" / "own" / "shared"
 const char *Label(MoneyMode rule);                 // "Off" / "Own wallets" / "Shared"
 bool        ParseMoney(const std::string &text, MoneyMode *out);
 
+// Who a hidden package counts for (docs/roadmap.md 5.11). `shared` is the
+// decision and the default: one player collects it and it is gone for all.
+// `perplayer` gives every player their own hundred to find.
+enum class PackageMode : uint8_t {
+	Shared    = 0,
+	PerPlayer = 1,
+};
+
+static_assert(static_cast<uint8_t>(PackageMode::Shared)    == PACKAGES_SHARED, "");
+static_assert(static_cast<uint8_t>(PackageMode::PerPlayer) == PACKAGES_PERPLAYER, "");
+
+inline uint8_t WireValue(PackageMode rule) { return static_cast<uint8_t>(rule); }
+
+const char *Name(PackageMode rule);                // "shared" / "perplayer"
+const char *Label(PackageMode rule);               // "Shared" / "Per player"
+bool        ParsePackages(const std::string &text, PackageMode *out);
+
 struct ServerConfig {
 	uint16_t        port               = 2001;
 	bool            friendlyFire       = false;                     // §5.2
@@ -135,6 +152,17 @@ struct ServerConfig {
 	// an award to whoever earned it; `shared` is one wallet for everybody.
 	MoneyMode       money              = MoneyMode::Off;
 
+	// Who a hidden package counts for (§5.11). `shared` by default.
+	PackageMode     hiddenPackages     = PackageMode::Shared;
+
+	// What a player has to give to join, or empty for nothing. protocol.h,
+	// C_Password: it keeps strangers out and no more.
+	std::string     password;
+
+	// The password as a hello can carry it: control characters out, and no
+	// longer than PASSWORD_LEN - 1.
+	static std::string CleanPassword(const std::string &text);
+
 	// Where the file lives: next to the executable, so a server copied to
 	// another folder takes its settings with it.
 	static std::string Path();
@@ -158,7 +186,8 @@ struct ServerConfig {
 		       wantedLevel == other.wantedLevel &&
 		       missionFailOnDeath == other.missionFailOnDeath &&
 		       ammoSync == other.ammoSync && rampage == other.rampage &&
-		       cheats == other.cheats && money == other.money;
+		       cheats == other.cheats && money == other.money &&
+		       hiddenPackages == other.hiddenPackages && password == other.password;
 	}
 	bool operator!=(const ServerConfig &other) const { return !(*this == other); }
 };

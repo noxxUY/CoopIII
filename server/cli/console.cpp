@@ -5,6 +5,7 @@
 // server itself is server/core/server.h, the same class the window runs.
 #include "run.h"
 
+#include "reach.h"
 #include "server.h"
 
 #include <csignal>
@@ -41,19 +42,23 @@ int RunConsole(const Startup &startup) {
 	else
 		std::printf("[coopiii] no %s, using the defaults\n", startup.configPath.c_str());
 	std::printf("[coopiii] wanted level %s, mission fails on death %s, rampages %s, "
-	            "cheats %s, money %s\n",
+	            "cheats %s, money %s, hidden packages %s\n",
 	            Name(startup.config.wantedLevel),
 	            startup.config.missionFailOnDeath ? "on" : "off",
 	            Name(startup.config.rampage), Name(startup.config.cheats),
-	            Name(startup.config.money));
+	            Name(startup.config.money), Name(startup.config.hiddenPackages));
 
 	Server server;
 	if (!server.Start(startup.config.port, startup.config.friendlyFire,
 	                  startup.config.ammoSync, WireValue(startup.config.wantedLevel),
 	                  WireValue(startup.config.rampage),
 	                  WireValue(startup.config.cheats),
-	                  WireValue(startup.config.money)))
+	                  WireValue(startup.config.money),
+	                  WireValue(startup.config.hiddenPackages)))
 		return 1;
+	server.SetPassword(startup.config.password);
+	for (const std::string &line : ReachLines(LocalIPv4Addresses(), startup.config.port))
+		std::printf("[coopiii] %s\n", line.c_str());
 
 	while (g_running)
 		server.Tick();

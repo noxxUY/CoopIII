@@ -93,12 +93,21 @@ void HeliSync::OnGone(const S_HeliGone &pkt, uint8_t localPlayerId) {
 	// hit is the one that did it.
 	if (in.reason == HELI_GONE_SHOT_DOWN && in.creditPlayerId == localPlayerId &&
 	    localPlayerId != INVALID_PLAYER) {
-		const bool paid = m_payShootDown && m_bridge && m_bridge->PayHeliShootDown;
-		Log("heli: we shot down player %u's police helicopter; the crime and the "
-		    "statistics are ours, the $250 is %s",
-		    owner, paid ? "ours too" : "nobody's");
+		// Its owner's game paid for it and could not take it back: the crime
+		// is still ours, the reward is already somebody's.
+		const bool kept = (in.flags & HELI_GONE_OWNER_KEPT) != 0;
+		const bool paid = m_payShootDown && !kept && m_bridge && m_bridge->PayHeliShootDown;
+		if (kept)
+			Log("heli: we shot down player %u's police helicopter; the crime is "
+			    "ours, and the statistics and the $250 stay with them - their game "
+			    "paid them and could not take them back",
+			    owner);
+		else
+			Log("heli: we shot down player %u's police helicopter; the crime and the "
+			    "statistics are ours, the $250 is %s",
+			    owner, paid ? "ours too" : "nobody's");
 		if (m_bridge && m_bridge->CreditHeliShootDown)
-			m_bridge->CreditHeliShootDown(in.slot, in.pos);
+			m_bridge->CreditHeliShootDown(in.slot, in.pos, !kept);
 		if (paid)
 			m_bridge->PayHeliShootDown();
 	}
@@ -283,7 +292,7 @@ void HeliSync::Send(uint8_t localPlayerId, uint32_t nowMs) {
 			OwnHeli &own = m_own[g.slot];
 			if (!own.active || own.handle != g.handle)
 				continue;   // never streamed; nobody has a replica of it
-			SendGone(own, g.slot, g.reason, g.creditPlayerId, g.pos, nowMs);
+			SendGone(own, g.slot, g.reason, g.creditPlayerId, g.pos, nowMs, g.ownerKept);
 			own = OwnHeli{};
 		}
 	}
@@ -476,7 +485,7 @@ void HeliSync::Orphan(RemoteHeli &heli, uint32_t nowMs) {
 }
 
 void HeliSync::SendGone(const OwnHeli &own, uint8_t slot, uint8_t reason,
-                        uint8_t credit, const Vec3 &pos, uint32_t nowMs) {
+                        uint8_t credit, const Vec3 &pos, uint32_t nowMs, bool ownerKept) {
 	C_HeliGone out;
 	InitHeader(out, nowMs);
 	out.body                = HeliGoneBody{};
@@ -484,6 +493,7 @@ void HeliSync::SendGone(const OwnHeli &own, uint8_t slot, uint8_t reason,
 	out.body.slot           = slot;
 	out.body.reason         = reason;
 	out.body.creditPlayerId = credit;
+	out.body.flags          = ownerKept && credit != INVALID_PLAYER ? HELI_GONE_OWNER_KEPT : 0;
 	out.body.pos            = pos;
 	Out(out, CH_EVENT);
 	Log("heli: our helicopter %u is gone (%s)", own.serial,

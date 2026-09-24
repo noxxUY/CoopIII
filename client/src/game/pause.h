@@ -69,4 +69,9 @@ bool PausePolicyInstalled();
 void ClearPauseForTheWorld();
 void RestorePauseForPresentation();
 
+// Keep the controls off the player while the chat line is open (game/chat.h),
+// through the same bit the menu uses. Either one holding it is enough, so
+// closing the menu mid-sentence does not hand the keys back.
+void HoldControlsForChat(bool hold);
+
 } // namespace coopiii::game

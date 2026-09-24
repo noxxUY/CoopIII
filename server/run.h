@@ -7,8 +7,11 @@
 #pragma once
 
 #include "config.h"
+#include "reach.h"
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace coopiii {
 
@@ -27,5 +30,10 @@ int RunWindow(const Startup &startup);
 
 // server/cli/console.cpp - stdout and a signal handler.
 int RunConsole(const Startup &startup);
+
+// server/addresses.cpp - this machine's IPv4 addresses, host order, loopback
+// and tunnels left out, each with whether its adapter has a gateway. For
+// server/core/reach.h.
+std::vector<LocalAddress> LocalIPv4Addresses();
 
 } // namespace coopiii

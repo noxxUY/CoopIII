@@ -426,11 +426,16 @@ void TestAPoolThatEmptiesIsSeededAgain() {
 // ---- Client and the helicopter -------------------------------------------------------
 
 struct HeliPayRec {
-	int credits = 0;
-	int paid    = 0;
+	int credits    = 0;
+	int crimesOnly = 0;
+	int paid       = 0;
 };
 HeliPayRec g_heliPay;
-void HeliCredit(uint8_t, const Vec3 &) { ++g_heliPay.credits; }
+void HeliCredit(uint8_t, const Vec3 &, bool statistics) {
+	++g_heliPay.credits;
+	if (!statistics)
+		++g_heliPay.crimesOnly;
+}
 void HeliPay() { ++g_heliPay.paid; }
 
 template <class T>
@@ -494,6 +499,11 @@ void TestTheHelicoptersRewardFollowsTheRule() {
 	Check(g_heliPay.credits == 2 && g_heliPay.paid == 1, "own: the shooter is paid it");
 	c.HandleMessage(Wrap(ShotDownBy(0, 9, 3)));
 	Check(g_heliPay.paid == 1, "and nobody else's shoot-down pays us");
+	S_HeliGone kept = ShotDownBy(0, 12, 1);
+	kept.body.flags = HELI_GONE_OWNER_KEPT;
+	c.HandleMessage(Wrap(kept));
+	Check(g_heliPay.paid == 1 && g_heliPay.credits == 3 && g_heliPay.crimesOnly == 1,
+	      "and when the owner's game kept the reward, the crime is all the shooter takes");
 
 	c.ClearRosterForTest();
 	Check(c.MoneyForTest().Rule() == MONEY_RULE_OFF && g_rec.rule == MONEY_RULE_OFF,

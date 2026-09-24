@@ -356,7 +356,7 @@ void RequestModel(uint16_t modelId) {
 	// addresses.h). IsModelReady still gates on it though, and that has the
 	// side benefit of not creating remote peds until this machine has a
 	// player of its own.
-	if (modelId == MI_PLAYER)
+	if (modelId == MI_PLAYER || modelId >= MODELINFO_SIZE)
 		return;
 
 	// CStreaming::RequestModel(id, flags). STREAMFLAGS_DEPENDENCY(0x02) |
@@ -845,6 +845,7 @@ bool SpawnRemote(RemotePlayer &player) {
 // null. It can also destroy the ped itself, for a ped the engine has flagged,
 // in which case there is nothing left to do here.
 void DespawnRemote(RemotePlayer &player) {
+	EndRemoteProjectilesOf(player.playerId);
 	void *ped = ResolveRemote(player);
 	player.poolHandle   = -1;
 	player.spawnPending = false;
@@ -1454,12 +1455,9 @@ void *WeaponInfo(uint8_t weaponType) {
 // spawn half and the steady half of the same job.
 void WriteSlotAmmo(void *ped, uint8_t slot, uint16_t clip, uint32_t total);
 
-bool GiveWeaponTo(RemotePlayer &player, void *ped, uint8_t want) {
-	if (!IsInventoryWeapon(want))
-		return false;
-	if (want == player.appliedWeapon)
-		return true;
-
+// The engine half of GiveWeaponTo, for any ped CoopIII drives: a remote
+// player's, or a replica of somebody else's pedestrian.
+bool PutWeaponInHand(void *ped, uint8_t want) {
 	void *info = WeaponInfo(want);
 	if (!info)
 		return false;
@@ -1493,6 +1491,16 @@ bool GiveWeaponTo(RemotePlayer &player, void *ped, uint8_t want) {
 	using SetFn  = void(__thiscall *)(void *, uint32_t);
 	Func<GiveFn>(CPed__GiveWeapon)(ped, static_cast<int>(want), REMOTE_AMMO);
 	Func<SetFn>(CPed__SetCurrentWeapon)(ped, want);
+	return true;
+}
+
+bool GiveWeaponTo(RemotePlayer &player, void *ped, uint8_t want) {
+	if (!IsInventoryWeapon(want))
+		return false;
+	if (want == player.appliedWeapon)
+		return true;
+	if (!PutWeaponInHand(ped, want))
+		return false;
 	player.appliedWeapon = want;
 
 	// With it on, the invented amount is immediately overwritten with what
@@ -2864,6 +2872,27 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 
 void *LightWatchedPedFire(void *ped) { return ped ? LightRemoteFire(ped) : nullptr; }
 
+// Where our engine has a remote player's ped, for a desync probe. Read without
+// ResolveRemote, which may destroy a ped the engine has flagged and is only
+// run before CGame::Process; this runs after it. And refused while the engine
+// is putting the ped in a car, by the same test ApplyRemotePose makes, since
+// the car says where they are then.
+bool SampleRemotePedPosition(const RemotePlayer &player, Vec3 &out) {
+	if (player.poolHandle < 0)
+		return false;
+	using GetPedFn = void *(__cdecl *)(int32_t);
+	void *const ped = Func<GetPedFn>(CPools__GetPed)(player.poolHandle);
+	if (!ped || Field<uintptr_t>(ped, offs::VTABLE) != CCivilianPed__vtable)
+		return false;
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (Field<bool>(ped, offs::PED_IN_VEHICLE) || state == PEDSTATE_ENTER_CAR ||
+	    state == PEDSTATE_CARJACK)
+		return false;
+	out = Vec3{Field<float>(ped, offs::POSITION + 0), Field<float>(ped, offs::POSITION + 4),
+	           Field<float>(ped, offs::POSITION + 8)};
+	return true;
+}
+
 bool WatchedPedFireIsOurs(int8_t fireSlot, void *ped, void *fire) {
 	if (!fire || fireSlot < 0)
 		return false;
@@ -2969,6 +2998,21 @@ void WriteRemoteSlotAmmo(void *ped, uint8_t slot, uint16_t clip, uint32_t total)
 
 bool GiveRemoteWeapon(RemotePlayer &player, void *ped, uint8_t weapon) {
 	return GiveWeaponTo(player, ped, weapon);
+}
+
+bool PutReplicaWeaponInHand(void *ped, uint8_t weapon) {
+	return ped && IsInventoryWeapon(weapon) && PutWeaponInHand(ped, weapon);
+}
+
+uint8_t HeldWeaponType(void *ped) {
+	if (!ped)
+		return WEAPONTYPE_UNARMED;
+	void *const held = WeaponSlot(ped, Field<uint8_t>(ped, offs::PED_CURRENT_WEAPON));
+	if (!held)
+		return WEAPONTYPE_UNARMED;
+	const uint32_t type = Field<uint32_t>(held, offs::WEAPON_TYPE);
+	return IsInventoryWeapon(static_cast<uint8_t>(type)) ? static_cast<uint8_t>(type)
+	                                                      : WEAPONTYPE_UNARMED;
 }
 
 bool RemotePlayerForPed(const void *ped, uint16_t &netId) {
@@ -3149,6 +3193,7 @@ WorldBridge MakeWorldBridge() {
 	b.SampleLocalAmmo        = &SampleLocalAmmo;
 	b.ApplyRemoteAmmo        = &ApplyRemoteAmmoSlot;
 	b.ApplyRemotePose   = &ApplyRemotePose;
+	b.SampleRemotePedPosition = &SampleRemotePedPosition;
 	b.SpawnRemote       = &SpawnRemote;
 	b.DespawnRemote     = &DespawnRemote;
 
@@ -3166,6 +3211,9 @@ WorldBridge MakeWorldBridge() {
 	b.SampleObservedVehicle = &SampleObservedVehicle;
 	b.VehicleAtRest         = &VehicleAtRest;
 	b.VehicleBurning        = &VehicleBurning;
+	b.VehiclePushedByUs     = &VehiclePushedByUs;
+	b.VehicleSinking        = &VehicleSinking;
+	b.TakeVehicleBack       = &TakeVehicleBack;
 	// What shape a car is in (docs/cardamage.md). Beside the state pair
 	// because they are the same seam, and separate from it because damage is
 	// an event on the reliable channel and state is a 25 Hz sample.
@@ -3197,6 +3245,10 @@ WorldBridge MakeWorldBridge() {
 	// either - with them missing this machine hosts no named pedestrians, so
 	// nothing ever resolves and the function is simply never useful.
 	b.ApplyRemotePedDamage = &ApplyRemotePedDamage;
+	// And the other direction: somebody else's pedestrian firing where we can
+	// see it, and hitting us.
+	b.ReplayAmbientShot   = &ReplayAmbientShot;
+	b.ApplyNpcDamage      = &ApplyNpcDamage;
 	b.SetFriendlyFire     = &SetFriendlyFire;
 	b.SetAmmoSync         = &SetAmmoSync;
 

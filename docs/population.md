@@ -183,15 +183,10 @@ players on opposite islands would each still generate their own, because
 neither one's cars are anywhere near the other's gate. Two players in the same
 street share. Nothing in between has been measured.
 
-**This is the idea CoopAndreas is built on**, and it is worth saying where it
-came from. It is a different person's GPL-3.0 project and none of its code is
-here - nor could it be, since it is San Andreas and not one address or
-structure survives the trip. What survives is the shape of the answer.
-
-Worth knowing, because the owner assumed otherwise: CoopAndreas has **no
-ownership handoff**. Its `AssignHost` is commented out in full. An entity stays
-with its creator until it is dropped. So this design should not promise a
-handoff on the strength of somebody else's working example.
+This design does not promise a general ownership handoff. A pedestrian stays
+with the machine that created it until that machine drops it, and so does a
+traffic car unless another player takes its wheel (§1.3.0); handing a living
+one to somebody else for any other reason is its own piece of work.
 
 ---
 
@@ -229,6 +224,54 @@ Two honest limitations in that, both of which step 5 is what fixes:
   observer is the server's job and it is not done.
 - The fall-off is a cliff rather than a curve: eight cars at full rate and
   everything else at nothing. §2.1 asks for three bands and this has two.
+
+**Step 5, 2026-09-23: the rows take turns.** Both limitations were one bug seen
+from two sides. The sampler had no memory, so the same nearest eight cars and
+twelve peds went out every tick and the ninth car and thirteenth ped never did.
+A machine hosting 25 pedestrians - `CPopulation`'s own number - left half of
+them frozen on every other screen. And it ranked them by the one player who
+never reads the batch: the host draws its own traffic from its own engine.
+
+It turned out not to be the server's job. Every client already has every other
+player's position from their snapshots, so the host ranks by those
+(`Client::ViewerPositions`). `client/src/game/streampick.h` is the rule:
+
+- Every hosted row carries a credit. Each tick it is left out, the credit
+  grows by the row's weight, and the batch is filled from the top. Sent rows
+  start again from zero.
+- The weight is `320 m / distance to the nearest other player`, from 8 down to
+  1: 8 within 40 m, 4 at 80, 2 at 160, 1 from 320 on, and 1 for everything
+  when nobody else's position is known. Inverse distance because that is how
+  far a moving thing appears to move on screen. A seated ped and a corpse get
+  1 wherever they are, because an observer does nothing with their position:
+  a seated replica is placed by its car, and a dead one is never driven.
+- A few rows go first whatever their credit. One that has never gone out. One
+  whose seat, fire, siren, horn or health changed since its last row, because
+  the observer holds those between rows. A honking car every tick
+  (`HORN_FRESH_MS` lapses a honk after 250 ms), and a burning ped at least
+  every fifth tick (`REMOTE_FIRE_MS` puts him out after a second).
+
+When everything fits in one batch, everything still goes every tick, and when
+it doesn't, the batch is full as it always was, so the wire cost is unchanged.
+What changes is who fills it. Simulated with the stream's own code, twelve
+cars 10-285 m from the other player share eight rows with the ones inside
+110 m going every tick and the rest every 150-300 ms; 25 peds, seven of them
+seated, share twelve with the walkers inside 50 m every tick, out to 150 m
+every 200-400 ms, and the seated ones every 600 ms. Fed through the real
+`VehicleInterpBuffer`, a car with a row every 200 ms never stops, every
+300-400 ms it holds on 6-12% of frames, and past about 700 ms the playback
+clock resyncs in jumps. Nothing this rule picks for a realistic crowd gets
+near that.
+
+Both ends say how it is going, every five seconds. The host: `over the last
+5.0s N of M hosted ped(s) and N of M hosted car(s) had a row; the longest a ped
+waited was X ms`. The observer: `other machines' crowd here - N of M ped
+replica(s) and N of M car replica(s) had a row in the last 3 s`. Before this
+change the first number stopped at 12 and 8.
+
+Not done: a view-direction or line-of-sight term (the camera is not on the
+wire), and dropping rows nobody can see to save bandwidth rather than only
+sharing it out.
 
 ### 2.2 The pools
 
@@ -281,7 +324,9 @@ prerequisite rather than a follow-up.
      standing still. A car replica left where it was created is a locked,
      undeletable roadblock across a junction on every screen but its owner's.
      So hosted cars carry `C_CarStates` - see §2.1 below for the rate.
-5. **Rate by distance** (§2.1), measured against a real session.
+5. ~~**Rate by distance** (§2.1)~~ **Built 2026-09-23**, as turns ranked by
+   the distance to the other players (§2.1, "Step 5"). Not yet measured in a
+   real session.
 
 Step 2 is the point of no return: after it the city's pedestrians are shared
 and every divergence is a bug rather than a documented difference.
@@ -317,8 +362,8 @@ happens to him in between and that everybody watches happen.
 
 Until this, a death reached an observer only as whatever animation happened
 to be dominant in the next `C_PedStates` row - and that is not a death. The
-stream carries the twelve peds nearest **the sender** (`MAX_PED_STATES`), a
-corpse drops out of that twelve as soon as the shooter walks on, and
+stream then carried the twelve peds nearest **the sender** (`MAX_PED_STATES`),
+a corpse dropped out of that twelve as soon as the shooter walked on, and
 `ApplyAmbientPedState` refuses to drive anything into a replica that is
 already dead while never being the thing that makes one dead. So you shoot a
 pedestrian, he drops on your screen, and on every other screen he keeps
@@ -564,3 +609,78 @@ the driver and each passenger; the `CPed::SetDead` calls themselves are at
 `BlowUpCar`, holds the health its host streams, and hits the local player lands
 on it go to the host as `C_CarHit`. The rebuild in §5.7.3 stays as the
 backstop for routes nobody has found.
+
+---
+
+## 6. A pedestrian fighting a player on another machine
+
+Built 2026-09-23, not yet run in game. `protocol.h`, the "pedestrians and cops
+fight players on every machine" history entry, is the wire.
+
+### 6.1 What was wrong
+
+A pedestrian fights on the machine hosting it: its AI picks the target and its
+`CWeapon::Fire` or `CPed::FightStrike` finds the hit. When that hit reached
+another player's copy, `combat.cpp` refused it and sent nothing, on the
+argument that "a city NPC shooting a remote player is a shot that happened in
+one simulation and not in the others". Since §1, that stopped being true: the
+pedestrian exists on every machine, and only its host decides what it does.
+So a cop hosted by A shooting at B, or a pedestrian fighting B back, did
+nothing to B, while on B's screen he stood unarmed and silent.
+
+### 6.2 What travels
+
+The same split every other hit has. The machine that found the hit forwards
+it and the machine that owns the victim applies it:
+
+- **A hit on a player** goes as `C_NpcDamage`: `C_Damage`'s body plus the
+  pedestrian's netId. The victim's `ApplyNpcDamage` runs the same path as a
+  player's hit - the reaction, the melee half, `CPed::InflictDamage` - blamed on
+  its replica of the pedestrian. A punch keeps its melee bytes, less
+  `MELEE_ARMED`, which only a striking player's has an effect; a bat keeps the
+  doubling a player victim gets (`melee.h`).
+- **A round on a car a player drives or settles** goes as `C_NpcVehicleHit`,
+  to that car's driver or custodian. Never to traffic or a car nobody holds,
+  and never makes anybody a custodian: a cop shooting a parked car hands it to
+  nobody (`vehicle.h`, `DecideCarDamage`).
+- **The weapon** is four bits of the ped row's `flags`, so the replica holds
+  what his host's ped holds (`ArmAmbientReplica`).
+- **Each round** from one of the five guns that trace a ray goes as
+  `C_NpcShot`, unreliable, to whoever is within 150 m. The observer draws it
+  through its own `CWeapon::Fire` on the replica, the way a remote player's
+  round is replayed, and anything it hits there is refused.
+
+Only a pedestrian the session has named is forwarded for. One still inside
+its naming round trip, and a mission pedestrian of this machine's own script,
+has no name on the other machine, and his hits stay local.
+
+### 6.3 Rules that keep it honest
+
+- A replica never fires on its own. It has no objective and no threat
+  response, and `combat.cpp`'s `CopyMayFire` refuses a round from one outside a
+  replay, the way `CopyMayStrike` refuses a punch.
+- The combat queue drops a pedestrian's round rather than push one of the
+  local player's events out when it is full.
+- A death from a pedestrian's hit is credited to nobody: the victim's last
+  attacker is cleared, so a player who hit him earlier is not given the kill.
+
+### 6.4 What it does not do
+
+- A pedestrian's round on another machine's pedestrian or traffic is still
+  refused and not forwarded. NPCs fighting NPCs across machines is §1's
+  divergence, not this.
+- The firing pose is not carried; the replica holds the gun and the round
+  comes out of it, but a partial fire animation has no room on the row.
+- The sniper rifle, rockets and the flamethrower are not replayed for a
+  pedestrian. No retail pedestrian carries them.
+
+### 6.5 What proves it in game
+
+On the host of the pedestrian: `combat: our first pedestrian's round went out
+for the others to draw`, `combat: our first pedestrian's hit on a remote
+player`, and `vehicle: our first pedestrian's round on a car a player holds`.
+On the victim: `client: our first hit from somebody else's NPC arrived`,
+`combat: took our first hit from somebody else's pedestrian off the wire`, and
+for a car `client: somebody else's pedestrian shot our car`. On an observer:
+`population: armed our first replica` and `combat: drew our first round from
+somebody else's pedestrian`.

@@ -3,6 +3,7 @@
 #include "addresses.h"
 #include "ped.h"
 #include "pedanim.h"
+#include "streampick.h"
 #include "vehicle.h"
 #include "wreckqueue.h"
 #include "../hook/hook.h"
@@ -183,6 +184,16 @@ uint32_t g_pedPacketsSent  = 0;
 uint32_t g_carRowsSent     = 0;
 uint32_t g_carPacketsSent  = 0;
 
+// And whether everything we host gets its turn (game/streampick.h): the
+// longest any row that went out had waited, in stream ticks, since the last
+// report. ReportStreamTurns counts who had a row at all.
+uint8_t g_pedLongestWait = 0;
+uint8_t g_carLongestWait = 0;
+bool    g_saidPedsTakeTurns = false;
+bool    g_saidCarsTakeTurns = false;
+
+void ReportStreamTurns(float seconds);
+
 // ---- and whether any of it is working --------------------------------------
 //
 // The crowd counts above say the city is shared rather than doubled. They say
@@ -312,6 +323,8 @@ void ReportCrowd(uint32_t peds, uint32_t pedReplicas, uint32_t cars,
 		    static_cast<double>(pedBytes / seconds / 1024.0f), carRows, carPkts,
 		    static_cast<double>(carBytes / seconds / 1024.0f),
 		    static_cast<double>((pedBytes + carBytes) / seconds / 1024.0f));
+
+		ReportStreamTurns(seconds);
 	}
 
 	lastPedRows    = g_pedRowsSent;
@@ -343,6 +356,10 @@ struct HostedPed {
 	// being re-filed - and telling those two apart is the whole question the
 	// duplicate-cop report asks.
 	uint16_t modelId    = 0;
+	// Its turn in the ped batch (game/streampick.h), and whether it has had a
+	// row since the last crowd report.
+	StreamRow stream;
+	bool      rowSinceReport = false;
 };
 
 // Matched to the engine rather than to the session: GTA III's ped pool is 140
@@ -467,6 +484,12 @@ struct HostedCar {
 	// Said once, and only ever by the machine hosting the car. See
 	// NoteWreckedHostedCars.
 	bool     reportedWreck = false;
+	// The same two HostedPed has, for the car batch.
+	StreamRow stream;
+	bool      rowSinceReport = false;
+	// The dents already told to the session (DrainHostedCarDamage).
+	uint32_t  sentPanels = 0;
+	uint16_t  sentDoors  = 0;
 };
 
 // GTA III's whole vehicle pool is 110 slots and CCarCtrl keeps a dozen-odd
@@ -475,6 +498,37 @@ struct HostedCar {
 // traffic car was before this file existed.
 constexpr size_t MAX_HOSTED_CARS = 64;
 HostedCar g_hostedCars[MAX_HOSTED_CARS];
+
+// Who had a row since the last report, out of everything named. Before the
+// batches took turns the first number stopped at MAX_PED_STATES and the
+// second at MAX_CAR_STATES whatever we hosted, and the rest waited for ever.
+void ReportStreamTurns(float seconds) {
+	uint32_t peds = 0, pedsHeard = 0, cars = 0, carsHeard = 0;
+	for (HostedPed &h : g_hosted) {
+		if (!h.active || !h.named)
+			continue;
+		++peds;
+		if (h.rowSinceReport)
+			++pedsHeard;
+		h.rowSinceReport = false;
+	}
+	for (HostedCar &c : g_hostedCars) {
+		if (!c.active || !c.named)
+			continue;
+		++cars;
+		if (c.rowSinceReport)
+			++carsHeard;
+		c.rowSinceReport = false;
+	}
+
+	if (peds != 0 || cars != 0)
+		Log("population: over the last %.1fs %u of %u hosted ped(s) and %u of %u "
+		    "hosted car(s) had a row; the longest a ped waited was %u ms, a car "
+		    "%u ms", static_cast<double>(seconds), pedsHeard, peds, carsHeard, cars,
+		    g_pedLongestWait * STREAM_TICK_MS, g_carLongestWait * STREAM_TICK_MS);
+	g_pedLongestWait = 0;
+	g_carLongestWait = 0;
+}
 
 constexpr size_t MAX_QUEUED_CARS = 32;
 LocalAmbientCar g_bornCars[MAX_QUEUED_CARS];
@@ -523,10 +577,11 @@ bool g_warnedLostCarsFull   = false;
 //     other running. Since docs/protocol.md §1.23 a replica takes no damage
 //     of its own and holds the health the host streams, so the replica never
 //     gets there first - it waits for this report.
-//   - Distance. Only the eight cars nearest the host's own player are
-//     streamed (protocol.h, MAX_CAR_STATES); the ninth is held wherever it
-//     was last heard. A replica several streets from its original is not in
-//     the same blast.
+//   - Distance. A batch holds MAX_CAR_STATES and the cars take turns at it,
+//     so a replica far from everybody can be a few rows behind its original,
+//     and it lags the host by the interpolation delay even when it is not.
+//     A replica a few metres from its original is not always in the same
+//     blast.
 //
 // So this is the backstop, exactly as it is for parked cars, and it is
 // asymmetric on purpose: only the machine hosting a car may say that car
@@ -794,6 +849,47 @@ uint32_t DrainLostAmbientCars(uint16_t *out, uint32_t max) {
 	return n;
 }
 
+// Our own traffic cars that have taken a dent the session has not heard
+// about, the way SendLocalVehicleDamage does it for the car we drive: absolute
+// words, only when they grew. A cursor walks the table so one pile-up does
+// not keep the rest waiting behind it.
+uint32_t g_carDamageCursor = 0;
+bool     g_saidCarDamageSent = false;
+
+uint32_t DrainHostedCarDamage(VehicleDamageBody *out, uint32_t max) {
+	uint32_t n = 0;
+	for (uint32_t step = 0; step < MAX_HOSTED_CARS && n < max; ++step) {
+		HostedCar &c = g_hostedCars[(g_carDamageCursor + step) % MAX_HOSTED_CARS];
+		if (!c.active || !c.named || c.reportedWreck || c.poolHandle < 0)
+			continue;
+		if (AmbientCarFromRef(c.poolHandle) != c.vehicle)
+			continue;   // SweepHostedCars will say it went
+
+		VehicleDamageBody now{};
+		if (!SampleHostedCarDamage(c.poolHandle, now))
+			continue;
+		if (!DamageGrew(c.sentPanels, c.sentDoors, now.panels, now.doors))
+			continue;
+		MergeDamage(c.sentPanels, c.sentDoors, now.panels, now.doors);
+
+		out[n]        = VehicleDamageBody{};
+		out[n].netId  = c.netId;
+		out[n].panels = c.sentPanels;
+		out[n].doors  = c.sentDoors;
+		++n;
+	}
+	g_carDamageCursor = (g_carDamageCursor + 1) % MAX_HOSTED_CARS;
+
+	if (n != 0 && !g_saidCarDamageSent) {
+		g_saidCarDamageSent = true;
+		Log("population: our traffic car %u took our first dent the session had "
+		    "not heard about (panels %08X doors %04X); telling it",
+		    out[0].netId, static_cast<unsigned>(out[0].panels),
+		    static_cast<unsigned>(out[0].doors));
+	}
+	return n;
+}
+
 uint8_t DrainAmbientWrecks(UnownedBlast *out, uint8_t max) {
 	const uint8_t n = g_ambientWrecks.Drain(out, max);
 
@@ -896,44 +992,32 @@ bool NameLocalAmbientCar(uint32_t tempId, uint16_t netId) {
 	return false;
 }
 
-// The eight nearest hosted cars, and the ordering is the point.
+// This tick's car batch.
 //
-// docs/population.md §2.1 says the rate has to fall off with distance and
-// that a flat rate is not on the table. There is one packet's worth of slots
-// per tick; this spends them on the cars closest to the local player, which
-// are the ones somebody is about to drive into. A car further out keeps
-// whatever transform every observer last heard, which is what
-// Client::CorrectAmbientCars holds it at.
+// docs/population.md §2.1, and game/streampick.h is the rule: every hosted car
+// takes its turn, more often the nearer it is to another player. This used to
+// be the eight nearest our own player, with no memory between ticks, which
+// sent the same eight every time and left the ninth frozen on every other
+// screen for as long as we hosted it - and ranked by the one player who never
+// reads the batch.
 //
-// Nearest the *local player*, not nearest each observer, and that is a real
-// limitation rather than an oversight: this machine does not know where
-// anybody else is standing when it picks. Two players in the same street get
-// nearly the same eight; two players on opposite islands do not, and the far
-// one's view of this machine's traffic is a set of parked cars. Fixing that
-// means the server choosing per-observer, which is step 5's business.
-uint32_t SampleHostedCars(AmbientCarState *out, uint32_t max, uint8_t &hornMask,
-                          uint8_t &sirenMask) {
+// A honking car goes out every tick, because its replica lets the honk lapse
+// HORN_FRESH_MS after the last row that said so, and a car whose health, siren
+// or horn just changed goes out on the next one.
+uint32_t SampleHostedCars(AmbientCarState *out, uint32_t max, const Vec3 *viewers,
+                          uint32_t viewerCount, uint8_t &hornMask, uint8_t &sirenMask) {
 	hornMask  = 0;
 	sirenMask = 0;
 	if (max == 0)
 		return 0;
-
-	void *const player = PlayerPed();
-	float       px = 0.0f, py = 0.0f, pz = 0.0f;
-	if (player) {
-		const float *const p = &Field<float>(player, offs::POSITION);
-		px = p[0];
-		py = p[1];
-		pz = p[2];
-	}
-
-	struct Candidate {
-		HostedCar *car;
-		float      dist2;
-	};
-	Candidate best[MAX_CAR_STATES];
-	uint32_t  found = 0;
 	const uint32_t want = max < MAX_CAR_STATES ? max : MAX_CAR_STATES;
+
+	AmbientCarState rows[MAX_HOSTED_CARS];
+	HostedCar      *hosts[MAX_HOSTED_CARS];
+	bool            horns[MAX_HOSTED_CARS];
+	bool            sirens[MAX_HOSTED_CARS];
+	StreamCandidate cand[MAX_HOSTED_CARS];
+	uint32_t        n = 0;
 
 	for (HostedCar &c : g_hostedCars) {
 		if (!c.active || !c.named || c.netId == INVALID_NETID)
@@ -942,43 +1026,43 @@ uint32_t SampleHostedCars(AmbientCarState *out, uint32_t max, uint8_t &hornMask,
 		if (v != c.vehicle)
 			continue;   // the sweep will deal with it; nothing to send
 
-		const float *const q = &Field<float>(v, offs::POSITION);
-		const float dx = q[0] - px, dy = q[1] - py, dz = q[2] - pz;
-		const float d2 = dx * dx + dy * dy + dz * dz;
+		rows[n] = AmbientCarState{};
+		if (!SampleHostedCar(c.poolHandle, rows[n]))
+			continue;
+		rows[n].netId = c.netId;
+		hosts[n]      = &c;
+		horns[n]      = HostedCarHonking(c.poolHandle);
+		sirens[n]     = HostedCarSirenOn(c.poolHandle);
 
-		// Insertion into a list of at most eight. Not a sort: n is at most
-		// MAX_HOSTED_CARS and the list is eight long, so this is a handful of
-		// compares per car per tick.
-		if (found < want) {
-			uint32_t i = found++;
-			while (i > 0 && best[i - 1].dist2 > d2) {
-				best[i] = best[i - 1];
-				--i;
-			}
-			best[i] = Candidate{&c, d2};
-			continue;
-		}
-		if (d2 >= best[found - 1].dist2)
-			continue;
-		uint32_t i = found - 1;
-		while (i > 0 && best[i - 1].dist2 > d2) {
-			best[i] = best[i - 1];
-			--i;
-		}
-		best[i] = Candidate{&c, d2};
+		StreamCandidate &k = cand[n];
+		k          = StreamCandidate{};
+		k.row      = &c.stream;
+		k.index    = n;
+		k.says     = CarRowSays(rows[n].health, sirens[n], horns[n]);
+		k.deadline = horns[n] ? STREAM_HONK_DEADLINE : uint8_t{0};
+		const bool seen = NearestViewerDist2(rows[n].pos, viewers, viewerCount, k.dist2);
+		k.weight   = StreamWeight(seen, k.dist2);
+		++n;
 	}
 
-	uint32_t written = 0;
-	for (uint32_t i = 0; i < found; ++i) {
-		AmbientCarState state{};
-		if (!SampleHostedCar(best[i].car->poolHandle, state))
-			continue;
-		state.netId    = best[i].car->netId;
-		if (HostedCarHonking(best[i].car->poolHandle))
-			hornMask |= CarStateHornBit(static_cast<uint8_t>(written));
-		if (HostedCarSirenOn(best[i].car->poolHandle))
-			sirenMask |= CarStateSirenBit(static_cast<uint8_t>(written));
-		out[written++] = state;
+	const uint32_t written = PickStreamRows(cand, n, want);
+	for (uint32_t i = 0; i < written; ++i) {
+		const uint32_t j = cand[i].index;
+		out[i] = rows[j];
+		if (horns[j])
+			hornMask |= CarStateHornBit(static_cast<uint8_t>(i));
+		if (sirens[j])
+			sirenMask |= CarStateSirenBit(static_cast<uint8_t>(i));
+		hosts[j]->rowSinceReport = true;
+		if (cand[i].waited > g_carLongestWait)
+			g_carLongestWait = cand[i].waited;
+	}
+
+	if (n > want && !g_saidCarsTakeTurns) {
+		g_saidCarsTakeTurns = true;
+		Log("population: hosting %u named cars and a batch holds %u, so they take "
+		    "turns now, the nearest another player most often (%u other player "
+		    "position(s) known)", n, want, viewerCount);
 	}
 
 	// The same instrument the ped sampler carries, and the reason it is here
@@ -1010,6 +1094,17 @@ void DespawnAmbientCarReplicaCounted(RemoteAmbientCar &car) {
 	DespawnAmbientCarReplica(car);
 	if (g_carReplicas > 0)
 		--g_carReplicas;
+}
+
+
+// What a birth says about a pedestrian: its model, its type and where it is.
+void FillPedBirth(void *entity, AmbientPedBody &body) {
+	body.modelId = static_cast<uint16_t>(Field<uint32_t>(entity, offs::MODEL_INDEX));
+	body.pedType = static_cast<uint8_t>(Field<uint32_t>(entity, offs::PED_TYPE));
+	body.pad     = 0;
+	const float *const p = &Field<float>(entity, offs::POSITION);
+	body.pos     = Vec3{p[0], p[1], p[2]};
+	body.heading = Field<float>(entity, offs::PED_ROT_CUR);
 }
 
 void __cdecl AddHook(void *entity) {
@@ -1072,12 +1167,8 @@ void __cdecl AddHook(void *entity) {
 
 	LocalAmbientPed &out = g_born[g_bornCount++];
 	out.tempId       = slot->tempId;
-	out.body.modelId = static_cast<uint16_t>(Field<uint32_t>(entity, offs::MODEL_INDEX));
-	out.body.pedType = static_cast<uint8_t>(Field<uint32_t>(entity, offs::PED_TYPE));
-	out.body.pad     = 0;
+	FillPedBirth(entity, out.body);
 	const float *const p = &Field<float>(entity, offs::POSITION);
-	out.body.pos     = Vec3{p[0], p[1], p[2]};
-	out.body.heading = Field<float>(entity, offs::PED_ROT_CUR);
 	slot->modelId    = out.body.modelId;
 	if (PopTrace())
 		Log("population/trace: host add ped %p temp %u model %u type %u at "
@@ -1226,8 +1317,13 @@ void __fastcall BodyPartHook(void *self, void * /*edx*/, int node, int8_t direct
 	// observer applying a limb from bouncing it straight back - and a ped
 	// that loses a limb inside the round trip of its own naming keeps it on
 	// other screens, which is a rare and harmless miss.
-	const HostedPed *h = FindHostedByPed(self);
-	if (!h || !h->named || h->netId == INVALID_NETID)
+	//
+	// Or our own player. Their machine is the only one that shoots them for
+	// real, so it is the only one that sees a limb go; it goes out under
+	// INVALID_NETID and Client puts our netId on it.
+	const HostedPed *h    = FindHostedByPed(self);
+	const bool       ours = self == PlayerPed();
+	if (!ours && (!h || !h->named || h->netId == INVALID_NETID))
 		return;
 
 	if (g_limbCount >= MAX_QUEUED_LIMBS) {
@@ -1239,7 +1335,7 @@ void __fastcall BodyPartHook(void *self, void * /*edx*/, int node, int8_t direct
 		return;
 	}
 	PedBodyPartBody &out = g_limbs[g_limbCount++];
-	out.netId     = h->netId;
+	out.netId     = ours ? INVALID_NETID : h->netId;
 	out.node      = static_cast<uint8_t>(node);
 	out.direction = direction;
 }
@@ -1419,6 +1515,16 @@ bool AmbientReplicaForPed(const void *ped, uint16_t &netId) {
 	return false;
 }
 
+int32_t HostedCarHandle(uint16_t netId) {
+	if (netId == INVALID_NETID)
+		return -1;
+	for (const HostedCar &c : g_hostedCars)
+		if (c.active && c.named && c.netId == netId && c.poolHandle >= 0 &&
+		    AmbientCarFromRef(c.poolHandle) == c.vehicle)
+			return c.poolHandle;
+	return -1;
+}
+
 void *ResolveHostedCar(uint16_t netId) {
 	if (netId == INVALID_NETID)
 		return nullptr;
@@ -1469,6 +1575,67 @@ void *ResolveHostedPed(uint16_t netId) {
 		return now == h.ped ? now : nullptr;
 	}
 	return nullptr;
+}
+
+bool HostedPedNetIdFor(const void *ped, uint16_t &netId) {
+	bool named = false;
+	if (!HostedPedFor(ped, named) || !named)
+		return false;
+	netId = FindHostedByPed(ped)->netId;
+	return true;
+}
+
+void *AmbientReplicaPed(const RemoteAmbientPed &ped) {
+	if (ped.poolHandle < 0)
+		return nullptr;
+	void *const mem = Func<GetPedFn>(CPools__GetPed)(ped.poolHandle);
+	if (!mem || Field<uintptr_t>(mem, offs::VTABLE) != CCivilianPed__vtable)
+		return nullptr;
+	return mem;
+}
+
+// Where our engine has a replica, for a desync probe (protocol.h,
+// C_DesyncProbe). Read only; a ped the engine is seating is left to its car.
+bool SampleReplicaPosition(int32_t poolHandle, bool car, Vec3 &out) {
+	if (poolHandle < 0)
+		return false;
+	void *mem = nullptr;
+	if (car) {
+		mem = Func<void *(__cdecl *)(int32_t)>(CPools__GetVehicle)(poolHandle);
+	} else {
+		mem = Func<GetPedFn>(CPools__GetPed)(poolHandle);
+		if (mem && (Field<uintptr_t>(mem, offs::VTABLE) != CCivilianPed__vtable ||
+		            Field<bool>(mem, offs::PED_IN_VEHICLE)))
+			return false;
+	}
+	if (!mem)
+		return false;
+	out = Vec3{Field<float>(mem, offs::POSITION + 0), Field<float>(mem, offs::POSITION + 4),
+	           Field<float>(mem, offs::POSITION + 8)};
+	return true;
+}
+
+// The weapon in the host's ped's hand, in the replica's. A replica holding a
+// gun still decides nothing with it: it has no objective and no threat
+// response (docs/protocol.md §1.13.6), and combat.cpp refuses any round it
+// fires outside a replay of its host's.
+bool ArmAmbientReplica(RemoteAmbientPed &ped, uint8_t weapon) {
+	void *const mem = AmbientReplicaPed(ped);
+	if (!mem || Field<bool>(mem, offs::PED_IN_VEHICLE))
+		return false;
+	const uint32_t state = Field<uint32_t>(mem, offs::PED_STATE);
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+		return false;
+	if (!PutReplicaWeaponInHand(mem, weapon))
+		return false;
+
+	static bool said = false;
+	if (!said && weapon != WEAPONTYPE_UNARMED) {
+		said = true;
+		Log("population: armed our first replica - pedestrian net %u holds weapon %u, "
+		    "as his host has him", static_cast<unsigned>(ped.netId), weapon);
+	}
+	return true;
 }
 
 namespace {
@@ -1565,12 +1732,34 @@ bool KillAmbientReplica(RemoteAmbientPed &ped, uint16_t animId) {
 	// will not reach anyway, since it refuses a dead replica, but the two
 	// disagreeing is how the next person reading this gets it wrong.
 	ped.appliedAnimId = ANIM_NONE;
+	ped.appliedWeapon = 0xFF;
 
 	static bool said = false;
 	if (!said) {
 		said = true;
 		Log("population: killed a replica because its host's engine did - ped %u, "
 		    "anim %u (and this will not be said again)", ped.netId, anim);
+	}
+	return true;
+}
+
+// The same for a remote player's ped: their own machine took the limb off
+// them. Also through the detour above, which leaves it alone - the ped is
+// neither hosted here nor our player.
+bool RemovePlayerBodyPart(RemotePlayer &player, uint8_t node, int8_t direction) {
+	if (player.poolHandle < 0 || !IsRemovableBodyPart(node))
+		return false;
+	void *const mem = Func<GetPedFn>(CPools__GetPed)(player.poolHandle);
+	if (!mem || Field<uintptr_t>(mem, offs::VTABLE) != CCivilianPed__vtable)
+		return false;
+
+	Func<BodyPartFn>(CPed__RemoveBodyPart)(mem, nullptr, node, direction);
+
+	static bool said = false;
+	if (!said) {
+		said = true;
+		Log("population: took a limb off player %u's ped because their own engine did "
+		    "- node %u (and this will not be said again)", player.playerId, node);
 	}
 	return true;
 }
@@ -1659,77 +1848,36 @@ bool HostedSeatOf(void *ped, uint16_t &vehicleNetId, uint8_t &seat) {
 
 // What this machine is saying about its own pedestrians this tick.
 //
-// Two passes, and the split is the whole of this function's design.
+// The car batch's rule (game/streampick.h), with two kinds of ped weighted
+// down to the floor whatever their distance, because an observer does nothing
+// with where they are:
 //
-// **Seated peds first, up to half the batch.** A seated pedestrian's 24 bytes
-// buy the entire traffic-driver fix: the observer cannot work out the pairing
-// for itself, because on its machine the ped and the car are two unrelated
-// replicas with unrelated netIds, and the host is the only one who knows they
-// belong together. It is also the cheapest row in the batch, because its
-// pos/heading are ignored on the far side - CWorld::Process positions a
-// seated ped from its car's matrix (docs/protocol.md §1.13.2) - so the row is
-// really six useful bytes. And there are few of them: at most one driver per
-// hosted traffic car, and §1.3.2 measured three hosted cars.
+//   - a seated one. His row is the traffic-driver fix - the host is the only
+//     one who knows which ped belongs in which car - but his pos/heading are
+//     ignored on the far side, where CWorld::Process positions him from his
+//     car's matrix (docs/protocol.md §1.13.2). The seat is held between rows,
+//     and a change of seat goes out on the next tick anyway.
+//   - a corpse. ApplyAmbientPedState refuses to drive a dead replica, and his
+//     death travelled on its own (S_PedDeath).
 //
-// Half the batch is a bound rather than an expectation. A machine that
-// somehow hosted twelve occupied cars must not spend the entire packet on
-// drivers and leave every pedestrian on the pavement standing still again.
-//
-// **Then nearest the local player**, which is the same crude first slice of
-// §2.1's rate-by-distance that SampleHostedCars takes, with the same honest
-// limitation: nearest the *sender*, because this machine does not know where
-// anybody else is standing when it picks.
-uint32_t SampleHostedPeds(AmbientPedState *out, uint32_t max) {
+// This replaces seated-first-up-to-half-then-nearest-our-player, which sent
+// the same twelve every tick and never the thirteenth.
+uint32_t SampleHostedPeds(AmbientPedState *out, uint32_t max, const Vec3 *viewers,
+                          uint32_t viewerCount) {
 	if (max == 0)
 		return 0;
-
 	const uint32_t want = max < MAX_PED_STATES ? max : MAX_PED_STATES;
-	// Half, rounded up, so a batch of one still has room for a driver.
-	const uint32_t seatedBudget = (want + 1) / 2;
 
-	void *const player = PlayerPed();
-	float       px = 0.0f, py = 0.0f, pz = 0.0f;
-	if (player) {
-		const float *const p = &Field<float>(player, offs::POSITION);
-		px = p[0];
-		py = p[1];
-		pz = p[2];
-	}
-
-	struct Candidate {
-		void    *ped;
-		uint16_t netId;
-		float    dist2;
-		uint16_t vehicleNetId;
-		uint8_t  seat;
+	struct Row {
+		void      *ped;
+		HostedPed *host;
+		uint16_t   vehicleNetId;
+		uint8_t    seat;
+		uint8_t    flags;
 	};
-	Candidate seated[MAX_PED_STATES];
-	Candidate onFoot[MAX_PED_STATES];
-	uint32_t  nSeated = 0, nOnFoot = 0;
-
-	// Insertion into a short nearest-first list. Not a sort: the lists are at
-	// most twelve long and there are at most MAX_HOSTED peds, so this is a
-	// handful of compares each.
-	auto insert = [](Candidate *list, uint32_t &count, uint32_t cap,
-	                 const Candidate &c) {
-		if (count < cap) {
-			uint32_t i = count++;
-			while (i > 0 && list[i - 1].dist2 > c.dist2) {
-				list[i] = list[i - 1];
-				--i;
-			}
-			list[i] = c;
-			return;
-		}
-		if (cap == 0 || c.dist2 >= list[count - 1].dist2)
-			return;
-		uint32_t i = count - 1;
-		while (i > 0 && list[i - 1].dist2 > c.dist2) {
-			list[i] = list[i - 1];
-			--i;
-		}
-		list[i] = c;
-	};
+	Row             rows[MAX_HOSTED];
+	StreamCandidate cand[MAX_HOSTED];
+	uint32_t        n = 0;
 
 	for (HostedPed &h : g_hosted) {
 		if (!h.active || !h.named || h.netId == INVALID_NETID)
@@ -1740,44 +1888,55 @@ uint32_t SampleHostedPeds(AmbientPedState *out, uint32_t max) {
 		if (ped != h.ped)
 			continue;   // the sweep will deal with it; nothing to say
 
-		Candidate c{};
-		c.ped   = ped;
-		c.netId = h.netId;
-
-		const bool inCar = HostedSeatOf(ped, c.vehicleNetId, c.seat);
-
-		// A seated ped's own position is the car's, which is fine: it puts
-		// him in the same nearest-first order his car is in, which is the
-		// order somebody is about to drive into.
-		const float *const q = &Field<float>(ped, offs::POSITION);
-		const float dx = q[0] - px, dy = q[1] - py, dz = q[2] - pz;
-		c.dist2 = dx * dx + dy * dy + dz * dz;
-
-		if (inCar)
-			insert(seated, nSeated, seatedBudget, c);
-		else
-			insert(onFoot, nOnFoot, want, c);
-	}
-
-	uint32_t written = 0;
-	auto emit = [&](const Candidate &c) {
-		AmbientPedState &s = out[written++];
-		s.netId        = c.netId;
-		s.animId       = ReadPedBaseAnim(c.ped);
-		s.vehicleNetId = c.vehicleNetId;
-		s.seat         = c.seat;
+		Row &r = rows[n];
+		r.ped  = ped;
+		r.host = &h;
+		const bool inCar = HostedSeatOf(ped, r.vehicleNetId, r.seat);
 		// Alight, as the host's own engine has it. m_pFire is set by
 		// StartFire and nilled by Extinguish, so there is no second copy of
-		// the answer to go stale (the same read PF_ON_FIRE makes).
-		s.flags        = Field<void *>(c.ped, PED_FIRE) ? AMBIENT_PED_ON_FIRE : 0;
-		s.pos          = ReadVec3(c.ped, offs::POSITION);
-		s.heading      = Field<float>(c.ped, offs::PED_ROT_CUR);
-	};
+		// the answer to go stale (the same read PF_ON_FIRE makes). And what
+		// is in his hand, so the replica is holding the gun his rounds come
+		// out of (C_NpcShot).
+		r.flags = Field<void *>(ped, PED_FIRE) ? AMBIENT_PED_ON_FIRE : 0;
+		r.flags = AmbientPedFlagsWithWeapon(r.flags, HeldWeaponType(ped));
 
-	for (uint32_t i = 0; i < nSeated && written < want; ++i)
-		emit(seated[i]);
-	for (uint32_t i = 0; i < nOnFoot && written < want; ++i)
-		emit(onFoot[i]);
+		const uint32_t state  = Field<uint32_t>(ped, offs::PED_STATE);
+		const bool     corpse = state == PEDSTATE_DIE || state == PEDSTATE_DEAD;
+
+		StreamCandidate &k = cand[n];
+		k          = StreamCandidate{};
+		k.row      = &h.stream;
+		k.index    = n;
+		k.says     = PedRowSays(r.vehicleNetId, r.seat, r.flags);
+		k.deadline = (r.flags & AMBIENT_PED_ON_FIRE) ? STREAM_FIRE_DEADLINE : uint8_t{0};
+		const bool seen =
+		    NearestViewerDist2(ReadVec3(ped, offs::POSITION), viewers, viewerCount, k.dist2);
+		k.weight = (inCar || corpse) ? uint16_t{1} : StreamWeight(seen, k.dist2);
+		++n;
+	}
+
+	const uint32_t written = PickStreamRows(cand, n, want);
+	for (uint32_t i = 0; i < written; ++i) {
+		const Row &r = rows[cand[i].index];
+		AmbientPedState &s = out[i];
+		s.netId        = r.host->netId;
+		s.animId       = ReadPedBaseAnim(r.ped);
+		s.vehicleNetId = r.vehicleNetId;
+		s.seat         = r.seat;
+		s.flags        = r.flags;
+		s.pos          = ReadVec3(r.ped, offs::POSITION);
+		s.heading      = Field<float>(r.ped, offs::PED_ROT_CUR);
+		r.host->rowSinceReport = true;
+		if (cand[i].waited > g_pedLongestWait)
+			g_pedLongestWait = cand[i].waited;
+	}
+
+	if (n > want && !g_saidPedsTakeTurns) {
+		g_saidPedsTakeTurns = true;
+		Log("population: hosting %u named peds and a batch holds %u, so they take "
+		    "turns now, the nearest another player most often (%u other player "
+		    "position(s) known)", n, want, viewerCount);
+	}
 
 	// The measurement §3 step 6 owes the design, kept beside the thing it
 	// measures. `written` is exactly what goes on the wire this tick - the
@@ -1902,6 +2061,7 @@ bool AmbientReplicaIsAlive(RemoteAmbientPed &ped) {
 		ped.spawnPending       = true;
 		ped.seatedVehicleNetId = INVALID_NETID;
 		ped.appliedAnimId      = ANIM_NONE;
+		ped.appliedWeapon      = 0xFF;
 		return false;
 	}
 
@@ -1940,6 +2100,7 @@ bool AmbientReplicaIsAlive(RemoteAmbientPed &ped) {
 	// And the clump went with the object, so the applied animation is not a
 	// fact about anything. Same reason UnseatAmbientPed clears it.
 	ped.appliedAnimId = ANIM_NONE;
+	ped.appliedWeapon = 0xFF;
 	if (g_replicas > 0)
 		--g_replicas;
 
@@ -2142,6 +2303,7 @@ void UnseatAmbientPed(RemoteAmbientPed &ped) {
 	// its state and its animations. Forgetting makes the next frame re-drive
 	// it, the same thing UnseatRemotePed does for a player.
 	ped.appliedAnimId = ANIM_NONE;
+	ped.appliedWeapon = 0xFF;
 }
 
 // Build somebody else's pedestrian here.
@@ -2358,6 +2520,75 @@ bool InstallPopulationHooks() {
 	return ok;
 }
 
+// The session is gone, and the names it gave our crowd and our traffic went
+// with it. Everything still alive here is announced again as though it had
+// just been born, and whatever was queued about the old names is dropped:
+// kept, our whole crowd was invisible to everybody else under ids the server
+// had already let go of, the state batches spent their rows on those, and
+// after a server restart the old ids named somebody else's things.
+void RestartHostedNames() {
+	g_bornCount    = 0;
+	g_lostCount    = 0;
+	g_bornCarCount = 0;
+	g_lostCarCount = 0;
+	g_deathCount   = 0;
+	g_limbCount    = 0;
+	UnownedBlast stale[8];
+	while (g_ambientWrecks.Drain(stale, 8) != 0) {
+	}
+
+	uint32_t peds = 0, cars = 0;
+	for (HostedPed &h : g_hosted) {
+		if (!h.active)
+			continue;
+		void *const now =
+		    h.poolHandle >= 0 ? Func<GetPedFn>(CPools__GetPed)(h.poolHandle) : nullptr;
+		if (now != h.ped || g_bornCount >= MAX_QUEUED) {
+			h = HostedPed{};
+			continue;
+		}
+		HostedPed fresh{};
+		fresh.active     = true;
+		fresh.ped        = h.ped;
+		fresh.poolHandle = h.poolHandle;
+		fresh.modelId    = h.modelId;
+		fresh.tempId     = g_nextTempId++;
+		if (g_nextTempId == 0)
+			g_nextTempId = 1;
+		h = fresh;
+		LocalAmbientPed &out = g_born[g_bornCount++];
+		out.tempId = h.tempId;
+		FillPedBirth(h.ped, out.body);
+		++peds;
+	}
+	for (HostedCar &c : g_hostedCars) {
+		if (!c.active)
+			continue;
+		void *const now = c.poolHandle >= 0 ? AmbientCarFromRef(c.poolHandle) : nullptr;
+		AmbientCarBody body{};
+		if (now != c.vehicle || g_bornCarCount >= MAX_QUEUED_CARS ||
+		    !SampleAmbientCarIdentity(c.vehicle, body)) {
+			c = HostedCar{};
+			continue;
+		}
+		HostedCar fresh{};
+		fresh.active     = true;
+		fresh.vehicle    = c.vehicle;
+		fresh.poolHandle = c.poolHandle;
+		fresh.tempId     = g_nextCarTempId++;
+		if (g_nextCarTempId == 0)
+			g_nextCarTempId = 1;
+		c = fresh;
+		LocalAmbientCar &out = g_bornCars[g_bornCarCount++];
+		out.tempId = c.tempId;
+		out.body   = body;
+		++cars;
+	}
+	if (peds != 0 || cars != 0)
+		Log("population: the session is gone; %u ped(s) and %u car(s) of ours "
+		    "will be announced again to the next one", peds, cars);
+}
+
 void RemovePopulationHooks() {
 	g_addDetour.Remove();
 	g_removeDetour.Remove();
@@ -2436,9 +2667,11 @@ void AddPopulationToBridge(WorldBridge &bridge) {
 	// that applied everybody else's ped states while never sending its own
 	// would watch a moving city and contribute a static one.
 	bridge.SampleHostedPeds     = &SampleHostedPeds;
+	bridge.ArmAmbientReplica    = &ArmAmbientReplica;
 	bridge.ApplyAmbientPedState = &ApplyAmbientPedState;
 	bridge.SeatAmbientPed       = &SeatAmbientPed;
 	bridge.UnseatAmbientPed     = &UnseatAmbientPed;
+	bridge.SampleReplicaPosition = &SampleReplicaPosition;
 
 	// Limbs (protocol version 17). Both or neither, and only with the hook
 	// in: a machine that applied other people's limbs while never reporting
@@ -2447,6 +2680,7 @@ void AddPopulationToBridge(WorldBridge &bridge) {
 	if (g_bodyPartDetour.IsInstalled()) {
 		bridge.DrainAmbientBodyParts = &DrainAmbientBodyParts;
 		bridge.RemoveAmbientBodyPart = &RemoveAmbientBodyPart;
+		bridge.RemovePlayerBodyPart  = &RemovePlayerBodyPart;
 	}
 
 	// Deaths. Both or neither, and for the same all-or-nothing reason: a
@@ -2485,6 +2719,8 @@ void AddPopulationToBridge(WorldBridge &bridge) {
 	// ambient roster and this is where that roster's seam is installed.
 	bridge.LocalDrivesAmbientCar    = &LocalDrivesAmbientCar;
 	bridge.AdoptPromotedCar         = &AdoptPromotedCarHere;
+	bridge.HostedCarHandle          = &HostedCarHandle;
+	bridge.RestartHostedNames       = &RestartHostedNames;
 
 	// And the wreck pair (docs/roadmap.md 5.8, the ambient half). Both or
 	// neither, like everything else here: a machine that applied other
@@ -2492,6 +2728,11 @@ void AddPopulationToBridge(WorldBridge &bridge) {
 	// on demand and never say when its own city did.
 	bridge.DrainAmbientWrecks     = &DrainAmbientWrecks;
 	bridge.WreckAmbientCarReplica = &WreckAmbientCarReplica;
+
+	// And its dents, on the same terms: reported by the host, worn by the
+	// replicas.
+	bridge.DrainHostedCarDamage  = &DrainHostedCarDamage;
+	bridge.ApplyAmbientCarDamage = &ApplyAmbientCarDamage;
 }
 
 uint32_t HostedAmbientPedCount() {

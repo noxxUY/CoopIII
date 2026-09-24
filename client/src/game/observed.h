@@ -42,6 +42,15 @@ struct ObservedRow {
 	// C_VehicleHit, so a replayed round of theirs must not take health off it
 	// here as well. Never set beside a driver.
 	bool     weSettle          = false;
+	// What a blast left the car at here while nobody held it, and whether one
+	// has (vehicle.h, HealthToWrite). Every machine replays the explosion at
+	// the same place and takes the same off, so until somebody who holds the
+	// car has reported it, that is its health. Written by the InflictDamage
+	// detour and nothing else: the upside-down drain and a burning occupant's
+	// write never go through it, happen on one machine only, and must not
+	// stick.
+	bool     blasted           = false;
+	float    blastHealth       = 0.0f;
 };
 
 template <size_t N>
@@ -97,8 +106,11 @@ public:
 	// because the caller is the roster, which has the number and not the
 	// object. A custodian given alongside a driver is dropped: a car with a
 	// driver is a car whose custody is over, whatever a stale field says.
+	// `blastFloorEnds`: somebody holds it and their word on its health has
+	// come in since, or it is us (client.h, BlastFloorEnds).
 	void NoteHolders(uint16_t netId, uint8_t driverPlayerId,
-	                 uint8_t custodianPlayerId, bool weSettle) {
+	                 uint8_t custodianPlayerId, bool weSettle,
+	                 bool blastFloorEnds = false) {
 		for (ObservedRow &r : m_rows)
 			if (r.handle >= 0 && r.netId == netId) {
 				r.driverPlayerId    = driverPlayerId;
@@ -106,7 +118,20 @@ public:
 				                                             : uint8_t{0xFF};
 				r.weSettle          = driverPlayerId == 0xFF &&
 				                      r.custodianPlayerId == 0xFF && weSettle;
+				if (blastFloorEnds)
+					r.blasted = false;
 			}
+	}
+
+	// A blast has just been let through on a car nobody holds; `health` is
+	// what the engine left it at.
+	template <class Resolve>
+	void NoteBlast(const void *vehicle, float health, Resolve resolve) {
+		if (ObservedRow *const r = Find(vehicle, resolve)) {
+			if (!r->blasted || health < r->blastHealth)
+				r->blastHealth = health;
+			r->blasted = true;
+		}
 	}
 
 	size_t Count() const {

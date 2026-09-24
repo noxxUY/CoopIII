@@ -36,11 +36,11 @@ struct Pose {
 //
 // Everything on the wire that's named after m_vecMoveSpeed carries it raw,
 // because the receivers also write it back into the engine
-// (ApplyRemoteVehicle, the remote ped's velocity). The conversion happens
-// here, at the push, and only there. HeliStateBody::velocity is already m/s
-// on the wire (game/heli.cpp converts on both ends), so helisync pushes it
-// as is.
-constexpr float ENGINE_STEPS_PER_SECOND = 50.0f;
+// (ApplyRemoteVehicle, the remote ped's velocity). The client converts here,
+// at the push, and nowhere else; the one other place is the server's desync
+// comparison (server/core/desync.h), which is why ENGINE_STEPS_PER_SECOND is
+// in protocol.h. HeliStateBody::velocity is already m/s on the wire
+// (game/heli.cpp converts on both ends), so helisync pushes it as is.
 
 inline Vec3 MoveSpeedToMps(const Vec3 &moveSpeed) {
 	return {moveSpeed.x * ENGINE_STEPS_PER_SECOND, moveSpeed.y * ENGINE_STEPS_PER_SECOND,
@@ -100,6 +100,8 @@ public:
 	// entity stands rather than from where the clock had wandered off to.
 	uint32_t Clamp(uint32_t maxMs);
 
+	uint32_t RenderTimeMs() const { return m_renderTimeMs; }
+
 private:
 	uint32_t m_renderTimeMs = 0;
 	uint32_t m_lastLocalMs  = 0;
@@ -112,10 +114,10 @@ public:
 	// (1000/25 = 40ms) plus margin for jitter.
 	static constexpr uint32_t DELAY_MS = 100;
 	// Past this, extrapolation is worse than just freezing in place.
-	static constexpr uint32_t MAX_EXTRAPOLATE_MS = 250;
+	static constexpr uint32_t MAX_EXTRAPOLATE_MS = EXTRAPOLATE_MS;
 	// Past this gap, interpolating would drag the entity across the map -
 	// snap instead (respawn, teleport, or a long stall).
-	static constexpr float SNAP_DISTANCE = 5.0f;
+	static constexpr float SNAP_DISTANCE = PED_SNAP_M;
 
 	static constexpr size_t MAX_SAMPLES = 32;
 
@@ -149,6 +151,21 @@ public:
 
 	uint32_t NewestTimeMs() const {
 		return m_samples.empty() ? 0 : m_samples.back().timeMs;
+	}
+
+	// The instant of the sender's clock the last SampleDelayed rendered, for
+	// a desync probe. False before the first one, once the buffer is empty,
+	// and while the clock is still behind the oldest sample: the copy is held
+	// there, which is not where the sender was at that instant - a fresh
+	// buffer after a respawn is exactly that for its first 100 ms.
+	bool RenderedAt(uint32_t &out) const {
+		if (m_samples.empty() || !m_clock.Running())
+			return false;
+		const uint32_t at = m_clock.RenderTimeMs();
+		if (static_cast<int32_t>(at - m_samples.front().timeMs) < 0)
+			return false;
+		out = at;
+		return true;
 	}
 
 private:
@@ -194,12 +211,12 @@ public:
 	// at a move speed of 1.0 (180 km/h). In practice it's a bit less: during
 	// a stall the playback clock settles about 220 ms past the newest sample
 	// at 60 fps, because CLOCK_EASE keeps pulling it back toward the target.
-	static constexpr uint32_t MAX_EXTRAPOLATE_MS = 250;
+	static constexpr uint32_t MAX_EXTRAPOLATE_MS = EXTRAPOLATE_MS;
 
 	// 20m, not the ped's 5. A car at 100 km/h covers about 1.1m between
 	// snapshots, more downhill, so 5 would read ordinary driving as a
 	// teleport and snap constantly.
-	static constexpr float  SNAP_DISTANCE = 20.0f;
+	static constexpr float  SNAP_DISTANCE = CAR_SNAP_M;
 	static constexpr size_t MAX_SAMPLES   = 32;
 
 	void Push(uint32_t sendTimeMs, const Vec3 &pos, const Quat &rot,
@@ -222,10 +239,10 @@ public:
 	// last velocity first.
 	//
 	// This is for traffic (Client::CorrectAmbientCars). A traffic car's host
-	// only streams the eight nearest its own player, so one can go quiet for
-	// good while its host still has it, and whatever pose it is held at is
-	// where it stands on this screen until it comes back or is despawned.
-	// That has to be a pose the host said, not a guess this end made.
+	// has more cars than one batch holds and they take turns, so one can go
+	// quiet for several batches while its host still has it, and whatever
+	// pose it is held at is where it stands on this screen until its next
+	// row. That has to be a pose the host said, not a guess this end made.
 	//
 	// While the stream is flowing it is SampleDelayed exactly: the playback
 	// clock sits DELAY_MS behind the newest sample and never reaches it. At
@@ -235,6 +252,16 @@ public:
 
 	uint32_t NewestTimeMs() const {
 		return m_samples.empty() ? 0 : m_samples.back().timeMs;
+	}
+
+	bool RenderedAt(uint32_t &out) const {
+		if (m_samples.empty() || !m_clock.Running())
+			return false;
+		const uint32_t at = m_clock.RenderTimeMs();
+		if (static_cast<int32_t>(at - m_samples.front().timeMs) < 0)
+			return false;
+		out = at;
+		return true;
 	}
 
 private:

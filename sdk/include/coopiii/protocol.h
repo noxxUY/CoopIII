@@ -1097,6 +1097,155 @@ namespace coopiii {
 //
 //    It needs a number because the layout moved: an older build reads these
 //    packets at the old size and drops them.
+//
+// Not a version: which hosted peds and cars go in each C_PedStates and
+//    C_CarStates batch. No opcode and no layout moves; only the sender's
+//    choice of rows changed (client/src/game/streampick.h).
+//
+//    A host took the twelve peds and eight cars nearest its *own* player,
+//    with no memory from one tick to the next, so the rest of what it hosted
+//    never got a row and stood frozen on every other screen - the one player
+//    the ranking used is the only one who never reads the batch. Now every
+//    row has a credit that grows each tick it is left out, by more the nearer
+//    it is to another player, and the batch is filled from the top. A row
+//    that has never gone out, or whose seat, fire, siren, horn or health just
+//    changed, goes first, and so does a honking car or a burning ped that is
+//    about to lapse on its receiver. The batches are the same size as before.
+//
+//    Every mix of builds reads the same packets. An old host keeps sending
+//    its nearest rows and a new receiver takes them as it always did; a new
+//    host's rows are ordinary rows to an old receiver and to the server.
+//
+// Not a version: pedestrians and cops fight players on every machine. Six
+//    opcodes, 0x90-0x95, and no existing layout moves: C_NpcShot /
+//    S_NpcShot, C_NpcDamage / S_NpcDamage, C_NpcVehicleHit / S_NpcVehicleHit,
+//    and bits 1..4 of AmbientPedState::flags (AMBIENT_PED_WEAPON_*).
+//
+//    An NPC only ever hurt the player whose machine hosts it. Its round or
+//    punch reaching another player's copy there was refused and forgotten,
+//    so half of every hostile crowd was harmless to each player, and on every
+//    other screen it stood empty-handed and silent while that player's health
+//    went down. Now the host forwards the hit to the player it landed on, or
+//    to the driver or custodian of the car it landed on, and the victim's
+//    engine applies it, blamed on its replica of the NPC. The weapon rides the
+//    ped row, so the replica holds the same gun, and each round from one of
+//    the five guns that trace a ray goes to everybody within 150 m to be drawn
+//    through their own CWeapon::Fire on the replica, which decides nothing.
+//
+//    Every mix of builds only loses the new part. An old build drops the six
+//    opcodes and never reads the weapon bits; an old host never sends them; a
+//    new client behind an old server has them dropped there. In each case an
+//    NPC is harmless and unarmed on the other screens, as before. Nothing is
+//    misread.
+//
+// Not a version: a sniper round is heard on every machine. No opcode and no
+//    layout moves. C_Shot with weapon 7 used to carry the shooter's body
+//    heading and went nowhere, because an observer cannot run
+//    CWeapon::FireSniper. It now carries the line the shooter's camera was
+//    looking down, and an observer plays the report off the shooter's ped and
+//    the impact where that line meets something (combat.h, SniperProbe). The
+//    victim was already hurt by it; now somebody heard it. An older observer
+//    refuses weapon 7 at IsReplayableWeapon, as before.
+//
+// Not a version: the chat is on the HUD, with who came and went. No opcode
+//    and no layout moves; C_Chat and S_Chat are as they were, and the one
+//    new thing on the wire is PJF_ARRIVED, a spare bit of S_PlayerJoin::flags
+//    the server sets on the live announcement and never on a backfill, so a
+//    client says "bob joined" for bob and not for everybody it is told about
+//    on its own way in. An older client never reads the bit; behind an older
+//    server nobody's arrival is announced, and leaving still is.
+//
+// Not a version: a traffic car's dents. No opcode and no layout moves. The
+//    host of a traffic car now sends its panels and doors on C_VehicleDamage,
+//    the packet a driver's go on, and the server takes it for a netId that
+//    names traffic from that car's host and nobody else (Session::NoteCarDamage),
+//    keeps the word for a joiner and carries it into a promotion. A replica is
+//    collision-proof, so until now it stayed undented everywhere but on its
+//    host. An older server refuses the report at MayReportVehicle, as it always
+//    did; an older client drops an S_VehicleDamage for a netId it has no
+//    session car for. Either way the car is as it was: dented on its host.
+//
+// Not a version: a car whose driver or custodian disconnects is handed, as a
+//    custody, to the nearest other player within 80 m instead of being pinned
+//    wherever the last snapshot left it (Session::HandOverVehiclesOf). It is
+//    the S_VehicleCustody every build already reads, sent after the leave.
+//
+// Not a version: the ping in the player list. One new opcode, S_PlayerPings
+//    (0xB2), that the server broadcasts once a second with every slot's round
+//    trip as ENet measures it. An older client drops the opcode and shows no
+//    ping; an older server never sends it.
+//
+// Not a version: a player's own limb comes off on every screen. The same
+//    C_PedBodyPart a pedestrian's host sends, naming the sender's own player
+//    netId, which the server now takes from that player alone. An older server
+//    refuses it and an older client finds no pedestrian by that netId and
+//    drops it, so the limb stays on as before.
+//
+// Not a version: somebody else's rocket no longer crashes a Dodo on the
+//    observer's machine. It used to, and the crime went on the observer's
+//    player and the crash blasts went out as the observer's on top of the
+//    shooter's. Now the shooter's machine decides the hit, as it decides every
+//    projectile it fires, and its explosion ends the observer's copy. The
+//    plane's fall is only on the shooter's screen. game/heli.h has the lead
+//    and how it is checked.
+//
+// Not a version: the server's `hiddenPackages = shared | perplayer`, default
+//    shared. Nothing on the wire changes and no client knows the rule: under
+//    perplayer the server keeps a package's lock per player, grants each
+//    player their own, sends nobody else an S_PickupTaken for it and hands a
+//    joiner nobody else's. Every build of the client reads that the way it
+//    reads a pickup nobody has taken yet.
+//
+// Not a version: a police helicopter's owner says when it kept the reward.
+//    Bit 0 of the byte after HeliGoneBody::creditPlayerId, which was padding
+//    and went out as zero: HELI_GONE_OWNER_KEPT, the owner's engine paid the
+//    $250 and the statistics for a helicopter somebody else shot down and
+//    could not take them back. The shooter then registers the crime and
+//    nothing else. An older owner sends zero and the shooter pays itself as
+//    before; an older shooter never reads the bit.
+//
+// Not a version: a shove settles a parked car. C_VehicleHit with weapon
+//    VEHICLE_HIT_PUSH and no amount, from the machine whose car just pushed a
+//    session car nobody holds; the server makes it the custodian, as for a
+//    shot, and relays nothing. An older server relays it as a hit, which
+//    every receiver drops as a weapon it cannot forward; an older client
+//    never sends it, and the car stays a wall on its screen. The server
+//    takes it only from somebody at the wheel of another car.
+//
+// Not a version: desync probes. Two new opcodes, C_DesyncProbe (0xB3) and
+//    S_DesyncReport (0xB4), diagnostics only. An older server drops the probe
+//    and never answers, so a newer client's list simply shows no distance;
+//    an older client never probes.
+//
+// Not a version: a car that changes hands is played on its new driver's
+//    clock. Nothing on the wire; the client's buffer for a car starts again
+//    when the player whose snapshots it holds changes, where it used to drop
+//    every snapshot older than the last one the previous driver sent - and a
+//    machine whose game started later sends nothing but those.
+//
+// Not a version: a server password. One new opcode, C_Password (0xB5), sent
+//    right behind the hello by a client that has a password, and one new
+//    reject reason, REJECT_BAD_PASSWORD (3). A server without a password
+//    drops the opcode or ignores it; one with a password turns away a client
+//    that never sends it, older ones included, which is the point.
+//
+// Not a version: a joiner is told who is settling which car. The backfill
+//    carries one S_VehicleCustody per custody in progress, after the seats;
+//    every build reads it the way it reads a custody announced live.
+//
+// Not a version: a car's own blast is no longer relayed as C_Explosion. The
+//    wreck's packet already makes every copy blow up through BlowUpCar, which
+//    adds the explosion itself, so an older observer simply stops seeing it
+//    twice. And the backfill's S_PickupTaken names nobody (INVALID_PLAYER)
+//    rather than the collector, whose slot a joiner may now have.
+//
+// Not a version: a kick keeps the player out. The server hangs up with
+//    LEAVE_KICKED as the ENet disconnect's data, as it always did, and a
+//    client that was welcomed reads it and stops reconnecting until the
+//    game restarts; an older client comes straight back as before. A
+//    connection that never says hello is dropped after HELLO_WAIT_MS and is
+//    sent nothing meanwhile, and the server keeps two connections past the
+//    last slot so a ninth player hears REJECT_FULL.
 
 constexpr uint16_t PROTOCOL_VERSION = 36;
 constexpr uint16_t DEFAULT_PORT     = 2001;
@@ -1298,6 +1447,17 @@ enum Opcode : uint8_t {
 	OP_C_RAMPAGE_CAR      = 0x8E,
 	OP_S_RAMPAGE_CAR      = 0x8F,
 
+	// An NPC's gunfire and the hits it lands on players, from the machine
+	// hosting it. 0x90..0x97 is the block; six of the eight are used. The
+	// shot is only drawn where it arrives, and a hit goes to the one player it
+	// landed on, or on whose car. See C_NpcShot, C_NpcDamage, C_NpcVehicleHit.
+	OP_C_NPC_SHOT         = 0x90,
+	OP_S_NPC_SHOT         = 0x91,
+	OP_C_NPC_DAMAGE       = 0x92,
+	OP_S_NPC_DAMAGE       = 0x93,
+	OP_C_NPC_VEHICLE_HIT  = 0x94,
+	OP_S_NPC_VEHICLE_HIT  = 0x95,
+
 	// 0xA0..0xAF was the garage block: doors, garages and the Pay'n'Spray.
 	// It uses 0xA0..0xA3. docs/protocol.md §1.16.
 	OP_C_GARAGE_STATE     = 0xA0,
@@ -1324,6 +1484,19 @@ enum Opcode : uint8_t {
 	// PlayerStateBody::ammoTotal for the argument.
 	OP_C_PLAYER_AMMO      = 0xB0,
 	OP_S_PLAYER_AMMO      = 0xB1,
+
+	// Everybody's round trip to the server, from the server, once a second:
+	// the ping in the player list. 0xB2..0xBF were free; this takes one.
+	OP_S_PLAYER_PINGS     = 0xB2,
+	// Where this machine has somebody else's player or car, and at what
+	// instant of its owner's clock, and the server's answer: how far that is
+	// from where the owner said it was at that instant. Diagnostics only;
+	// nothing is corrected by it.
+	OP_C_DESYNC_PROBE     = 0xB3,
+	OP_S_DESYNC_REPORT    = 0xB4,
+	// The server's password, right behind the hello, when the player has one
+	// to give. A server with a password holds the hello until it arrives.
+	OP_C_PASSWORD         = 0xB5,
 
 	// 0xC0..0xCF is the breakable-street-object block. docs/objects.md.
 	// Four of the sixteen are used and the rest stay reserved. 0xC0/0xC1 are
@@ -1372,6 +1545,10 @@ enum RejectReason : uint8_t {
 	REJECT_NONE            = 0,
 	REJECT_BAD_VERSION     = 1,
 	REJECT_FULL            = 2,
+	// The server has a password and the hello brought the wrong one, or none
+	// within PASSWORD_WAIT_MS. An older client reads it as a reason it does
+	// not know, which it is.
+	REJECT_BAD_PASSWORD    = 3,
 };
 
 // Session-wide rules a client has to know about, handed over in S_Welcome.
@@ -1885,6 +2062,12 @@ enum PlayerJoinFlags : uint8_t {
 	// somebody was lying in the road got a live one, standing up, on zero
 	// health, until the corpse got up by itself.
 	PJF_DEAD = 1 << 1,
+	// The live announcement of somebody connecting this moment, as opposed to
+	// a backfill telling a joiner who was already here. It is what lets a
+	// client say "X joined" without saying it for everybody it is told about
+	// on its own way in. An older server never sets it, so behind one nobody's
+	// arrival is announced.
+	PJF_ARRIVED = 1 << 2,
 };
 
 struct S_PlayerJoin {
@@ -3245,11 +3428,11 @@ struct S_PedBodyPart {
 //
 // A death reaches observers today only as whatever animation happens to be
 // dominant in the next C_PedStates row, and that is not a death: the stream
-// carries the twelve peds nearest the *sender* (MAX_PED_STATES), a corpse is
-// rarely among them for long, and ApplyAmbientPedState refuses to drive
-// anything into a replica that is already dead without ever being the thing
-// that makes one dead. So you shoot a pedestrian, he drops on your screen,
-// and on every other screen he keeps walking.
+// carries twelve peds a batch (MAX_PED_STATES), a corpse's turn in it comes
+// rarely, and ApplyAmbientPedState refuses to drive anything into a replica
+// that is already dead without ever being the thing that makes one dead. So
+// you shoot a pedestrian, he drops on your screen, and on every other screen
+// he keeps walking.
 //
 // Only the host may say it, the same rule as the despawn and the limb, and
 // for a stronger reason than either: every replica is bullet-, fire-, melee-
@@ -3381,6 +3564,62 @@ struct S_PedDamage {
 	PedDamageBody body;
 };
 
+// ---- an NPC's gunfire, and its hits on players (0x90..0x93) ----------------
+//
+// A pedestrian or a cop fights on the machine hosting it: its AI picks the
+// target, its CWeapon::Fire traces the round, and when the round or a punch
+// reaches another player's copy there, that machine's engine is the one that
+// found the hit. It used to throw the hit away, so an NPC only ever hurt the
+// player on its own host's machine. Now the host forwards it the way a
+// player's own hit is forwarded (C_Damage) and the victim applies it to
+// himself.
+//
+// The round goes to everybody else as well, so the NPC is seen and heard
+// firing. It is drawn through the observer's own CWeapon::Fire on its replica,
+// the way a remote player's round is, and it decides nothing there: the damage
+// it would find is refused, because the host already decided it.
+//
+// Only the five guns that trace a ray (combat.h, IsInstantHitWeapon) are sent.
+// Retail NPCs carry nothing else that fires.
+
+// Unreliable: a lost round is a missing streak, and a firefight with a few
+// cops in it is a stream rather than a handful of events.
+struct C_NpcShot {
+	static constexpr uint8_t OPCODE = OP_C_NPC_SHOT;
+	PacketHeader hdr;
+	uint16_t     pedNetId;
+	ShotBody     body;
+};
+
+struct S_NpcShot {
+	static constexpr uint8_t OPCODE = OP_S_NPC_SHOT;
+	PacketHeader hdr;
+	uint8_t      ownerPlayerId;
+	uint16_t     pedNetId;
+	ShotBody     body;
+};
+
+// One hit a hosted pedestrian landed on another player's copy, exactly as the
+// host's CPed::InflictDamage was asked to make it. The body is C_Damage's: the
+// victim's netId and the engine's own five arguments, plus the melee bytes
+// for a punch or a bat. Friendly fire has no say, because nobody here is a
+// player hurting another player.
+struct C_NpcDamage {
+	static constexpr uint8_t OPCODE = OP_C_NPC_DAMAGE;
+	PacketHeader hdr;
+	uint16_t     attackerPedNetId;
+	DamageBody   body;
+};
+
+// To the victim alone, like S_Damage.
+struct S_NpcDamage {
+	static constexpr uint8_t OPCODE = OP_S_NPC_DAMAGE;
+	PacketHeader hdr;
+	uint8_t      ownerPlayerId;
+	uint16_t     attackerPedNetId;
+	DamageBody   body;
+};
+
 // ---- shooting somebody else's car (CH_EVENT) -------------------------------
 //
 // The pedestrian exchange above, aimed at a car another player is driving.
@@ -3477,10 +3716,19 @@ struct S_PedDamage {
 // it off still lets everybody shoot cars.
 struct VehicleHitBody {
 	uint16_t netId;
-	// 9 is an ignition rather than a hit, on C_CarHit too (§1.24).
+	// 9 is an ignition rather than a hit, on C_CarHit too (§1.24), and
+	// VEHICLE_HIT_PUSH on C_VehicleHit is a shove.
 	uint8_t  weapon;
 	float    amount;
 };
+
+// "Our car has just shoved this one, and nobody holds it": a session car
+// parked where the session last had it is pinned there on every screen, so
+// until somebody's engine is allowed to simulate it, pushing it is pushing a
+// wall. The server makes the sender its custodian, as for a shot, and relays
+// nothing. No engine weapon has this number and IsForwardableDamage refuses
+// it, so a server from before it relays a shove nobody applies.
+constexpr uint8_t VEHICLE_HIT_PUSH = 0xFE;
 
 struct C_VehicleHit {
 	static constexpr uint8_t OPCODE = OP_C_VEHICLE_HIT;
@@ -3508,6 +3756,27 @@ struct S_VehicleHit {
 	static constexpr uint8_t OPCODE = OP_S_VEHICLE_HIT;
 	PacketHeader   hdr;
 	uint8_t        attackerId;
+	VehicleHitBody body;
+};
+
+// An NPC's round on a car another player is driving or settling, the last of
+// the 0x90 block (C_NpcShot has the rest): the cop shooting at the car we
+// drive, or at the one his own player is a passenger in. C_VehicleHit's body,
+// to that car's driver or custodian (Session::VehicleHitRecipient), who blames
+// the cop's replica rather than the player whose machine hosts him. Traffic
+// and a car nobody holds are not sent (game/vehicle.h, DecideCarDamage).
+struct C_NpcVehicleHit {
+	static constexpr uint8_t OPCODE = OP_C_NPC_VEHICLE_HIT;
+	PacketHeader   hdr;
+	uint16_t       attackerPedNetId;
+	VehicleHitBody body;
+};
+
+struct S_NpcVehicleHit {
+	static constexpr uint8_t OPCODE = OP_S_NPC_VEHICLE_HIT;
+	PacketHeader   hdr;
+	uint8_t        ownerPlayerId;
+	uint16_t       attackerPedNetId;
 	VehicleHitBody body;
 };
 
@@ -3585,16 +3854,14 @@ struct S_CarHit {
 //     cycle is not something anybody can see is wrong. A remote *player*
 //     carries both because a player is looked at.
 //   - **moveState (1 byte).** It is read by nothing. See above.
-//   - **health, armour, weapon, aim (about 20 bytes).** An ambient ped's
-//     damage, death and removal all happen on its host. A replica can be
-//     shot from another machine, but the hit goes to the host as
-//     C_PedDamage (20) and the limb and the death come back as
-//     S_PedBodyPart (17) and S_PedDeath (18), so health never needed to
-//     travel. Leaving out the weapon and the aim costs something else: a
-//     replica is built unarmed and never fires, so an NPC shooting at his
-//     host's player is drawn with empty hands and makes no sound on every
-//     other screen. (The `flags` byte this list used to leave out is now
-//     the one below, which used to be padding.)
+//   - **health, armour, aim (about 16 bytes).** An ambient ped's damage,
+//     death and removal all happen on its host. A replica can be shot from
+//     another machine, but the hit goes to the host as C_PedDamage (20) and
+//     the limb and the death come back as S_PedBodyPart (17) and
+//     S_PedDeath (18), so health never needed to travel. The weapon did,
+//     and it rides four bits of `flags` below: the replica holds the same
+//     gun, and its rounds arrive on C_NpcShot with their own line, so the
+//     aim is not needed either. (`flags` is what used to be padding.)
 //
 // 24 bytes, against PlayerStateBody's 71 and AmbientCarState's 44.
 struct AmbientPedState {
@@ -3628,6 +3895,28 @@ struct AmbientPedState {
 // host stops saying so. docs/protocol.md §1.24.
 constexpr uint8_t AMBIENT_PED_ON_FIRE = 1 << 0;
 
+// Bits 1..4: the eWeaponType in the host's pedestrian's hand, 0..12. An older
+// sender leaves them 0, which is UNARMED and what every replica held before
+// they existed, and an older receiver only ever reads bit 0. The observer puts
+// the same weapon in its replica's hand, which is what C_NpcShot fires.
+constexpr uint8_t AMBIENT_PED_WEAPON_SHIFT = 1;
+constexpr uint8_t AMBIENT_PED_WEAPON_MASK  = 0x1E;
+
+inline uint8_t AmbientPedFlagsWithWeapon(uint8_t flags, uint8_t weapon) {
+	if (weapon >= INVENTORY_SLOTS)
+		weapon = 0;
+	return static_cast<uint8_t>((flags & ~AMBIENT_PED_WEAPON_MASK) |
+	                            (weapon << AMBIENT_PED_WEAPON_SHIFT));
+}
+
+// 0 for anything that is not an inventory weapon, which can only be a newer
+// sender's bits this build does not know.
+inline uint8_t AmbientPedWeapon(uint8_t flags) {
+	const uint8_t w = static_cast<uint8_t>((flags & AMBIENT_PED_WEAPON_MASK) >>
+	                                       AMBIENT_PED_WEAPON_SHIFT);
+	return w < INVENTORY_SLOTS ? w : 0;
+}
+
 // Twelve, against the traffic stream's eight, and both numbers come out of
 // the same sum rather than out of symmetry.
 //
@@ -3638,9 +3927,9 @@ constexpr uint8_t AMBIENT_PED_ON_FIRE = 1 << 0;
 // streams together are 6.4 KB/s each way per observer, against the 13 KB/s
 // 2.1 says a *dozen cars alone* would cost at the player rate.
 //
-// The thirteenth pedestrian and beyond is held where it was last heard of,
-// which is 2.1's far band, and it is only ever a ped nobody is standing
-// next to.
+// A host with more peds than that gives them turns, the ones nearest another
+// player most often (client/src/game/streampick.h), so the batch stays this
+// size however many it hosts.
 constexpr uint8_t MAX_PED_STATES = 12;
 
 struct C_PedStates {
@@ -3808,11 +4097,10 @@ inline bool DecodeAmbientHealth(uint16_t wire, float &out) {
 // Eight, and the number is the design rather than a round figure.
 //
 // population.md §2.1: a dozen cars at the player rate is already most of the
-// budget, and a flat rate is not on the table. Eight nearest cars at 10 Hz is
+// budget, and a flat rate is not on the table. Eight cars at 10 Hz is
 // 8 × 44 × 10 = 3.5 KB/s each way per observer, against 13 KB/s for the same
-// dozen cars at 25 Hz. The ninth car and beyond is left where it was last
-// seen, which is §2.1's "far but still in the world: nothing" - and it is
-// only ever a car nobody is near.
+// dozen cars at 25 Hz. A ninth car shares the eight rows by turns, the same
+// way the peds share theirs.
 constexpr uint8_t MAX_CAR_STATES = 8;
 
 // A traffic car's horn, one bit per row, kept in the batch's own padding
@@ -4492,6 +4780,109 @@ struct S_PlayerAmmo {
 	AmmoSlotBody slot;
 };
 
+// Each slot's round trip to the server as ENet measures it, in milliseconds,
+// PING_NONE for a slot nobody is in. Broadcast once a second; a client only
+// ever draws it. What the server measures is the one number every machine can
+// agree on for everybody, the machine it describes included.
+constexpr uint16_t PING_NONE = 0xFFFF;
+constexpr uint16_t PING_MAX  = 0xFFFE;
+
+struct S_PlayerPings {
+	static constexpr uint8_t OPCODE = OP_S_PLAYER_PINGS;
+	PacketHeader hdr;
+	uint16_t     rttMs[MAX_PLAYERS];
+};
+
+// ---------------------------------------------------------------------------
+// The server's password
+// ---------------------------------------------------------------------------
+//
+// A server somebody runs for their friends on the open internet needs a way to
+// keep strangers out, and a hello carries no room for one. So a client with a
+// password sends C_Password right after its hello, on the same reliable
+// ordered channel, and a server that has one holds the hello until it comes:
+// the right one and the hello goes on as it always did, the wrong one or none
+// within PASSWORD_WAIT_MS and the welcome says REJECT_BAD_PASSWORD. A server
+// without a password ignores it. It crosses the network as it is typed, so it
+// is a gate against strangers and nothing more.
+
+constexpr size_t   PASSWORD_LEN     = 32;
+constexpr uint32_t PASSWORD_WAIT_MS = 3000;
+
+struct C_Password {
+	static constexpr uint8_t OPCODE = OP_C_PASSWORD;
+	PacketHeader hdr;
+	char         password[PASSWORD_LEN];   // not necessarily terminated
+};
+
+// ---------------------------------------------------------------------------
+// Desync probes
+// ---------------------------------------------------------------------------
+//
+// docs/protocol.md 1.26. "He was somewhere else on my screen" is a claim about
+// two machines, and the server is the one place that hears from both. Every
+// DESYNC_PROBE_MS an observer says where its engine actually has each remote
+// player on foot, each session car it is only watching and its replicas of
+// other people's traffic and pedestrians, together with the
+// instant of the owner's clock its playback was rendering (`atMs`, the
+// owner's sendTimeMs timebase, which is the one its buffer runs on). The
+// server keeps the last second or so of what each owner reported, looks up
+// that instant and answers with the distance.
+//
+// So network delay is not counted as desync: an observer drawing a car 100 ms
+// behind is compared with where the car was 100 ms ago. What is left is a copy
+// the engine pushed off its pose, a replica frozen on a stale row, a stream
+// that stalled, a car being corrected to the wrong place.
+
+constexpr uint32_t DESYNC_PROBE_MS   = 2000;
+
+// How far apart two consecutive samples are before a client's buffer jumps to
+// the second instead of sliding (client/src/interp.h, SNAP_DISTANCE): a
+// respawn, a teleport, a stall. Here so the server's comparison jumps where
+// the copy did, instead of measuring the copy against a point halfway along a
+// teleport that nobody was ever at.
+constexpr float PED_SNAP_M = 5.0f;
+constexpr float CAR_SNAP_M = 20.0f;
+
+// And how far past the newest sample a player's or a session car's buffer
+// runs on along its last velocity before it holds (interp.h,
+// MAX_EXTRAPOLATE_MS), with that velocity converted from the engine's
+// per-step move speed at this many steps a second (interp.h,
+// ENGINE_STEPS_PER_SECOND).
+constexpr uint32_t EXTRAPOLATE_MS          = 250;
+constexpr float    ENGINE_STEPS_PER_SECOND = 50.0f;
+constexpr uint8_t  DESYNC_PROBE_ROWS = 24;
+// The answer for a row the server could not compare: an entity it has no
+// history for, or an instant outside what it kept.
+constexpr uint16_t DESYNC_UNKNOWN    = 0xFFFF;
+constexpr uint16_t DESYNC_MAX_CM     = 0xFFFE;
+
+struct DesyncProbeRow {
+	uint16_t netId;   // a player, a session car, a replica of traffic or a pedestrian
+	uint32_t atMs;    // the owner's clock
+	Vec3     pos;     // where this machine's engine has it
+};
+
+struct C_DesyncProbe {
+	static constexpr uint8_t OPCODE = OP_C_DESYNC_PROBE;
+	PacketHeader   hdr;
+	uint8_t        count;
+	DesyncProbeRow rows[DESYNC_PROBE_ROWS];
+};
+
+struct DesyncReportRow {
+	uint16_t netId;
+	uint16_t offCm;   // DESYNC_UNKNOWN when there was nothing to compare with
+};
+
+// To the prober alone, in the order it asked.
+struct S_DesyncReport {
+	static constexpr uint8_t OPCODE = OP_S_DESYNC_REPORT;
+	PacketHeader    hdr;
+	uint8_t         count;
+	DesyncReportRow rows[DESYNC_PROBE_ROWS];
+};
+
 // ---------------------------------------------------------------------------
 // Breakable street objects
 // ---------------------------------------------------------------------------
@@ -4743,9 +5134,16 @@ struct HeliGoneBody {
 	// own machine registers the crime and the statistics; INVALID_PLAYER when
 	// the owner's own player or engine did it, or it wasn't shot down.
 	uint8_t  creditPlayerId;
-	uint8_t  pad[3];
+	uint8_t  flags;           // HELI_GONE_OWNER_KEPT; was padding, sent as 0
+	uint8_t  pad[2];
 	Vec3     pos;             // where it went off, or where it was last
 };
+
+// The owner's engine paid its $250 and statistics for a helicopter somebody
+// else shot down and could not take them back (game/heli.h,
+// WithholdHeliRewards). The shooter then registers only the crime: paying
+// itself too would leave both of them holding the reward.
+constexpr uint8_t HELI_GONE_OWNER_KEPT = 1 << 0;
 
 // From the owner, reliable.
 struct C_HeliGone {
@@ -5002,6 +5400,12 @@ static_assert(offsetof(PlayerStateBody, flags)    == 70, "flags is last");
 static_assert(sizeof(AmmoSlotBody)    == 8,  "ammo slot layout");
 static_assert(sizeof(C_PlayerAmmo)    == 13, "player ammo layout");
 static_assert(sizeof(S_PlayerAmmo)    == 14, "player ammo layout");
+static_assert(sizeof(S_PlayerPings)   == 5 + 2 * MAX_PLAYERS, "ping table layout");
+static_assert(sizeof(C_Password)      == 5 + PASSWORD_LEN, "password layout");
+static_assert(sizeof(DesyncProbeRow)  == 18, "desync probe row layout");
+static_assert(sizeof(C_DesyncProbe)   == 6 + 18 * DESYNC_PROBE_ROWS, "desync probe layout");
+static_assert(sizeof(DesyncReportRow) == 4, "desync report row layout");
+static_assert(sizeof(S_DesyncReport)  == 6 + 4 * DESYNC_PROBE_ROWS, "desync report layout");
 static_assert(sizeof(VehicleStateBody)== 72, "vehicle state layout");
 static_assert(sizeof(C_VehicleState)  == 77, "vehicle snapshot layout");
 static_assert(sizeof(S_VehicleState)  == 78, "vehicle snapshot layout");
@@ -5319,6 +5723,17 @@ static_assert(offsetof(S_PickupTaken, ident)    == 6,  "playerId comes first");
 // The type numbers are spelled here rather than included from the client's
 // addresses.h, which is the wrong direction for a shared header - addresses.h
 // static_asserts its own copy against this one.
+// PICKUP_COLLECTABLE1, the hidden package: a ONCE pickup that also counts
+// towards CPlayerInfo::m_nCollectedPackages. Spelled here for the server's
+// `hiddenPackages` rule, which is the one thing that tells packages apart.
+constexpr uint8_t PICKUP_TYPE_PACKAGE = 5;
+
+// The server's `hiddenPackages` rule (docs/roadmap.md 5.11). Never sent: under
+// either rule a client does what it is told, and the difference is only in
+// what the server tells it.
+constexpr uint8_t PACKAGES_SHARED    = 0;   // one collects it, it is gone for all
+constexpr uint8_t PACKAGES_PERPLAYER = 1;   // each player finds their own hundred
+
 constexpr uint32_t PickupRespawnMs(uint8_t type, bool isBribeModel) {
 	switch (type) {
 	case 1:  return 5000;                              // PICKUP_IN_SHOP
@@ -5326,6 +5741,20 @@ constexpr uint32_t PickupRespawnMs(uint8_t type, bool isBribeModel) {
 	case 15: return isBribeModel ? 300000u : 720000u;  // PICKUP_ON_STREET_SLOW
 	default: return 0;
 	}
+}
+
+// PICKUP_ONCE_TIMEOUT and PICKUP_MONEY: what a dead pedestrian drops, and
+// gone from the ground on every machine within 20 s and 30 s (addresses.h,
+// PICKUP_ONCE_TIMEOUT_MS and PICKUP_MONEY_MS). Collected, the session
+// remembers one of those for a minute rather than for good: kept, every
+// backfill grew by one for each drop anybody ever picked up.
+constexpr uint8_t  PICKUP_TYPE_ONCE_TIMEOUT = 4;
+constexpr uint8_t  PICKUP_TYPE_MONEY        = 7;
+constexpr uint32_t PICKUP_DROP_FORGET_MS    = 60000;
+
+constexpr uint32_t PickupForgetMs(uint8_t type) {
+	return type == PICKUP_TYPE_ONCE_TIMEOUT || type == PICKUP_TYPE_MONEY ? PICKUP_DROP_FORGET_MS
+	                                                                     : 0;
 }
 
 } // namespace coopiii

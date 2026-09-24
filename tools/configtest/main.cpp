@@ -40,6 +40,69 @@ void TestDefaults() {
 	// for what its own engine saw, so that is what off is and off is the
 	// default.
 	Check(c.money == MoneyMode::Off, "money is off");
+	Check(c.hiddenPackages == PackageMode::Shared, "hidden packages are shared (5.11)");
+}
+
+void TestPassword() {
+	std::printf("the password\n");
+
+	ServerConfig c;
+	Check(c.password.empty(), "none by default: anybody with the address can join");
+	Check(c.Parse("password = hunter2\n") && c.password == "hunter2", "a password parses");
+	c.Parse("password = \n");
+	Check(c.password.empty(), "and an empty one is none again");
+	Check(ServerConfig::CleanPassword("a\tb\x01" "c") == "abc",
+	      "control characters are left out, as a hello cannot carry them");
+	Check(ServerConfig::CleanPassword(std::string(60, 'x')).size() == PASSWORD_LEN - 1,
+	      "and one longer than the packet is cut to what it carries");
+
+	ServerConfig written;
+	written.password      = "open sesame";
+	written.hiddenPackages = PackageMode::PerPlayer;
+	const std::string ini = written.ToIni();
+	Check(ini.find("password = open sesame\n") != std::string::npos,
+	      "the file says the password, on the last line and whole");
+	ServerConfig read;
+	read.Parse(ini);
+	Check(read == written, "and reads back the same");
+	ServerConfig other = written;
+	other.password     = "";
+	Check(other != written, "and a different password is a different config");
+}
+
+void TestHiddenPackages() {
+	std::printf("hidden packages (5.11)\n");
+
+	ServerConfig c;
+	Check(c.Parse("hiddenPackages = perplayer\n") && c.hiddenPackages == PackageMode::PerPlayer,
+	      "\"perplayer\" parses");
+	Check(c.Parse("HIDDENPACKAGES = Shared\n") && c.hiddenPackages == PackageMode::Shared,
+	      "\"Shared\" parses, key and value both without case");
+	Check(c.Parse("hiddenPackages = per-player\n") && c.hiddenPackages == PackageMode::PerPlayer,
+	      "and so does the spelling the wanted level takes");
+	c.Parse("hiddenPackages = some\n");
+	Check(c.hiddenPackages == PackageMode::PerPlayer, "an unknown value leaves it where it was");
+
+	Check(std::string(Name(PackageMode::Shared)) == "shared" &&
+	          std::string(Name(PackageMode::PerPlayer)) == "perplayer",
+	      "the two names are the two values the file takes");
+	Check(WireValue(PackageMode::Shared) == PACKAGES_SHARED &&
+	          WireValue(PackageMode::PerPlayer) == PACKAGES_PERPLAYER,
+	      "and each one is the session's rule");
+
+	ServerConfig written;
+	written.hiddenPackages = PackageMode::PerPlayer;
+	const std::string ini  = written.ToIni();
+	Check(ini.find("hiddenPackages = perplayer") != std::string::npos,
+	      "the file says hiddenPackages = perplayer");
+	Check(ini.find("money = off") != std::string::npos,
+	      "and still has the key written before it, whole");
+	ServerConfig read;
+	read.Parse(ini);
+	Check(read == written, "and reads back the same");
+	ServerConfig other = written;
+	other.hiddenPackages = PackageMode::Shared;
+	Check(other != written, "and a different package rule is a different config");
 }
 
 void TestMoney() {
@@ -171,6 +234,7 @@ void TestRoundTrip() {
 	written.ammoSync           = true;
 	written.rampage            = RampageMode::Scaled;
 	written.money              = MoneyMode::Own;
+	written.hiddenPackages     = PackageMode::PerPlayer;
 
 	const std::string ini = written.ToIni();
 	Check(ini.find("[CoopIII]") != std::string::npos, "the file has its section header");
@@ -213,6 +277,8 @@ int main() {
 	TestNames();
 	TestCheats();
 	TestMoney();
+	TestHiddenPackages();
+	TestPassword();
 
 	std::printf("\n%s\n", g_failures == 0 ? "all server config checks passed"
 	                                      : "server config checks FAILED");

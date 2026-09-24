@@ -340,6 +340,38 @@ this project.
 | `CPed::m_nCreatedBy` | — | none | Needed to tell an ambient ped from a mission one, so CoopIII does not replicate the campaign's peds as traffic. |
 
 
+## The camera's look direction (2026-09-23, the sniper round)
+
+`client/src/game/combat.cpp`, `RecordLocalShot`, reads this for one thing: the
+line a sniper round of ours goes out along, so everybody else can play its
+report and its impact. A wrong value sends that sound the wrong way and does
+nothing else - it is read, never written, and only ever reaches
+`CWorld::ProcessLineOfSight` through `UnitDirection` and `ClampToWorld`.
+
+| What | Value | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| `TheCamera`'s forward axis, `GetForward()` | `TheCamera + 0x14` (`0x006FAD0C`) | medium | `TheCamera` (`0x006FACF8`) and its position at `+0x34` are in `addresses.h`, and `+0x34` is exactly `CPlaceable`'s `GetPosition()` for every entity, so the camera carries the same `CPlaceable` matrix and the forward axis sits where it does on a ped (`offs::MATRIX_FWD`). That it holds the *look direction* rests on re3's `CCamera::Process`, which ends by writing `GetForward() = CamFront` and `GetPosition() = CamSource` from the active `CCam` - the same `Front` `CWeapon::FireSniper` fires along. Not read in the image. To verify: find the stores into `0x006FAD0C..0x006FAD14` at the tail of `CCamera::Process` and check they come from the active cam's `Front`. |
+
+## A plane and somebody else's rocket (2026-09-23)
+
+| What | Value | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| `CPlane::TestRocketCollision` | `0x0054DE90` | medium, checked at run time | From the report that an observer's copy of a rocket crashes a Dodo and gives the observer stars; re3 has it as `static bool CPlane::TestRocketCollision(CVector *)`, called in `CProjectileInfo::Update` straight after `CHeli::TestRocketCollision`. Not read in the image. `game/heli.cpp` hooks it only when both of the helicopter test's call sites in `addresses.h` (`0x0055B8E2`, `0x0055B9BC`) have a one-argument `call 0x0054DE90` within `0x30` bytes, and logs and leaves it alone otherwise. Both calls are read in the image: `0x0055B8F1` and `0x0055B9CB`, each `push eax / call / test al,al / pop ecx`, straight after the helicopter test. Still to read: the function's own loop over the planes. |
+| the crime it registers | call at `0x0054DF86`, crime 16 | low | From the same report. Not used: refusing the collision for a remote rocket is what keeps it from running. |
+| the crash blasts' culprit | `0x0054C25B`..`0x0054C265` | low | From the same report: the Dodo's crash explosions push `FindPlayerPed()` as culprit, which is why they went out as the observer's. Not used, for the same reason. |
+
+## A window and somebody else's drive-by (2026-09-24)
+
+| What | Value | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| `CGlass::WasGlassHitByBullet` | `0x00504670` | medium, checked at run time | Named in two listings `addresses.h` does prove: `CWeapon::FireInstantHitFromCar`'s `other` arm calls it for a round that ends on anything but a ped or a car, and `CWeapon::DoBulletImpact` calls it "with the col point's three floats" right after its `if (victim)`. The function itself is not read in the image; the signature, `__cdecl(CEntity *, CVector)`, is re3's (`Glass.cpp`) and fits the three floats. `game/combat.cpp` calls it from `DriveByImpact`, for somebody else's round, only when a `call 0x00504670` is found both in `FireInstantHitFromCar` (`0x005624D0` up to `DoDoomAiming`, `0x00562EB0`) and in the first `0x100` bytes of `DoBulletImpact` (`0x0055F950`), and logs and leaves windows alone otherwise. To verify: disassemble both calls and the pushes before them, and the function's own `IsGlass` test on the entity's model. |
+
+## A gear off the wire (2026-09-24)
+
+| What | Value | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| highest gear the transmission table takes | `5` (reverse plus five forward) | low | `CVehicle::m_nCurrentGear` (`+0x204`, in `addresses.h`) is an index into the handling's gear table; re3 has `tTransmissionGear Gears[6]` in `cTransmission`. Not read in the image, and neither is the table's size. `ApplyRemoteVehicle` writes a gear off the wire only when it is `<= 5` and otherwise leaves the copy's own, so a wrong bound costs a gear indicator, never a write past the table. To verify: the `cTransmission` layout in `CHandlingDataMgr::LoadHandlingData`, and the reads of `+0x204` in `CAutomobile::ProcessControl`. |
+
 ## Pickups - what could not be proved statically (2026-09-22)
 
 Everything the pickup work actually uses is in `addresses.h` with its

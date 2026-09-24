@@ -24,6 +24,8 @@
 
 #include <coopiii/protocol.h>
 
+#include <cmath>
+
 namespace coopiii::game {
 
 // True when the local player is sitting in a vehicle (driving or riding).
@@ -140,6 +142,67 @@ bool VehicleAtRest(RemoteVehicle &vehicle);
 // CustodyMayEnd). False for a wreck or a car the pool no longer has.
 bool VehicleBurning(RemoteVehicle &vehicle);
 
+// Under the water's surface and still moving: a car on its way to the bottom.
+bool VehicleSinking(RemoteVehicle &vehicle);
+
+// Still going down, or still drifting, in the engine's per-step units: faster
+// than a tenth of a metre a second down, or a fifth of one any way at all. Not
+// the rest test, whose 3.5 m/s is CanPedExitCar's: the water holds a sinking
+// car well under that, and a car handed back on its word is pinned half way
+// down on every screen.
+constexpr float SINK_FALL     = 0.002f;
+constexpr float SINK_DRIFT_SQ = 0.004f * 0.004f;
+
+inline bool StillSinking(const Vec3 &move) {
+	return move.z < -SINK_FALL ||
+	       move.x * move.x + move.y * move.y + move.z * move.z > SINK_DRIFT_SQ;
+}
+
+// A car this machine drives or settles, every frame: ours to dent again.
+void TakeVehicleBack(RemoteVehicle &vehicle);
+
+// Has the local player's car just shoved it? For a session car nobody holds,
+// after physics and before the correction puts it back.
+bool VehiclePushedByUs(RemoteVehicle &vehicle);
+
+// How much a pinned car has to be moving after a collision for it to count as
+// pushed, in the engine's per-step units: a fifth of a metre a second across
+// the ground, or turning about its upright. Far below the rest test's numbers,
+// which are CanPedExitCar's and let a car roll at 3.5 m/s, and the correction
+// zeroes it again every frame, so anything above this is this frame's
+// collision. Up and down, roll and pitch are left out: one step of gravity on
+// a car the correction has just zeroed is more than a nudge, and a car ours is
+// only resting against bobs on its springs.
+constexpr float PUSH_MOVE_SQ = 0.004f * 0.004f;
+constexpr float PUSH_TURN    = 0.001f;
+
+inline bool MovedByPush(const Vec3 &move, const Vec3 &turn) {
+	return move.x * move.x + move.y * move.y > PUSH_MOVE_SQ || turn.z > PUSH_TURN ||
+	       turn.z < -PUSH_TURN;
+}
+
+// A car's motion off the wire, held to what anything in the city can do. The
+// engine integrates it in CWorld::Process before any correction runs, so a
+// wild but finite number put the copy far outside the world on that frame's
+// physics step, where CPhysical::RemoveAndAdd files it past the end of
+// CWorld::ms_aSectors (pedanim.h, ClampToWorld). Per engine step: 500 m/s,
+// and a radian a step about each axis. The pedals are -1 to 1 by definition.
+constexpr float   WIRE_MOVE_MAX = 10.0f;
+constexpr float   WIRE_TURN_MAX = 1.0f;
+constexpr uint8_t WIRE_GEAR_MAX = 5;   // a lead: addresses-unverified.md
+
+inline Vec3 HeldMoveSpeed(const Vec3 &v) {
+	const float sq = v.x * v.x + v.y * v.y + v.z * v.z;
+	if (!(sq > WIRE_MOVE_MAX * WIRE_MOVE_MAX))
+		return v;
+	const float k = WIRE_MOVE_MAX / std::sqrt(sq);
+	return Vec3{v.x * k, v.y * k, v.z * k};
+}
+
+inline float HeldWithin(float value, float limit) {
+	return value > limit ? limit : value < -limit ? -limit : value;
+}
+
 // A traffic car the session has just made a session car, under the same netId
 // and with nothing created or destroyed anywhere. protocol.h, S_CarPromoted.
 void AdoptPromotedCar(RemoteVehicle &vehicle, bool weHostedIt);
@@ -224,6 +287,14 @@ bool SampleObservedVehicleDamage(RemoteVehicle &vehicle, VehicleDamageBody &out)
 // server, because no applier in the engine has an arm that restores an atomic.
 void ApplyRemoteVehicleDamage(RemoteVehicle &vehicle,
                               const VehicleDamageBody &body, bool flying);
+
+// The same two for traffic. A traffic car is simulated by its host alone, so
+// its host's engine is the only one that dents it for real: the host reads one
+// of its own by pool reference, and a replica wears what its host said through
+// the same appliers, with the same refusals.
+bool SampleHostedCarDamage(int32_t poolHandle, VehicleDamageBody &out);
+void ApplyAmbientCarDamage(RemoteAmbientCar &car, const VehicleDamageBody &body,
+                           bool flying);
 
 // Stop, or resume, this machine's own engine deciding a car's damage.
 //
@@ -418,12 +489,23 @@ uint8_t DrainLocalVehicleHits(VehicleHitBody *out, uint8_t max);
 void ApplyRemoteVehicleHit(RemoteVehicle &vehicle, RemotePlayer *attacker,
                            const VehicleHitBody &body, bool settling);
 
+// The same for a round somebody else's pedestrian landed on that car
+// (protocol.h, C_NpcVehicleHit), blamed on our replica of him.
+void ApplyNpcVehicleHit(RemoteVehicle &vehicle, RemoteAmbientPed *attacker,
+                        const VehicleHitBody &body, bool settling);
+
+// Rounds our own pedestrians landed on a car another player holds, oldest
+// first.
+uint8_t DrainNpcVehicleHits(NpcVehicleHit *out, uint8_t max);
+
 // Who else holds the session car `netId`, into the table the two detours
 // read. Client works both names out from the roster before every frame's
 // physics (Client::NoteVehicleHolders); 0xFF means nobody, or us. `weSettle`
-// is the custody that is ours (client.h, VehicleHolders).
+// is the custody that is ours (client.h, VehicleHolders), `blastFloorEnds`
+// client.h's BlastFloorEnds.
 void NoteVehicleHolders(uint16_t netId, uint8_t driverPlayerId,
-                        uint8_t custodianPlayerId, bool weSettle);
+                        uint8_t custodianPlayerId, bool weSettle,
+                        bool blastFloorEnds);
 
 // ---------------------------------------------------------------------------
 // Shooting somebody else's traffic (protocol.h, C_CarHit)
@@ -509,7 +591,8 @@ enum class CarOwner : uint8_t {
 	// so a hit taken here was undone the next frame and a shot-up parked car
 	// never caught fire. A hit from the local player goes out as C_VehicleHit
 	// and the server makes the shooter its custodian, so one engine owns the
-	// damage and the fire timer. A blast is still every machine's own.
+	// damage and the fire timer. A blast is still every machine's own, and
+	// what it takes off stays (HealthToWrite, ObservedRow::blastHealth).
 	Nobody,
 };
 
@@ -549,14 +632,24 @@ enum class CarDamageVerdict : uint8_t {
 // the same explosion at the same place, so a car it kills dies everywhere and
 // roadmap.md 5.8 carries the wreck. Everything else is refused, and the local
 // player's own round goes to the session, which gives the car to the shooter.
+//
+// A round one of our own pedestrians fired is forwarded as well, but only to a
+// car a player drives or settles (protocol.h, VEHICLE_HIT_BY_NPC): that car's
+// owner is the one the cop was shooting at. Traffic and a car nobody holds
+// are left alone, as they always were, so our city's gunfire does not shoot
+// up the cars another machine's city made or hand anybody a parked car.
 inline CarDamageVerdict DecideCarDamage(CarOwner owner, bool byLocalPlayer,
-                                        bool wrecked, uint8_t weapon) {
+                                        bool wrecked, uint8_t weapon,
+                                        bool byOurPedestrian = false) {
 	if (owner == CarOwner::Local)
 		return CarDamageVerdict::Apply;
 	if (owner == CarOwner::Nobody && !IsForwardableDamage(weapon) &&
 	    !IsFireDamage(weapon))
 		return CarDamageVerdict::Apply;
 	if (byLocalPlayer && !wrecked && IsForwardableDamage(weapon))
+		return CarDamageVerdict::Forward;
+	if (byOurPedestrian && !wrecked && IsForwardableDamage(weapon) &&
+	    (owner == CarOwner::RemoteDriver || owner == CarOwner::RemoteCustodian))
 		return CarDamageVerdict::Forward;
 	return CarDamageVerdict::Refuse;
 }
@@ -579,6 +672,25 @@ inline ReplayTarget ClassifyReplayCar(CarOwner owner, bool weDrive, bool weSettl
 	if (hostedTraffic)
 		return named ? ReplayTarget::NamedHostedCar : ReplayTarget::UnnamedHostedCar;
 	return ReplayTarget::NobodysCar;
+}
+
+// The health ApplyRemoteVehicle writes onto a copy: the wire's, or what a
+// blast here left a car nobody held at (ObservedRow::blastHealth) when that is
+// less. Every machine replays the same explosion at the same place and takes
+// the same off it; written back up to the session's last word, a blast that
+// did not kill a parked car was undone the next frame.
+//
+// The blast's number and not the engine's own. The engine lowers a copy's
+// health outside InflictDamage too - the upside-down drain at 0x0052F472 sits
+// above the bCollisionProof gate, a burning occupant writes 75 at 0x00479959 -
+// and each of those is this machine alone: kept, a parked car lying on its
+// roof drained to a fire and a wreck on one screen.
+inline float HealthToWrite(float wire, bool blasted, float blastHealth) {
+	if (!(wire == wire && wire > -1.0e9f && wire < 1.0e9f))
+		wire = 1000.0f;
+	if (blasted && blastHealth == blastHealth && blastHealth < wire)
+		return blastHealth;
+	return wire;
 }
 
 // BlowUpCar has no proof flag to test (it only reads bCanBeDamaged, at
@@ -689,8 +801,11 @@ inline bool MayTakeReportedHit(bool atOurWheel, bool wheelEmpty, bool settling) 
 //   - its health, because writing health destroys nothing and a low one arms
 //     the fire timer on the receiver, which is an observer deciding to
 //     destroy somebody else's car five seconds later;
-//   - its doors, panels and dents, because the cause already travels and the
-//     divergence is a dent.
+//   - its doors, panels and dents. Not because the cause travels - it does for
+//     a blast and it does not for a shunt, the one thing that dents anything
+//     (docs/cardamage.md 2.6) - but because nobody's engine simulates a car the
+//     map parked. A traffic car's host does simulate it, and reports its dents
+//     (SampleHostedCarDamage above).
 
 // The unowned cars this machine's engine destroyed since the last call. Same
 // shape as DrainLocalVehicleBlasts, and off the same detour.

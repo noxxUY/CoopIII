@@ -160,6 +160,22 @@ void TestTheTrailAnObserverDraws() {
 	      "and a line across the map");
 }
 
+void TestTheSniperRoundIsHeard() {
+	std::printf("somebody else's sniper round\n");
+	Check(!IsReplayableWeapon(WEAPONTYPE_SNIPERRIFLE),
+	      "is not replayed - FireSniper would fire out of our own camera");
+	Check(IsForwardableDamage(WEAPONTYPE_SNIPERRIFLE), "and its hit still comes from the shooter");
+	Vec3 start, end;
+	Check(SniperProbe(Vec3{10, 20, 30}, Vec3{0, 2, 0}, start, end) &&
+	          Near(start.y, 20.0f + SNIPER_PROBE_SKIP_M) && Near(end.y, 20.0f + SNIPER_PROBE_M) &&
+	          Near(start.x, 10.0f) && Near(end.z, 30.0f),
+	      "its impact is looked for along the line sent, starting clear of the shooter");
+	const float nan = std::numeric_limits<float>::quiet_NaN();
+	Check(!SniperProbe(Vec3{0, 0, 0}, Vec3{0, 0, 0}, start, end) &&
+	          !SniperProbe(Vec3{0, 0, 0}, Vec3{nan, 0, 1}, start, end),
+	      "and a line that is not a direction is not played at all");
+}
+
 } // namespace
 
 int RunDriveByTests() {
@@ -172,5 +188,6 @@ int RunDriveByTests() {
 	TestWhoseHitItIs();
 	TestTheLineOnTheWire();
 	TestTheTrailAnObserverDraws();
+	TestTheSniperRoundIsHeard();
 	return g_driveByFailures;
 }

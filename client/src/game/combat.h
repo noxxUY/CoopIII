@@ -101,10 +101,10 @@ inline float LengthSq(const Vec3 &v) { return v.x * v.x + v.y * v.y + v.z * v.z;
 // weapons whose discharge ends in CWeapon::ProcessLineOfSight, and therefore
 // the five whose direction the fix below can steer.
 //
-// The sniper is deliberately absent even though FireSniper traces a ray too.
-// It is not replayed at all (IsReplayableWeapon, and the reason is in the
-// comment there), so there is nothing to aim; including it would only make
-// the local sampler log about a shot nobody replays.
+// The sniper is deliberately absent even though its round is a line too. It is
+// not replayed through the engine (IsReplayableWeapon says why) and its line
+// comes off the camera rather than off a ray (SniperLineFromCamera), so there
+// is nothing here to aim.
 //
 // The flamethrower is absent because it traces nothing: FireAreaEffect hands
 // the shot to CShotInfo, which is a moving volume rather than a line, and it
@@ -304,6 +304,28 @@ inline bool ProjectileBasis(const Vec3 &dir, Vec3 &right, Vec3 &forward, Vec3 &u
 	return true;
 }
 
+// The most a replayed projectile may be sent off at, in the engine's units a
+// step. A bound rather than the engine's number: a thrower's engine sends
+// single figures. A speed off the wire that is wrong by orders of magnitude
+// puts the object far outside the world on its first physics step, and
+// CPhysical::RemoveAndAdd then files it past the end of CWorld::ms_aSectors
+// (pedanim.h, ClampToWorld) - clamping the position it starts from does not
+// help with where the velocity takes it.
+constexpr float REPLAYED_PROJECTILE_MAX_SPEED = 10.0f;
+
+// The velocity a replayed projectile starts with: along the unit `forward`
+// ProjectileBasis made of the wire's direction, which may not have been unit
+// itself, at the wire's speed held to that bound. False when there is no
+// speed to give it, NaN included.
+inline bool ReplayedProjectileVelocity(const Vec3 &forward, float speed, Vec3 &out) {
+	if (!(speed > 0.0f))
+		return false;
+	if (!(speed < REPLAYED_PROJECTILE_MAX_SPEED))
+		speed = REPLAYED_PROJECTILE_MAX_SPEED;
+	out = Vec3{forward.x * speed, forward.y * speed, forward.z * speed};
+	return true;
+}
+
 // The eExplosionType a projectile of this weapon produces, or -1.
 //
 // Not a table CoopIII invented - it's the three-way switch at the top of
@@ -324,6 +346,16 @@ inline int ExplosionTypeForWeapon(uint8_t weapon) {
 // own array. re3 declares ten of them.
 inline bool IsKnownExplosionType(uint8_t type) {
 	return type < EXPLOSION_TYPE_COUNT;
+}
+
+// Does an explosion our player caused go out as C_Explosion? Not a car's own:
+// every machine that has the car blows up its copy through the wreck's own
+// packet (C_VehicleBlowUp, C_UnownedBlowUp) or its own BlowUpCar, and each of
+// those calls AddExplosion itself, so relaying it as well went off twice on
+// every other screen.
+inline bool RelaysLocalExplosion(uint8_t type) {
+	return IsKnownExplosionType(type) && type != EXPLOSION_CAR &&
+	       type != EXPLOSION_CAR_QUICK;
 }
 
 // Is this one of the three explosions a thrown or fired projectile makes?
@@ -351,7 +383,8 @@ inline bool IsProjectileExplosion(uint8_t type) {
 //                          travel with the damage (melee.h).
 //   SNIPERRIFLE            CWeapon::FireSniper returns false unless this
 //                          machine's camera is in first-person, and
-//                          otherwise fires along that camera's Front.
+//                          otherwise fires along that camera's Front. Its
+//                          round is heard instead (SniperProbe below).
 //   DETONATOR              sets off bombs that were never synced.
 //
 // The flamethrower used to be on that list and no longer is. The reason it
@@ -376,6 +409,35 @@ inline bool IsProjectileExplosion(uint8_t type) {
 //
 // HELICANNON (13) and anything above it aren't inventory weapons at all and
 // get refused by the bound check.
+// ---- the sniper's round, heard rather than replayed --------------------------
+//
+// An observer cannot run CWeapon::FireSniper (above), and would draw nothing
+// if it could: CBulletTraces::AddTrace has six callers and the sniper's round
+// is none of them (addresses.h), so a sniper leaves no streak anywhere. What
+// somebody standing nearby gets from the engine is the report - CWeapon::Fire's
+// join point plays SOUND_WEAPON_SHOT_FIRED on the shooter, and the audio picks
+// the sample off the weapon in his hand - and the sound of where the round
+// landed. That is what the observer plays, along the line the shooter's camera
+// was looking down.
+//
+// The far end is found by the observer's own line-of-sight query, which only
+// places a sound. It starts a metre out so it doesn't find the shooter's own
+// copy, and stops at SNIPER_PROBE_M, which is the observer's choice rather
+// than the engine's: past it the impact is too far off to be told apart.
+constexpr float SNIPER_PROBE_SKIP_M = 1.0f;
+constexpr float SNIPER_PROBE_M      = 300.0f;
+
+inline bool SniperProbe(const Vec3 &origin, const Vec3 &wireDir, Vec3 &start, Vec3 &end) {
+	Vec3 dir;
+	if (!UnitDirection(wireDir, dir))
+		return false;
+	start = Vec3{origin.x + dir.x * SNIPER_PROBE_SKIP_M, origin.y + dir.y * SNIPER_PROBE_SKIP_M,
+	             origin.z + dir.z * SNIPER_PROBE_SKIP_M};
+	end   = Vec3{origin.x + dir.x * SNIPER_PROBE_M, origin.y + dir.y * SNIPER_PROBE_M,
+	             origin.z + dir.z * SNIPER_PROBE_M};
+	return true;
+}
+
 inline bool IsReplayableWeapon(uint8_t weapon) {
 	switch (weapon) {
 	case WEAPONTYPE_COLT45:
@@ -667,8 +729,7 @@ constexpr float MAX_REMOTE_DAMAGE = 1000.0f;
 // sniper shot. The two questions aren't the same one: the replay is refused
 // because CWeapon::FireSniper fires along the observer's own camera, while
 // the damage was resolved on the shooter's machine like any other bullet.
-// The result is a sniper that hurts without a flash, which is a cosmetic gap
-// rather than a missing weapon.
+// The round itself is heard on every machine instead (SniperProbe).
 inline bool IsForwardableDamage(uint8_t weapon) {
 	switch (weapon) {
 	case WEAPONTYPE_UNARMED:
@@ -1176,6 +1237,16 @@ void ApplyRemoteDamage(RemotePlayer *attacker, const DamageBody &body);
 // therefore what every machine in the session agrees on.
 void ApplyRemotePedDamage(RemotePlayer *attacker, const PedDamageBody &body);
 
+// Draw a round somebody else's pedestrian fired, on our replica of him
+// (protocol.h, C_NpcShot). ReplayRemoteShot's replay, for the five guns that
+// trace a ray: whatever it hits here is refused, because his host decided it.
+void ReplayAmbientShot(RemoteAmbientPed &ped, const ShotBody &shot);
+
+// Hurt the local player with a hit somebody else's pedestrian landed on our
+// copy on his host's machine (C_NpcDamage). ApplyRemoteDamage's path, blamed
+// on our replica of him; `attacker` may be null.
+void ApplyNpcDamage(RemoteAmbientPed *attacker, const DamageBody &body);
+
 // Kill a remote player's ped with the animation their engine chose.
 //
 // One way. CPed::SetDie zeroes the health and clears the collision, so the
@@ -1187,5 +1258,9 @@ void KillRemotePed(RemotePlayer &player, uint16_t animId);
 // by refusing to relay a C_Damage; this covers the blast an observer replays
 // for itself, which never goes near the server (docs/protocol.md §1.10.3).
 void SetFriendlyFire(bool enabled);
+
+// Ends every projectile we are animating for `playerId`, before their ped
+// goes (ped.cpp, DespawnRemote).
+void EndRemoteProjectilesOf(uint8_t playerId);
 
 } // namespace coopiii::game

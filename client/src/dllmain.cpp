@@ -12,6 +12,7 @@
 #include "client.h"
 #include "clock.h"
 #include "config.h"
+#include "game/chat.h"
 #include "game/cheats.h"
 #include "game/combat.h"
 #include "game/darkel.h"
@@ -40,6 +41,8 @@
 #include "game/worldstate.h"
 #include "hook/hook.h"
 #include "log.h"
+
+#include <coopiii/version.h>
 
 #include <cstdlib>
 
@@ -70,6 +73,7 @@ void PreFrame() {
 	// whether to update the world. game/pause.h has the full reasoning.
 	game::ClearPauseForTheWorld();
 	g_client.PreFrame();
+	game::TickChat();
 
 	// The moving-list sweep does NOT run from here any more when the
 	// CWorld::Process detour took - it runs on entry to CWorld::Process,
@@ -177,7 +181,8 @@ DWORD WINAPI Boot(LPVOID) {
 	if (g_config.logToFile)
 		LogOpen(Config::PathNextToModule("CoopIII.log"));
 
-	Log("CoopIII starting (pid %lu)", GetCurrentProcessId());
+	Log("CoopIII " COOPIII_VERSION " starting (pid %lu, protocol %u)", GetCurrentProcessId(),
+	    static_cast<unsigned>(PROTOCOL_VERSION));
 
 	// docs/roadmap.md §5.6: dropping CoopIII.asi into the game folder must not
 	// change single player. The mod activates only when the game was started
@@ -198,8 +203,9 @@ DWORD WINAPI Boot(LPVOID) {
 		Log("log: another instance already holds CoopIII.log, so this one is writing to "
 		    "\"%s\". Two processes appending to one log interleave into nonsense.",
 		    LogPath().c_str());
-	Log("config: server %s:%u, nick \"%s\" (from %s)", g_config.host.c_str(), g_config.port,
-	    g_config.nick.c_str(), Config::IniPath().c_str());
+	Log("config: server %s:%u, nick \"%s\"%s (from %s)", g_config.host.c_str(), g_config.port,
+	    g_config.nick.c_str(), g_config.password.empty() ? "" : ", with a password",
+	    Config::IniPath().c_str());
 
 	const game::VerifyResult image = game::VerifyGameImage();
 	Log("image: %s", image.detail.c_str());
@@ -337,6 +343,9 @@ DWORD WINAPI Boot(LPVOID) {
 	game::AddHeliGunToBridge(bridge);
 	game::AddCheatsToBridge(bridge);
 	game::AddMoneyToBridge(bridge);
+	game::SetChatKeys(g_config.chatKey, g_config.listKey);
+	game::SetVersionMarkShown(g_config.showVersion);
+	game::AddChatToBridge(bridge);
 
 	// Pickups. One detour, on CPickups::Update, and it is the only way a
 	// pickup can be collected in this build - docs/pickups.md 3 has the
@@ -478,6 +487,7 @@ DWORD WINAPI Boot(LPVOID) {
 	}
 
 
+	g_client.SetPassword(g_config.password);
 	if (!g_client.Start(g_config.host, g_config.port, g_config.nick, bridge)) {
 		Log("CoopIII: the network client failed to start; the frame hook stays "
 		    "installed but nothing will be sent");
@@ -492,6 +502,9 @@ DWORD WINAPI Boot(LPVOID) {
 	// works, you just can't tell who is who.
 	game::SetNametagScale(g_config.nametagScale);
 	game::InstallNametags(g_client);
+	// Drawn from the same detour, so without it the chat still goes out and
+	// comes in (the server log has it) but nobody sees it.
+	game::InstallChat(g_client);
 
 	// And the minimap. A remote player is drawn the way the local one is, as
 	// the rotating arrow that shows which way they are facing, out of a detour
@@ -525,6 +538,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			// First, because the draw reads the roster straight out of the
 			// client and the client is about to be stopped.
 			game::RemoveNametags();
+			// And the window procedure, which reads the client's session state.
+			game::RemoveChat();
 			// Same reason: the arrow draw reads the roster every frame the
 			// radar is on screen, so the detour goes before the client does.
 			game::RemoveRadarArrows();

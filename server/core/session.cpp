@@ -81,11 +81,11 @@ uint8_t Session::RemovePeer(uint32_t peer) {
 			v.driverPlayerId = INVALID_PLAYER;
 
 	// And any car they were settling for the session (protocol.h,
-	// S_VehicleCustody). Cleared rather than handed on, and that is a
-	// decision: the only machine worth giving a driverless car to is one that
-	// has it streamed in with the collision loaded around it, which is why
-	// custody goes to the player who was just driving it in the first place.
-	// Nobody else is known to be anywhere near it, and a custodian that
+	// S_VehicleCustody). HandOverVehiclesOf has already given every one of
+	// these that somebody is standing near to that somebody; what is left
+	// here is a car nobody is near, and that one is cleared rather than handed
+	// on. The only machine worth giving a driverless car to is one that has it
+	// streamed in with the collision loaded around it, and a custodian that
 	// cannot see the car simulates it falling through an unloaded world and
 	// reports the fall.
 	//
@@ -98,6 +98,25 @@ uint8_t Session::RemovePeer(uint32_t peer) {
 		if (v.active && v.custodianPlayerId == id)
 			v.custodianPlayerId = INVALID_PLAYER;
 
+	// And what they said about where those cars were: on their clock, which
+	// the next player in the slot does not share.
+	for (Vehicle &v : m_vehicles)
+		if (v.active && v.history.Reporter() == id)
+			v.history.Clear();
+
+	// Their own hidden packages, under `hiddenPackages = perplayer`. A package
+	// record is keyed on the slot, and the slot is about to be somebody else's:
+	// left in place, the next player to fill it would be refused every package
+	// this one found. What a player collected in shared mode stays collected.
+	for (size_t i = 0; i < m_pickups.size();) {
+		if (m_pickups[i].byPlayerId == id && PickupIsPerPlayer(m_pickups[i].ident)) {
+			m_pickups[i] = m_pickups.back();
+			m_pickups.pop_back();
+			continue;
+		}
+		++i;
+	}
+
 	// Their helicopters went with their engine. The observers find out from
 	// the S_PlayerLeave the server sends anyway, and the slot is about to be
 	// handed to somebody whose serials start again from 1.
@@ -108,6 +127,46 @@ uint8_t Session::RemovePeer(uint32_t peer) {
 	p->id = id;
 	PickHost();
 	return id;
+}
+
+std::vector<uint16_t> Session::HandOverVehiclesOf(uint8_t playerId) {
+	std::vector<uint16_t> handed;
+	if (playerId == INVALID_PLAYER)
+		return handed;
+	constexpr float r2 = VEHICLE_HANDOVER_RADIUS_M * VEHICLE_HANDOVER_RADIUS_M;
+
+	for (Vehicle &v : m_vehicles) {
+		if (!v.active || v.destroyed)
+			continue;
+		if (v.driverPlayerId != playerId && v.custodianPlayerId != playerId)
+			continue;
+
+		// Nearest by the last position each machine reported. Somebody on a
+		// loading screen has none, and a corpse is not going to settle a car.
+		const Player *heir = nullptr;
+		float         best = r2;
+		for (const Player &p : m_players) {
+			if (!p.active || p.id == playerId || !p.havePos || !p.alive)
+				continue;
+			const float dx = p.pos.x - v.pos.x, dy = p.pos.y - v.pos.y,
+			            dz = p.pos.z - v.pos.z;
+			const float d2 = dx * dx + dy * dy + dz * dz;
+			if (d2 < best) {
+				best = d2;
+				heir = &p;
+			}
+		}
+		if (!heir)
+			continue;
+
+		// A settle, not a seat: the leaver's ped comes out of the car on every
+		// machine with the S_PlayerLeave that goes out first, and the heir's
+		// engine lets it come to rest. Never a driver and a custodian at once.
+		v.driverPlayerId    = INVALID_PLAYER;
+		v.custodianPlayerId = heir->id;
+		handed.push_back(v.netId);
+	}
+	return handed;
 }
 
 // ---- keeping the session's copy current ------------------------------------
@@ -293,6 +352,53 @@ Session::HitCustody Session::CustodyForHit(uint16_t netId, uint8_t byPlayerId) {
 	return HitCustody::Granted;
 }
 
+bool Session::MayPush(uint8_t playerId, uint16_t netId) const {
+	for (const Player &p : m_players)
+		if (p.active && p.id == playerId)
+			return p.alive && p.seat == 0 && p.vehicleNetId != INVALID_NETID &&
+			       p.vehicleNetId != netId;
+	return false;
+}
+
+// The next number nobody holds. The counter wraps after 65535 claims, a few
+// hours of a busy session, and both ends of that were wrong: 0 is
+// INVALID_NETID, which no lookup finds and no despawn can remove, and the
+// numbers after it are the oldest things still alive, the first player's
+// own among them. So 0 and anything in use are skipped, wrecks included,
+// since a wreck keeps its row. There are never more than a few hundred rows
+// against 65535 numbers.
+uint16_t Session::AllocNetId() {
+	for (uint32_t tries = 0; tries <= 0xFFFF; ++tries) {
+		const uint16_t id = m_nextNetId++;
+		if (id != INVALID_NETID && !NetIdInUse(id))
+			return id;
+	}
+	return INVALID_NETID;
+}
+
+bool Session::PlayerIdActive(uint8_t playerId) const {
+	for (const Player &p : m_players)
+		if (p.active && p.id == playerId)
+			return true;
+	return false;
+}
+
+bool Session::NetIdInUse(uint16_t netId) const {
+	for (const Player &p : m_players)
+		if (p.active && p.netId == netId)
+			return true;
+	for (const Vehicle &v : m_vehicles)
+		if (v.active && v.netId == netId)
+			return true;
+	for (const AmbientPed &ped : m_peds)
+		if (ped.active && ped.netId == netId)
+			return true;
+	for (const AmbientCar &car : m_cars)
+		if (car.active && car.netId == netId)
+			return true;
+	return false;
+}
+
 // Who may report this car's position and condition.
 //
 // The driver, and - only when there is no driver at all - the one machine the
@@ -420,6 +526,27 @@ bool Session::NoteVehicleDamage(const VehicleDamageBody &in,
 	// What the session now believes, not what one machine happened to see.
 	out.panels = v->damagePanels;
 	out.doors  = v->damageDoors;
+	return true;
+}
+
+bool Session::NoteCarDamage(uint8_t playerId, const VehicleDamageBody &in,
+                            VehicleDamageBody &out) {
+	AmbientCar *car = FindCar(in.netId);
+	if (!car || !car->active || car->destroyed || car->ownerPlayerId != playerId)
+		return false;
+	if (IsDamageReset(in.panels))
+		return false;
+
+	const uint32_t wasPanels = car->damagePanels;
+	const uint16_t wasDoors  = car->damageDoors;
+	MergeDamage(car->damagePanels, car->damageDoors, in.panels, in.doors);
+	if (car->damagePanels == wasPanels && car->damageDoors == wasDoors)
+		return false;
+
+	out        = VehicleDamageBody{};
+	out.netId  = car->netId;
+	out.panels = car->damagePanels;
+	out.doors  = car->damageDoors;
 	return true;
 }
 
@@ -625,6 +752,18 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 		out.seats.push_back(seat);
 	}
 
+	for (const Vehicle &v : m_vehicles) {
+		if (!v.active || v.destroyed || v.custodianPlayerId == INVALID_PLAYER ||
+		    v.custodianPlayerId == joinerId)
+			continue;
+		S_VehicleCustody custody;
+		InitHeader(custody, sendTimeMs);
+		custody.netId    = v.netId;
+		custody.playerId = v.custodianPlayerId;
+		custody.pad      = 0;
+		out.custodies.push_back(custody);
+	}
+
 	// The city the joiner is walking into. Their own engine is about to
 	// generate its own crowd on top of this, which is the doubling
 	// docs/population.md §1.3 fixes and this slice does not - see the note
@@ -684,6 +823,18 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 		spawn.netId         = car.netId;
 		spawn.body          = car.body;
 		out.cars.push_back(spawn);
+
+		// Its dents, beside the session cars' and sent after every spawn,
+		// which is the order the joiner needs: a row to put them on first.
+		if (car.damagePanels != 0 || car.damageDoors != 0) {
+			S_VehicleDamage dmg{};
+			InitHeader(dmg, sendTimeMs);
+			dmg.playerId    = INVALID_PLAYER;
+			dmg.body.netId  = car.netId;
+			dmg.body.panels = car.damagePanels;
+			dmg.body.doors  = car.damageDoors;
+			out.vehicleDamage.push_back(dmg);
+		}
 	}
 
 	// Which pickups are currently gone, so a joiner is not the one player in
@@ -696,9 +847,17 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 		// away the reservation simply ends.
 		if (t.state != TakenPickup::State::TAKEN)
 			continue;
+		// Somebody else's package, under `perplayer`, is still there for the
+		// joiner to find.
+		if (PickupIsPerPlayer(t.ident))
+			continue;
+		// From nobody in particular, like the cheats below: the collector may
+		// have left, and the joiner may have their slot now. A client drops a
+		// removal that names itself, so the joiner would be the one player
+		// still seeing a package the group had already found.
 		S_PickupTaken taken;
 		InitHeader(taken, sendTimeMs);
-		taken.playerId = t.byPlayerId;
+		taken.playerId = INVALID_PLAYER;
 		taken.ident    = t.ident;
 		out.pickups.push_back(taken);
 	}
@@ -819,9 +978,10 @@ bool Session::SameIdent(const PickupIdent &a, const PickupIdent &b) {
 	return dx * dx + dy * dy + dz * dz <= 0.25f * 0.25f;
 }
 
-TakenPickup *Session::FindPickup(const PickupIdent &ident) {
+TakenPickup *Session::FindPickup(const PickupIdent &ident, uint8_t forPlayer) {
+	const bool perPlayer = PickupIsPerPlayer(ident);
 	for (TakenPickup &t : m_pickups)
-		if (SameIdent(t.ident, ident))
+		if (SameIdent(t.ident, ident) && (!perPlayer || t.byPlayerId == forPlayer))
 			return &t;
 	return nullptr;
 }
@@ -829,7 +989,7 @@ TakenPickup *Session::FindPickup(const PickupIdent &ident) {
 Session::PickupVerdict Session::ClaimPickup(uint8_t playerId,
                                             const PickupIdent &ident,
                                             uint32_t nowMs) {
-	if (TakenPickup *held = FindPickup(ident)) {
+	if (TakenPickup *held = FindPickup(ident, playerId)) {
 		// Unsigned subtraction throughout, so a server that has been up past
 		// 2^32 ms reads as a small elapsed time rather than an enormous one -
 		// the same rule KillCreditFor follows on the client.
@@ -870,7 +1030,7 @@ Session::PickupVerdict Session::ClaimPickup(uint8_t playerId,
 
 bool Session::NotePickupCollected(uint8_t playerId, const PickupIdent &ident,
                                   uint32_t nowMs) {
-	TakenPickup *held = FindPickup(ident);
+	TakenPickup *held = FindPickup(ident, playerId);
 	if (!held || held->byPlayerId != playerId ||
 	    held->state != TakenPickup::State::RESERVED)
 		return false;
@@ -879,6 +1039,8 @@ bool Session::NotePickupCollected(uint8_t playerId, const PickupIdent &ident,
 	held->sinceMs   = nowMs;
 	held->respawnMs =
 	    PickupRespawnMs(ident.type, (ident.flags & PICKUP_F_BRIBE) != 0);
+	if (held->respawnMs == 0)
+		held->respawnMs = PickupForgetMs(ident.type);
 	return true;
 }
 
@@ -894,10 +1056,20 @@ void Session::ReleaseReservationsOf(uint8_t playerId) {
 	}
 }
 
-void Session::ReleasePickup(const PickupIdent &ident) {
+void Session::ReleasePickup(const PickupIdent &ident, uint8_t byPlayerId) {
+	const bool perPlayer = PickupIsPerPlayer(ident);
 	for (size_t i = 0; i < m_pickups.size(); ++i) {
 		if (!SameIdent(m_pickups[i].ident, ident))
 			continue;
+		if (perPlayer && m_pickups[i].byPlayerId != byPlayerId)
+			continue;
+		// A reservation is its holder's to give back. Anybody may release a
+		// collected record, which is how a pickup the script re-created comes
+		// back, but a player walking away from one somebody else now holds
+		// was taking the holder's grant with them.
+		if (m_pickups[i].state == TakenPickup::State::RESERVED &&
+		    byPlayerId != INVALID_PLAYER && m_pickups[i].byPlayerId != byPlayerId)
+			return;
 		m_pickups[i] = m_pickups.back();
 		m_pickups.pop_back();
 		return;
@@ -910,9 +1082,12 @@ void Session::ExpirePickups(uint32_t nowMs) {
 
 		const bool gone =
 		    t.state == TakenPickup::State::RESERVED
-		        // A holder who never said anything again: a crashed client,
-		        // or a connection lost between the grant and the release.
-		        ? nowMs - t.sinceMs >= PICKUP_RESERVATION_MS
+		        // A holder who is no longer here. One who is keeps honouring
+		        // the grant for as long as they stand by it, never asking
+		        // again, so timing it out handed the same pickup to a second
+		        // player; a leave gives everything back anyway
+		        // (ReleaseReservationsOf).
+		        ? !PlayerIdActive(t.byPlayerId) && nowMs - t.sinceMs >= PICKUP_RESERVATION_MS
 		        // respawnMs == 0 is "never", and never does not expire. Those
 		        // are the ONCE / COLLECTABLE1 / MONEY pickups, and they are
 		        // the ones a joiner most needs telling about - a hidden
@@ -1219,6 +1394,21 @@ const Vehicle *Session::FindVehicle(uint16_t netId) const {
 	return const_cast<Session *>(this)->FindVehicle(netId);
 }
 
+const PoseHistory *Session::HistoryFor(uint16_t netId, uint8_t askerId) const {
+	if (netId == INVALID_NETID)
+		return nullptr;
+	for (const Player &p : m_players)
+		if (p.active && p.netId == netId)
+			return p.id == askerId ? nullptr : &p.history;
+	if (const Vehicle *v = FindVehicle(netId))
+		return v->destroyed ? nullptr : &v->history;
+	if (const AmbientCar *car = FindCar(netId))
+		return car->destroyed || car->ownerPlayerId == askerId ? nullptr : &car->history;
+	if (const AmbientPed *ped = FindPed(netId))
+		return !ped->alive || ped->ownerPlayerId == askerId ? nullptr : &ped->history;
+	return nullptr;
+}
+
 Vehicle *Session::AddVehicle(uint16_t modelId, uint8_t colour1, uint8_t colour2,
                              const Vec3 &pos, const Quat &rot) {
 	// Capped because this whole list gets replayed to every joining player,
@@ -1350,6 +1540,10 @@ Vehicle *Session::PromoteCar(uint16_t netId, uint8_t driverPlayerId,
 	promoted.extra2  = body.extra2;
 	promoted.pos     = body.pos;
 	promoted.rot     = body.rot;
+	// The dents its host reported. The new driver's own first report will say
+	// the same, but a joiner between the two should not get a clean car.
+	promoted.damagePanels = car->damagePanels;
+	promoted.damageDoors  = car->damageDoors;
 	// Straight into the driver's seat. The claim that got here is a
 	// C_EnterVehicle for seat 0 and the caller records the seat through
 	// NoteEnterVehicle immediately afterwards; this is only the row existing
@@ -1481,6 +1675,21 @@ Player *Session::PedDamageRecipient(uint16_t pedNetId, uint8_t byPlayerId) {
 	// pedestrians with them (Server::DropPedsOf), so this is belt and braces
 	// rather than a race anyone has seen.
 	return FindById(ped->ownerPlayerId);
+}
+
+bool Session::NpcShotAllowed(uint16_t pedNetId, uint8_t byPlayerId) const {
+	const AmbientPed *ped = FindPed(pedNetId);
+	return ped && ped->ownerPlayerId == byPlayerId && ped->alive;
+}
+
+Player *Session::NpcHitRecipient(uint16_t attackerPedNetId, uint16_t victimNetId,
+                                 uint8_t byPlayerId) {
+	if (!NpcShotAllowed(attackerPedNetId, byPlayerId))
+		return nullptr;
+	Player *victim = FindByNetId(victimNetId);
+	if (!victim || victim->id == byPlayerId || !victim->alive)
+		return nullptr;
+	return victim;
 }
 
 std::vector<uint16_t> Session::PedsOwnedBy(uint8_t playerId) const {

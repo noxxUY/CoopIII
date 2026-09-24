@@ -1126,6 +1126,10 @@ constexpr uint8_t  STREAMING_LOADED          = 1;      // STREAMSTATE_LOADED
 constexpr uint32_t STREAM_OFFSET_TXD         = 0x157C; // txd ids start here
 
 inline bool HasModelLoaded(uint32_t modelId) {
+	// A model id off the wire indexes the streaming array with nothing else
+	// in the way. Model ids end where txd ids begin (MODELINFO_SIZE below).
+	if (modelId >= STREAM_OFFSET_TXD)
+		return false;
 	const auto *state = reinterpret_cast<const uint8_t *>(
 	    CStreaming__ms_aInfoForModel + modelId * STREAMING_INFO_STRIDE +
 	    STREAMING_LOADSTATE_OFFS);
@@ -5632,6 +5636,11 @@ constexpr uint8_t EXPLOSION_TYPE_COUNT = 10;   // re3 Explosion.h, for bounding
 // Nothing reads AddExplosion's result: the next instruction reloads the model
 // index for the upward kick. FireShotgun does not call this function.
 constexpr uint8_t EXPLOSION_BARREL  = 7;
+// CAutomobile::BlowUpCar's two, from its own call to AddExplosion (the block
+// on BlowUpCar above: `push 3` at 0x0053BF20, `push 4` on the arm at
+// 0x0053BF15).
+constexpr uint8_t EXPLOSION_CAR       = 3;
+constexpr uint8_t EXPLOSION_CAR_QUICK = 4;
 constexpr uintptr_t CWeapon__BlowUpExplosiveThings = 0x00564A60;
 
 // ---- projectiles ----
@@ -8441,6 +8450,12 @@ static_assert(PickupRespawnMs(PICKUP_ON_STREET_SLOW, true) ==
 static_assert(PickupRespawnMs(PICKUP_ON_STREET_SLOW, false) ==
                   ::coopiii::PickupRespawnMs(PICKUP_ON_STREET_SLOW, false),
               "slow window agrees with protocol.h");
+static_assert(PICKUP_COLLECTABLE1 == ::coopiii::PICKUP_TYPE_PACKAGE,
+              "the hidden package agrees with protocol.h");
+static_assert(PICKUP_TYPE_ONCE_TIMEOUT == PICKUP_ONCE_TIMEOUT &&
+                  PICKUP_TYPE_MONEY == PICKUP_MONEY &&
+                  PICKUP_DROP_FORGET_MS >= 2 * PICKUP_MONEY_MS,
+              "a collected drop is remembered past the longest it lies on the ground");
 static_assert(PickupRespawnMs(PICKUP_ONCE, false) == 0 &&
                   PickupRespawnMs(PICKUP_COLLECTABLE1, false) == 0 &&
                   PickupRespawnMs(PICKUP_MONEY, false) == 0,
@@ -9205,6 +9220,8 @@ constexpr uint8_t ENTITY_TYPE_OBJECT = 4;
 // the whole reason a break and an uproot need separate treatment.
 constexpr uintptr_t CWeapon__DoBulletImpactObjectArm = 0x00560481;   // for the record
 constexpr uintptr_t CWeapon__FireShotgunObjectArm    = 0x005616A2;
+// Misnamed: the arm is in CBulletInfo::Update, the sniper round, and FireMelee
+// has none ("fists and the bat" above). Kept under this name for the record.
 constexpr uintptr_t CWeapon__FireMeleeObjectArm      = 0x00558A64;
 
 } // namespace object

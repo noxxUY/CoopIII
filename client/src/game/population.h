@@ -87,6 +87,9 @@ void *ResolveHostedPed(uint16_t netId);
 // netId, or null. A replica fails it, so a C_CarHit can only ever land on the
 // host's own car. docs/protocol.md §1.23.
 void *ResolveHostedCar(uint16_t netId);
+int32_t HostedCarHandle(uint16_t netId);
+// A new session: every ped and car this machine hosts goes out again as new.
+void RestartHostedNames();
 
 // Does this machine host this CPed / CVehicle, and has the session named it?
 //
@@ -98,6 +101,24 @@ void *ResolveHostedCar(uint16_t netId);
 // test as ResolveHostedPed: the handle has to still resolve to this object.
 bool HostedPedFor(const void *ped, bool &named);
 bool HostedCarFor(const void *vehicle, bool &named);
+
+// The netId of a pedestrian this machine hosts and the session has named, for
+// the hits and rounds combat.cpp forwards on his behalf (protocol.h,
+// C_NpcShot). HostedPedFor's liveness test.
+bool HostedPedNetIdFor(const void *ped, uint16_t &netId);
+
+// The live CPed of a replica this machine built for somebody else's
+// pedestrian, or null: the pool handle has to resolve and the vtable has to be
+// CCivilianPed's, the test every write into a replica goes through.
+void *AmbientReplicaPed(const RemoteAmbientPed &ped);
+
+// Where our engine has a replica, for a desync probe: a ped (`car` false) or a
+// traffic car, by pool reference. False with nothing there, or a seated ped.
+bool SampleReplicaPosition(int32_t poolHandle, bool car, Vec3 &out);
+
+// Put `weapon` in a replica's hand. False while it has no replica, is seated,
+// dying or dead, or the weapon's model is still streaming.
+bool ArmAmbientReplica(RemoteAmbientPed &ped, uint8_t weapon);
 
 // How many ambient peds this machine is currently hosting, for diagnostics.
 uint32_t HostedAmbientPedCount();

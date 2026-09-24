@@ -37,11 +37,29 @@ struct Config {
 	// the other.
 	float nametagScale = 1.0f;
 
-	// Which key asks for a passenger seat in somebody else's car. A single
-	// letter or digit in the ini, stored as its virtual-key code. GTA III has
+	// Which key asks for a passenger seat in somebody else's car. A letter, a
+	// digit or F1 to F12 in the ini, stored as its virtual-key code. GTA III has
 	// no binding of its own for this, so there is nothing to clash with inside
 	// the game - but plenty outside it, which is why it is settable.
 	int seatKey = 'G';
+
+	// The chat: one key opens a line to type, Enter sends it and Escape drops
+	// it; the other shows or hides the list of who is in the session. Spelled
+	// the way seatKey is.
+	int chatKey = 'T';
+	int listKey = 0x78;   // F9
+
+	// The version in the bottom-left corner of the HUD. On by default, since
+	// the first thing anybody reporting a bug gets asked is which build.
+	bool showVersion = true;
+
+	// The server's password, when it has one (protocol.h, C_Password). Empty
+	// sends nothing, which is what a server without one expects.
+	std::string password;
+
+	// A key as the ini spells it, as a virtual-key code: one letter or digit,
+	// or F1 to F12. Zero for anything else. Exposed for tests.
+	static int ParseKey(const std::string &value);
 
 	// Parses INI text. Unknown keys are ignored, not fatal, so a config from
 	// a newer build still loads. Returns false only if `text` is empty.

@@ -355,7 +355,7 @@ floor = max over remote players p where p.seatVehicleNetId == our car's netId
 riding; on foot, or in a car the session has never heard of, there are no
 co-occupants and the floor is zero. `seatVehicleNetId` is used rather than
 `seatedVehicleNetId` on purpose: it is the session's standing instruction
-(`AGENTS.md`, "written as a reconciliation"), so a car-mate whose ped has not
+(`client/src/client.h`, `RemotePlayer::seatVehicleNetId`), so a car-mate whose ped has not
 finished streaming in here is still in the car as far as this rule is
 concerned, which is what stops the stars flickering while a model loads.
 

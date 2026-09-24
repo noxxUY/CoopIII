@@ -4,6 +4,7 @@
 #pragma once
 
 #include "coopiii/protocol.h"
+#include "desync.h"
 
 #include <cstdint>
 #include <string>
@@ -66,6 +67,12 @@ struct Player {
 	// behind it.
 	bool        warnedCarCap    = false;
 	bool        warnedCarTempId = false;
+
+	// Where they said they were over the last second, for desync probes, and
+	// when a probe of theirs last got a line in the log.
+	PoseHistory history;
+	bool        saidDesync     = false;
+	uint32_t    desyncSaidAtMs = 0;
 
 	// Which garages this player's own machine has away from rest, one bit
 	// per garage (docs/protocol.md §1.16).
@@ -146,6 +153,8 @@ struct Vehicle {
 	Vec3     pos = {};
 	Quat     rot = {0.0f, 0.0f, 0.0f, 1.0f};
 	uint8_t  driverPlayerId = INVALID_PLAYER;
+	// Where whoever reports it said it was over the last second.
+	PoseHistory history{CAR_SNAP_M, true};
 
 	// The one machine allowed to simulate this car while nobody is driving
 	// it, or INVALID_PLAYER for the ordinary case: nobody simulates it and
@@ -234,6 +243,13 @@ constexpr size_t MAX_SESSION_VEHICLES = 64;
 constexpr float    VEHICLE_KEEP_RADIUS_M = 200.0f;
 constexpr uint32_t VEHICLE_RELEASE_MS    = 60000;
 
+// How near a player has to be to be handed the settle of a car whose driver or
+// custodian just left (HandOverVehiclesOf). The argument NoteExitVehicle makes
+// for the ex-driver is that his machine has the car streamed in with the
+// ground loaded under it; this is the distance that is still true at without
+// argument, well inside any streaming or collision radius the engine keeps.
+constexpr float VEHICLE_HANDOVER_RADIUS_M = 80.0f;
+
 // A pedestrian one player's engine made, that the whole session now shares.
 //
 // Unlike a Vehicle, this row is owned: an ambient ped exists because one
@@ -264,6 +280,9 @@ struct AmbientPed {
 	// that can say when it ran out. Same split as a Player's `alive`.
 	bool     alive       = true;
 	uint16_t deathAnimId = ANIM_NONE;
+
+	// Where its host said it was over the last second, for desync probes.
+	PoseHistory history{PED_SNAP_M, false};
 };
 
 // How many ambient peds the session will track at once.
@@ -302,6 +321,14 @@ struct AmbientCar {
 	// S_CarSpawn can describe a burnt shell, and a joiner handed the intact
 	// car would be the only person in the session who could see it.
 	bool     destroyed = false;
+
+	// What shape it is in, as its host last said (NoteCarDamage), merged the
+	// way a session car's record is. Carried into the Vehicle row if somebody
+	// takes the wheel, and handed to a joiner after the spawn.
+	uint32_t damagePanels = 0;
+	uint16_t damageDoors  = 0;
+
+	PoseHistory history{CAR_SNAP_M, false};
 };
 
 // Fewer than the peds, and lower than the vehicle cap for a different reason
@@ -359,6 +386,10 @@ struct Backfill {
 	std::vector<S_PlayerJoin>   players;
 	std::vector<S_VehicleSpawn> vehicles;
 	std::vector<S_EnterVehicle> seats;
+	// Who is settling which car nobody drives, after the seats. Not told, a
+	// joiner pins a car somebody is settling where the session last had it,
+	// lets its own blast damage it and runs its own fire timer on it.
+	std::vector<S_VehicleCustody> custodies;
 	// Last, and carrying tempId 0 throughout: these are peds the joiner
 	// certainly did not create, so nothing in them may look like an answer
 	// to a claim of its own.
@@ -491,6 +522,13 @@ public:
 	// Returns the id freed, or INVALID_PLAYER if the peer wasn't a player.
 	uint8_t RemovePeer(uint32_t peer);
 
+	// Before RemovePeer: the cars `playerId` was driving or settling go to the
+	// nearest other player within VEHICLE_HANDOVER_RADIUS_M to settle, the
+	// custody NoteExitVehicle would have given them had they got out. Returns
+	// the netIds whose custodian changed, for S_VehicleCustody. A car nobody
+	// is near is left to RemovePeer, which pins it where it stands.
+	std::vector<uint16_t> HandOverVehiclesOf(uint8_t playerId);
+
 	Player *FindByPeer(uint32_t peer);
 	Player *FindById(uint8_t id);
 	// Players are addressed by netId on the wire wherever the thing being
@@ -498,7 +536,11 @@ public:
 	// that way, and so does the killer in a death.
 	Player *FindByNetId(uint16_t netId);
 
-	uint16_t AllocNetId() { return m_nextNetId++; }
+	uint16_t AllocNetId();
+	bool     NetIdInUse(uint16_t netId) const;
+	bool     PlayerIdActive(uint8_t playerId) const;
+	// Where the next netId is looked for, so a test can reach the wrap.
+	void     NextNetIdForTest(uint16_t netId) { m_nextNetId = netId; }
 
 	// docs/roadmap.md §5.2: server-configurable, off by default. With it off
 	// the server simply doesn't relay a C_Damage between players, so no
@@ -724,6 +766,12 @@ public:
 	Vehicle       *FindVehicle(uint16_t netId);
 	const Vehicle *FindVehicle(uint16_t netId) const;
 
+	// What the owner of a player, a session car or a hosted ped or traffic car
+	// said about where it was, for a desync probe from `askerId`. Null for the
+	// asker's own player or hosted things, for a wreck or a corpse, and for a
+	// number the session has no such thing under.
+	const PoseHistory *HistoryFor(uint16_t netId, uint8_t askerId) const;
+
 	// Registers a newly claimed vehicle, returns it, or null if the session
 	// already has MAX_SESSION_VEHICLES alive. A freed row is reused first.
 	Vehicle *AddVehicle(uint16_t modelId, uint8_t colour1, uint8_t colour2,
@@ -817,6 +865,20 @@ public:
 	// be handed: the health it produced lives on the owner's machine, and no
 	// packet has ever carried an ambient ped's health.
 	Player *PedDamageRecipient(uint16_t pedNetId, uint8_t byPlayerId);
+
+	// An NPC's round (protocol.h, C_NpcShot). Only its host may fire it, and
+	// only while it is alive: a replica's own engine never fires, and a
+	// corpse's round is a round nobody saw fired.
+	bool NpcShotAllowed(uint16_t pedNetId, uint8_t byPlayerId) const;
+
+	// Who an NPC's hit goes to (C_NpcDamage), or null for nobody. The same
+	// test as NpcShotAllowed for the attacker, and then a victim who is
+	// somebody other than the sender, connected and alive - the PedDamageRecipient
+	// rules turned round, since this one travels from an NPC's owner towards
+	// a player rather than from a player towards an NPC's owner. Friendly fire
+	// is not consulted, for the reason PedDamageRecipient gives.
+	Player *NpcHitRecipient(uint16_t attackerPedNetId, uint16_t victimNetId,
+	                        uint8_t byPlayerId);
 
 	const std::vector<AmbientPed> &Peds() const { return m_peds; }
 
@@ -921,6 +983,14 @@ public:
 	// everybody downstream is told what the session now believes rather than
 	// what one machine happened to see.
 	bool NoteVehicleDamage(const VehicleDamageBody &in, VehicleDamageBody &out);
+
+	// The same for a traffic car, from its host and nobody else: the same
+	// C_VehicleDamage, for a netId that names an AmbientCar. The host's engine
+	// is the only one simulating the car, so its dents are the car's. False
+	// for anybody else, a wreck, a repair marker (traffic never sees a spray
+	// shop - a car driven into one is a session car by then) and a report
+	// that adds nothing.
+	bool NoteCarDamage(uint8_t playerId, const VehicleDamageBody &in, VehicleDamageBody &out);
 
 	// May `playerId` tell the session what condition `netId` is in?
 	//
@@ -1036,6 +1106,11 @@ public:
 	enum class HitCustody : uint8_t { NotTheirs, Granted, AlreadyTheirs };
 	HitCustody CustodyForHit(uint16_t netId, uint8_t byPlayerId);
 
+	// A shove (protocol.h, VEHICLE_HIT_PUSH) comes from somebody alive at the
+	// wheel of some other car. On foot or riding along, nobody's car is
+	// pushing anything, and the ask is dropped before it can take a custody.
+	bool MayPush(uint8_t playerId, uint16_t netId) const;
+
 	// ---- a traffic car that has stopped being traffic ---------------------
 	//
 	// A player has taken the wheel of a car another machine's engine made.
@@ -1117,8 +1192,24 @@ public:
 	void ReleaseReservationsOf(uint8_t playerId);
 
 	// Let go of a record: a grant the client could not consume, or a key the
-	// script has re-created. Safe to call for a key nobody holds.
-	void ReleasePickup(const PickupIdent &ident);
+	// script has re-created. Safe to call for a key nobody holds. For a pickup
+	// counted per player, only `byPlayerId`'s own record goes.
+	void ReleasePickup(const PickupIdent &ident, uint8_t byPlayerId = INVALID_PLAYER);
+
+	// ---- hidden packages (docs/roadmap.md 5.11) ----------------------------
+	//
+	// Under `perplayer` a package is locked per player rather than per
+	// session: each player's claim is weighed only against their own record,
+	// a collection is told to nobody else, and a joiner is not handed anybody
+	// else's. Every machine's own engine keeps its own count, which is what
+	// rewards.sc reads, so nothing on a client changes.
+	uint8_t PackageRule() const { return m_packageRule; }
+	void    SetPackageRule(uint8_t rule) {
+		m_packageRule = rule == PACKAGES_PERPLAYER ? PACKAGES_PERPLAYER : PACKAGES_SHARED;
+	}
+	bool PickupIsPerPlayer(const PickupIdent &ident) const {
+		return m_packageRule == PACKAGES_PERPLAYER && ident.type == PICKUP_TYPE_PACKAGE;
+	}
 
 	// Drop records whose respawn window has passed, and reservations nobody
 	// has said anything about for PICKUP_RESERVATION_MS. Called on the
@@ -1190,6 +1281,7 @@ private:
 	};
 	WorldCheat           m_worldCheats[CHEAT_COUNT];
 	uint8_t              m_moneyRule    = MONEY_RULE_OFF;
+	uint8_t              m_packageRule  = PACKAGES_SHARED;
 	// The session's wallet under `shared`. Empty until the first player in
 	// says what he has, and empty again once the last one leaves.
 	bool                 m_moneySeeded  = false;
@@ -1230,7 +1322,8 @@ private:
 
 	// Found by ident, or null. Non-const so ClaimPickup can overwrite a
 	// record whose window has passed instead of growing the vector forever.
-	TakenPickup *FindPickup(const PickupIdent &ident);
+	// For a pickup counted per player, `forPlayer`'s own record only.
+	TakenPickup *FindPickup(const PickupIdent &ident, uint8_t forPlayer);
 
 	// Called after the roster changes. Keeps the host on the lowest active
 	// slot, and clears it when the session empties out.

@@ -60,6 +60,7 @@
 // on its own schedule.
 #include "nametag.h"
 
+#include "chat.h"
 #include "client.h"
 #include "hook/hook.h"
 #include "log.h"
@@ -526,6 +527,19 @@ void __cdecl HookedHudDraw() {
 		if (!reported) {
 			reported = true;
 			Log("nametag: draw threw; tags may be missing from here on");
+		}
+	}
+
+	// The chat and the player list ride the same detour, contained apart so
+	// one going wrong leaves the other drawn.
+	try {
+		if (g_client)
+			DrawChatOverlay(*g_client);
+	} catch (...) {
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			Log("chat: draw threw; the chat may be missing from here on");
 		}
 	}
 

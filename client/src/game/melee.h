@@ -190,6 +190,23 @@ inline float SwingAmountForPlayer(float amount, bool bat, bool heavy, bool adren
 	return bat && !heavy && !adrenaline ? amount * SWING_PLAYER_BAT_MULT : amount;
 }
 
+// The same two for a pedestrian's hit on a player, which is what an NPC's hit
+// on the wire always is (protocol.h, C_NpcDamage). His engine asked IsPlayer
+// of its copy of the victim, so a bat still came out at half; the heavy swing
+// and adrenaline arms want a player swinging (0x0055CE0E) and never apply.
+inline float NpcSwingAmountForPlayer(float amount, bool bat) {
+	return SwingAmountForPlayer(amount, bat, false, false);
+}
+
+// And his strike's MELEE_ARMED is dropped: it only knocks a victim down when a
+// player is striking (004E9482), and against a player it changes nothing else
+// (DefendArg), so on the wire it could only ever mislead.
+inline MeleeTag NpcMeleeTagForPlayer(MeleeTag tag) {
+	if (MeleeKind(tag) == MELEE_STRIKE)
+		tag.melee = static_cast<uint8_t>(tag.melee & ~MELEE_ARMED);
+	return tag;
+}
+
 // May the fight code react on this ped here? Not while a strike or a swing
 // is running and the ped is another machine's: its owner plays the reaction.
 inline bool CopyMayReactToMelee(bool insideMelee, bool otherMachinesPed) {

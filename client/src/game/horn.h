@@ -225,9 +225,10 @@ inline constexpr bool TrafficHornOnWire(uint16_t model, bool sirenOn, uint8_t ti
 //   lastRowAtMs   when that row arrived, on WallClock; 0 for never
 //
 // HORN_FRESH_MS again, and at the car stream's 10 Hz it covers one lost batch
-// (the next row lands 200 ms after the last). A car that drops out of its
-// host's eight nearest stops getting rows at all, so it falls silent 250 ms
-// later instead of honking until it comes back.
+// (the next row lands 200 ms after the last). A honking car goes out in every
+// batch whatever its turn (game/streampick.h, STREAM_HONK_DEADLINE), and a car
+// whose host stops streaming it falls silent 250 ms later instead of honking
+// for good.
 inline bool ReplicaTrafficHornSounds(bool onWire, bool destroyed,
                                      uint32_t lastRowAtMs, uint32_t nowMs) {
 	if (!onWire || destroyed || lastRowAtMs == 0)

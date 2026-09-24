@@ -9,6 +9,7 @@
 #include "run.h"
 
 #include "config.h"
+#include "reach.h"
 #include "server.h"
 
 #include "ui/anim.h"
@@ -92,39 +93,16 @@ State g_state;
 
 // ---- the address to share -------------------------------------------------
 
-// The first IPv4 address on an interface that is up and is not loopback. That
-// is the one a player on the same network types in, and the one the design's
-// header shows.
+// The address a player on the same network types in, and the one the design's
+// header shows: a private one behind a gateway if there is one
+// (PreferredLanAddress), or failing that the first there is.
 std::string LanAddress() {
-	ULONG                size  = 16 * 1024;
-	std::vector<uint8_t> buffer(size);
-	auto                *table = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(buffer.data());
-
-	ULONG result = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-	                                                GAA_FLAG_SKIP_DNS_SERVER,
-	                                    nullptr, table, &size);
-	if (result == ERROR_BUFFER_OVERFLOW) {
-		buffer.resize(size);
-		table  = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(buffer.data());
-		result = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-		                                          GAA_FLAG_SKIP_DNS_SERVER,
-		                              nullptr, table, &size);
-	}
-	if (result != NO_ERROR)
-		return "127.0.0.1";
-
-	for (const IP_ADAPTER_ADDRESSES *a = table; a; a = a->Next) {
-		if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
-			continue;
-		for (const IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next) {
-			if (u->Address.lpSockaddr->sa_family != AF_INET)
-				continue;
-			const auto *in = reinterpret_cast<const sockaddr_in *>(u->Address.lpSockaddr);
-			char        text[INET_ADDRSTRLEN] = {0};
-			if (inet_ntop(AF_INET, &in->sin_addr, text, sizeof(text)) && std::strcmp(text, "127.0.0.1") != 0)
-				return text;
-		}
-	}
+	const std::vector<LocalAddress> all = LocalIPv4Addresses();
+	if (const uint32_t lan = PreferredLanAddress(all))
+		return FormatAddress(lan);
+	for (const LocalAddress &a : all)
+		if (KindOf(a.addr) != AddressKind::LinkLocal)
+			return FormatAddress(a.addr);
 	return "127.0.0.1";
 }
 
@@ -168,12 +146,16 @@ void StartServer() {
 	                          WireValue(g_state.config.wantedLevel),
 	                          WireValue(g_state.config.rampage),
 	                          WireValue(g_state.config.cheats),
-	                          WireValue(g_state.config.money))) {
+	                          WireValue(g_state.config.money),
+	                          WireValue(g_state.config.hiddenPackages))) {
 		g_state.startError = "Could not listen on that port. Something else may be using it.";
 		return;
 	}
 	g_state.running = true;
+	g_state.server.SetPassword(g_state.config.password);
 	g_state.address = LanAddress();
+	for (const std::string &line : ReachLines(LocalIPv4Addresses(), g_state.config.port))
+		Say(LogKind::Info, line.c_str());
 }
 
 void StopServer() {
@@ -661,6 +643,8 @@ int RunWindow(const Startup &startup) {
 				// it is set, and this keeps a save from quietly putting it back.
 				g_state.server.SessionRef().SetCheatRule(WireValue(g_state.config.cheats));
 				g_state.server.SessionRef().SetMoneyRule(WireValue(g_state.config.money));
+				g_state.server.SessionRef().SetPackageRule(
+				    WireValue(g_state.config.hiddenPackages));
 				g_state.savedAt = app.Seconds();
 				Say(LogKind::Info, "options saved");
 				if (wlChanged) {

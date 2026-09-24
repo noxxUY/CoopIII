@@ -41,6 +41,16 @@ void *ResolveRemotePed(RemotePlayer &player);
 // isn't holding plays the wrong animation, wrong stance, no model in hand.
 bool GiveRemoteWeapon(RemotePlayer &player, void *ped, uint8_t weapon);
 
+// The same for a ped that is not a player's: GiveWeapon and SetCurrentWeapon
+// once the weapon's model has streamed in, false until then. For
+// population.cpp, which arms the replicas of other machines' pedestrians.
+bool PutReplicaWeaponInHand(void *ped, uint8_t weapon);
+
+// The eWeaponType in any ped's hand, read the way SampleLocalPlayer reads the
+// local player's: m_currentWeapon bounded before it indexes m_weapons, and
+// UNARMED for anything that is not an inventory weapon.
+uint8_t HeldWeaponType(void *ped);
+
 // Whether this session reports ammunition honestly (protocol.h,
 // SESSION_AMMO_SYNC). Set from S_Welcome; read wherever the engine is about
 // to decide how much ammunition a remote ped has.
@@ -76,6 +86,10 @@ void *LightWatchedPedFire(void *ped);
 // still on `ped`? A slot is re-let the moment its fire goes out, so the index
 // alone is not an identity.
 bool WatchedPedFireIsOurs(int8_t fireSlot, void *ped, void *fire);
+
+// Where the engine has a remote player's ped, for a desync probe. False with no
+// ped, or while the engine is seating it.
+bool SampleRemotePedPosition(const RemotePlayer &player, Vec3 &out);
 
 // ---- for dllmain.cpp ------------------------------------------------------
 

@@ -166,6 +166,28 @@ bool ParseMoney(const std::string &text, MoneyMode *out) {
 	return false;
 }
 
+const char *Name(PackageMode rule) {
+	return rule == PackageMode::PerPlayer ? "perplayer" : "shared";
+}
+
+const char *Label(PackageMode rule) {
+	return rule == PackageMode::PerPlayer ? "Per player" : "Shared";
+}
+
+bool ParsePackages(const std::string &text, PackageMode *out) {
+	const std::string t = Trim(text);
+	if (_stricmp(t.c_str(), "shared") == 0) {
+		*out = PackageMode::Shared;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "perplayer") == 0 || _stricmp(t.c_str(), "per-player") == 0 ||
+	    _stricmp(t.c_str(), "own") == 0) {
+		*out = PackageMode::PerPlayer;
+		return true;
+	}
+	return false;
+}
+
 std::string ServerConfig::Path() {
 	char        buf[MAX_PATH] = {0};
 	const DWORD n             = GetModuleFileNameA(nullptr, buf, MAX_PATH);
@@ -222,9 +244,27 @@ bool ServerConfig::Parse(const std::string &text) {
 			MoneyMode rule = money;
 			if (ParseMoney(value, &rule))
 				money = rule;
+		} else if (_stricmp(key.c_str(), "hiddenpackages") == 0) {
+			PackageMode rule = hiddenPackages;
+			if (ParsePackages(value, &rule))
+				hiddenPackages = rule;
+		} else if (_stricmp(key.c_str(), "password") == 0) {
+			password = CleanPassword(value);
 		}
 	}
 	return true;
+}
+
+std::string ServerConfig::CleanPassword(const std::string &text) {
+	std::string out;
+	for (const char c : text) {
+		if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F)
+			continue;
+		if (out.size() + 1 >= PASSWORD_LEN)
+			break;
+		out.push_back(c);
+	}
+	return out;
 }
 
 bool ServerConfig::Load(const std::string &path) {
@@ -253,7 +293,11 @@ std::string ServerConfig::ToIni() const {
 	    "\n"
 	    "[CoopIII]\n"
 	    "\n"
-	    "; UDP port to listen on. Players have to use the same one.\n"
+	    "; UDP port to listen on. Players have to use the same one. Players who\n"
+	    "; are not on this machine's network usually reach it through the\n"
+	    "; router, which then has to forward this UDP port to this machine -\n"
+	    "; not with a public address of its own, or a VPN everybody is on. The\n"
+	    "; server's log says which applies when it starts.\n"
 	    "port = %u\n"
 	    "\n"
 	    "; Whether players can hurt and kill each other. Off by default.\n"
@@ -267,7 +311,9 @@ std::string ServerConfig::ToIni() const {
 	    "wantedLevel = %s\n"
 	    "\n"
 	    "; If anyone dies during a mission, it fails for everyone, as it does\n"
-	    "; in single player.\n"
+	    "; in single player. For missions the session shares, which is not yet:\n"
+	    "; today every game runs its own missions and fails them when its own\n"
+	    "; player dies, whatever this says.\n"
 	    "missionFailOnDeath = %s\n"
 	    "\n"
 	    "; Whether everybody sees everybody else's real ammunition. Off by\n"
@@ -305,10 +351,22 @@ std::string ServerConfig::ToIni() const {
 	    ";           or a police helicopter goes to whoever destroyed it, once\n"
 	    ";   shared  one wallet for everybody: anything anyone earns, spends\n"
 	    ";           or is fined comes out of the same money\n"
-	    "money = %s\n",
+	    "money = %s\n"
+	    "\n"
+	    "; Who a hidden package counts for:\n"
+	    ";   shared     one player collects it and it is gone for everybody,\n"
+	    ";              and everybody's count goes up (the default)\n"
+	    ";   perplayer  every player finds their own hundred\n"
+	    "hiddenPackages = %s\n"
+	    "\n"
+	    "; What players have to give to join, or nothing for anybody who knows\n"
+	    "; the address. Each of them puts the same in their CoopIII.ini as\n"
+	    "; `password = ...`. It crosses the network as it is typed, so it keeps\n"
+	    "; strangers out and nothing more; up to 31 characters.\n"
+	    "password = %s\n",
 	    port, friendlyFire ? "true" : "false", Name(wantedLevel),
 	    missionFailOnDeath ? "true" : "false", ammoSync ? "true" : "false",
-	    Name(rampage), Name(cheats), Name(money));
+	    Name(rampage), Name(cheats), Name(money), Name(hiddenPackages), password.c_str());
 	return out;
 }
 

@@ -334,11 +334,15 @@ constexpr bool MayReportBreak(uint8_t createdBy, bool isPickupObject,
 // No impulse means nothing collided with it, and there is exactly one other
 // thing in the image that can clear bIsStatic on a breakable map object: the
 // object arm shared by CWeapon::DoBulletImpact, CWeapon::FireShotgun and
-// CWeapon::FireMelee. That arm only ever runs inside somebody's
+// CBulletInfo::Update (the sniper round; addresses.h has why its constant is
+// called FireMeleeObjectArm). The first two only ever run inside somebody's
 // CWeapon::Fire - ours, or the one combat.cpp is replaying for a remote
 // player right now. So **the shooter knows a break was theirs because the
 // engine is still inside their own trigger pull when it happens**, which is
-// a fact rather than an inference from a stale pointer.
+// a fact rather than an inference from a stale pointer. The third runs from
+// the world update instead, outside any replay, and reads as ours - which it
+// is: no observer runs CWeapon::FireSniper, so a sniper round only exists on
+// the machine that fired it.
 //
 // The alternative - leave it with the host and make the host's report travel
 // - is worse, and docs/objects.md 5 already contains the proof without

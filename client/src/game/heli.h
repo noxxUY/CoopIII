@@ -14,13 +14,19 @@
 //   CWanted::RegisterCrime_Immediately   only while UpdateHelis is blowing
 //                                up a helicopter somebody else shot down
 //
+// and a seventh, on a lead, when its call sites check out:
+//
+//   CPlane::TestRocketCollision  somebody else's rocket passes a plane by
+//
 // The rules the engine applies are transcribed below as pure functions, so
 // tools/clienttest checks them without a game.
 #pragma once
 
 #include "helisync.h"
+#include "leadcheck.h"
 
 #include <cstdint>
+#include <cstring>
 
 namespace coopiii {
 struct WorldBridge;
@@ -146,8 +152,28 @@ inline bool IsWithheldHeliCrime(int32_t crime, uint32_t id, uint8_t withheldSlot
 	return (withheldSlots & (1u << (id - 0x4D83u))) != 0;
 }
 
-// Installs the six detours. False if any failed; the ones that did install
-// stay, and each failure says in the log what it costs.
+// ---- a plane, and somebody else's rocket ----------------------------------
+//
+// CPlane::TestRocketCollision is CProjectileInfo::Update's other rocket test,
+// straight after the helicopter's. For an observer's copy of somebody else's
+// rocket it crashed the Dodo here and registered the crime against *our*
+// player - stars for a rocket we never fired - and the crash blasts, which name
+// FindPlayerPed as their culprit, went out as ours on top of the shooter's.
+// The shooter's machine is the one that decides that rocket, so here it passes
+// the plane by and the owner's explosion ends it, as every other remote
+// projectile ends.
+//
+// Its address is a lead, not in addresses.h (docs/addresses-unverified.md):
+// the detour goes in only when both of the helicopter test's call sites, which
+// addresses.h does prove, have a call to it within a few bytes, taking one
+// dword and popping it the way a one-argument __cdecl call does.
+constexpr uintptr_t PLANE_ROCKET_TEST_LEAD = 0x0054DE90;
+constexpr uintptr_t HELI_ROCKET_CALL_SITES[2] = {0x0055B8E2, 0x0055B9BC};
+constexpr size_t    PLANE_CALL_WINDOW = 0x30;
+
+// Installs the six detours, and the plane's when its lead checks out. False if
+// any of the six failed; the ones that did install stay, and each failure says
+// in the log what it costs.
 bool InstallHeliHooks();
 void RemoveHeliHooks();
 

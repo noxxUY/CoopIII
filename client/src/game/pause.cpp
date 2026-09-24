@@ -10,6 +10,9 @@ namespace {
 
 Detour g_timer;
 
+// The chat line is open (HoldControlsForChat).
+bool g_chatHolds = false;
+
 // CTimer::Update is a static member (re3 Timer.h), so __cdecl with no
 // arguments - same reasoning as CGame::Process in frame.cpp. Get this wrong
 // and the stack corrupts sixty times a second.
@@ -125,7 +128,17 @@ void RestorePauseForPresentation() {
 	// Costs the same single frame the pause itself costs: the frame the menu
 	// opens on still moves the player, and the frame it closes on still
 	// ignores them.
-	LockPlayerControls(menu);
+	LockPlayerControls(menu || g_chatHolds);
+}
+
+void HoldControlsForChat(bool hold) {
+	if (hold == g_chatHolds)
+		return;
+	g_chatHolds = hold;
+	// Straight away, and whether or not the pause policy is installed: with
+	// the menu pausing the game as in single player, nothing else ever sets
+	// or clears our bit.
+	LockPlayerControls(hold || (g_timer.IsInstalled() && InAGame() && MenuIsUp()));
 }
 
 } // namespace coopiii::game

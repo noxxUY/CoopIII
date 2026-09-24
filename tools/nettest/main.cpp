@@ -103,6 +103,64 @@ C_Hello MakeHello(const char *nick) {
 	return hello;
 }
 
+C_Password MakePassword(const char *text) {
+	C_Password pw;
+	InitHeader(pw, 0);
+	std::strncpy(pw.password, text, PASSWORD_LEN - 1);
+	return pw;
+}
+
+// Against a server started with a password: `nettest HOST PORT password=PW`.
+int RunPasswordTests(const char *host, uint16_t port, const char *password) {
+	std::printf("\na server with a password\n");
+	NetClient late, wrong, right;
+	std::vector<NetClient *> three = {&late, &wrong, &right};
+	std::vector<std::vector<Message>> inbox(3);
+	if (!late.Connect(host, port) || !wrong.Connect(host, port) || !right.Connect(host, port)) {
+		std::printf("connect failed\n");
+		return 1;
+	}
+	PumpUntil(three, inbox, 3000, [&] {
+		return late.IsConnected() && wrong.IsConnected() && right.IsConnected();
+	});
+
+	late.Send(MakeHello("nopass"), CH_EVENT);
+	wrong.Send(MakeHello("guess"), CH_EVENT);
+	wrong.Send(MakePassword("letmein"), CH_EVENT);
+	right.Send(MakeHello("friend"), CH_EVENT);
+	right.Send(MakePassword(password), CH_EVENT);
+
+	PumpUntil(three, inbox, 1500, [&] {
+		return FindOp(inbox[1], OP_S_WELCOME) != nullptr &&
+		       FindOp(inbox[2], OP_S_WELCOME) != nullptr;
+	});
+	const S_Welcome *guessed = nullptr, *known = nullptr;
+	if (const Message *m = FindOp(inbox[1], OP_S_WELCOME))
+		guessed = m->as<S_Welcome>();
+	if (const Message *m = FindOp(inbox[2], OP_S_WELCOME))
+		known = m->as<S_Welcome>();
+	Check(guessed && guessed->reject == REJECT_BAD_PASSWORD,
+	      "the wrong password is turned away at once");
+	Check(known && known->reject == REJECT_NONE && known->netId != INVALID_NETID,
+	      "the right one is let in, as a hello always was");
+	Check(FindOp(inbox[0], OP_S_WELCOME) == nullptr,
+	      "and a hello with no password behind it is held, not answered");
+
+	PumpUntil(three, inbox, PASSWORD_WAIT_MS + 1500,
+	          [&] { return FindOp(inbox[0], OP_S_WELCOME) != nullptr; });
+	const S_Welcome *waited = nullptr;
+	if (const Message *m = FindOp(inbox[0], OP_S_WELCOME))
+		waited = m->as<S_Welcome>();
+	Check(waited && waited->reject == REJECT_BAD_PASSWORD,
+	      "until the wait runs out, and then it is turned away too");
+
+	right.Disconnect();
+	NetDeinit();
+	std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures,
+	            g_failures == 1 ? "" : "s");
+	return g_failures == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -118,6 +176,9 @@ int main(int argc, char **argv) {
 		std::printf("enet init failed\n");
 		return 1;
 	}
+
+	if (argc > 3 && std::strncmp(argv[3], "password=", 9) == 0)
+		return RunPasswordTests(host, port, argv[3] + 9);
 
 	// Four, not two. The last two arrive late on purpose: a backfill is only
 	// a backfill if there was already a session to be behind, so the only way
@@ -153,6 +214,7 @@ int main(int argc, char **argv) {
 	Check(welcomeMsg != nullptr, "alice got S_WELCOME");
 
 	uint8_t aliceId     = INVALID_PLAYER;
+	uint16_t aliceNetId = INVALID_NETID;
 	// Copied out now, not read off `welcomeMsg` later: the inbox is cleared
 	// several times below and that pointer is into its storage.
 	uint8_t sessionFlags = 0;
@@ -164,12 +226,16 @@ int main(int argc, char **argv) {
 			Check(w->snapshotHz == SNAPSHOT_HZ, "server reports 25 Hz");
 			Check(w->netId != INVALID_NETID, "got a netId");
 			aliceId      = w->playerId;
+			aliceNetId   = w->netId;
 			sessionFlags = w->flags;
 		}
 	}
 
 	// --- second player: both directions of the join fan-out ---------------
 	inbox[0].clear();
+	// Bob's peer has been connected all along and heard alice arrive. What is
+	// checked below is the backfill his own hello gets him.
+	inbox[1].clear();
 	b.Send(MakeHello("bob"), CH_EVENT);
 	PumpUntil(both, inbox, 2000, [&] {
 		return FindOp(inbox[1], OP_S_WELCOME) != nullptr &&
@@ -181,10 +247,13 @@ int main(int argc, char **argv) {
 	const Message *bobWelcome = FindOp(inbox[1], OP_S_WELCOME);
 	Check(bobWelcome != nullptr, "bob got S_WELCOME");
 
-	uint8_t bobId = INVALID_PLAYER;
+	uint8_t  bobId    = INVALID_PLAYER;
+	uint16_t bobNetId = INVALID_NETID;
 	if (bobWelcome)
-		if (const auto *w = bobWelcome->as<S_Welcome>())
-			bobId = w->playerId;
+		if (const auto *w = bobWelcome->as<S_Welcome>()) {
+			bobId    = w->playerId;
+			bobNetId = w->netId;
+		}
 
 	Check(aliceId != bobId, "distinct player slots assigned");
 
@@ -192,13 +261,32 @@ int main(int argc, char **argv) {
 	Check(aliceSawBob != nullptr, "alice notified of bob joining");
 	if (aliceSawBob)
 		if (const auto *j = aliceSawBob->as<S_PlayerJoin>())
-			Check(std::strcmp(j->nick, "bob") == 0, "join carries bob's nick");
+			Check(std::strcmp(j->nick, "bob") == 0 && (j->flags & PJF_ARRIVED) != 0,
+			      "join carries bob's nick, marked as somebody arriving");
 
 	const Message *bobSawAlice = FindOp(inbox[1], OP_S_PLAYER_JOIN);
 	Check(bobSawAlice != nullptr, "bob told about already-present alice");
 	if (bobSawAlice)
 		if (const auto *j = bobSawAlice->as<S_PlayerJoin>())
-			Check(std::strcmp(j->nick, "alice") == 0, "backfill carries alice's nick");
+			Check(std::strcmp(j->nick, "alice") == 0 && (j->flags & PJF_ARRIVED) == 0,
+			      "backfill carries alice's nick, and she is not announced as new");
+
+	// --- everybody's ping, once a second -------------------------------------
+	PumpUntil(both, inbox, 2500, [&] { return FindOp(inbox[1], OP_S_PLAYER_PINGS) != nullptr; });
+	std::printf("\npings\n");
+	if (const Message *m = FindOp(inbox[1], OP_S_PLAYER_PINGS)) {
+		if (const auto *pings = m->as<S_PlayerPings>()) {
+			Check(pings->rttMs[aliceId] != PING_NONE && pings->rttMs[bobId] != PING_NONE,
+			      "the server says how far away alice and bob are");
+			bool empty = true;
+			for (uint8_t id = 0; id < MAX_PLAYERS; ++id)
+				if (id != aliceId && id != bobId && pings->rttMs[id] != PING_NONE)
+					empty = false;
+			Check(empty, "and nothing for the slots nobody is in");
+		}
+	} else {
+		Check(false, "a ping table arrives within a couple of seconds");
+	}
 
 	// --- snapshot relay ----------------------------------------------------
 	inbox[0].clear();
@@ -255,6 +343,44 @@ int main(int argc, char **argv) {
 	}
 	Check(CountOp(inbox[0], OP_S_PLAYER_STATE) == 0,
 	      "sender does not receive its own snapshot");
+
+	// --- desync probe: bob says where he has alice ---------------------------
+	inbox[0].clear();
+	inbox[1].clear();
+	C_PlayerState moved = snap;
+	InitHeader(moved, 1274);
+	moved.body     = snap.body;
+	moved.body.pos = {104.5f, -200.25f, 10.0f};
+	a.Send(moved, CH_SNAPSHOT);
+	PumpUntil(both, inbox, 2000,
+	          [&] { return FindOp(inbox[1], OP_S_PLAYER_STATE) != nullptr; });
+
+	C_DesyncProbe probe;
+	InitHeader(probe, 5000);
+	probe.count         = 3;
+	probe.rows[0].netId = aliceNetId;
+	probe.rows[0].atMs  = 1254;                         // halfway between her two
+	probe.rows[0].pos   = {105.5f, -200.25f, 10.0f};    // 3 m past where she was
+	probe.rows[1].netId = 4000;
+	probe.rows[1].atMs  = 1254;
+	probe.rows[2].netId = bobNetId;
+	probe.rows[2].atMs  = 1254;
+	b.Send(probe, CH_SNAPSHOT);
+	PumpUntil(both, inbox, 2000,
+	          [&] { return FindOp(inbox[1], OP_S_DESYNC_REPORT) != nullptr; });
+
+	std::printf("\ndesync probe\n");
+	const Message *reportMsg = FindOp(inbox[1], OP_S_DESYNC_REPORT);
+	Check(reportMsg != nullptr, "bob gets an answer to his probe");
+	if (reportMsg)
+		if (const auto *r = reportMsg->as<S_DesyncReport>()) {
+			Check(r->count == 3 && r->rows[0].netId == aliceNetId &&
+			          r->rows[0].offCm >= 299 && r->rows[0].offCm <= 301,
+			      "alice is 3 m off, against where she was at that instant");
+			Check(r->rows[1].offCm == DESYNC_UNKNOWN && r->rows[2].offCm == DESYNC_UNKNOWN,
+			      "a number nobody has, and bob's own, are not compared");
+		}
+	Check(FindOp(inbox[0], OP_S_DESYNC_REPORT) == nullptr, "and nobody else is told");
 
 	// --- chat --------------------------------------------------------------
 	inbox[0].clear();
@@ -334,6 +460,132 @@ int main(int argc, char **argv) {
 			      "the head, of alice's pedestrian, from the side it was hit");
 	Check(CountOp(inbox[0], OP_S_PED_BODY_PART) == 0,
 	      "alice is not told about her own limb, or about bob's attempt on it");
+
+	// And alice's own player losing one, which only her machine sees happen.
+	inbox[0].clear();
+	inbox[1].clear();
+	C_PedBodyPart herHead{};
+	InitHeader(herHead, 3120);
+	herHead.body.netId     = aliceNetId;
+	herHead.body.node      = 2;
+	herHead.body.direction = 1;
+	a.Send(herHead, CH_EVENT);
+	b.Send(herHead, CH_EVENT);   // bob cannot say alice lost hers
+	PumpUntil(both, inbox, 500, [&] { return false; });
+	Check(CountOp(inbox[1], OP_S_PED_BODY_PART) == 1, "bob hears alice lost her own head, once");
+	if (const Message *m = FindOp(inbox[1], OP_S_PED_BODY_PART))
+		if (const auto *s = m->as<S_PedBodyPart>())
+			Check(s->body.netId == aliceNetId && s->body.node == 2, "hers, the head");
+	Check(CountOp(inbox[0], OP_S_PED_BODY_PART) == 0,
+	      "and alice is told nothing, bob's word about her included");
+
+	// --- the pedestrian fighting -------------------------------------------
+	//
+	// Alice's pedestrian fires and hits bob. The round is drawn for everybody
+	// but alice and the hit goes to bob alone; bob cannot speak for her
+	// pedestrian, and she cannot have it hit herself.
+	std::printf("\nher pedestrian fighting\n");
+	inbox[0].clear();
+	inbox[1].clear();
+
+	C_NpcShot round{};
+	InitHeader(round, 3150);
+	round.pedNetId    = pedNetId;
+	round.body.weapon = 2;   // WEAPONTYPE_COLT45
+	round.body.origin = {5.0f, 6.0f, 8.0f};
+	round.body.dir    = {1.0f, 0.0f, 0.0f};
+	a.Send(round, CH_SNAPSHOT);
+	b.Send(round, CH_SNAPSHOT);   // bob does not host her pedestrian
+
+	C_NpcDamage hit{};
+	InitHeader(hit, 3160);
+	hit.attackerPedNetId = pedNetId;
+	hit.body.victimNetId = bobNetId;
+	hit.body.weapon      = 2;
+	hit.body.amount      = 25.0f;
+	hit.body.piece       = 3;
+	hit.body.direction   = 1;
+	a.Send(hit, CH_EVENT);
+
+	C_NpcDamage onHerself = hit;
+	onHerself.body.victimNetId = aliceNetId;
+	a.Send(onHerself, CH_EVENT);
+	b.Send(onHerself, CH_EVENT);   // and bob cannot have it hit her either
+
+	PumpUntil(both, inbox, 500, [&] { return false; });
+
+	Check(CountOp(inbox[1], OP_S_NPC_SHOT) == 1, "bob draws exactly one round");
+	if (const Message *m = FindOp(inbox[1], OP_S_NPC_SHOT))
+		if (const auto *s = m->as<S_NpcShot>())
+			Check(s->ownerPlayerId == aliceId && s->pedNetId == pedNetId &&
+			          s->body.weapon == 2 && s->body.origin.z == 8.0f,
+			      "her pedestrian's, with its pistol, from where it stood");
+	Check(CountOp(inbox[0], OP_S_NPC_SHOT) == 0,
+	      "alice is not sent her own pedestrian's round, or bob's copy of it");
+	Check(CountOp(inbox[1], OP_S_NPC_DAMAGE) == 1, "bob is hit exactly once");
+	if (const Message *m = FindOp(inbox[1], OP_S_NPC_DAMAGE))
+		if (const auto *s = m->as<S_NpcDamage>())
+			Check(s->ownerPlayerId == aliceId && s->attackerPedNetId == pedNetId &&
+			          s->body.victimNetId == bobNetId && s->body.amount == 25.0f &&
+			          s->body.piece == 3 && s->body.direction == 1,
+			      "by her pedestrian, for what her engine said");
+	Check(CountOp(inbox[0], OP_S_NPC_DAMAGE) == 0,
+	      "alice is hit by nobody: not by her own pedestrian, not on bob's word");
+
+	// --- a traffic car's dents -------------------------------------------------
+	//
+	// Alice's engine makes a traffic car and dents it. Bob hears the dent;
+	// bob's word about her car, and a repair marker for traffic, reach nobody.
+	std::printf("\nher traffic car's dents\n");
+	inbox[0].clear();
+	inbox[1].clear();
+
+	C_CarSpawn traffic{};
+	InitHeader(traffic, 3170);
+	traffic.tempId       = 88;
+	traffic.body.modelId = 90;
+	traffic.body.extra1  = -1;
+	traffic.body.extra2  = -1;
+	traffic.body.pos     = {15.0f, 16.0f, 7.0f};
+	traffic.body.rot     = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+	a.Send(traffic, CH_EVENT);
+	PumpUntil(both, inbox, 2000,
+	          [&] { return FindOp(inbox[0], OP_S_CAR_SPAWN) != nullptr; });
+
+	uint16_t trafficNetId = INVALID_NETID;
+	if (const Message *m = FindOp(inbox[0], OP_S_CAR_SPAWN))
+		if (const auto *s = m->as<S_CarSpawn>())
+			trafficNetId = s->netId;
+	Check(trafficNetId != INVALID_NETID, "alice's traffic car got a netId");
+
+	inbox[0].clear();
+	inbox[1].clear();
+
+	C_VehicleDamage dent{};
+	InitHeader(dent, 3180);
+	dent.body.netId = trafficNetId;
+	SetPanelLevel(dent.body.panels, 2, 2);
+	a.Send(dent, CH_EVENT);
+
+	C_VehicleDamage bobsDent = dent;
+	SetPanelLevel(bobsDent.body.panels, 4, 3);
+	b.Send(bobsDent, CH_EVENT);
+
+	C_VehicleDamage sprayed = dent;
+	sprayed.body.panels = VEH_DAMAGE_RESET;
+	a.Send(sprayed, CH_EVENT);
+
+	PumpUntil(both, inbox, 500, [&] { return false; });
+
+	Check(CountOp(inbox[1], OP_S_VEHICLE_DAMAGE) == 1, "bob hears exactly one dent");
+	if (const Message *m = FindOp(inbox[1], OP_S_VEHICLE_DAMAGE))
+		if (const auto *s = m->as<S_VehicleDamage>())
+			Check(s->playerId == aliceId && s->body.netId == trafficNetId &&
+			          GetPanelLevel(s->body.panels, 2) == 2 &&
+			          GetPanelLevel(s->body.panels, 4) == 0,
+			      "hers, on her car, and nothing of bob's in it");
+	Check(CountOp(inbox[0], OP_S_VEHICLE_DAMAGE) == 0,
+	      "and alice is told nothing about her own car");
 
 	// --- and the pedestrian dying ------------------------------------------
 	//
@@ -526,6 +778,21 @@ int main(int argc, char **argv) {
 	              IndexOfOp(inbox[2], OP_S_ENTER_VEHICLE),
 	      "players, then cars, then who is sitting in them");
 
+	// And alice's traffic car, with its dent after it.
+	PumpUntil(all, inbox, 1000, [&] {
+		return FindOp(inbox[2], OP_S_CAR_SPAWN) != nullptr &&
+		       FindOp(inbox[2], OP_S_VEHICLE_DAMAGE) != nullptr;
+	});
+	bool carolSawTheDent = false;
+	for (const Message &m : inbox[2])
+		if (const auto *d = m.as<S_VehicleDamage>())
+			if (d->body.netId == trafficNetId && GetPanelLevel(d->body.panels, 2) == 2 &&
+			    d->playerId == INVALID_PLAYER)
+				carolSawTheDent = true;
+	Check(carolSawTheDent, "carol is handed alice's traffic car's dent, as the session's record");
+	Check(IndexOfOp(inbox[2], OP_S_CAR_SPAWN) < IndexOfOp(inbox[2], OP_S_VEHICLE_DAMAGE),
+	      "after the car it is on");
+
 	// --- a death survives into the next backfill ---------------------------
 	//
 	// A death is an event and an event only reaches whoever was connected at
@@ -564,6 +831,18 @@ int main(int argc, char **argv) {
 	// behind the wheel.
 	Check(FindSeatFor(inbox[3], aliceId) == nullptr, "and in no seat");
 	Check(FindSeatFor(inbox[3], bobId) != nullptr, "while bob is still sitting in it");
+	// And that the car she died in is hers to settle, after the seats.
+	PumpUntil(all, inbox, 2000,
+	          [&] { return FindOp(inbox[3], OP_S_VEHICLE_CUSTODY) != nullptr; });
+	if (const Message *m = FindOp(inbox[3], OP_S_VEHICLE_CUSTODY)) {
+		const auto *custody = m->as<S_VehicleCustody>();
+		Check(custody && custody->netId == carNetId && custody->playerId == aliceId,
+		      "dave is told whose custody the car is in");
+		Check(IndexOfOp(inbox[3], OP_S_ENTER_VEHICLE) < IndexOfOp(inbox[3], OP_S_VEHICLE_CUSTODY),
+		      "after the seats");
+	} else {
+		Check(false, "dave is told the car is being settled");
+	}
 
 	c.Disconnect();
 	d.Disconnect();
@@ -619,19 +898,143 @@ int main(int argc, char **argv) {
 	}
 
 	// --- leave -------------------------------------------------------------
-	inbox[0].clear();
-	b.Disconnect();
-	PumpUntil({&a}, inbox, 3000,
-	          [&] { return FindOp(inbox[0], OP_S_PLAYER_LEAVE) != nullptr; });
+	//
+	// Alice goes. She was settling the car since she died in it, and bob is
+	// sitting in it, so the settle is his: told after the leave, so his
+	// machine has her out of the seat before it hears whose the car is.
+	C_PlayerState bobInTheCar{};
+	InitHeader(bobInTheCar, 9000);
+	bobInTheCar.body.pos    = {251.0f, 40.0f, 5.0f};
+	bobInTheCar.body.health = 100.0f;
+	b.Send(bobInTheCar, CH_SNAPSHOT);
+	PumpUntil(both, inbox, 300, [&] { return false; });
+
+	std::vector<std::vector<Message>> bobHears(1);
+	a.Disconnect();
+	PumpUntil({&b}, bobHears, 3000, [&] {
+		return FindOp(bobHears[0], OP_S_PLAYER_LEAVE) != nullptr &&
+		       FindOp(bobHears[0], OP_S_VEHICLE_CUSTODY) != nullptr;
+	});
 
 	std::printf("\nleave\n");
-	const Message *leave = FindOp(inbox[0], OP_S_PLAYER_LEAVE);
-	Check(leave != nullptr, "alice notified of bob leaving");
+	const Message *leave = FindOp(bobHears[0], OP_S_PLAYER_LEAVE);
+	Check(leave != nullptr, "bob notified of alice leaving");
 	if (leave)
 		if (const auto *l = leave->as<S_PlayerLeave>())
-			Check(l->playerId == bobId, "leave names bob's slot");
+			Check(l->playerId == aliceId, "leave names alice's slot");
+	if (const Message *m = FindOp(bobHears[0], OP_S_VEHICLE_CUSTODY)) {
+		if (const auto *c = m->as<S_VehicleCustody>())
+			Check(c->netId == carNetId && c->playerId == bobId,
+			      "and the car she was settling is bob's to settle, not frozen");
+	} else {
+		Check(false, "bob is handed the car she was settling");
+	}
+	Check(IndexOfOp(bobHears[0], OP_S_PLAYER_LEAVE) < IndexOfOp(bobHears[0], OP_S_VEHICLE_CUSTODY),
+	      "after the leave, never before it");
 
-	a.Disconnect();
+	// --- a shove settles a car nobody holds ----------------------------------
+	//
+	// Bob is still riding in it. A shove from a passenger is nobody's; once
+	// bob is out and at the wheel of a car of bob's own, it is.
+	bobHears[0].clear();
+	C_VehicleSettled settled;
+	InitHeader(settled, 9100);
+	settled.netId = carNetId;
+	b.Send(settled, CH_EVENT);
+	C_VehicleHit shove;
+	InitHeader(shove, 9200);
+	shove.body.netId  = carNetId;
+	shove.body.weapon = VEHICLE_HIT_PUSH;
+	b.Send(shove, CH_EVENT);
+	C_ExitVehicle getOut{};
+	InitHeader(getOut, 9250);
+	getOut.netId = carNetId;
+	b.Send(getOut, CH_EVENT);
+	C_EnterVehicle bobsOwn{};
+	InitHeader(bobsOwn, 9300);
+	bobsOwn.body.netId   = INVALID_NETID;
+	bobsOwn.body.seat    = 0;
+	bobsOwn.body.modelId = 92;
+	bobsOwn.body.pos     = {256.0f, 40.0f, 5.0f};
+	bobsOwn.body.rot     = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+	b.Send(bobsOwn, CH_EVENT);
+	InitHeader(shove, 9400);
+	shove.body.netId  = carNetId;
+	shove.body.weapon = VEHICLE_HIT_PUSH;
+	b.Send(shove, CH_EVENT);
+	C_Chat shoveMarker;
+	InitHeader(shoveMarker, 0);
+	std::strncpy(shoveMarker.text, "shove-marker", CHAT_LEN - 1);
+	b.Send(shoveMarker, CH_EVENT);
+	PumpUntil({&b}, bobHears, 2000,
+	          [&] { return FindOp(bobHears[0], OP_S_CHAT) != nullptr; });
+
+	std::printf("\na shove\n");
+	size_t bobsCarAt = bobHears[0].size();
+	for (size_t i = 0; i < bobHears[0].size(); ++i)
+		if (bobHears[0][i].opcode == OP_S_ENTER_VEHICLE)
+			if (const auto *e = bobHears[0][i].as<S_EnterVehicle>())
+				if (e->playerId == bobId && e->body.netId != carNetId) {
+					bobsCarAt = i;
+					break;
+				}
+	Check(bobsCarAt < bobHears[0].size(), "(bob has a car of bob's own)");
+	uint8_t lastCustodian = 0xEE;
+	size_t  toBob = 0, toBobEarly = 0;
+	for (size_t i = 0; i < bobHears[0].size(); ++i)
+		if (bobHears[0][i].opcode == OP_S_VEHICLE_CUSTODY)
+			if (const auto *c = bobHears[0][i].as<S_VehicleCustody>())
+				if (c->netId == carNetId) {
+					lastCustodian = c->playerId;
+					if (c->playerId == bobId)
+						++(i < bobsCarAt ? toBobEarly : toBob);
+				}
+	Check(toBobEarly == 0, "riding in it, bob's shove takes nothing");
+	Check(toBob == 1 && lastCustodian == bobId,
+	      "a car handed back to nobody is bob's to settle again once bob's car pushes it");
+	Check(FindOp(bobHears[0], OP_S_VEHICLE_HIT) == nullptr,
+	      "and there is no hit in a shove for anybody to take");
+
+	// --- turned away, and told why -------------------------------------------
+	std::printf("\nturned away\n");
+	{
+		NetClient stranger;
+		std::vector<NetClient *>          one = {&stranger};
+		std::vector<std::vector<Message>> heard(1);
+		stranger.Connect(host, port);
+		PumpUntil(one, heard, 2000, [&] { return stranger.IsConnected(); });
+		C_Hello old = MakeHello("oldbuild");
+		old.protocolVersion = PROTOCOL_VERSION - 1;
+		stranger.Send(old, CH_EVENT);
+		PumpUntil(one, heard, 2000,
+		          [&] { return FindOp(heard[0], OP_S_WELCOME) != nullptr; });
+		const S_Welcome *no = nullptr;
+		if (const Message *m = FindOp(heard[0], OP_S_WELCOME))
+			no = m->as<S_Welcome>();
+		Check(no && no->reject == REJECT_BAD_VERSION,
+		      "a client on another protocol hears why before it is disconnected");
+	}
+
+	// --- a connection that never says hello hears nothing -------------------
+	std::printf("\nsilent connections\n");
+	{
+		NetClient lurker;
+		std::vector<NetClient *>          everyone = {&lurker, &b};
+		std::vector<std::vector<Message>> heard(2);
+		lurker.Connect(host, port);
+		PumpUntil(everyone, heard, 2000, [&] { return lurker.IsConnected(); });
+		C_Chat said;
+		InitHeader(said, 0);
+		std::strncpy(said.text, "lurker-marker", CHAT_LEN - 1);
+		b.Send(said, CH_EVENT);
+		PumpUntil(everyone, heard, 2000,
+		          [&] { return FindOp(heard[1], OP_S_CHAT) != nullptr; });
+		Check(FindOp(heard[1], OP_S_CHAT) != nullptr, "(the chat went round)");
+		Check(heard[0].empty(), "a connection that never said hello is sent none of it");
+		lurker.Disconnect();
+	}
+
+	b.Disconnect();
 	NetDeinit();
 
 	std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL",
