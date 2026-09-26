@@ -66,6 +66,15 @@ target("launcher-core")
     add_includedirs("launcher/include", {public = true})
     add_syslinks("advapi32", {public = true})
 
+-- The launcher's side of the lobby (docs/protocol.md §1.31): its own
+-- connection to the server, before any game runs. Nothing Windows in it, so
+-- servertest drives it against a real server.
+target("launcher-lobby")
+    set_kind("static")
+    add_files("launcher/lobby/*.cpp")
+    add_includedirs("launcher/include", {public = true})
+    add_deps("sdk")
+
 -- ---------------------------------------------------------------------------
 -- The graphical front ends. design/DESIGN.md is the spec; design/screens/ has
 -- the exact values.
@@ -236,7 +245,7 @@ target("launcher")
     set_basename("coopiii-launcher")
     add_files("launcher/*.cpp", "launcher/cli/*.cpp", "launcher/gui/*.cpp")
     add_includedirs("launcher")
-    add_deps("ui", "launcher-core")
+    add_deps("ui", "launcher-core", "launcher-lobby")
     add_ldflags("/subsystem:windows", "/entry:mainCRTStartup", {force = true})
 
 -- Headless protocol test. Drives real clients against a running server.exe,
@@ -272,7 +281,8 @@ target("clienttest")
               "client/src/client.cpp", "client/src/netthread.cpp",
               "client/src/interp.cpp", "client/src/log.cpp",
               "client/src/game/sessionclock.cpp",
-              "client/src/helisync.cpp", "client/src/moneysync.cpp")
+              "client/src/helisync.cpp", "client/src/moneysync.cpp",
+              "client/src/missionsync.cpp")
     add_includedirs("client/src")
     add_deps("sdk")
 
@@ -336,6 +346,16 @@ target("sessiontest")
     set_default(false)
     add_files("tools/sessiontest/*.cpp")
     add_deps("sdk", "server-core")
+
+-- The server's wiring end to end: a real Server in the test process and real
+-- NetClients over loopback, so what is checked is what reaches a client.
+-- sessiontest covers the decisions; this covers who hears them. It listens on
+-- a port of its own, and skips rather than fails when it cannot bind one.
+target("servertest")
+    set_kind("binary")
+    set_default(false)
+    add_files("tools/servertest/*.cpp")
+    add_deps("sdk", "server-core", "launcher-lobby")
 
 -- Resolves rel32 call targets and checks whether they land on a function
 -- start. Exists because hand arithmetic got one wrong and crashed the game.

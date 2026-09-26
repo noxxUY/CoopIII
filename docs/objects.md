@@ -632,6 +632,27 @@ Opcodes `0xC4`-`0xCF` stay reserved.
 
 ---
 
+### 8.5 Coming back to one that was broken
+
+§2's "nothing to back-fill" held for one machine and not for two. The 80 m
+line is each machine's own: a player who drives off has his copy turned back
+into a dummy and rebuilt pristine when he returns, while a teammate who stayed
+still has it broken. So the session keeps what it was told
+(`server/core/objectrecords.h`: the break, OR'd over every report, and the
+resting place) for as long as any player is within 120 m, and forgets it once
+nobody is, which is when every copy has become a dummy again.
+
+The client finds out it rebuilt one at `CPopulation::ManagePopulation`'s own
+call to `ConvertToRealObject` (`0x004F3E48` calls `0x004F4470`, redirected at
+the call site; `addresses.h` has the body). The dummy is deleted inside that
+call, so its model and position are read first; the dummy sits at the IPL
+placement, which is the new object's `m_objectMatrix`. Only an object in the
+ring of 128 this machine has heard of or reported is asked about
+(`C_ObjectRebuilt`), and the answer is the ordinary `S_ObjectBroken` and
+`S_ObjectSettled`, applied by §6. Unproven in game: the round trip leaves it
+standing for a moment, and the replayed break throws its debris again, 80 m
+off.
+
 ## 9. What has not been in front of GTA III
 
 Everything above is proved against the binary or is design. **None of it has

@@ -55,13 +55,13 @@ namespace coopiii::game {
 // How far from the toucher, and how many other spots to try when one has no
 // ground under it. Three metres gives seven players two and a half metres
 // each, which is room to turn round in and close enough to see who's who.
-constexpr float SPREAD_RADIUS_M   = 3.0f;
-constexpr int   SPREAD_ATTEMPTS   = 8;
+constexpr float VOTE_SPREAD_RADIUS_M   = 3.0f;
+constexpr int   VOTE_SPREAD_ATTEMPTS   = 8;
 // How far a spot's ground may be from the toucher's before it counts as a
 // roof, a ledge or the road under a bridge rather than where he is standing.
-constexpr float SPREAD_MAX_STEP_M = 2.0f;
+constexpr float VOTE_SPREAD_MAX_STEP_M = 2.0f;
 
-struct SpreadSpot {
+struct VoteSpreadSpot {
 	float dx = 0.0f;
 	float dy = 0.0f;
 };
@@ -70,29 +70,29 @@ struct SpreadSpot {
 // try. Attempt 0 is its own place on the ring. Later ones go half a place
 // either side, then the same angles closer in and further out, so a spot
 // against a wall still ends up near where it was meant to be.
-inline SpreadSpot SpreadCandidate(uint8_t slot, uint8_t count, int attempt) {
+inline VoteSpreadSpot VoteSpreadCandidate(uint8_t slot, uint8_t count, int attempt) {
 	constexpr float kTwoPi = 6.28318530718f;
 	if (count == 0)
 		count = 1;
 	const float step  = kTwoPi / static_cast<float>(count);
 	float       angle = step * static_cast<float>(slot % count);
-	float       r     = SPREAD_RADIUS_M;
+	float       r     = VOTE_SPREAD_RADIUS_M;
 	switch (attempt) {
 	case 0: break;
 	case 1: angle += step * 0.5f; break;
 	case 2: angle -= step * 0.5f; break;
-	case 3: r = SPREAD_RADIUS_M * 0.6f; break;
-	case 4: r = SPREAD_RADIUS_M * 1.5f; break;
-	case 5: angle += step * 0.5f; r = SPREAD_RADIUS_M * 0.6f; break;
-	case 6: angle -= step * 0.5f; r = SPREAD_RADIUS_M * 1.5f; break;
+	case 3: r = VOTE_SPREAD_RADIUS_M * 0.6f; break;
+	case 4: r = VOTE_SPREAD_RADIUS_M * 1.5f; break;
+	case 5: angle += step * 0.5f; r = VOTE_SPREAD_RADIUS_M * 0.6f; break;
+	case 6: angle -= step * 0.5f; r = VOTE_SPREAD_RADIUS_M * 1.5f; break;
 	default: r = 1.2f; break;   // almost on top of him, as a last resort
 	}
-	return SpreadSpot{std::cos(angle) * r, std::sin(angle) * r};
+	return VoteSpreadSpot{std::cos(angle) * r, std::sin(angle) * r};
 }
 
 // Is ground found at a spot where he can stand next to the toucher?
-inline bool SpreadGroundOk(bool found, float groundZ, float starterGroundZ) {
-	return found && std::fabs(groundZ - starterGroundZ) <= SPREAD_MAX_STEP_M;
+inline bool VoteSpreadGroundOk(bool found, float groundZ, float starterGroundZ) {
+	return found && std::fabs(groundZ - starterGroundZ) <= VOTE_SPREAD_MAX_STEP_M;
 }
 
 // The heading that faces `to` from `from`, in the engine's convention:
@@ -146,6 +146,24 @@ inline bool IslandOpen(int32_t level, bool industrialPassed, bool commercialPass
 	return true;
 }
 
+// The island a move to a place on island `target` has to load before the
+// player is put down there, with `loaded` the one whose collision is in
+// memory: 0 when nothing does, the water between the islands (level 0)
+// included.
+inline int32_t IslandToLoadFirst(int32_t target, int32_t loaded) {
+	return target != 0 && target != loaded ? target : 0;
+}
+
+// Whether the owner's LOAD_COLLISION_WITH_SCREEN of island `wanted` may run
+// on a participant whose own player stands on island `here`. The owner's
+// script decided it from where the owner stands (S.A.M. near the platform);
+// loaded under a player standing on another island, it takes his ground away
+// until CCollision::Update puts his own back, behind a second loading screen.
+// Between the islands (0) the owner's word is as good as any.
+inline bool MayLoadIslandUnder(int32_t wanted, int32_t here) {
+	return here == 0 || here == wanted;
+}
+
 // ---------------------------------------------------------------------------
 // The game half
 // ---------------------------------------------------------------------------
@@ -160,5 +178,20 @@ void RemoveRampageVote();
 // Once a frame, from the frame pump before CGame::Process: the help box, the
 // keys, and a move that is waiting or in progress.
 void TickRampageVote();
+
+// The same move for the session's mission (docs/missions.md 11.5): this
+// machine's player out of any car and put down in place `slot` of `count`
+// round `pos`, where player `targetId` stands, the other island loaded first
+// if it is on one. MayMovePlayer says whether it can be done now: not while
+// dead, being arrested, in a cutscene, or already on the way somewhere.
+// MovePlayerBeside is false, doing nothing, when it can't.
+bool MayMovePlayer();
+bool MovePlayerBeside(const Vec3 &pos, uint8_t targetId, uint8_t slot, uint8_t count);
+
+// The island (x, y, z) is on, by CTheZones::GetLevelFromPosition, and the
+// one whose collision is in memory here. The move above and the mission's
+// own moves (game/mission.cpp, Teleport) both start from these.
+int32_t IslandAt(float x, float y, float z);
+int32_t IslandLoaded();
 
 } // namespace coopiii::game

@@ -1,6 +1,7 @@
 #include "session.h"
 
 #include "coopiii/net.h"   // InitHeader
+#include "coopiii/sky.h"
 
 #include <algorithm>
 #include <cstring>
@@ -104,6 +105,15 @@ uint8_t Session::RemovePeer(uint32_t peer) {
 		if (v.active && v.history.Reporter() == id)
 			v.history.Clear();
 
+	// And the bombs that were theirs. The bomb stays on the car; whose it is
+	// goes, because the next player in the slot did not fit it, and a joiner
+	// told otherwise would blame the wreck on him.
+	for (Vehicle &v : m_vehicles)
+		if (v.active && v.bombBlame == id) {
+			v.bombBlame   = INVALID_PLAYER;
+			v.bombMission = false;
+		}
+
 	// Their own hidden packages, under `hiddenPackages = perplayer`. A package
 	// record is keyed on the slot, and the slot is about to be somebody else's:
 	// left in place, the next player to fill it would be refused every package
@@ -136,7 +146,10 @@ std::vector<uint16_t> Session::HandOverVehiclesOf(uint8_t playerId) {
 	constexpr float r2 = VEHICLE_HANDOVER_RADIUS_M * VEHICLE_HANDOVER_RADIUS_M;
 
 	for (Vehicle &v : m_vehicles) {
-		if (!v.active || v.destroyed)
+		// A wreck is handed on too, while it is being settled: a shell left
+		// where its custodian last had it is the wreck frozen in the air, or
+		// half way down to the bottom of the harbour.
+		if (!v.active)
 			continue;
 		if (v.driverPlayerId != playerId && v.custodianPlayerId != playerId)
 			continue;
@@ -416,6 +429,13 @@ bool Session::MayReportVehicle(uint8_t playerId, uint16_t netId) const {
 	       v->custodianPlayerId == playerId;
 }
 
+bool Session::MaySprayCannon(uint8_t playerId, uint16_t netId) const {
+	if (MayReportVehicle(playerId, netId))
+		return true;
+	const AmbientCar *car = FindCar(netId);
+	return car && !car->destroyed && car->ownerPlayerId == playerId;
+}
+
 Player *Session::VehicleHitRecipient(uint16_t netId, uint8_t byPlayerId) {
 	Vehicle *v = FindVehicle(netId);
 	if (!v || !v->active)
@@ -529,6 +549,111 @@ bool Session::NoteVehicleDamage(const VehicleDamageBody &in,
 	return true;
 }
 
+bool Session::NoteVehicleRadio(uint8_t playerId, uint16_t netId, uint8_t station,
+                               uint8_t &held) {
+	held = RADIO_STATION_UNKNOWN;
+	Vehicle *v = FindVehicle(netId);
+	if (!v || v->destroyed)
+		return false;
+	held = v->radio;
+
+	// Only somebody sitting in it, driver or passenger. A player who has got
+	// out has no listener in that car any more, and one who never got in is
+	// naming a car his machine only watches.
+	const Player *p = FindById(playerId);
+	if (!p || !p->alive || p->vehicleNetId != netId)
+		return false;
+	if (!RadioStationValid(station) || station == v->radio)
+		return false;
+
+	v->radio = station;
+	held     = station;
+	return true;
+}
+
+bool Session::NoteVehicleBomb(uint8_t playerId, const C_VehicleBomb &in, uint32_t nowMs) {
+	if (in.bombType > CARBOMB_MAX || in.fuseMs > CARBOMB_FUSE_MAX_MS ||
+	    !MayReportVehicle(playerId, in.netId))
+		return false;
+	// Somebody the session has, or nobody. A player id that is nobody's would
+	// be the next joiner's, blamed for a bomb he never saw.
+	if (in.blame != INVALID_PLAYER && !FindById(in.blame))
+		return false;
+	Vehicle *v = FindVehicle(in.netId);
+	if (!v || v->destroyed)
+		return false;
+	v->bombMission = KeepsMissionBomb(v->bombMission, v->bomb, v->bombBlame, in.bombType, in.blame);
+	v->bomb        = in.bombType;
+	v->bombBlame   = in.blame;
+	// Kept as an end rather than a length, so a joiner is handed what is left
+	// of it. A fuse said unlit leaves one that is already burning alone: the
+	// engine only ever lights a fuse, and no copy puts one out.
+	if (in.fuseMs != 0) {
+		v->bombFuseEndMs = nowMs + in.fuseMs;
+		if (v->bombFuseEndMs == 0)
+			v->bombFuseEndMs = 1;
+	}
+	return true;
+}
+
+bool Session::NoteMissionBomb(uint8_t playerId, const C_MissionBomb &in) {
+	if (in.bombType > CARBOMB_MAX || !FindById(playerId) || !m_mission.MayRelayEffect(playerId))
+		return false;
+	Vehicle *v = FindVehicle(in.netId);
+	if (!v || v->destroyed)
+		return false;
+	// A fuse already burning is left alone: ARM_CAR_WITH_BOMB writes the type
+	// and the rigger and never the timer (0x00444459..0x00444496).
+	v->bomb        = in.bombType;
+	v->bombBlame   = playerId;
+	v->bombMission = in.bombType != CARBOMB_NONE;
+	return true;
+}
+
+uint16_t FuseLeftMs(uint32_t endMs, uint32_t nowMs) {
+	if (endMs == 0)
+		return 0;
+	const int32_t left = static_cast<int32_t>(endMs - nowMs);
+	if (left <= 0)
+		return 0;
+	return left > CARBOMB_FUSE_MAX_MS ? CARBOMB_FUSE_MAX_MS : static_cast<uint16_t>(left);
+}
+
+bool Session::NoteVehicleAlarm(uint8_t playerId, uint16_t netId, uint16_t &remainingMs,
+                               uint32_t nowMs) {
+	Vehicle *v = FindVehicle(netId);
+	if (!v || v->destroyed || !MayReportVehicle(playerId, netId))
+		return false;
+	if (remainingMs > VEHICLE_ALARM_MS)
+		remainingMs = VEHICLE_ALARM_MS;
+	if (remainingMs == 0) {
+		// A stop is only news for an alarm the session thinks is sounding.
+		const bool sounding = v->alarmEndsAtMs != 0 &&
+		                      static_cast<int32_t>(v->alarmEndsAtMs - nowMs) > 0;
+		v->alarmEndsAtMs = 0;
+		return sounding;
+	}
+	// Never 0, which is "none", whatever the clock reads.
+	v->alarmEndsAtMs = nowMs + remainingMs;
+	if (v->alarmEndsAtMs == 0)
+		v->alarmEndsAtMs = 1;
+	return true;
+}
+
+bool Session::NoteVehicleAim(uint8_t playerId, uint16_t netId, float gunLR, float gunUD) {
+	Vehicle *v = FindVehicle(netId);
+	if (!v || v->destroyed || !MayReportVehicle(playerId, netId))
+		return false;
+	// NaN fails both.
+	if (!(gunLR == gunLR && gunUD == gunUD) || gunLR > 1e6f || gunLR < -1e6f ||
+	    gunUD > 1e6f || gunUD < -1e6f)
+		return false;
+	v->aimKnown = true;
+	v->gunLR    = gunLR;
+	v->gunUD    = gunUD;
+	return true;
+}
+
 bool Session::NoteCarDamage(uint8_t playerId, const VehicleDamageBody &in,
                             VehicleDamageBody &out) {
 	AmbientCar *car = FindCar(in.netId);
@@ -550,14 +675,15 @@ bool Session::NoteCarDamage(uint8_t playerId, const VehicleDamageBody &in,
 	return true;
 }
 
-void Session::DestroyVehicle(uint16_t netId) {
+void Session::DestroyVehicle(uint16_t netId, uint8_t settlerId, uint32_t nowMs) {
 	Vehicle *v = FindVehicle(netId);
 	if (!v || v->destroyed)
 		return;
 
-	v->destroyed = true;
-	v->health    = 0.0f;
-	v->flags     = static_cast<uint8_t>(v->flags | VEH_WRECKED);
+	v->destroyed     = true;
+	v->destroyedAtMs = nowMs;
+	v->health        = 0.0f;
+	v->flags         = static_cast<uint8_t>(v->flags | VEH_WRECKED);
 
 	// Nobody is sitting in a wreck - and nobody means the passengers too, not
 	// just whoever was driving. Clearing every end of it stops the backfill
@@ -573,10 +699,30 @@ void Session::DestroyVehicle(uint16_t netId) {
 	// And nobody is settling one either. `v->destroyed` was set above, so the
 	// NoteExitVehicle calls that just ran already declined to grant it; this
 	// is the case where the car was *already* being settled and then blew up
-	// underneath its custodian. Nothing is left to finish, and a custodian
-	// still holding it would go on being the one machine entitled to report a
-	// wreck's position.
+	// underneath its custodian. Whoever held it is done with it.
 	v->custodianPlayerId = INVALID_PLAYER;
+
+	// What is left is where the wreck ends up, and that is the machine's that
+	// decided it: its engine ran the BlowUpCar that threw the car up, and it
+	// is the only one that knows where it comes down. Every other machine
+	// follows its settle, which is the ordinary custody with VEH_WRECKED on
+	// every snapshot (client/src/game/wreck.h), and holds the shell where it
+	// came to rest once it says so.
+	if (settlerId != INVALID_PLAYER && FindById(settlerId))
+		v->custodianPlayerId = settlerId;
+}
+
+bool Session::NoteWreckState(uint8_t playerId, const VehicleStateBody &body) {
+	Vehicle *v = FindVehicle(body.netId);
+	if (!v || !v->active || !v->destroyed)
+		return false;
+	if (v->custodianPlayerId == INVALID_PLAYER || v->custodianPlayerId != playerId)
+		return false;
+	if ((body.flags & VEH_WRECKED) == 0)
+		return false;
+	v->pos = body.pos;
+	v->rot = body.rot;
+	return true;
 }
 
 // ---- what a joiner is told -------------------------------------------------
@@ -624,6 +770,21 @@ S_PlayerLook Session::MakeLook(const Player &p, uint32_t sendTimeMs) const {
 	return out;
 }
 
+bool Session::NotePlayerAway(Player &p, bool away) {
+	if (p.away == away)
+		return false;
+	p.away = away;
+	return true;
+}
+
+S_PlayerAway Session::MakeAway(const Player &p, uint32_t sendTimeMs) const {
+	S_PlayerAway out;
+	InitHeader(out, sendTimeMs);
+	out.playerId = p.id;
+	out.away     = p.away ? 1 : 0;
+	return out;
+}
+
 Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 	Backfill out;
 
@@ -633,6 +794,8 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 		out.players.push_back(MakeJoin(p, sendTimeMs));
 		if (p.look[0] != '\0')
 			out.looks.push_back(MakeLook(p, sendTimeMs));
+		if (p.away)
+			out.aways.push_back(MakeAway(p, sendTimeMs));
 
 		// Their doors, if any are off their resting position right now.
 		// Nothing for the overwhelmingly common case, which is why this is a
@@ -692,18 +855,14 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 		if (!v.active)
 			continue;
 
-		// A wreck is left out. The people already here watched it happen;
-		// the joiner is simply never told there is a car there, which is a
-		// smaller lie than being told there is a working one.
-		//
-		// The alternative - send it with VEH_WRECKED and let the receiver
-		// build a burnt-out shell - is the more faithful answer and is one
-		// branch away: drop this continue and the packet below already
-		// carries everything it would need. It is out because nothing on the
-		// client can yet *make* a wreck (that is the vehicle seam's open
-		// question), and a client that is handed VEH_WRECKED and ignores it
-		// reproduces the original bug exactly.
-		if (v.destroyed)
+		// A wreck goes as a wreck: VEH_WRECKED and zero health on the spawn,
+		// where its settle left it, and the client builds the shell without
+		// the blast (client/src/game/wreck.h). Only while the engines of the
+		// people already here still have it: CCarCtrl::PossiblyRemoveVehicle
+		// clears a wreck WRECK_BACKFILL_MS after it died, the same clock the
+		// map's wrecks go by, and past that a joiner would be the one machine
+		// with a shell in the street.
+		if (v.destroyed && sendTimeMs - v.destroyedAtMs >= WRECK_BACKFILL_MS)
 			continue;
 
 		S_VehicleSpawn spawn;
@@ -718,7 +877,13 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 		spawn.extra2  = v.extra2;
 		spawn.health  = v.health;
 		spawn.flags   = v.flags;
+		spawn.parkedSlot = v.parkedSlot;
 		out.vehicles.push_back(spawn);
+
+		// FuckCarCompletely has said everything about a wreck's body, and
+		// nobody is listening to its radio.
+		if (v.destroyed)
+			continue;
 
 		// ...and what it has been through. Only when there is something to
 		// say, because most cars in a session have never been touched and a
@@ -732,6 +897,65 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 			dmg.body.panels = v.damagePanels;
 			dmg.body.doors  = v.damageDoors;
 			out.vehicleDamage.push_back(dmg);
+		}
+
+		// And its radio, when anybody has said. Behind the spawn on the same
+		// ordered channel, so the joiner has the row before it is told the
+		// station.
+		if (v.radio != RADIO_STATION_UNKNOWN) {
+			S_VehicleRadio radio;
+			InitHeader(radio, sendTimeMs);
+			radio.playerId = INVALID_PLAYER;
+			radio.station  = v.radio;
+			radio.netId    = v.netId;
+			out.radios.push_back(radio);
+		}
+
+		// And its bomb, when it has one or one is burning, with what is left
+		// of the fuse by our clock. A fuse that has run out is left out: the
+		// car's wreck is on its way from whoever simulates it.
+		const uint16_t fuse = FuseLeftMs(v.bombFuseEndMs, sendTimeMs);
+		if (v.bomb != CARBOMB_NONE || fuse != 0) {
+			S_VehicleBomb bomb{};
+			InitHeader(bomb, sendTimeMs);
+			bomb.playerId = INVALID_PLAYER;
+			bomb.bombType = v.bomb;
+			bomb.netId    = v.netId;
+			bomb.blame    = v.bombBlame;
+			bomb.fuseMs   = fuse;
+			out.bombs.push_back(bomb);
+			if (v.bombMission && v.bombBlame != INVALID_PLAYER) {
+				S_MissionBomb mission{};
+				InitHeader(mission, sendTimeMs);
+				mission.playerId = v.bombBlame;
+				mission.bombType = v.bomb;
+				mission.netId    = v.netId;
+				out.missionBombs.push_back(mission);
+			}
+		}
+
+		// Its alarm, if it is still going, with what is left of it.
+		if (v.alarmEndsAtMs != 0 &&
+		    static_cast<int32_t>(v.alarmEndsAtMs - sendTimeMs) > 0) {
+			const uint32_t left = v.alarmEndsAtMs - sendTimeMs;
+			S_VehicleAlarm alarm;
+			InitHeader(alarm, sendTimeMs);
+			alarm.playerId    = INVALID_PLAYER;
+			alarm.netId       = v.netId;
+			alarm.remainingMs = static_cast<uint16_t>(
+			    left > VEHICLE_ALARM_MS ? VEHICLE_ALARM_MS : left);
+			out.alarms.push_back(alarm);
+		}
+
+		// And where its gun points, once anybody has aimed it.
+		if (v.aimKnown) {
+			S_VehicleAim aim;
+			InitHeader(aim, sendTimeMs);
+			aim.playerId = INVALID_PLAYER;
+			aim.netId    = v.netId;
+			aim.gunLR    = v.gunLR;
+			aim.gunUD    = v.gunUD;
+			out.aims.push_back(aim);
 		}
 	}
 
@@ -771,8 +995,11 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 		out.seats.push_back(seat);
 	}
 
+	// A wreck's settle included: its spawn went out above, and a joiner not
+	// told who settles it drops the stream and holds the shell where the
+	// session last had it.
 	for (const Vehicle &v : m_vehicles) {
-		if (!v.active || v.destroyed || v.custodianPlayerId == INVALID_PLAYER ||
+		if (!v.active || v.custodianPlayerId == INVALID_PLAYER ||
 		    v.custodianPlayerId == joinerId)
 			continue;
 		S_VehicleCustody custody;
@@ -900,6 +1127,45 @@ Backfill Session::BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const {
 	return out;
 }
 
+MissionCatchUp Session::BuildMissionCatchUp(uint8_t askerId, uint32_t sendTimeMs) const {
+	MissionCatchUp out;
+	for (const AmbientPed &ped : m_peds) {
+		if (!ped.active || ped.ownerPlayerId == askerId || (ped.body.flags & AMBIENT_MISSION) == 0)
+			continue;
+		S_PedSpawn spawn;
+		InitHeader(spawn, sendTimeMs);
+		spawn.ownerPlayerId = ped.ownerPlayerId;
+		spawn.tempId        = 0;
+		spawn.netId         = ped.netId;
+		spawn.body          = ped.body;
+		out.peds.push_back(spawn);
+		if (ped.alive)
+			continue;
+		S_PedDeath death;
+		InitHeader(death, sendTimeMs);
+		death.body.netId  = ped.netId;
+		death.body.animId = ped.deathAnimId;
+		out.pedDeaths.push_back(death);
+	}
+	for (const AmbientCar &car : m_cars) {
+		// A wreck is left out, as the backfill leaves it out.
+		if (!car.active || car.destroyed || car.ownerPlayerId == askerId ||
+		    (car.body.flags & AMBIENT_MISSION) == 0)
+			continue;
+		S_CarSpawn spawn;
+		InitHeader(spawn, sendTimeMs);
+		spawn.ownerPlayerId = car.ownerPlayerId;
+		spawn.tempId        = 0;
+		spawn.netId         = car.netId;
+		spawn.body          = car.body;
+		out.cars.push_back(spawn);
+	}
+	for (const Vehicle &v : m_vehicles)
+		if (v.active && !v.destroyed && v.missionMade)
+			++out.sessionCars;
+	return out;
+}
+
 // ---- cars nobody owns ------------------------------------------------------
 
 bool Session::NoteUnownedBlowUp(const UnownedVehicleKey &key, uint8_t byPlayerId,
@@ -931,7 +1197,9 @@ bool Session::NoteUnownedBlowUp(const UnownedVehicleKey &key, uint8_t byPlayerId
 		if (v->custodianPlayerId != INVALID_PLAYER &&
 		    v->custodianPlayerId != byPlayerId)
 			return false;
-		DestroyVehicle(key.id);
+		// And the reporter settles the wreck: the first machine to say so is
+		// one whose engine blew it up, and the one it goes on following.
+		DestroyVehicle(key.id, byPlayerId, nowMs);
 		return true;
 	}
 
@@ -1007,7 +1275,9 @@ TakenPickup *Session::FindPickup(const PickupIdent &ident, uint8_t forPlayer) {
 
 Session::PickupVerdict Session::ClaimPickup(uint8_t playerId,
                                             const PickupIdent &ident,
-                                            uint32_t nowMs) {
+                                            uint32_t nowMs, uint8_t *movedFrom) {
+	if (movedFrom)
+		*movedFrom = INVALID_PLAYER;
 	if (TakenPickup *held = FindPickup(ident, playerId)) {
 		// Unsigned subtraction throughout, so a server that has been up past
 		// 2^32 ms reads as a small elapsed time rather than an enormous one -
@@ -1030,6 +1300,18 @@ Session::PickupVerdict Session::ClaimPickup(uint8_t playerId,
 		// Free, one way or the other. Reuse the record rather than growing
 		// the vector: a shop counter is claimable every five seconds for as
 		// long as anybody stands near it.
+		//
+		// A reservation that stood too long is moved, and its old holder has
+		// to hear so: left alone, their machine keeps offering the pickup to
+		// its engine and both players end up with it.
+		if (held->state == TakenPickup::State::RESERVED && held->byPlayerId != playerId) {
+			held->displacedPlayerId = held->byPlayerId;
+			held->displacedAtMs     = nowMs;
+			if (movedFrom)
+				*movedFrom = held->byPlayerId;
+		} else if (held->state != TakenPickup::State::RESERVED) {
+			held->displacedPlayerId = INVALID_PLAYER;
+		}
 		held->ident      = ident;
 		held->state      = TakenPickup::State::RESERVED;
 		held->byPlayerId = playerId;
@@ -1050,9 +1332,18 @@ Session::PickupVerdict Session::ClaimPickup(uint8_t playerId,
 bool Session::NotePickupCollected(uint8_t playerId, const PickupIdent &ident,
                                   uint32_t nowMs) {
 	TakenPickup *held = FindPickup(ident, playerId);
-	if (!held || held->byPlayerId != playerId ||
-	    held->state != TakenPickup::State::RESERVED)
+	if (!held || held->state != TakenPickup::State::RESERVED)
 		return false;
+	if (held->byPlayerId != playerId) {
+		// The holder it was just moved away from, whose engine took it before
+		// the denial got there. Theirs: the caller's S_PickupTaken reaches the
+		// new holder, whose machine takes its copy away.
+		if (held->displacedPlayerId != playerId ||
+		    nowMs - held->displacedAtMs >= PICKUP_DISPLACED_GRACE_MS)
+			return false;
+		held->byPlayerId = playerId;
+	}
+	held->displacedPlayerId = INVALID_PLAYER;
 
 	held->state     = TakenPickup::State::TAKEN;
 	held->sinceMs   = nowMs;
@@ -1346,9 +1637,21 @@ bool Session::TakeMoneyAward(uint8_t from, const MoneyAwardBody &body, uint32_t 
 	return true;
 }
 
+uint8_t Session::SkyHolderId() const {
+	// A mission whose owner has gone ended as they went (MissionSlot::Leave),
+	// so this only guards against the two ever disagreeing.
+	const uint8_t owner =
+	    m_mission.Running() && PlayerIdActive(m_mission.Owner()) ? m_mission.Owner() : INVALID_PLAYER;
+	return SkyHolder(m_hostId, owner);
+}
+
 uint8_t Session::NoteCheat(uint8_t from, const CheatBody &body) {
-	const uint8_t relay = CheatRelayFor(m_cheatRule, body.cheat, body.state,
-	                                    from == m_hostId, m_hostId != INVALID_PLAYER);
+	// A sky cheat goes to whoever holds the sky, which is the host unless a
+	// mission runs: run on the host then, the owner's next world packet would
+	// put it back.
+	const uint8_t sky   = SkyHolderId();
+	const uint8_t relay = CheatRelayFor(m_cheatRule, body.cheat, body.state, from == sky,
+	                                    sky != INVALID_PLAYER);
 	if (relay == CHEAT_RELAY_OTHERS) {
 		// TIMEFLIES and BOOOOORING are one setting reached from two ends, so
 		// they share a record and the later one wins.
@@ -1386,6 +1689,51 @@ Player *Session::FindByNetId(uint16_t netId) {
 		return p.active && p.netId == netId;
 	});
 	return it == m_players.end() ? nullptr : &*it;
+}
+
+size_t Session::MissionPresences(MissionPresence (&out)[MAX_PLAYERS]) const {
+	size_t n = 0;
+	for (const Player &p : m_players) {
+		if (!p.active || p.id >= MAX_PLAYERS || n >= MAX_PLAYERS)
+			continue;
+		out[n].playerId = p.id;
+		// A game in a mission of its own is nowhere: its player stands on the
+		// first mission's marker all through the intro, invisible. Nor is a
+		// dead player there, whose body may well lie on the marker: the
+		// respawn resets their camera, controls and HUD and clears their
+		// streets, which in the middle of a start is its cutscene gone.
+		out[n].havePos  = p.havePos && !p.missionBusy && p.alive;
+		out[n].pos      = p.pos;
+		out[n].busy     = p.missionBusy;
+		++n;
+	}
+	return n;
+}
+
+uint8_t Session::ConnectedMask() const {
+	uint8_t mask = 0;
+	for (const Player &p : m_players)
+		if (p.active)
+			mask = static_cast<uint8_t>(mask | PlayerBit(p.id));
+	return mask;
+}
+
+uint8_t Session::ReadyMask() const {
+	uint8_t mask = 0;
+	for (const Player &p : m_players)
+		if (p.active && !p.missionBusy)
+			mask = static_cast<uint8_t>(mask | PlayerBit(p.id));
+	return mask;
+}
+
+Session::KickVerdict Session::MayKick(uint8_t askerId, uint8_t targetId) const {
+	if (askerId == INVALID_PLAYER || askerId != m_hostId || !PlayerIdActive(askerId))
+		return KickVerdict::NotHost;
+	if (!PlayerIdActive(targetId))
+		return KickVerdict::NoSuchPlayer;
+	if (targetId == askerId)
+		return KickVerdict::Themselves;
+	return KickVerdict::Allowed;
 }
 
 Player *Session::FindById(uint8_t id) {
@@ -1513,6 +1861,38 @@ std::vector<uint16_t> Session::ReleaseIdleVehicles(uint32_t nowMs) {
 	return released;
 }
 
+// A session car the holder's engine took away on purpose (protocol.h,
+// C_VehicleRemoved). The holder is the client's decision - it is the only
+// machine whose crusher, crane and garages can see the car - and the server
+// cannot check it: whoever drove a car last is not something it records, and
+// the host fallback is the client's too. What it can refuse is a car somebody
+// ELSE is driving, which no garage of the sender's ever takes, and a reason
+// that is not one.
+bool Session::RemoveVehicleOnPurpose(uint8_t byPlayerId, const VehicleRemovedBody &body,
+                                     VehicleRemovedBody &relay) {
+	if (body.reason == VEHICLE_REMOVED_NONE || body.reason >= VEHICLE_REMOVED_COUNT)
+		return false;
+	Vehicle *v = FindVehicle(body.netId);
+	if (!v || !v->active)
+		return false;
+	if (v->driverPlayerId != INVALID_PLAYER && v->driverPlayerId != byPlayerId)
+		return false;
+
+	// Anybody still recorded in a seat of it is out: the engine that took it
+	// took them out of it too, and a seat in a car the session no longer has
+	// would keep VehicleNeeded answering for a netId nobody can name.
+	for (Player &p : m_players)
+		if (p.active && p.vehicleNetId == body.netId) {
+			p.vehicleNetId = INVALID_NETID;
+			p.seat         = 0;
+		}
+
+	relay     = body;
+	relay.pad = 0;
+	*v = Vehicle{};
+	return true;
+}
+
 // A traffic car becomes a session car, keeping its number. protocol.h,
 // S_CarPromoted.
 //
@@ -1587,9 +1967,32 @@ Vehicle *Session::PromoteCar(uint16_t netId, uint8_t driverPlayerId,
 		slot = &m_vehicles.back();
 	}
 
+	// A car the running mission made stays the mission's (ReleaseMissionCars).
+	promoted.missionMade = (body.flags & AMBIENT_MISSION) != 0 && m_mission.Running();
+
 	*slot = promoted;
 	*car  = AmbientCar{};
 	return slot;
+}
+
+std::vector<uint16_t> Session::ReleaseMissionCars() {
+	std::vector<uint16_t> released;
+	if (m_mission.Running())
+		return released;   // its cars are still its own
+	for (Vehicle &v : m_vehicles) {
+		if (!v.active || !v.missionMade)
+			continue;
+		v.missionMade = false;
+		bool occupied = v.driverPlayerId != INVALID_PLAYER;
+		for (const Player &p : m_players)
+			if (p.active && p.vehicleNetId == v.netId)
+				occupied = true;
+		if (occupied)
+			continue;
+		released.push_back(v.netId);
+		v = Vehicle{};
+	}
+	return released;
 }
 
 // ---- ambient peds ----------------------------------------------------------
@@ -1677,6 +2080,20 @@ bool Session::NotePedDeath(const PedDeathBody &death, uint8_t byPlayerId) {
 		return false;
 	ped->alive       = false;
 	ped->deathAnimId = death.animId;
+	return true;
+}
+
+bool Session::NotePedRevive(uint16_t netId) {
+	AmbientPed *ped = FindPed(netId);
+	if (!ped || ped->alive)
+		return false;
+	// CAccidentManager::ReportAccident and FindNearestAccident both skip a
+	// MISSION_CHAR (0x004565E7, 0x004567A9), and every mission pedestrian is
+	// one on the machine that made him.
+	if (ped->body.flags & AMBIENT_MISSION)
+		return false;
+	ped->alive       = true;
+	ped->deathAnimId = ANIM_NONE;
 	return true;
 }
 
@@ -1807,6 +2224,60 @@ std::vector<AdoptVerdict> Session::HandOverAmbientOf(uint8_t playerId) {
 			peds.push_back(AdoptPed{p.netId, p.body.pos, p.alive, p.body.pedType, p.vehicleNetId});
 
 	const std::vector<AdoptVerdict> verdicts = PlanAmbientHandover(cars, peds, viewers);
+	ApplyAdoptVerdicts(verdicts);
+	return verdicts;
+}
+
+std::vector<AdoptVerdict> Session::LetGoCar(uint16_t netId, const uint16_t *peds,
+                                            size_t pedCount, uint8_t byPlayerId,
+                                            uint32_t nowMs) {
+	if (byPlayerId == INVALID_PLAYER || byPlayerId >= MAX_PLAYERS)
+		return {};
+	if (pedCount > MAX_LET_GO_PEDS)
+		pedCount = MAX_LET_GO_PEDS;
+
+	std::vector<AdoptPed> mine;
+	for (size_t i = 0; i < pedCount; ++i) {
+		const AmbientPed *p = FindPed(peds[i]);
+		if (!p || p->ownerPlayerId != byPlayerId)
+			continue;
+		bool twice = false;
+		for (const AdoptPed &m : mine)
+			twice = twice || m.netId == p->netId;
+		if (twice)
+			continue;
+		// Sitting in this car whatever his last row said: his host's engine
+		// is taking him out of the world with it.
+		mine.push_back(AdoptPed{p->netId, p->body.pos, p->alive, p->body.pedType, netId});
+	}
+
+	AmbientCar *car = FindCar(netId);
+	if (!car || car->ownerPlayerId != byPlayerId) {
+		std::vector<AdoptVerdict> out;
+		for (const AdoptPed &p : mine)
+			out.push_back(AdoptVerdict{p.netId, AMBIENT_ADOPT_PED, INVALID_PLAYER, 0});
+		ApplyAdoptVerdicts(out);
+		return out;
+	}
+
+	if (car->letGoMask != 0 && nowMs - car->letGoAtMs > CAR_LET_GO_MEMORY_MS)
+		car->letGoMask = 0;
+	car->letGoMask = static_cast<uint8_t>(car->letGoMask | (1u << byPlayerId));
+	car->letGoAtMs = nowMs;
+
+	std::vector<AdoptViewer> viewers;
+	for (const Player &p : m_players)
+		if (p.active && p.havePos && p.alive && p.id < MAX_PLAYERS &&
+		    (car->letGoMask & (1u << p.id)) == 0)
+			viewers.push_back(AdoptViewer{p.id, p.pos});
+
+	const std::vector<AdoptCar> cars{AdoptCar{car->netId, car->body.pos, car->destroyed}};
+	const std::vector<AdoptVerdict> verdicts = PlanAmbientHandover(cars, mine, viewers);
+	ApplyAdoptVerdicts(verdicts);
+	return verdicts;
+}
+
+void Session::ApplyAdoptVerdicts(const std::vector<AdoptVerdict> &verdicts) {
 	for (const AdoptVerdict &v : verdicts) {
 		if (v.kind == AMBIENT_ADOPT_CAR) {
 			AmbientCar *car = FindCar(v.netId);
@@ -1831,7 +2302,6 @@ std::vector<AdoptVerdict> Session::HandOverAmbientOf(uint8_t playerId) {
 			ped->history.Clear();
 		}
 	}
-	return verdicts;
 }
 
 bool Session::NoteCarState(const AmbientCarState &state, uint8_t byPlayerId) {

@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 namespace coopiii {
 class Client;
@@ -369,6 +370,9 @@ struct TagColor {
 
 constexpr TagColor TAG_NAME_COLOR   {233, 230, 222};
 constexpr TagColor TAG_HEALTH_COLOR {186, 101, 50};
+// CHud::Draw's ARMOUR_COLOR, pushed as a CRGBA at 0x00506A20:
+// `push 5Fh / push 8Ch / push 7Ch`.
+constexpr TagColor TAG_ARMOUR_COLOR {124, 140, 95};
 constexpr TagColor TAG_WASTED_COLOR {170, 123, 87};
 constexpr TagColor TAG_SHADOW_COLOR {0, 0, 0};
 
@@ -453,6 +457,34 @@ inline void TagHealth(float health, char *out, size_t size) {
 	std::snprintf(out, size, "%c %d", TAG_HEART, hp);
 }
 
+// A player with the menu up: said after the health line, so the ped
+// standing still with nobody at the keys has its reason over its head.
+inline void TagPaused(char *out, size_t size) {
+	const size_t n = std::strlen(out);
+	if (n + 1 < size)
+		std::snprintf(out + n, size - n, "%sPAUSED", n ? " " : "");
+}
+
+// The HUD's armour glyph in FONT_HEADING, the shield. CHud::Draw writes it
+// the same way as the heart, `mov byte [esp+280h],5Bh` at 0x00506855.
+constexpr char TAG_SHIELD = '[';
+
+// "[ 50" beside the health, or nothing. Shown on the HUD's own terms: CHud::Draw
+// prints armour only while m_fArmour > 1.0f, and a dead player has none to
+// show. The same number, not a bar, for the same reason the health is one.
+inline bool TagArmour(float armour, float health, char *out, size_t size) {
+	if (size == 0)
+		return false;
+	out[0] = '\0';
+	if (!(health > 0.0f) || !(armour > 1.0f))
+		return false;
+	int ap = static_cast<int>(armour + 0.5f);
+	if (ap > 999)
+		ap = 999;
+	std::snprintf(out, size, "%c %d", TAG_SHIELD, ap);
+	return true;
+}
+
 // ---- eight of them at once -------------------------------------------------
 //
 // This is where an overlay like this usually falls apart: a co-op squad stands
@@ -464,6 +496,18 @@ inline void TagHealth(float health, char *out, size_t size) {
 struct TagBox {
 	float left = 0.0f, right = 0.0f, top = 0.0f, bottom = 0.0f;
 };
+
+// The top of the name line: the text column is centred in the box, beside the
+// icon.
+inline float TagTextTop(const TagBox &box, const TagMetrics &m) {
+	return box.top + (box.bottom - box.top - m.columnH) * 0.5f;
+}
+
+// The top of the lowest glyph a tag prints, the health line's shadow. That is
+// the one PrintChar's cull test sees first (game/fontcull.h).
+inline float TagLowestGlyphTop(const TagBox &box, const TagMetrics &m) {
+	return TagTextTop(box, m) + m.nameH + m.lineGap + m.shadow;
+}
 
 inline bool TagBoxesOverlap(const TagBox &a, const TagBox &b, float pad) {
 	return a.left < b.right + pad && b.left < a.right + pad &&

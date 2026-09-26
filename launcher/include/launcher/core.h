@@ -25,6 +25,11 @@ constexpr const char        *GAME_MD5        = "85414BF9EB414D00AD81062360F0DB1F
 constexpr const char *ENV_LAUNCHED = "COOPIII_LAUNCHED";
 constexpr const char *ENV_LAUNCHED_VALUE = "1";
 
+// The lobby's host started everybody's game into a new game (docs/protocol.md
+// 1.31): the client starts one from the menu by itself, the way the menu's
+// own New Game does. Only ever set alongside ENV_LAUNCHED.
+constexpr const char *ENV_NEW_GAME = "COOPIII_NEW_GAME";
+
 // ---- checks ---------------------------------------------------------------
 
 struct Check {
@@ -71,9 +76,12 @@ Checks RunChecks(const std::string &gameDir);
 bool UpdateIni(const std::string &path, const std::string &host, int port,
                const std::string &nick);
 
-// Reads host, port and nick back out, for filling the form in. Missing keys
-// leave their argument alone.
-void ReadIni(const std::string &path, std::string *host, uint16_t *port, std::string *nick);
+// Reads host, port and nick back out, for filling the form in, and the
+// server's password, for the lobby. Missing keys leave their argument alone.
+// The password is cleaned the way the client cleans it: control characters
+// out, and no longer than C_Password carries.
+void ReadIni(const std::string &path, std::string *host, uint16_t *port, std::string *nick,
+             std::string *password = nullptr);
 
 // ---- validation -----------------------------------------------------------
 
@@ -91,10 +99,11 @@ bool ValidHost(const std::string &text);
 
 // ---- starting the game ----------------------------------------------------
 
-// Starts gta3.exe from `gameDir` with the co-op marker in its environment.
-// The working directory is the game folder, because GTA III resolves its data
+// Starts gta3.exe from `gameDir` with the co-op marker in its environment,
+// and with `newGame` the lobby's word to start a new game (ENV_NEW_GAME). The
+// working directory is the game folder, because GTA III resolves its data
 // paths relative to it.
-bool LaunchGame(const std::string &gameDir, std::string *error);
+bool LaunchGame(const std::string &gameDir, std::string *error, bool newGame = false);
 
 // ---- small helpers the front ends share -----------------------------------
 

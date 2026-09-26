@@ -4,6 +4,9 @@
 #include "hook/hook.h"
 #include "log.h"
 #include "pedanim.h"
+#include "leadcheck.h"
+
+#include <windows.h>
 
 #include <cmath>
 #include <cstring>
@@ -14,11 +17,18 @@ namespace {
 namespace obj = ::coopiii::game::object;
 
 ObjectCallbacks g_cb;
+// The session's mission's objects (mission-audit.md R3), game/mission.cpp's.
+MissionObjectBrokenFn g_missionBroken = nullptr;
 ObjectStats     g_stats;
 
 Detour g_damage;      // CObject::ObjectDamage
 Detour g_explosion;   // CWorld::TriggerExplosion
 Detour g_moving;      // CPhysical::AddToMovingList
+
+// Every break and resting place heard of or reported here (object.h,
+// KnownObjects), and whether the population manager's call is ours.
+KnownObjects g_known;
+bool         g_rebuildRedirected = false;
 
 // CObject::ObjectDamage is __thiscall(float). The float does not fit in a
 // register under that convention, so __fastcall with a dummy edx lines up
@@ -324,6 +334,16 @@ void __fastcall HookedObjectDamage(void *self, void * /*edx*/, float amount) {
 	if (g_applying)
 		return;   // this break is one we were told about, not one we saw
 
+	// The session's mission's own, which game/mission.cpp names by its global.
+	if (Field<uint8_t>(self, obj::CREATED_BY) == obj::MISSION_OBJECT) {
+		const BreakCause cause = CauseOf(self);
+		if (g_missionBroken && g_insideExplosion == 0 && cause != BreakCause::REPLICA)
+			g_missionBroken(self, amount,
+			                static_cast<uint8_t>(after | (IsLoose(self) ? OBJ_BREAK_UPROOTED : 0)),
+			                cause == BreakCause::OURS);
+		return;
+	}
+
 	if (!IsMapObject(self) || IsPickupObject(self)) {
 		++g_stats.skippedNotMapObj;
 		return;
@@ -362,6 +382,7 @@ void __fastcall HookedObjectDamage(void *self, void * /*edx*/, float amount) {
 	body.state  = static_cast<uint8_t>(after | (IsLoose(self) ? OBJ_BREAK_UPROOTED
 	                                                          : 0));
 
+	g_known.Add(body.ident);
 	if (g_cb.Broken && g_cb.Broken(body))
 		++g_stats.reported;
 	else
@@ -472,6 +493,7 @@ bool SaneRotation(const ObjectRestBody &body) {
 }
 
 void SetObjectCallbacks(const ObjectCallbacks &callbacks) { g_cb = callbacks; }
+void SetMissionObjectBroken(MissionObjectBrokenFn fn) { g_missionBroken = fn; }
 
 ObjectPoolView LiveObjectPool() {
 	return ViewPool(CPools__ms_pObjectPool, obj::OBJECT_POOL_STRIDE);
@@ -522,23 +544,11 @@ void *FindObjectByIdent(const ObjectPoolView &pool, const ObjectIdent &want,
 
 const ObjectStats &GetObjectStats() { return g_stats; }
 
-void OnObjectBrokenElsewhere(const ObjectBreakBody &body) {
-	++g_stats.received;
+namespace {
 
-	bool  ambiguous = false;
-	void *object    = FindObjectByIdent(LiveObjectPool(), body.ident, &ambiguous);
-	if (ambiguous)
-		++g_stats.identCollisions;
-
-	if (!object) {
-		// Ordinary, not an error. Their player is standing next to it and
-		// ours is not, so our copy is a CDummyObject 80 m outside the
-		// conversion range and there is nothing here to break. Walking over
-		// there builds a pristine one, which is what single player does too.
-		++g_stats.receivedUnmatched;
-		return;
-	}
-
+// A break somebody else's machine reported, carried out on our copy: the
+// uproot first, then the engine's own ObjectDamage as many times as it takes.
+void ApplyBreak(void *object, float wireAmount, uint8_t state) {
 	// Their copy came loose. Drop ours now rather than leaving it standing
 	// until the resting place arrives - the fall is the half of this the
 	// player is looking at, and a post that stands for a second and then
@@ -550,7 +560,7 @@ void OnObjectBrokenElsewhere(const ObjectBreakBody &body) {
 	// there is the second node client/src/game/movinglist.h exists to clean
 	// up after. Nothing here unlinks anything either - CWorld::Process does
 	// that itself the moment bIsStatic goes back on.
-	if ((body.state & OBJ_BREAK_UPROOTED) && !IsLoose(object)) {
+	if ((state & OBJ_BREAK_UPROOTED) && !IsLoose(object)) {
 		Field<uint8_t>(object, offs::ENTITY_FLAGS_A) &=
 		    static_cast<uint8_t>(~offs::ENTITY_IS_STATIC);
 		g_applying = true;
@@ -560,7 +570,7 @@ void OnObjectBrokenElsewhere(const ObjectBreakBody &body) {
 	}
 
 	const uint8_t local   = BreakStateOf(object);
-	int           replays = BreakReplaysNeeded(local, body.state);
+	int           replays = BreakReplaysNeeded(local, state);
 	if (replays == 0) {
 		++g_stats.receivedNoop;
 		return;
@@ -577,7 +587,7 @@ void OnObjectBrokenElsewhere(const ObjectBreakBody &body) {
 	// leave the object standing here and gone there. The receiver is not
 	// deciding anything by doing this - the reporter already decided, and this
 	// is how the decision is carried out.
-	float amount = body.amount;
+	float amount = wireAmount;
 	const float multiplier = Field<float>(object, obj::DAMAGE_MULTIPLIER);
 	if (multiplier > 0.0f) {
 		const float needed = (obj::OBJECT_DAMAGE_THRESHOLD / multiplier) * 1.01f;
@@ -596,7 +606,38 @@ void OnObjectBrokenElsewhere(const ObjectBreakBody &body) {
 		++g_stats.applyFailed;
 }
 
+}  // namespace
+
+void OnObjectBrokenElsewhere(const ObjectBreakBody &body) {
+	g_known.Add(body.ident);
+	++g_stats.received;
+
+	bool  ambiguous = false;
+	void *object    = FindObjectByIdent(LiveObjectPool(), body.ident, &ambiguous);
+	if (ambiguous)
+		++g_stats.identCollisions;
+
+	if (!object) {
+		// Ordinary, not an error. Their player is standing next to it and
+		// ours is not, so our copy is a CDummyObject 80 m outside the
+		// conversion range and there is nothing here to break. Walking over
+		// there builds a pristine one, which is what single player does too.
+		++g_stats.receivedUnmatched;
+		return;
+	}
+
+	ApplyBreak(object, body.amount, body.state);
+}
+
+void ApplyMissionObjectBreak(void *object, float amount, uint8_t state) {
+	if (!object || Field<uint8_t>(object, obj::CREATED_BY) != obj::MISSION_OBJECT)
+		return;
+	++g_stats.received;
+	ApplyBreak(object, amount, state);
+}
+
 void OnObjectSettledElsewhere(const ObjectRestBody &body) {
+	g_known.Add(body.ident);
 	++g_stats.restsReceived;
 
 	bool  ambiguous = false;
@@ -697,6 +738,7 @@ void TickUprootedObjects() {
 		}
 
 		const ObjectRestBody body = RestOf(w.object, w.ident);
+		g_known.Add(w.ident);
 		if (g_cb.Settled && g_cb.Settled(body))
 			++g_stats.restsSent;
 		else
@@ -706,6 +748,95 @@ void TickUprootedObjects() {
 	}
 }
 
+bool KnownObjects::Contains(const ObjectIdent &ident) const {
+	for (size_t i = 0; i < count; ++i)
+		if (SameObject(ring[i], ident))
+			return true;
+	return false;
+}
+
+void KnownObjects::Add(const ObjectIdent &ident) {
+	if (Contains(ident))
+		return;
+	ring[next] = ident;
+	next       = (next + 1) % kKnownObjects;
+	if (count < kKnownObjects)
+		++count;
+}
+
+namespace {
+
+using ConvertToRealObjectFn = void(__cdecl *)(void *dummy);
+
+// Points the `call` at `site` at `to`, only while it still calls `from`.
+bool RedirectCall(uintptr_t site, uintptr_t from, uintptr_t to) {
+	if (!RelCallAt(Ptr<uint8_t>(site), site, from))
+		return false;
+	DWORD old = 0;
+	if (!VirtualProtect(reinterpret_cast<void *>(site), 5, PAGE_EXECUTE_READWRITE, &old))
+		return false;
+	const int32_t rel = static_cast<int32_t>(to - (site + 5));
+	std::memcpy(reinterpret_cast<void *>(site + 1), &rel, sizeof rel);
+	VirtualProtect(reinterpret_cast<void *>(site), 5, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void *>(site), 5);
+	return true;
+}
+
+// CPopulation::ManagePopulation building a map object back out of its
+// dummy, because this machine's player has come within 80 m of it. The
+// engine's own conversion runs untouched; what is added is the question, for
+// an object the session told us was broken. The dummy is deleted inside the
+// call, so what names it is read first: the dummy sits at the map's own
+// placement, which is exactly the m_objectMatrix the new object will carry.
+void __cdecl RebuiltHere(void *dummy) {
+	bool ask = false;
+	ObjectIdent ident{};
+	if (dummy && g_known.count != 0) {
+		const float *p   = &Field<float>(dummy, offs::POSITION);
+		ident.pos.x      = p[0];
+		ident.pos.y      = p[1];
+		ident.pos.z      = p[2];
+		ident.modelIndex = Field<int16_t>(dummy, offs::MODEL_INDEX);
+		ask              = g_known.Contains(ident);
+	}
+	Func<ConvertToRealObjectFn>(obj::CPopulation__ConvertToRealObject)(dummy);
+	if (!ask || !g_cb.Rebuilt || !g_cb.HaveSession || !g_cb.HaveSession())
+		return;
+	g_cb.Rebuilt(ident);
+	if (g_stats.rebuildsAsked++ == 0)
+		Log("object: built model %d at (%.1f %.1f %.1f) again after going away from it, and "
+		    "it was broken; asked the session how it was left",
+		    static_cast<int>(ident.modelIndex), ident.pos.x, ident.pos.y, ident.pos.z);
+}
+
+void RedirectRebuilds() {
+	if (g_rebuildRedirected)
+		return;
+	g_rebuildRedirected =
+	    RedirectCall(obj::ManagePopulation_ConvertToRealObjectCall,
+	                 obj::CPopulation__ConvertToRealObject,
+	                 reinterpret_cast<uintptr_t>(&RebuiltHere));
+	if (g_rebuildRedirected)
+		Log("object: the population manager's ConvertToRealObject at 0x%08X is ours - a "
+		    "broken street object stays broken for a player who went away and came back",
+		    static_cast<unsigned>(obj::ManagePopulation_ConvertToRealObjectCall));
+	else
+		Log("object: 0x%08X is not ManagePopulation's call to ConvertToRealObject in this "
+		    "image - a broken street object stands up again for a player who leaves and "
+		    "comes back",
+		    static_cast<unsigned>(obj::ManagePopulation_ConvertToRealObjectCall));
+}
+
+void UndoRebuilds() {
+	if (g_rebuildRedirected &&
+	    RedirectCall(obj::ManagePopulation_ConvertToRealObjectCall,
+	                 reinterpret_cast<uintptr_t>(&RebuiltHere),
+	                 obj::CPopulation__ConvertToRealObject))
+		g_rebuildRedirected = false;
+}
+
+}  // namespace
+
 bool InstallObjectHooks() {
 	g_stats           = ObjectStats{};
 	g_insideExplosion = 0;
@@ -713,6 +844,10 @@ bool InstallObjectHooks() {
 	g_watchedCount    = 0;
 	for (Watched &w : g_watched)
 		w = Watched{};
+	g_known.Clear();
+	// Separate from the three detours and not fatal to them: without it a
+	// break is still shared, and stands up again for a player who leaves.
+	RedirectRebuilds();
 
 	const bool damage = g_damage.Install(
 	    "CObject::ObjectDamage",
@@ -779,6 +914,8 @@ void RemoveObjectHooks() {
 	g_damage.Remove();
 	g_explosion.Remove();
 	g_moving.Remove();
+	UndoRebuilds();
+	g_known.Clear();
 	g_insideExplosion = 0;
 	g_applying        = false;
 	g_watchedCount    = 0;

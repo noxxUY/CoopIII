@@ -209,6 +209,13 @@ uint32_t NetServer::RoundTripMs(PeerId peer) const {
 	return m_host->peers[peer].roundTripTime;
 }
 
+uint32_t NetServer::PeerTimeoutMaxMs(PeerId peer) const {
+	if (!m_host || peer >= m_host->peerCount ||
+	    m_host->peers[peer].state != ENET_PEER_STATE_CONNECTED)
+		return 0;
+	return m_host->peers[peer].timeoutMaximum;
+}
+
 void NetServer::Disconnect(PeerId peer, uint8_t reason) {
 	if (!m_host || peer >= m_host->peerCount)
 		return;
@@ -233,6 +240,10 @@ void NetServer::Service(std::vector<ServerEvent> &out, uint32_t timeoutMs) {
 
 		switch (ev.type) {
 		case ENET_EVENT_TYPE_CONNECT:
+			// Per connection: ENet puts a peer's timeouts back to its own
+			// defaults whenever the slot is reset.
+			enet_peer_timeout(ev.peer, NET_PEER_TIMEOUT_LIMIT, NET_PEER_TIMEOUT_MIN_MS,
+			                  NET_PEER_TIMEOUT_MAX_MS);
 			se.type = ServerEvent::CONNECT;
 			out.push_back(std::move(se));
 			break;

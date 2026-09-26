@@ -92,9 +92,10 @@ inline bool WantedPeerRaisesFloor(uint8_t rule, uint16_t ourCarNetId,
 // own.** That one comparison is the whole of the earned-versus-granted
 // bookkeeping, and it needs no hook: if the level is exactly where CoopIII
 // left it, CoopIII learned nothing this tick and must not overwrite what it
-// knows. If it is anywhere else, the engine moved it - a crime, a death, a
-// bust, a bribe pickup, a Pay'n'Spray - and that new number is this player's
-// own by definition.
+// knows. If it is higher, the engine moved it with a crime and the new number
+// is this player's own. If it is lower - a death, a bust, a bribe pickup, a
+// Pay'n'Spray - `own` can only come down with it, never up to it
+// (docs/wanted.md §4.9).
 //
 // **`write` is false when the target and the engine already agree**, and that
 // is what makes the feature invisible to a player who is alone with their
@@ -119,7 +120,16 @@ inline WantedPlan PlanWanted(uint8_t rule, uint8_t engine, uint8_t applied,
 		floor = WANTED_LEVEL_CEILING;
 
 	// The engine moved by itself since we last looked.
-	if (engine != applied)
+	//
+	// Up is a crime, and the new level is this player's own. Down is a death,
+	// a bust, a bribe, a spray, a script or the one-star decay, and it can
+	// only ever take away: a borrowed level that the engine brought down a
+	// star is still mostly borrowed, and reading the whole of what is left as
+	// earned would turn one bribe into a level that outlives the player who
+	// actually earned it.
+	if (engine > applied)
+		own = engine;
+	else if (engine < applied && engine < own)
 		own = engine;
 	if (own > WANTED_LEVEL_CEILING)
 		own = WANTED_LEVEL_CEILING;
@@ -153,6 +163,93 @@ inline WantedPlan PlanWanted(uint8_t rule, uint8_t engine, uint8_t applied,
 	plan.applied  = plan.target;
 	plan.borrowed = plan.target > plan.own;
 	return plan;
+}
+
+// ---- coming down (docs/wanted.md §4.9) ------------------------------------
+//
+// The rule above only ever looks at the last snapshot each player sent, and a
+// snapshot is 40 ms to a round trip old. So the moment our stars come down -
+// a Pay'n'Spray, a bribe, a mission's CLEAR_WANTED_LEVEL, a death - every
+// other player is still reporting the level they had a moment ago, and the
+// floor puts ours straight back. That is the respray bug: the spray shop
+// cleared the stars and the next tick raised them again off a car-mate, or in
+// `shared` off whoever else held the session's level, before either had heard
+// of the respray.
+//
+// The answer is a hold. Whoever was reporting more than we now have counts
+// for no more than what we now have, until they report less than they did -
+// they came down too - or until WANTED_HOLD_MS has passed, after which they
+// are simply still wanted and count again. The second half is what keeps a
+// hold from ever being a way out: a car-mate who did not come down raises us
+// again three seconds later, which is the vehicle rule, and in `shared` a
+// player who earned stars of their own still gives them to the session.
+//
+// A cap rather than a plain "does not count", because a bribe takes one star
+// and not all of them: after one, the session's four is a three everywhere,
+// and a player still reporting four for a few more ticks has to go on
+// counting as that three.
+
+constexpr uint32_t WANTED_HOLD_MS = 3000;
+
+// Our level has just come down to `cap`; start or restart the hold on a
+// player whose last report was `reported`. Nothing to hold when they already
+// have no more than we do.
+inline void HoldWantedPeer(WantedHold &hold, uint8_t reported, uint8_t cap,
+                           uint32_t nowMs) {
+	if (reported <= cap) {
+		hold = WantedHold{};
+		return;
+	}
+	hold.above   = reported;
+	hold.cap     = cap;
+	hold.sinceMs = nowMs;
+}
+
+// What this player's report counts for right now, ending the hold when its
+// reason has gone: they reported less than when it began, or it has run out.
+inline uint8_t CountedWantedLevel(WantedHold &hold, uint8_t reported,
+                                  uint32_t nowMs) {
+	if (hold.above == 0)
+		return reported;
+	if (reported < hold.above ||
+	    static_cast<uint32_t>(nowMs - hold.sinceMs) >= WANTED_HOLD_MS) {
+		hold = WantedHold{};
+		return reported;
+	}
+	return reported < hold.cap ? reported : hold.cap;
+}
+
+// Does another player's Pay'n'Spray or bribe reach us?
+//
+//   shared    - yes, wherever they are. The session holds one level, so what
+//               takes it away takes it away for everybody.
+//   perplayer - only if we are in the car they were in. The vehicle rule says
+//               a car's occupants share the highest level among them, so a
+//               respray that cleared only the driver would be undone by the
+//               passenger on the next tick - the reported bug, in this rule.
+//               Anyone else's stars were never theirs to take.
+//   off       - there is nothing to take.
+//
+// INVALID_NETID for either car means on foot, or a car the session never
+// heard of, and matches nothing.
+inline bool WantedEventReaches(uint8_t rule, uint16_t ourCarNetId,
+                               uint16_t theirCarNetId) {
+	switch (rule) {
+	case WANTED_RULE_SHARED:
+		return true;
+	case WANTED_RULE_PERPLAYER:
+		return ourCarNetId != INVALID_NETID && ourCarNetId == theirCarNetId;
+	default:
+		return false;
+	}
+}
+
+// Where our engine should be after the events that reached us: zero for a
+// respray, one star fewer per bribe, never below zero.
+inline uint8_t WantedAfterEvents(uint8_t engine, bool clear, uint8_t starsOff) {
+	if (clear)
+		return 0;
+	return engine > starsOff ? static_cast<uint8_t>(engine - starsOff) : uint8_t(0);
 }
 
 } // namespace coopiii::game

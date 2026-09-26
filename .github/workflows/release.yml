@@ -52,8 +52,8 @@ jobs:
         run: |
           set -e
           out=build/windows/x86/release
-          for suite in interptest basetest clienttest patterntest sessiontest hooktest \
-                       uitest launchertest configtest installertest; do
+          for suite in interptest basetest clienttest patterntest sessiontest servertest \
+                       hooktest uitest launchertest configtest installertest; do
             xmake build -q "$suite"
             printf '%-16s' "$suite"
             "./$out/$suite.exe" > /dev/null && echo "ok" || { echo "FAILED"; "./$out/$suite.exe"; exit 1; }

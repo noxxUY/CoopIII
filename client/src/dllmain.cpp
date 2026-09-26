@@ -12,19 +12,33 @@
 #include "client.h"
 #include "clock.h"
 #include "config.h"
+#include "game/carextras.h"
 #include "game/chat.h"
 #include "game/cheats.h"
 #include "game/combat.h"
+#include "game/copcrime.h"
+#include "game/cutsceneskip.h"
 #include "game/darkel.h"
+#include "game/carremoval.h"
+#include "game/carletgo.h"
+#include "game/crowdrange.h"
+#include "game/emergency.h"
+#include "game/fontcull.h"
 #include "game/frame.h"
 #include "game/garage.h"
+#include "game/gates.h"
 #include "game/heli.h"
 #include "game/heligun.h"
 #include "game/liftbridge.h"
+#include "game/radio.h"
 #include "game/lights.h"
+#include "game/mine.h"
+#include "game/mission.h"
 #include "game/money.h"
 #include "game/nametag.h"
+#include "game/newgame.h"
 #include "game/object.h"
+#include "game/passengeraim.h"
 #include "game/pause.h"
 #include "game/ped.h"
 #include "game/pickup.h"
@@ -32,9 +46,15 @@
 #include "game/population.h"
 #include "game/radar.h"
 #include "game/rampagevote.h"
+#include "game/ridecam.h"
+#include "game/runover.h"
+#include "game/social.h"
+#include "game/replicacalm.h"
+#include "game/stunt.h"
 #include "game/scoreboard.h"
 #include "game/seat.h"
 #include "game/sessionclock.h"
+#include "game/sidejob.h"
 #include "game/trains.h"
 #include "game/vehicle.h"
 #include "game/wanted.h"
@@ -75,7 +95,13 @@ void PreFrame() {
 	// whether to update the world. game/pause.h has the full reasoning.
 	game::ClearPauseForTheWorld();
 	g_client.PreFrame();
+	game::TickSocial();
 	game::TickChat();
+	// Once, on the first frame: here because no glyph is being printed
+	// (game/fontcull.cpp).
+	game::FixFontCull();
+	// A participant's $ONMISSION, held before this frame's scripts run.
+	game::TickMissions();
 
 	// The moving-list sweep does NOT run from here any more when the
 	// CWorld::Process detour took - it runs on entry to CWorld::Process,
@@ -97,10 +123,19 @@ void PreFrame() {
 	// player who touched the skull. Before CGame::Process, so a move to
 	// another island is seen by this frame's CCollision::Update.
 	game::TickRampageVote();
+
+	// Skipping a cutscene together: what this game is in, for the server, and
+	// a skip the others agreed on. Before CGame::Process, whose
+	// CCutsceneMgr::Update is where the skip input is read.
+	game::TickCutsceneSkip();
 }
 
 void PostFrame() {
 	g_client.PostFrame();
+
+	// The session's mission's blue markers, drawn after this frame's scripts
+	// the way the owner's own checks draw them, and before the frame is.
+	game::DrawMissionMarkers();
 
 	// After CGame::Process, which is exactly where CPhysical::ProcessControl
 	// has just finished deciding whether each loose object is asleep. Walks
@@ -222,6 +257,19 @@ DWORD WINAPI Boot(LPVOID) {
 		return 0;
 	}
 
+	// The lobby's host started everybody's game into a new game
+	// (docs/protocol.md 1.31): once the menu is up, it starts one the way its
+	// New Game does. Hooked before the game runs, the one thing that is, since
+	// the game only runs once somebody has left the menu.
+	if (const char *fresh = std::getenv("COOPIII_NEW_GAME"); fresh && fresh[0] == '1') {
+		if (HookInit() && game::ArmNewGameFromMenu())
+			Log("newgame: the lobby's host started a new game for everybody, and it starts "
+			    "by itself once the menu is up");
+		else
+			Log("newgame: the lobby's host started a new game for everybody, but the menu "
+			    "could not be hooked, so pick New Game yourself");
+	}
+
 	if (!game::WaitForGameLoop(GAME_LOOP_TIMEOUT_MS)) {
 		Log("no game was started within %u minutes, giving up without "
 		    "installing anything. Start or load a game and relaunch.",
@@ -273,6 +321,25 @@ DWORD WINAPI Boot(LPVOID) {
 		Log("CoopIII: combat is not fully hooked; firing, explosions and damage "
 		    "may not reach other players");
 
+	// A car another player drives, hitting us: priced by its speed, and
+	// friendly fire decides whether it costs health. Not fatal.
+	game::InstallRunOverHooks();
+
+	// Whom the lock-on picks, what a respawn clears, whose honk scatters a
+	// crowd and whose foot the engine sound follows (game/social.h). Not
+	// fatal: whatever does not install is the engine's own behaviour.
+	game::InstallSocialHooks(g_client);
+	// A remote player's copy neither side-steps when bumped nor, as a
+	// passenger, looks round at passers-by. Cosmetic, not fatal.
+	game::InstallReplicaCalm();
+
+	// The stunt threads' question about a car in the air, answered no for a
+	// car somebody else's engine moves. Not fatal.
+	game::InstallStuntGuard();
+
+	// The odd jobs' key, heard from the wheel only (game/sidejob.h). Not fatal.
+	game::InstallSideJobKey();
+
 	// A remote player's arms up or down with their aim. Cosmetic: the shot
 	// itself is aimed off C_Shot's direction whether this installs or not.
 	game::InstallAimPitchHook();
@@ -296,6 +363,24 @@ DWORD WINAPI Boot(LPVOID) {
 	// same thing and wires nothing if the door is shut.
 	if (!game::InstallPopulationHooks())
 		Log("CoopIII: ambient pedestrians stay local to each machine");
+	// Reads the replica index, so after it. Not fatal: without it somebody
+	// else's policeman is a civilian to our wanted level.
+	game::InstallCopCrimeHook();
+	// Medics and fire trucks (game/emergency.h). Reads the replica index and
+	// the car tables, so after both. Not fatal: whatever is not taken stays
+	// each machine's own, as it always was.
+	game::InstallEmergencyHooks();
+	// The crusher, the crane and the garages (game/carremoval.h). Reads the
+	// car tables, so after them. Not fatal: whatever is not taken goes on
+	// acting on every machine's own copy, as it always did.
+	game::InstallCarRemovalHooks();
+	// Other machines' traffic kept out of a wanted player's police count
+	// (game/crowdrange.h). Not fatal: without it he may see few police cars.
+	game::InstallCrowdRange();
+	// A car of ours our engine drops beside another player is handed to him
+	// (game/carletgo.h). Not fatal: without it such a car is despawned in
+	// front of him, as it always was.
+	game::InstallCarLetGo();
 
 	// Cheats (game/cheats.h). Not fatal: without the first detour every cheat
 	// runs where it was typed, which is what it always did; without the second
@@ -318,6 +403,10 @@ DWORD WINAPI Boot(LPVOID) {
 	// bridge.
 	game::InstallLightClock();
 	game::InstallLiftBridgeClock();
+	// The car radio (game/radio.h): three calls in the music manager pointed
+	// at us, none fatal. Without them every copy of a car plays its own
+	// station from wherever its own machine left it, as it always has.
+	game::InstallRadioSync();
 
 	// The police helicopter (game/heli.h). Six detours, none fatal: without
 	// them each wanted player's helicopter is his machine's alone, which is
@@ -339,10 +428,16 @@ DWORD WINAPI Boot(LPVOID) {
 	// addresses, different file, no entities involved.
 	game::AddWorldToBridge(bridge);
 	game::AddSessionClockToBridge(bridge);
+	game::AddRadioToBridge(bridge);
+	game::AddCarExtrasToBridge(bridge);
 	game::AddVehicleBlastToBridge(bridge);
 	game::SetSeatKey(g_config.seatKey);
 	game::AddSeatToBridge(bridge);
+	game::AddRideCameraToBridge(bridge);
 	game::AddPopulationToBridge(bridge);
+	game::AddEmergencyToBridge(bridge);
+	game::AddCarRemovalToBridge(bridge);
+	game::AddCrowdRangeToBridge(bridge);
 	// The wanted level. Two reads and one write into the local player's own
 	// CWanted, and nothing else: the police are ambient entities that
 	// AddPopulationToBridge above has been replicating all along
@@ -355,11 +450,18 @@ DWORD WINAPI Boot(LPVOID) {
 	game::AddHeliGunToBridge(bridge);
 	game::AddCheatsToBridge(bridge);
 	game::AddMoneyToBridge(bridge);
+	// The session's one mission (game/mission.h). Seven detours on the script
+	// engine's range handlers, and only with `missions = on`: the addresses are
+	// III.CLEO's and plugin-sdk's, not yet this project's own proof. Without it
+	// every mission stays this machine's own, as it always has.
+	game::InstallMissionHooks(g_config.missions, g_client);
+	game::AddMissionsToBridge(bridge);
 	game::SetChatKeys(g_config.chatKey, g_config.listKey);
 	game::SetScoreboardKey(g_config.scoreboardKey);
 	game::SetScoreboardServer(g_config.host, g_config.port);
 	game::SetVersionMarkShown(g_config.showVersion);
 	game::AddChatToBridge(bridge);
+	game::AddSocialToBridge(bridge);
 
 	// Pickups. One detour, on CPickups::Update, and it is the only way a
 	// pickup can be collected in this build - docs/pickups.md 3 has the
@@ -385,6 +487,15 @@ DWORD WINAPI Boot(LPVOID) {
 		Log("CoopIII: doors and garages are local to each machine");
 
 	game::AddGaragesToBridge(bridge);
+	// And main.scm's seven gates, the same union (game/gates.h). No detour of
+	// its own: it reads SLIDE_OBJECT through the mission hooks.
+	game::AddGatesToBridge(bridge);
+
+	// The mines a mission drops go off on every machine, whichever sees it
+	// first. Not fatal: without it each machine's mines are its own.
+	if (!game::InstallMineHooks())
+		Log("CoopIII: mines go off on each machine by itself");
+	game::AddMinesToBridge(bridge);
 
 	game::AddPickupsToBridge(bridge);
 	// The outbound half of the pickup seam, wired only once there is a
@@ -497,6 +608,7 @@ DWORD WINAPI Boot(LPVOID) {
 		// collision in single player and then try to send into a dead socket.
 		objects.HaveSession = []() { return g_client.IsConnected(); };
 		objects.IsHost      = []() { return g_client.IsHost(); };
+		objects.Rebuilt     = [](const ObjectIdent &ident) { g_client.ReportObjectRebuilt(ident); };
 		game::SetObjectCallbacks(objects);
 	}
 
@@ -530,6 +642,23 @@ DWORD WINAPI Boot(LPVOID) {
 	// The vote before a rampage. Nothing hooked; ticked from PreFrame.
 	game::InstallRampageVote(g_client);
 
+	// Skipping a cutscene together. Two call sites, no detour: the skip input's
+	// call to FinishCutscene and the intro's button test (game/cutsceneskip.h).
+	// Not fatal: without the first every skip stays this machine's own.
+	game::InstallCutsceneSkip(g_client);
+
+	// A rider's camera: the car he rides in corrected before the frame's
+	// camera follows it, and the driver's unique jump shot on his screen
+	// (game/ridecam.h). Three call sites, no detour. Not fatal.
+	game::InstallRideCamera(g_client);
+
+	// A passenger's gun: the on-foot mouse camera around him with its four
+	// collision calls taken so it ignores his car, and his rounds through
+	// CWeapon::Fire (game/passengeraim.h). Ticked from the camera call above,
+	// so nothing without it. Not fatal.
+	if (game::RideCameraOrderTaken())
+		game::InstallPassengerAim();
+
 	Log("CoopIII ready");
 	return 0;
 }
@@ -561,16 +690,26 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			// radar is on screen, so the detour goes before the client does.
 			game::RemoveRadarArrows();
 			game::RemoveRampageVote();
+			game::RemoveCutsceneSkip();
+			game::RemovePassengerAim();
+			game::RemoveRideCamera();
 			g_client.Stop();
 			game::RemovePausePolicy();
 			game::RemoveTrainClock();
 			game::RemovePlaneClock();
 			game::RemoveLightClock();
 			game::RemoveLiftBridgeClock();
+			game::RemoveRadioSync();
 			// Before the frame hook, and before MinHook goes away. Removing
 			// the combat detours ends every projectile CoopIII was animating
 			// for somebody else, and that has to happen while the detour
 			// keeping them from exploding is still installed.
+			game::RemoveRunOverHooks();
+			game::RemoveSocialHooks();
+			game::RemoveReplicaCalm();
+			game::RemoveMineHooks();
+			game::RemoveStuntGuard();
+			game::RemoveSideJobKey();
 			game::RemoveCombatHooks();
 			game::RemoveAimPitchHook();
 			game::RemoveLookHook();
@@ -590,6 +729,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			game::RemoveCheatHooks();
 			// After Client::Stop, which has told it the session is over.
 			game::RemoveMoneyHook();
+			game::RemoveCopCrimeHook();
+			game::RemoveEmergencyHooks();
+			game::RemoveCarRemovalHooks();
+			game::RemoveCrowdRange();
+			game::RemoveCarLetGo();
+			game::RemoveMissionHooks();
 			// After Client::Stop, which has already destroyed every replica.
 			// The peds this machine hosts are left alone: they are the engine's
 			// own pedestrians and go on being pedestrians without us.

@@ -417,8 +417,10 @@ And the case that must *not* drop: A and B each independently earn three. Both
 report `(3, own)`, because neither one's level was ever written by CoopIII.
 Each one's floor is three, which equals what they already hold, so nothing is
 written and neither is marked borrowed. A dies; A's floor is B's three and A is
-raised straight back to three, which is what "the whole session shares the
-highest level" means and is the mode working rather than failing.
+raised back to three, which is what "the whole session shares the highest
+level" means and is the mode working rather than failing. (Since §4.9 that is
+three seconds after the death rather than on the next tick: B's three is held
+until it is clear B did not die too.)
 
 ### 4.6 The whole decision, as arithmetic
 
@@ -432,10 +434,13 @@ engine  = the engine's current m_nWantedLevel
 applied = the level CoopIII last left it at
 own     = the level this player reached without help
 
-if (engine != applied)        own = engine       the engine moved by itself:
-                                                 a crime, a death, a bust,
-                                                 a bribe, a Pay'n'Spray
-floor  = Floor(rule, roster)
+if (engine > applied)         own = engine       the engine moved up by
+                                                 itself: a crime
+if (engine < applied)         own = min(own, engine)
+                                                 down by itself: a death, a
+                                                 bust, a bribe, a spray. It
+                                                 only takes away (§4.9)
+floor  = Floor(rule, roster)                     with held players capped (§4.9)
 target = rule == Off ? 0 : max(own, floor)
 if (target != engine)         Write(target)
 if (rule == PerPlayer)        own = target       a borrowed star becomes yours
@@ -493,6 +498,95 @@ radius of that lie is exactly the blast radius of getting into their car and
 shooting a policeman, which any client can already do honestly, so there is
 nothing here worth a trust mechanism.
 
+### 4.9 Coming down: the Pay'n'Spray that did nothing, 2026-09-26
+
+**Reported from a live session:** a player resprayed their car and the stars
+stayed. The spray shop did clear them — the engine's respray arm calls
+`CWanted::Reset` at `0x004226FB` whatever the level was — and the very next
+send tick put them back.
+
+**Why.** §4.6 folds the other players' *last snapshots* into a floor, and a
+snapshot is anything from 40 ms to a round trip old. At the instant the respray
+cleared the payer, every other machine was still reporting the level it had a
+moment before, and nothing had told any of them to do otherwise:
+
+- `perplayer`, two players in one car: the payer clears, the passenger (who
+  adopted the payer's stars, §4.4) is still reporting four, the vehicle rule
+  raises the payer straight back to four and the payer adopts it. Nothing
+  ever brings either of them down. This is the one that was seen.
+- `shared`: the payer clears, whoever earned the session's level is still
+  reporting it, the payer is raised back to it. The respray only ever worked
+  when the payer happened to be the only player holding a level of their own.
+
+It is the same shape as the §4.5 deadlock, one step earlier: not two machines
+echoing each other forever, but one stale report undoing an event that the
+other machines had not yet heard of — and, in `perplayer`, never would.
+
+**The fix is two halves, and neither adds a packet.**
+
+1. **The events that end a level for more than one player travel.** A
+   respray is already `S_Respray` (§1.16 of `protocol.md`), and a bribe is
+   already an `S_PickupTaken` carrying `PICKUP_F_BRIBE`. A receiver the rule
+   reaches (`WantedEventReaches`) writes its own level down through
+   `CPlayerPed::SetWantedLevel` — to zero for a respray, one star fewer for a
+   bribe — from `TickWanted`, where it waits if there is no player ped yet.
+   The write is recorded as CoopIII's, not as the player's (`applied` moves
+   with it and `own` is only ever lowered), so it does not read back as a
+   level this player reached by themselves.
+2. **A hold.** Whenever this machine's level comes down — by its own engine
+   or by (1) — every player who was reporting more counts for no more than
+   the new level until they report *less than they did*, or until
+   `WANTED_HOLD_MS` (3 s) has passed. `HoldWantedPeer` and
+   `CountedWantedLevel` in `client/src/game/wanted.h`; one per remote player,
+   in `RemotePlayer::wantedHold`.
+
+The hold's two exits are the design, not details:
+
+- *They reported less* is how a player who heard of the respray, or died
+  too, or ran the same mission clear, lets go of us as soon as they have.
+- *Three seconds* is what stops a hold from being a way out. A car-mate who
+  did not come down — they were never told, or it was a cheat of ours — is
+  simply still wanted after that, and the vehicle rule gives us their stars
+  again. In `shared`, a player who really earned stars of their own gives
+  them to the session again. The hold only ever discounts a report that
+  might be from before the fall.
+
+It is a cap rather than a plain "does not count" because a bribe takes one
+star and not all of them: after one, the session's four is a three
+everywhere, and a player still reporting four for a few ticks has to go on
+counting as that three rather than as nothing.
+
+**`own` only ever goes down when the engine comes down.** §4.6 used to read
+any engine move as the player's own level. A borrower whose engine loses a
+star to a bribe would have become the *earner* of the three that was left, and
+that three would then outlive the player who actually earned it — the §4.5
+deadlock again, reached through a pickup. `PlanWanted` now takes the engine's
+level as `own` when it goes up (a crime) and lowers `own` to it when it comes
+down, never raises it.
+
+**Which clears reach whom.** Written down because every one of these was a
+choice:
+
+| What brings it down | `perplayer` | `shared` |
+|---|---|---|
+| Pay'n'Spray | the payer, and everybody in the car the respray names | everybody |
+| Bribe pickup | the collector, and everybody in the car they are in | everybody, one star |
+| Death, bust | only that player; a car-mate still in the same car gives theirs back after the hold | only that player; if somebody else earned stars of their own, the session's come back after the hold. If the dead player was the only earner, everybody's go with it (§4.5) |
+| `CLEAR_WANTED_LEVEL`, `ALTER_WANTED_LEVEL` in a mission | every participant, because the mission replays them on every participant's machine (`client/src/game/replay.h`, including the per-helper `STORE_WANTED_LEVEL` save and restore from each machine's own global). The hold is what stops two participants in one car re-raising each other in the moment between the owner's clear and the helper's | the same; a player outside the mission who earned stars of their own still gives them to the session |
+| NOPOLICEPLEASE | only the typist (`docs/cheats.md`, a personal cheat) | only the typist |
+| The one-star decay (§2.2) | only that player | only that player. A borrower's single star can decay on its own and comes back after the hold while the earner still holds one — a known flicker, and a star every half a minute at worst |
+| `wanted = off` | — | — |
+
+The server still does nothing here (§4.8). It never held a level to keep
+high; the only thing that kept one high was the clients' own floors.
+
+**Not measured in the game.** Every case above is in `tools/clienttest`
+(`TestAResprayIsNotUndoneByACarMate`, `TestAResprayClearsTheWholeCar`,
+`TestAResprayClearsASharedSession`, `TestABribeTakesAStarOffASharedSession`,
+`TestOurOwnBribeWhileBorrowing`, `TestABribeDoesNotMakeABorrowerAnEarner`,
+`TestWantedHoldArithmetic`), against the recording bridge. What a live run has
+to confirm is §7's last three items.
+
 ---
 
 ## 5. Addresses this needs
@@ -522,6 +616,24 @@ table `0x005EEC40`, 85 entries).
 ## 6. What this costs, honestly
 
 ### 6.1 Shared mode can crowd the streets, and the gate is named
+
+**What starved a wanted player of police, fixed 2026-09-25.**
+`GenerateOneRandomCar`'s police arm (0x00416746) only runs after both of the
+generator's gates, and both count every traffic replica built here. Until
+`population.md` §2.3 was done that was every replica in the session, at any
+distance, so a wanted player across the city from a busy street could get few
+or no police cars. The radius removes the far ones. It does not help a wanted
+player standing in a street full of somebody else's traffic, whose engine
+still sees the street as full. So `client/src/game/crowdrange.cpp` takes
+`GenerateRandomCars`' two calls into `GenerateOneRandomCar` (0x004165B3,
+0x004165C8), and for exactly the calls in which the engine's own police
+decision would say yes with the replicas left out (`PoliceCarDue`, the
+disassembly written out), lowers `NumRandomCars` and `NumLawEnforcerCars` by
+the replicas built here and raises `MaxNumberOfCarsInUse` by what they add to
+the six-term sum, then puts all three back by the same amounts. The room goes
+to the police car and to nothing else: a call in which no police car is due is
+left alone, so the street around a wanted player is not doubled. Each wanted
+player's machine does this for itself, so in `shared` mode each gets its own.
 
 In `perplayer` only the wanted player's engine generates police, so the city
 holds one player's worth of them and everybody else holds replicas. The counts
@@ -614,3 +726,16 @@ that is wrong:
 7. **That a replayed shot does not raise the observer's stars.** §2.4 says it
    cannot, from the disassembly. Stand next to a player who is shooting
    pedestrians in front of a policeman and watch your own HUD stay empty.
+8. **That a Pay'n'Spray clears the whole car in `perplayer`** (§4.9): two
+   players in one wanted car, drive into a spray shop, and both HUDs must be
+   empty when the door opens and still empty three seconds later.
+9. **That one respray clears a `shared` session**, with the other player
+   across the city, and that their police break off. A receiver clears through
+   `CPlayerPed::SetWantedLevel(0)`, not `CWanted::Reset`, so pursuits are
+   ended the way `CLEAR_WANTED_LEVEL` ends them rather than the way the spray
+   shop does — if cops keep chasing a cleared receiver, that is the
+   difference to look at.
+10. **That a bribe takes exactly one star off a `shared` session**, and that
+    the passenger's machine's own garage arm, which can also see the car in
+    the shop, does not produce a second respray that matters (it would clear
+    what is already clear).

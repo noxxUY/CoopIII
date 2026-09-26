@@ -28,6 +28,11 @@ bool SampleLocalPlayer(PlayerStateBody &out);
 // True if a player ped exists right now.
 bool LocalPlayerExists();
 
+// While this machine plays a mission's cutscene the session's other players
+// are not drawn, or they would stand in the middle of the scene
+// (docs/missions.md 11.3). game/mission.cpp says when.
+void SetRemotePlayersHidden(bool hidden);
+
 // ---- for game/combat.cpp --------------------------------------------------
 
 // This player's live CPed, or null when the engine has taken it away. Same
@@ -105,6 +110,18 @@ void RemoveAimPitchHook();
 bool InstallLookHook();
 void RemoveLookHook();
 
+// Model 0's name, which is the clothes the local player has on, or null
+// before the model info is there.
+const char *LocalPlayerModelName();
+
+// Whether gta3.img has a model of this name for RequestSpecialModel to load.
+// It doesn't check itself (addresses.h, CStreaming__ms_pExtraObjectsDir).
+bool LookInGameImage(const char *look);
+
+// How many remote players' peds are built from this model: the ones
+// HookedRequestSpecialModel takes down itself before a script renames it.
+uint16_t RemotePlayerPedsBuiltFrom(int32_t modelId);
+
 // How many animations ASSOCGRP_STD actually holds in this build, or 0 before
 // the anim files have loaded. The bound every id off the wire gets measured
 // against, read from the engine rather than taken from re3 - the retail 1.0
@@ -148,9 +165,12 @@ bool BlendReplicaAnim(void *ped, uint16_t animId);
 
 // CPed::SetObjective then CPed::WarpPedIntoCar, in that order, because
 // WarpPedIntoCar branches on m_objective and silently assigns no seat at all
-// given anything else. False means the warp did not take, and the ped has
-// already been put back on foot.
-bool SeatReplicaPed(void *ped, void *car, uint8_t seat);
+// given anything else. Into `seat` when seatplan.h gives it, another free
+// passenger seat when it does not. The seat he is in, AMBIENT_SEAT_NONE_FREE
+// when there was none to give and nothing was touched, or
+// AMBIENT_SEAT_REFUSED when the warp did not take and he has already been put
+// back on foot.
+int SeatReplicaPed(void *ped, void *car, uint8_t seat);
 
 // The other direction, and also a plain "make sure this ped is on foot". It
 // clears the objective as well as the seat: a CCivilianPed left holding
@@ -190,5 +210,34 @@ uint32_t CarEntryMark(void *ped);
 // Whether our engine is taking this ped out of its seat through a jack played
 // here, as a PullOut (client.h). For population.cpp's traffic drivers.
 uint8_t PullOutOf(void *ped);
+
+// SampleLocalCarEntry's reading of any ped: the car he is opening a door of,
+// the seat it ends in and the door, as a seat. For population.cpp, which says
+// it of the pedestrians this machine hosts (AMBIENT_PED_ENTERING).
+bool    SamplePedCarEntry(void *ped, LocalCarEntry &out);
+
+// The door-opening entry and the climb out, on a copy of somebody else's
+// pedestrian, because his host's is doing it. The entry only goes for an
+// empty seat (seatplan.h, DoorEntryMayTake); PollCarEntry and CancelCarEntry
+// above follow it as they do the local player's. False when the engine would
+// not start it, and nothing changed.
+bool    StartReplicaCarEntry(void *ped, void *car, uint8_t seat, uint8_t doorSeat);
+bool    StartCarExit(void *ped);
+
+// The wire seat a ped holds in a car, 0 for the wheel, -1 for none.
+int     WireSeatOf(void *car, void *ped);
+
+// Bit s for each wire seat a warp may give in this car: nobody in it and
+// nobody climbing in by its door (seatplan.h, FreeSeatMask).
+uint16_t FreeSeatsForWarp(void *car);
+
+// A sitting passenger along to another free passenger seat of the same car.
+// The wire seat he is in afterwards.
+int     MovePassengerToSeat(void *car, void *ped, uint8_t seat);
+
+// A player's copy into the passenger seat the session gives him, from another
+// one of the same car he was put in when it was taken (seatplan.h,
+// PlanSettle). True when he moved.
+bool    SettleRemoteSeat(RemotePlayer &player, RemoteVehicle &vehicle, uint8_t seat);
 
 } // namespace coopiii::game

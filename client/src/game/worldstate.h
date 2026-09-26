@@ -23,12 +23,13 @@ void AddWorldToBridge(WorldBridge &bridge);
 bool SampleWorld(WorldState &out);
 
 // CClock::SetGameClock. A jump, so the caller is expected to have decided it
-// is worth one.
+// is worth one. The weather's blend is moved with it, so the jump doesn't
+// also turn the local weather over.
 void ApplyWorldTime(uint8_t hour, uint8_t minute);
 
-// Writes the pair CWeather blends between, and pins ForcedWeatherType so the
-// local rotation stops choosing its own next type.
-void ApplyWorldWeather(uint8_t weather, uint8_t weatherOld);
+// Writes the pair CWeather blends between, and pins ForcedWeatherType to
+// `forced` so the local rotation stops choosing its own next type.
+void ApplyWorldWeather(uint8_t weather, uint8_t weatherOld, uint8_t forced);
 
 // Unpins it again.
 void ReleaseWorldWeather();

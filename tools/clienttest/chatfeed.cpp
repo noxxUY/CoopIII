@@ -5,6 +5,7 @@
 
 #include "boardlayout.h"
 #include "chatfeed.h"
+#include "game/fontcull.h"
 
 #include <cmath>
 #include <cstdio>
@@ -329,57 +330,79 @@ void TestTheColours() {
 	Check(none.r == none.g && none.g == none.b, "and nobody's is a plain grey");
 }
 
-bool Inside(const BoardLayout &b, float screenW, float screenH) {
+// With PrintChar's y test as retail has it, unless `fixed`: everything these
+// tests ask was written against the retail cull first.
+BoardLayout Board(float screenW, float screenH, int rows, int footLines = 1, bool fixed = false) {
+	return MeasureBoard(screenW, screenH, rows, footLines,
+	                    game::TextCullLine(screenW, screenH, fixed));
+}
+
+MarkLayout Mark(float screenW, float screenH, bool fixed = false) {
+	return MeasureVersionMark(screenH, game::TextCullLine(screenW, screenH, fixed));
+}
+
+bool Inside(const BoardLayout &b, float screenW, float screenH, bool fixed = false) {
 	return b.left >= 0.0f && b.top >= 0.0f && b.left + b.width <= screenW &&
-	       b.top + b.height <= PrintableHeight(screenW, screenH);
+	       b.top + b.height <= PrintableHeight(screenH, game::TextCullLine(screenW, screenH, fixed));
 }
 
 void TestWhereTheScoreboardGoes() {
 	std::printf("\nwhere the scoreboard goes\n");
 
-	const BoardLayout full = MeasureBoard(1920.0f, 1080.0f, MAX_PLAYERS);
+	const BoardLayout full = Board(1920.0f, 1080.0f, MAX_PLAYERS);
 	Check(Inside(full, 1920.0f, 1080.0f), "a full session fits a 1080p screen");
 	Check(std::fabs(full.unit - 1080.0f / BOARD_REF_HEIGHT) < 1e-4f,
 	      "at the HUD's own scale, by height on a wide screen");
 	Check(std::fabs(full.left + full.width * 0.5f - 960.0f) < 0.01f, "centred across");
 	Check(full.top + full.height * 0.5f < 540.0f, "and a little above the middle, clear of subtitles");
 
-	const BoardLayout wider = MeasureBoard(2560.0f, 1080.0f, MAX_PLAYERS);
+	const BoardLayout wider = Board(2560.0f, 1080.0f, MAX_PLAYERS);
 	Check(wider.unit == full.unit && wider.width == full.width,
 	      "a wider screen does not stretch it");
 
-	const BoardLayout four3 = MeasureBoard(640.0f, 480.0f, 2);
+	const BoardLayout four3 = Board(640.0f, 480.0f, 2);
 	Check(four3.unit > 1.0f &&
 	          FEED_CELL_HEIGHT * BOARD_SMALL_SY * four3.unit >= BOARD_MIN_SMALL_PX - 0.01f,
 	      "640x480 raises it until the smallest text is readable");
 	Check(Inside(four3, 640.0f, 480.0f), "and it still fits");
-	const BoardLayout four3Full = MeasureBoard(640.0f, 480.0f, MAX_PLAYERS);
+	const BoardLayout four3Full = Board(640.0f, 480.0f, MAX_PLAYERS);
 	Check(Inside(four3Full, 640.0f, 480.0f), "a full session too");
 
 	// The window the version mark went missing in: taller than it is wide.
-	const BoardLayout tall = MeasureBoard(958.0f, 1000.0f, MAX_PLAYERS, 2);
+	const BoardLayout tall = Board(958.0f, 1000.0f, MAX_PLAYERS, 2);
 	Check(std::fabs(tall.unit - 958.0f / BOARD_REF_WIDTH) < 1e-4f, "a tall window scales it by width");
 	Check(Inside(tall, 958.0f, 1000.0f) && tall.top + tall.height < 958.0f,
 	      "and keeps every glyph above y = width, where CFont stops printing");
+	// With PrintChar's y test reading the height, the line is the bottom.
+	const BoardLayout tallFixed = Board(958.0f, 1000.0f, MAX_PLAYERS, 2, true);
+	Check(tallFixed.unit == tall.unit && Inside(tallFixed, 958.0f, 1000.0f, true) &&
+	          std::fabs(tallFixed.top + tallFixed.height * 0.5f - 1000.0f * BOARD_CENTRE_OF_HEIGHT) <
+	              0.01f,
+	      "fixed, the same panel is placed on the whole height instead");
+	const BoardLayout thin      = Board(400.0f, 1000.0f, MAX_PLAYERS, 2);
+	const BoardLayout thinFixed = Board(400.0f, 1000.0f, MAX_PLAYERS, 2, true);
+	Check(thin.top + thin.height < 400.0f && thinFixed.top + thinFixed.height > 400.0f &&
+	          Inside(thinFixed, 400.0f, 1000.0f, true),
+	      "and only then does a narrow window get it across y = width");
 
-	const BoardLayout tiny = MeasureBoard(320.0f, 240.0f, MAX_PLAYERS, 2);
+	const BoardLayout tiny = Board(320.0f, 240.0f, MAX_PLAYERS, 2);
 	Check(tiny.unit > 0.0f && Inside(tiny, 320.0f, 240.0f),
 	      "a window too small for readable text gets it small rather than off the edge");
 
-	const BoardLayout none = MeasureBoard(1280.0f, 720.0f, 0, 0);
+	const BoardLayout none = Board(1280.0f, 720.0f, 0, 0);
 	Check(none.rows == 1 && none.footLines == 1, "never fewer than one row and one footer line");
-	const BoardLayout lots = MeasureBoard(1280.0f, 720.0f, 40, 9);
+	const BoardLayout lots = Board(1280.0f, 720.0f, 40, 9);
 	Check(lots.rows == MAX_PLAYERS && lots.footLines == 2, "nor more than the session and two lines");
 
-	const BoardLayout two = MeasureBoard(1280.0f, 720.0f, 2);
-	const BoardLayout three = MeasureBoard(1280.0f, 720.0f, 3);
+	const BoardLayout two = Board(1280.0f, 720.0f, 2);
+	const BoardLayout three = Board(1280.0f, 720.0f, 3);
 	Check(std::fabs(three.height - two.height - BOARD_ROW_H * two.unit) < 0.01f,
 	      "each player is one row taller");
 }
 
 void TestTheScoreboardBands() {
 	std::printf("\nthe scoreboard, band by band\n");
-	const BoardLayout b = MeasureBoard(1600.0f, 900.0f, 5, 2);
+	const BoardLayout b = Board(1600.0f, 900.0f, 5, 2);
 	Check(b.titleTop == b.top && b.titleTop < b.accentTop && b.accentTop < b.subTop &&
 	          b.subTop < b.headTop && b.headTop < b.rowsTop && b.rowsTop < b.footTop,
 	      "title, accent, session line, headings, rows, footer, top to bottom");
@@ -483,13 +506,57 @@ void TestThePingBars() {
 	Check(s[0] == '\0', "and none is blank");
 }
 
+void TestTheCommands() {
+	std::printf("\ncommands in the chat line\n");
+	Check(ParseChatCommand("hello /kick 2").kind == ChatCommand::None,
+	      "a line that does not start with a slash is chat");
+	const ParsedCommand kick = ParseChatCommand("/kick 2");
+	Check(kick.kind == ChatCommand::Kick && std::strcmp(kick.arg, "2") == 0, "/kick and its number");
+	const ParsedCommand loud = ParseChatCommand("/KICK   bob  ");
+	Check(loud.kind == ChatCommand::Kick && std::strcmp(loud.arg, "bob") == 0,
+	      "in any case, and the spaces round the name go");
+	const ParsedCommand bare = ParseChatCommand("/kick");
+	Check(bare.kind == ChatCommand::Kick && bare.arg[0] == '\0', "/kick alone names nobody");
+	const ParsedCommand longer = ParseChatCommand("/kickall now");
+	Check(longer.kind == ChatCommand::Unknown && std::strcmp(longer.word, "kickall") == 0,
+	      "a longer word is not /kick");
+	const ParsedCommand slash = ParseChatCommand("/");
+	Check(slash.kind == ChatCommand::Unknown && slash.word[0] == '\0',
+	      "and a slash alone is not a command either");
+
+	const RosterEntry roster[] = {{0, "alice"}, {1, "bob"}, {3, "Bobby"}, {5, "carol"}};
+	uint8_t id = 0;
+	Check(ResolveKickTarget("2", roster, 4, &id) == KickTarget::Found && id == 1,
+	      "2 is slot 1, the number the list shows");
+	Check(ResolveKickTarget("4", roster, 4, &id) == KickTarget::Found && id == 3, "4 is slot 3");
+	Check(ResolveKickTarget("3", roster, 4, &id) == KickTarget::Nobody && id == INVALID_PLAYER,
+	      "an empty slot's number is nobody");
+	Check(ResolveKickTarget("0", roster, 4, &id) == KickTarget::Nobody, "there is no number 0");
+	Check(ResolveKickTarget("99999999999", roster, 4, &id) == KickTarget::Nobody,
+	      "and a huge number is nobody too");
+	Check(ResolveKickTarget("BOB", roster, 4, &id) == KickTarget::Found && id == 1,
+	      "a whole name in any case, although another name starts with it");
+	Check(ResolveKickTarget("bobb", roster, 4, &id) == KickTarget::Found && id == 3,
+	      "the start of exactly one name");
+	Check(ResolveKickTarget("bo", roster, 4, &id) == KickTarget::SeveralNames &&
+	          id == INVALID_PLAYER,
+	      "the start of two names is neither of them");
+	Check(ResolveKickTarget("dave", roster, 4, &id) == KickTarget::Nobody, "a name nobody has");
+	Check(ResolveKickTarget("", roster, 4, &id) == KickTarget::Nobody, "and nothing names nobody");
+	const RosterEntry numbers[] = {{0, "alice"}, {4, "1234"}};
+	Check(ResolveKickTarget("1234", numbers, 2, &id) == KickTarget::Found && id == 4,
+	      "a number nobody has is somebody's name");
+	Check(ResolveKickTarget("5", numbers, 2, &id) == KickTarget::Found && id == 4,
+	      "though the number the list shows still wins");
+}
+
 void TestTheVersionMark() {
 	std::printf("\nthe version mark\n");
 	Check(std::string(VERSION_MARK) == std::string("CoopIII ") + COOPIII_VERSION,
 	      "it says CoopIII and the version");
 	Check(Copied(VERSION_MARK) == VERSION_MARK, "and CFont can draw every character of it");
 	for (const float h : {448.0f, 480.0f, 720.0f, 1080.0f, 2160.0f}) {
-		const MarkLayout m = MeasureVersionMark(h * 16.0f / 9.0f, h);
+		const MarkLayout m = Mark(h * 16.0f / 9.0f, h);
 		const float unit   = h / 448.0f;
 		const float bottom = m.y + FEED_CELL_HEIGHT * m.scaleY;
 		if (!(m.x > 0.0f && bottom < h && m.y > h - RADAR_BOTTOM_UNITS * unit)) {
@@ -498,34 +565,118 @@ void TestTheVersionMark() {
 		}
 	}
 	Check(true, "in the strip under the radar, at every height");
-	const MarkLayout a = MeasureVersionMark(1280.0f, 720.0f);
-	const MarkLayout b = MeasureVersionMark(1920.0f, 720.0f);
+	const MarkLayout a = Mark(1280.0f, 720.0f);
+	const MarkLayout b = Mark(1920.0f, 720.0f);
 	Check(a.scaleY == b.scaleY && a.x == b.x && a.y == b.y, "and a wider screen does not move it");
-	const MarkLayout small = MeasureVersionMark(960.0f, 540.0f);
+	const MarkLayout small = Mark(960.0f, 540.0f);
 	Check(FEED_CELL_HEIGHT * small.scaleY >= MARK_MIN_TEXT_PX - 0.01f &&
 	          small.scaleX / small.scaleY == MARK_SCALE_X / MARK_SCALE_Y,
 	      "a 960x540 window still gets it at a readable size, in proportion");
-	const MarkLayout big = MeasureVersionMark(1920.0f, 1080.0f);
+	const MarkLayout big = Mark(1920.0f, 1080.0f);
 	Check(std::fabs(big.scaleY - MARK_SCALE_Y * (1080.0f / 448.0f)) < 1e-5f,
 	      "and a big screen is left as it was");
 	Check(big.y == 1080.0f - FEED_CELL_HEIGHT * big.scaleY - MARK_MARGIN_UNITS * (1080.0f / 448.0f),
 	      "at the very bottom, where it always was, on a screen wider than it is tall");
 
-	// CFont::PrintChar drops a glyph whose top is at y >= SCREEN_WIDTH.
-	const MarkLayout tall = MeasureVersionMark(958.0f, 1000.0f);
+	// Retail CFont::PrintChar drops a glyph whose top is at y >= SCREEN_WIDTH.
+	const MarkLayout tall = Mark(958.0f, 1000.0f);
 	const float      tallUnit = 1000.0f / 448.0f;
 	Check(tall.y < 958.0f && tall.y > 0.0f, "a 958x1000 window gets it above y = width");
 	Check(tall.y >= 1000.0f - RADAR_BOTTOM_UNITS * tallUnit &&
 	          tall.y + FEED_CELL_HEIGHT * tall.scaleY < 1000.0f,
 	      "and still in the strip under the radar, all of it on the screen");
-	const MarkLayout narrow = MeasureVersionMark(600.0f, 1000.0f);
+	const MarkLayout narrow = Mark(600.0f, 1000.0f);
 	const float      radarTop = 1000.0f - RADAR_TOP_UNITS * tallUnit;
 	const float      radarBot = 1000.0f - RADAR_BOTTOM_UNITS * tallUnit;
 	Check(narrow.y < 600.0f &&
 	          (narrow.y + FEED_CELL_HEIGHT * narrow.scaleY <= radarTop || narrow.y >= radarBot),
 	      "a narrower one moves it above the radar, never across it");
-	const MarkLayout square = MeasureVersionMark(1000.0f, 1000.0f);
+	const MarkLayout square = Mark(1000.0f, 1000.0f);
 	Check(square.y < 1000.0f, "and a square one keeps it above the line too");
+
+	// PrintChar's y test fixed: the line is the bottom of the screen, and the
+	// mark goes back where a wide screen of that height has it.
+	const MarkLayout wideSame = Mark(1920.0f, 1000.0f);
+	bool             home     = true;
+	for (const float w : {958.0f, 600.0f, 1000.0f}) {
+		const MarkLayout m = Mark(w, 1000.0f, true);
+		home = home && m.x == wideSame.x && m.y == wideSame.y && m.scaleY == wideSame.scaleY;
+	}
+	Check(home, "fixed, a tall window gets it at the very bottom, as a wide one does");
+	Check(wideSame.y > 958.0f, "which is below y = width in a 958x1000 one");
+}
+
+void TestTheChatLineInATallWindow() {
+	std::printf("\nthe chat line in a tall window\n");
+	// game/chat.cpp lifts the line by this much before drawing the feed.
+	const auto lifted = [](float w, float h, bool fixed) {
+		FeedLayout l = MeasureFeed(w, h);
+		l.bottom -= game::LiftAboveCull(l.bottom + l.shadow, game::TextCullLine(w, h, fixed), h);
+		return l;
+	};
+	bool still = true;
+	for (const float h : {448.0f, 720.0f, 1080.0f, 2160.0f}) {
+		const FeedLayout a = MeasureFeed(h * 16.0f / 9.0f, h);
+		const FeedLayout b = lifted(h * 16.0f / 9.0f, h, false);
+		const FeedLayout c = lifted(h * 4.0f / 3.0f, h, false);
+		still = still && a.bottom == b.bottom && c.bottom == MeasureFeed(h * 4.0f / 3.0f, h).bottom;
+	}
+	Check(still, "a wide screen does not move it");
+	Check(lifted(958.0f, 1000.0f, false).bottom == MeasureFeed(958.0f, 1000.0f).bottom,
+	      "nor a 958x1000 window, where 70% down is still above y = width");
+
+	const FeedLayout narrow = MeasureFeed(600.0f, 1000.0f);
+	Check(narrow.bottom >= 600.0f, "a 600x1000 one puts the line past y = width");
+	const FeedLayout up = lifted(600.0f, 1000.0f, false);
+	Check(up.bottom + up.shadow < 600.0f && up.bottom + up.shadow > 590.0f,
+	      "so with the retail test it goes up to just above it, shadow and all");
+	Check(lifted(600.0f, 1000.0f, true).bottom == narrow.bottom,
+	      "and with the test fixed it stays where it was");
+}
+
+// The owner's run on 2026-09-24, two 958x1000 windows side by side: the text is
+// sized by the height and the room is 55% of the width, and a 46-character
+// notice ran off the edge of it.
+void TestANoticeIsBrokenWhereTheFontSaysSo() {
+	std::printf("\na line is broken where the font says it no longer fits\n");
+	const FeedLayout l    = MeasureFeed(958.0f, 1000.0f);
+	const float      glyph = 12.0f;   // a wide face's letters at this scale, near enough
+	const char      *line  = "noxx3 is on Give Me Liberty, and you are in it";
+	const auto fits = [&](size_t, size_t n, size_t indent) {
+		return static_cast<float>(n + indent) * glyph <= l.maxWidth;
+	};
+	Check(std::strlen(line) < FEED_WRAP && std::strlen(line) * glyph > l.maxWidth,
+	      "under FEED_WRAP, and still wider than the room on that window");
+
+	FeedRow rows[FEED_ROWS_MAX];
+	size_t  n = FeedRows(line, fits, rows);
+	Check(n == 2 && std::string(line + rows[0].from, rows[0].count) ==
+	                    "noxx3 is on Give Me Liberty, and you are in" &&
+	          std::string(line + rows[1].from, rows[1].count) == "it",
+	      "so it goes on two rows, broken at a space, and nothing is lost");
+
+	n = FeedRows("you passed Give Me Liberty", fits, rows);
+	Check(n == 1 && rows[0].from == 0 && rows[0].count == 26, "one that fits is one row");
+
+	std::string words;
+	while (words.size() < 200)
+		words += "word ";
+	words.pop_back();
+	n = FeedRows(words.c_str(), fits, rows);
+	bool every = true;
+	for (size_t i = 0; i + 1 < n; ++i)
+		every = every && static_cast<float>(rows[i].count + (i ? 2 : 0)) * glyph <= l.maxWidth &&
+		        words[rows[i].from + rows[i].count] == ' ';
+	Check(n == FEED_ROWS_MAX && every, "a long one takes at most four rows, each broken between words");
+	Check(rows[n - 1].from + rows[n - 1].count == words.size(),
+	      "and the last row carries the rest, to be cut where it is drawn");
+
+	const std::string oneWord(60, 'x');
+	n = FeedRows(oneWord.c_str(), fits, rows);
+	Check(n == 2 && rows[0].count + rows[1].count == 60 && rows[0].count * glyph <= l.maxWidth,
+	      "a word wider than a row is split, losing nothing");
+	Check(FeedRowBreak("abc", 3, [](size_t) { return false; }) == 1,
+	      "and a row too narrow for anything still takes a character");
 }
 
 } // namespace
@@ -535,6 +686,7 @@ int RunChatFeedTests() {
 	TestWhatAKeyboardTypes();
 	TestTheLines();
 	TestALongMessageWraps();
+	TestANoticeIsBrokenWhereTheFontSaysSo();
 	TestTheFeedKeepsTheLast();
 	TestTheFade();
 	TestTheLineBeingTyped();
@@ -546,6 +698,8 @@ int RunChatFeedTests() {
 	TestTheScoreboardBands();
 	TestTheScoreboardRows();
 	TestThePingBars();
+	TestTheCommands();
 	TestTheVersionMark();
+	TestTheChatLineInATallWindow();
 	return g_chatFailures;
 }

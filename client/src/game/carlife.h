@@ -8,10 +8,11 @@
 // engine from reaping it: CanBeDeleted says no for MISSION_VEHICLE and every
 // reaping site also tests bIsLocked (addresses.h, "READ THIS BEFORE WRITING
 // THE SPAWN"). MISSION_VEHICLE also buys the rest of what a mission car gets:
-// a hideout garage won't store and delete it (0x0042794C), Craig won't take it
-// (0x00423BDB), CWorld::RemoveFallenCars puts it back on a road instead of
-// deleting it. None of that is wanted any less for a copy, so the creator
-// type stays.
+// CWorld::RemoveFallenCars puts it back on a road instead of deleting it, and
+// a hideout garage (0x0042794C) and Craig (0x00423BDB) refuse it - which is
+// wanted for a copy somebody else holds and not for one the local player
+// drives in, so game/carremoval.h lets the holder's copy past both. The
+// creator type stays.
 //
 // What was wrong with it is the two things MISSION_VEHICLE also costs, and
 // both are fixed around the car rather than by changing what it is:

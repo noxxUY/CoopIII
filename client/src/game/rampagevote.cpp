@@ -227,6 +227,9 @@ void TickKeys(const RampageVoteView &v) {
 
 struct Move {
 	bool                active = false;
+	// A rampage vote's, which the server hears the end of; otherwise the
+	// session's mission bringing a participant to its owner (MovePlayerBeside).
+	bool                vote   = true;
 	RampageTeleportBody body{};
 	int32_t             level  = 0;
 	bool                locked = false;
@@ -234,6 +237,9 @@ struct Move {
 	float               hold[3] = {};
 };
 Move g_move;
+
+// What the log calls the move.
+const char *Tag() { return g_move.vote ? "rampage" : "missions"; }
 
 // Give up waiting for an island's collision after this long, and put him
 // down where he is being held. Loading an island takes a second or two with
@@ -286,7 +292,7 @@ void OutOfAnyCar(void *ped) {
 
 	if (entering && !inCar) {
 		CancelCarEntry(ped);
-		Log("rampage: called off getting into a car before the move");
+		Log("%s: called off getting into a car before the move", Tag());
 	}
 
 	if (inCar) {
@@ -310,7 +316,7 @@ void OutOfAnyCar(void *ped) {
 			float *const tv = &Field<float>(car, offs::TURN_SPEED);
 			tv[0] = tv[1] = tv[2] = 0.0f;
 		}
-		Log("rampage: out of the car for the move");
+		Log("%s: out of the car for the move", Tag());
 	}
 
 	Field<bool>(ped, offs::PED_IN_VEHICLE)     = false;
@@ -364,7 +370,8 @@ float GroundAt(float x, float y, float fromZ, bool &found) {
 }
 
 void Report(uint8_t result) {
-	g_client->ReportRampageArrival(g_move.body.voteId, result);
+	if (g_move.vote)
+		g_client->ReportRampageArrival(g_move.body.voteId, result);
 }
 
 // On the ground, in his place round the toucher, facing him.
@@ -377,11 +384,11 @@ void Settle(void *ped) {
 
 	float x = at.x, y = at.y, ground = groundRef;
 	int   used = -1;
-	for (int attempt = 0; attempt < SPREAD_ATTEMPTS; ++attempt) {
-		const SpreadSpot s = SpreadCandidate(g_move.body.slot, g_move.body.count, attempt);
+	for (int attempt = 0; attempt < VOTE_SPREAD_ATTEMPTS; ++attempt) {
+		const VoteSpreadSpot s = VoteSpreadCandidate(g_move.body.slot, g_move.body.count, attempt);
 		bool        found  = false;
 		const float g      = GroundAt(at.x + s.dx, at.y + s.dy, groundRef + 2.0f, found);
-		if (SpreadGroundOk(found, g, groundRef)) {
+		if (VoteSpreadGroundOk(found, g, groundRef)) {
 			x      = at.x + s.dx;
 			y      = at.y + s.dy;
 			ground = g;
@@ -412,46 +419,49 @@ void Settle(void *ped) {
 
 	const char *nick = g_client->NickFor(g_move.body.starterId);
 	if (used < 0)
-		Log("rampage: no ground in the ring round %s, put down right beside him at "
+		Log("%s: no ground in the ring round %s, put down right beside him at "
 		    "(%.1f %.1f %.1f)",
-		    nick ? nick : "?", x, y, z);
+		    Tag(), nick ? nick : "?", x, y, z);
 	else
-		Log("rampage: moved next to %s, place %u of %u (try %d), at (%.1f %.1f %.1f)%s",
-		    nick ? nick : "?", g_move.body.slot + 1, g_move.body.count, used, x, y, z,
+		Log("%s: moved next to %s, place %u of %u (try %d), at (%.1f %.1f %.1f)%s",
+		    Tag(), nick ? nick : "?", g_move.body.slot + 1, g_move.body.count, used, x, y, z,
 		    g_move.locked ? " - an island our story hasn't opened yet" : "");
 	Report(g_move.locked ? RAMPAGE_ARRIVED_LOCKED : RAMPAGE_ARRIVED);
 	g_move.active = false;
 }
 
-void StartMove(const RampageTeleportBody &body) {
+void StartMove(const RampageTeleportBody &body, bool vote = true) {
 	g_move        = Move{};
+	g_move.vote   = vote;
 	g_move.body   = body;
 
-	void *const   ped     = PlayerPed();
-	const uint8_t verdict = DecideTeleport(ReadFacts(ped));
+	void *const   ped   = PlayerPed();
+	TeleportFacts facts = ReadFacts(ped);
+	// The session's mission is why a participant is moved, not a reason not to.
+	if (!vote)
+		facts.onMission = false;
+	const uint8_t verdict = DecideTeleport(facts);
 	if (verdict != RAMPAGE_ARRIVED) {
 		const char *nick = g_client->NickFor(body.starterId);
-		Log("rampage: not moving to %s: %s. The vote still counted", nick ? nick : "?",
-		    WhyNot(verdict));
+		Log("%s: not moving to %s: %s.%s", Tag(), nick ? nick : "?", WhyNot(verdict),
+		    vote ? " The vote still counted" : "");
 		Report(verdict);
 		return;
 	}
 
 	OutOfAnyCar(ped);
 
-	const float at[3] = {body.pos.x, body.pos.y, body.pos.z};
-	using LevelFn     = uint8_t(__cdecl *)(const float *);
-	g_move.level      = Func<LevelFn>(CTheZones__GetLevelFromPosition)(at);
-	g_move.locked     = !IslandOpen(g_move.level, Global<int32_t>(CStats__IndustrialPassed) != 0,
+	g_move.level      = IslandAt(body.pos.x, body.pos.y, body.pos.z);
+	g_move.locked     =!IslandOpen(g_move.level, Global<int32_t>(CStats__IndustrialPassed) != 0,
 	                                Global<int32_t>(CStats__CommercialPassed) != 0);
 	if (g_move.locked)
-		Log("rampage: going to island %d, which our story hasn't opened yet. Going "
+		Log("%s: going to island %d, which our story hasn't opened yet. Going "
 		    "anyway, to be with the others",
-		    g_move.level);
+		    Tag(), g_move.level);
 
-	const int32_t loaded = Global<int32_t>(CCollision__ms_collisionInMemory);
+	const int32_t loaded = IslandLoaded();
 	g_move.active        = true;
-	if (g_move.level == LEVEL_GENERIC || g_move.level == loaded) {
+	if (IslandToLoadFirst(g_move.level, loaded) == 0) {
 		Settle(ped);
 		return;
 	}
@@ -464,9 +474,9 @@ void StartMove(const RampageTeleportBody &body) {
 	g_move.hold[1] = body.pos.y;
 	g_move.hold[2] = body.pos.z + 0.5f;
 	TeleportPed(ped, g_move.hold[0], g_move.hold[1], g_move.hold[2]);
-	Log("rampage: the toucher is on island %d and we have %d loaded; waiting for the "
+	Log("%s: the one we go to is on island %d and we have %d loaded; waiting for the "
 	    "engine to load it",
-	    g_move.level, loaded);
+	    Tag(), g_move.level, loaded);
 }
 
 void TickMove() {
@@ -480,14 +490,14 @@ void TickMove() {
 	}
 	const int32_t loaded = Global<int32_t>(CCollision__ms_collisionInMemory);
 	if (loaded == g_move.level) {
-		Log("rampage: island %d is loaded after %u frame(s)", g_move.level, g_move.frames);
+		Log("%s: island %d is loaded after %u frame(s)", Tag(), g_move.level, g_move.frames);
 		Settle(ped);
 		return;
 	}
 	if (++g_move.frames >= COLLISION_WAIT_FRAMES) {
-		Log("rampage: island %d never loaded (still %d after %u frames); putting him "
+		Log("%s: island %d never loaded (still %d after %u frames); putting him "
 		    "down anyway",
-		    g_move.level, loaded, g_move.frames);
+		    Tag(), g_move.level, loaded, g_move.frames);
 		Settle(ped);
 		return;
 	}
@@ -513,6 +523,34 @@ void InstallRampageVote(Client &client) {
 }
 
 void RemoveRampageVote() { g_client = nullptr; }
+
+int32_t IslandAt(float x, float y, float z) {
+	const float at[3] = {x, y, z};
+	using LevelFn     = uint8_t(__cdecl *)(const float *);
+	return Func<LevelFn>(CTheZones__GetLevelFromPosition)(at);
+}
+
+int32_t IslandLoaded() { return Global<int32_t>(CCollision__ms_collisionInMemory); }
+
+bool MayMovePlayer() {
+	if (!g_client || g_move.active)
+		return false;
+	TeleportFacts facts = ReadFacts(PlayerPed());
+	facts.onMission     = false;
+	return DecideTeleport(facts) == RAMPAGE_ARRIVED;
+}
+
+bool MovePlayerBeside(const Vec3 &pos, uint8_t targetId, uint8_t slot, uint8_t count) {
+	if (!MayMovePlayer())
+		return false;
+	RampageTeleportBody body{};
+	body.starterId = targetId;
+	body.slot      = slot;
+	body.count     = count;
+	body.pos       = pos;
+	StartMove(body, false);
+	return true;
+}
 
 void TickRampageVote() {
 	if (!g_client)

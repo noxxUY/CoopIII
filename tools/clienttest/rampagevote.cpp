@@ -186,10 +186,10 @@ void TestTheRing() {
 		float closest = 1e9f;
 		bool  onRing  = true;
 		for (uint8_t a = 0; a < count; ++a) {
-			const SpreadSpot p = SpreadCandidate(a, count, 0);
-			onRing = onRing && std::fabs(std::hypot(p.dx, p.dy) - SPREAD_RADIUS_M) < 1e-4f;
+			const VoteSpreadSpot p = VoteSpreadCandidate(a, count, 0);
+			onRing = onRing && std::fabs(std::hypot(p.dx, p.dy) - VOTE_SPREAD_RADIUS_M) < 1e-4f;
 			for (uint8_t b = a + 1; b < count; ++b) {
-				const SpreadSpot q = SpreadCandidate(b, count, 0);
+				const VoteSpreadSpot q = VoteSpreadCandidate(b, count, 0);
 				closest = std::fmin(closest, std::hypot(p.dx - q.dx, p.dy - q.dy));
 			}
 		}
@@ -200,23 +200,23 @@ void TestTheRing() {
 	}
 
 	bool inRange = true, allDifferent = true;
-	for (int attempt = 0; attempt < SPREAD_ATTEMPTS; ++attempt) {
-		const SpreadSpot s = SpreadCandidate(2, 5, attempt);
+	for (int attempt = 0; attempt < VOTE_SPREAD_ATTEMPTS; ++attempt) {
+		const VoteSpreadSpot s = VoteSpreadCandidate(2, 5, attempt);
 		const float      r = std::hypot(s.dx, s.dy);
-		inRange = inRange && r >= 1.19f && r <= SPREAD_RADIUS_M * 1.5f + 1e-4f;
+		inRange = inRange && r >= 1.19f && r <= VOTE_SPREAD_RADIUS_M * 1.5f + 1e-4f;
 		for (int other = 0; other < attempt; ++other) {
-			const SpreadSpot o = SpreadCandidate(2, 5, other);
+			const VoteSpreadSpot o = VoteSpreadCandidate(2, 5, other);
 			allDifferent = allDifferent && std::hypot(s.dx - o.dx, s.dy - o.dy) > 0.1f;
 		}
 	}
 	Check(inRange, "every fallback stays between 1.2 m and 4.5 m from him");
 	Check(allDifferent, "and every one is a different spot");
-	const SpreadSpot z = SpreadCandidate(3, 0, 0);
+	const VoteSpreadSpot z = VoteSpreadCandidate(3, 0, 0);
 	Check(std::isfinite(z.dx) && std::isfinite(z.dy), "a count of zero doesn't divide by it");
 
-	Check(SpreadGroundOk(true, 10.0f, 11.5f) && !SpreadGroundOk(true, 10.0f, 12.5f),
+	Check(VoteSpreadGroundOk(true, 10.0f, 11.5f) && !VoteSpreadGroundOk(true, 10.0f, 12.5f),
 	      "ground within 2 m of his is somewhere he can stand");
-	Check(!SpreadGroundOk(false, 10.0f, 10.0f), "no ground is no ground");
+	Check(!VoteSpreadGroundOk(false, 10.0f, 10.0f), "no ground is no ground");
 
 	const float kPi = 3.14159265f;
 	Check(std::fabs(HeadingToward(0, 0, 0, 5)) < 1e-5f, "facing north is heading 0");
@@ -265,6 +265,14 @@ void TestWhoMoves() {
 	Check(!IslandOpen(3, true, false) && IslandOpen(3, true, true),
 	      "Shoreside after staunton_complete");
 	Check(IslandOpen(0, false, false), "the water between is nobody's to lock");
+
+	Check(IslandToLoadFirst(2, 1) == 2, "a move from Portland to Staunton loads Staunton first");
+	Check(IslandToLoadFirst(2, 2) == 0, "one to the island in memory loads nothing");
+	Check(IslandToLoadFirst(0, 1) == 0, "nor one to the water between");
+	Check(MayLoadIslandUnder(3, 3) && MayLoadIslandUnder(3, 0),
+	      "the owner's island load runs under a player on that island or between islands");
+	Check(!MayLoadIslandUnder(3, 2),
+	      "and never under one standing on another, whose ground it would take away");
 }
 
 void TestTheSkullsTouch() {

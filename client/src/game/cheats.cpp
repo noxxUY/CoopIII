@@ -1,9 +1,13 @@
 #include "cheats.h"
 
+#include "mission.h"
 #include "ped.h"
 #include "population.h"
+#include "social.h"
 #include "hook/hook.h"
 #include "log.h"
+
+#include <windows.h>
 
 #include <cstring>
 
@@ -195,7 +199,10 @@ uint32_t __fastcall HookedScanForThreats(void *ped, void * /*edx*/) {
 		}
 		return 0;
 	}
-	return g_scanForThreats.Original<ScanFn>()(ped);
+	// The session's mission's own pedestrians see its participants as the
+	// player too (mission.h).
+	// And an everyday gang member set on the player, the other players too.
+	return EverydayGangThreat(ped, MissionThreat(ped, g_scanForThreats.Original<ScanFn>()(ped)));
 }
 
 uint8_t LiveByte(const void * /*ctx*/, uint32_t va) { return *Ptr<uint8_t>(va); }
@@ -307,6 +314,35 @@ void RemoveCheatHooks() {
 	g_scanForThreats.Remove();
 	g_ctx          = CheatContext{};
 	g_pendingCount = 0;
+}
+
+char EngineCheatCharFor(int vk) {
+	// What the key handler does before AddToPCCheatString sees a key:
+	// `push 2 / push edx / call [MapVirtualKeyA] / and eax,0FFFFh /
+	// cmp eax,0FFh / jge skip` at 0x00583D90.
+	const UINT c = MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_CHAR) & 0xFFFF;
+	return c != 0 && c < 0xFF ? static_cast<char>(c) : '\0';
+}
+
+bool ChatKeyWouldFinishCheat(char key) {
+	return ChatKeyFinishesCheat(Ptr<char>(CPad__KeyBoardCheatString), key);
+}
+
+bool FinishCheatFromChatLine(char key, const char *line) {
+	char          keys[KEYBOARD_CHEAT_STRING_LEN];
+	uint8_t       count = 0;
+	const uint8_t id =
+	    CheatFinishedInChatLine(Ptr<char>(CPad__KeyBoardCheatString), key, line, keys, &count);
+	if (id >= CHEAT_COUNT)
+		return false;
+	Log("cheats: %s ran into the chat key and was finished in the chat line; "
+	    "handing it to the game, the line is not sent", TypedName(id));
+	// The engine's key handler passes CPad::GetPad(0), i.e. Pads[0]
+	// (0x00583F17 .. 0x005841C7). Through the address, so it goes through
+	// the detour above when that is installed.
+	for (uint8_t i = 0; i < count; ++i)
+		Func<CheatStrFn>(CPad__AddToPCCheatString)(Ptr<void>(CPad__Pads), keys[i]);
+	return true;
 }
 
 void AddCheatsToBridge(WorldBridge &bridge) {

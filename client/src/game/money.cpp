@@ -1,11 +1,15 @@
 #include "money.h"
 
+#include "leadcheck.h"
 #include "ped.h"
 #include "../client.h"
 #include "../hook/hook.h"
 #include "../log.h"
 
+#include <cstring>
 #include <intrin.h>
+
+#include <windows.h>
 
 namespace coopiii::game {
 
@@ -27,6 +31,11 @@ uint8_t           g_awardCount = 0;
 bool g_saidDropped   = false;
 bool g_saidForwarded = false;
 bool g_saidFull      = false;
+
+// The bomb timer's two calls (addresses.h, BombTimer_*), taken together or not
+// at all.
+bool g_gateTaken    = false;
+bool g_saidBomber   = false;
 
 using AwardFn = void(__thiscall *)(void *, void *);
 using FindFn  = void *(__cdecl *)();
@@ -129,6 +138,108 @@ void __fastcall HookedAward(void *self, void * /*edx*/, void *wreck) {
 	}
 }
 
+// ---- the bomb timer's pay gate (addresses.h, BombTimer_*) ------------------
+
+// Another player's ped the car's bomb blames, when the gate is to ask about
+// him (BombGateAsksBomber); null for the engine's own question.
+void *OtherBomberOf(void *car) {
+	if (!car)
+		return nullptr;
+	void *const bomber = Field<void *>(car, offs::VEH_BLOW_UP_ENTITY);
+	uint16_t    netId  = INVALID_NETID;
+	const bool  other  = bomber != nullptr && bomber != PlayerPed() &&
+	                   RemotePlayerForPed(bomber, netId);
+	return BombGateAsksBomber(g_inSession, g_rule, g_award.IsInstalled(), other) ? bomber
+	                                                                               : nullptr;
+}
+
+// In place of FindPlayerVehicle() at 0x00551D42: the car the bomber sits in,
+// read off his ped the way FindPlayerVehicle reads ours.
+void *__fastcall GateVehicle(void *car) {
+	void *const bomber = OtherBomberOf(car);
+	if (!bomber)
+		return PlayerVehicle();
+	return Field<uint8_t>(bomber, offs::PED_IN_VEHICLE) != 0
+	           ? Field<void *>(bomber, offs::PED_MY_VEHICLE)
+	           : nullptr;
+}
+
+// In place of FindPlayerPed() at 0x00551D4B: the bomber.
+void *__fastcall GatePed(void *car) {
+	void *const bomber = OtherBomberOf(car);
+	if (!bomber)
+		return PlayerPed();
+	if (!g_saidBomber) {
+		g_saidBomber = true;
+		Log("money: another player's bomb went off here; the bomb timer pays for model %d "
+		    "as his own machine would, and it goes to him",
+		    static_cast<int>(Field<int16_t>(car, offs::MODEL_INDEX)));
+	}
+	return bomber;
+}
+
+// The call sites' ebp is the car (addresses.h): handed on in ecx, and the
+// return goes straight back to the gate's compare.
+__declspec(naked) void GateVehicleFromCar() {
+	__asm {
+		mov ecx, ebp
+		jmp GateVehicle
+	}
+}
+
+__declspec(naked) void GatePedFromCar() {
+	__asm {
+		mov ecx, ebp
+		jmp GatePed
+	}
+}
+
+bool Redirect(uintptr_t site, uintptr_t from, uintptr_t to) {
+	if (!RelCallAt(Ptr<uint8_t>(site), site, from))
+		return false;
+	DWORD old = 0;
+	if (!VirtualProtect(reinterpret_cast<void *>(site), 5, PAGE_EXECUTE_READWRITE, &old))
+		return false;
+	const int32_t rel = static_cast<int32_t>(to - (site + 5));
+	std::memcpy(reinterpret_cast<void *>(site + 1), &rel, sizeof rel);
+	VirtualProtect(reinterpret_cast<void *>(site), 5, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void *>(site), 5);
+	return true;
+}
+
+void TakeBombGate() {
+	const uintptr_t vehicle = reinterpret_cast<uintptr_t>(&GateVehicleFromCar);
+	const uintptr_t ped     = reinterpret_cast<uintptr_t>(&GatePedFromCar);
+	if (!RelCallAt(Ptr<uint8_t>(BombTimer_FindPlayerPedCall), BombTimer_FindPlayerPedCall,
+	               FindPlayerPed) ||
+	    !Redirect(BombTimer_FindPlayerVehicleCall, FindPlayerVehicle, vehicle)) {
+		Log("money: FAILED to take the bomb timer's pay gate at 0x%08X; another player's bomb "
+		    "that goes off here pays nobody",
+		    static_cast<unsigned>(BombTimer_FindPlayerVehicleCall));
+		return;
+	}
+	if (!Redirect(BombTimer_FindPlayerPedCall, FindPlayerPed, ped)) {
+		Redirect(BombTimer_FindPlayerVehicleCall, vehicle, FindPlayerVehicle);
+		Log("money: FAILED to take the bomb timer's pay gate at 0x%08X; another player's bomb "
+		    "that goes off here pays nobody",
+		    static_cast<unsigned>(BombTimer_FindPlayerPedCall));
+		return;
+	}
+	g_gateTaken = true;
+	Log("money: the bomb timer's pay gate at 0x%08X asks about the bomber, whoever's he is",
+	    static_cast<unsigned>(BombTimer_FindPlayerVehicleCall));
+}
+
+void GiveBombGateBack() {
+	if (!g_gateTaken)
+		return;
+	Redirect(BombTimer_FindPlayerPedCall, reinterpret_cast<uintptr_t>(&GatePedFromCar),
+	         FindPlayerPed);
+	Redirect(BombTimer_FindPlayerVehicleCall, reinterpret_cast<uintptr_t>(&GateVehicleFromCar),
+	         FindPlayerVehicle);
+	g_gateTaken = false;
+}
+
 // ---- MoneyBridge ------------------------------------------------------------
 
 void SetMoneySession(bool inSession, uint8_t rule) {
@@ -200,10 +311,12 @@ bool InstallMoneyHook() {
 	}
 	Log("money: hooked CPlayerInfo::AwardMoneyForExplosion at 0x%08X",
 	    CPlayerInfo__AwardMoneyForExplosion);
+	TakeBombGate();
 	return true;
 }
 
 void RemoveMoneyHook() {
+	GiveBombGateBack();
 	g_award.Remove();
 	g_inSession  = false;
 	g_rule       = MONEY_RULE_OFF;

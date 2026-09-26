@@ -57,6 +57,8 @@ int RunConsole(const Startup &startup) {
 	                  WireValue(startup.config.hiddenPackages)))
 		return 1;
 	server.SetPassword(startup.config.password);
+	server.SetMissionRules(startup.config.missionFailOnDeath, startup.config.missionMarginCm,
+	                       startup.config.missionEnemies, startup.config.missionScale);
 	for (const std::string &line : ReachLines(LocalIPv4Addresses(), startup.config.port))
 		std::printf("[coopiii] %s\n", line.c_str());
 

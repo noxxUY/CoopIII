@@ -155,6 +155,186 @@ void TestNoCheatFiresAnotherOnTheWay() {
 	Check(fired == 3, "BANGBANGBANG then BANG, BANG fires three times, as in single player");
 }
 
+// ---- the chat key inside a cheat --------------------------------------------
+
+// The chat window's key handling (game/chat.cpp) in front of the engine's
+// buffer: T opens the line unless it finishes a cheat, keys typed into an open
+// line reach the engine only when the line is the rest of a cheat, and Enter
+// sends. Letters arrive in the line in lower case, the way ToUnicode gives
+// them without Shift.
+struct ChatKeyboard {
+	Keyboard                 engine;
+	bool                     open = false;
+	std::string              line;
+	std::vector<uint8_t>     fired;
+	std::vector<std::string> sent;
+
+	void Engine(char c) {
+		const std::vector<uint8_t> f = engine.Key(c);
+		fired.insert(fired.end(), f.begin(), f.end());
+	}
+
+	void Key(char c) {
+		if (!open) {
+			if (c == 'T' && !ChatKeyFinishesCheat(engine.buffer, 'T')) {
+				open = true;
+				line.clear();
+				return;
+			}
+			Engine(c);
+			return;
+		}
+		line += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+		char    keys[KEYBOARD_CHEAT_STRING_LEN];
+		uint8_t count = 0;
+		if (CheatFinishedInChatLine(engine.buffer, 'T', line.c_str(), keys, &count) <
+		    CHEAT_COUNT) {
+			for (uint8_t i = 0; i < count; ++i)
+				Engine(keys[i]);
+			open = false;
+			line.clear();
+		}
+	}
+
+	void Type(const std::string &s) {
+		for (char c : s)
+			Key(c);
+	}
+
+	void Enter() {
+		if (open)
+			sent.push_back(line);
+		open = false;
+		line.clear();
+	}
+};
+
+void TestEveryCheatCanBeTypedPastTheChatKey() {
+	std::printf("\ntyping every cheat with T as the chat key\n");
+
+	int withT = 0;
+	for (uint8_t id = 0; id < CHEAT_COUNT; ++id)
+		if (Forward(id).find('T') != std::string::npos)
+			++withT;
+	Check(withT == 11, "eleven cheats have a T in them, which the chat key used to eat");
+
+	// From a fresh buffer, and after some walking and a jump: the buffer is
+	// every key the engine saw, movement included. BOOOOORING only ever works
+	// first (the retail bug, above), so it is left out of the second.
+	int wrong = 0;
+	for (int walked = 0; walked < 2; ++walked) {
+		for (uint8_t id = 0; id < CHEAT_COUNT; ++id) {
+			if (walked && id == CHEAT_SLOW_TIME)
+				continue;
+			ChatKeyboard kb;
+			if (walked)
+				kb.Type("WWWWASDDW ");
+			kb.Type(Forward(id));
+			if (kb.fired != std::vector<uint8_t>{id} || kb.open || !kb.sent.empty()) {
+				++wrong;
+				std::printf("    %s%s: fired %zu, line %s\n", walked ? "after walking, " : "",
+				            Forward(id).c_str(), kb.fired.size(), kb.open ? "open" : "shut");
+			}
+		}
+	}
+	Check(wrong == 0, "all 23 fire once, as themselves, with the line shut and nothing sent");
+
+	// The engine's own pairs test, through the chat key: whatever the engine
+	// fires for two cheats in a row, the chat key changes none of it.
+	int pairs = 0;
+	for (uint8_t a = 0; a < CHEAT_COUNT; ++a)
+		for (uint8_t b = 0; b < CHEAT_COUNT; ++b) {
+			Keyboard     plain;
+			ChatKeyboard chat;
+			std::vector<uint8_t> want;
+			for (char c : Forward(a) + Forward(b)) {
+				const std::vector<uint8_t> f = plain.Key(c);
+				want.insert(want.end(), f.begin(), f.end());
+			}
+			chat.Type(Forward(a) + Forward(b));
+			if (chat.fired != want || !chat.sent.empty())
+				++pairs;
+		}
+	Check(pairs == 0, "529 pairs fire what they fire without a chat key, and send nothing");
+
+	ChatKeyboard gesundheit;
+	gesundheit.Type("GESUNDHEI");
+	Check(ChatKeyFinishesCheat(gesundheit.engine.buffer, 'T'),
+	      "the T after GESUNDHEI finishes a cheat, so it goes to the game");
+	ChatKeyboard fresh;
+	Check(!ChatKeyFinishesCheat(fresh.engine.buffer, 'T'),
+	      "a T on its own finishes nothing and opens the line");
+	Check(!ChatKeyFinishesCheat(gesundheit.engine.buffer, '\0'),
+	      "a chat key the engine pushes nothing for never finishes a cheat");
+
+	ChatKeyboard scotland;
+	scotland.Type("ILOVESCOTLAND");
+	Check(scotland.fired == std::vector<uint8_t>{CHEAT_RAINY},
+	      "LAND after ILOVESCOT is rain, not ILIKESCOTLAND's cloud: what came before T decides");
+
+	ChatKeyboard tank;
+	tank.Type("SDT");
+	tank.Type("ANK");
+	Check(tank.fired.empty() && tank.open,
+	      "\"ank\" is only the rest of GIVEUSATANK after GIVEUSA; after anything else it is chat");
+}
+
+void TestChatTextNeverStartsACheat() {
+	std::printf("\nchat text never starts a cheat\n");
+
+	// Every cheat as a whole line, and inside a sentence, after the chat key
+	// opened it - from a fresh buffer and from one that ends in the cheat's
+	// own first letters, which is the nearest a line can come to one.
+	int fired = 0, lost = 0;
+	for (uint8_t id = 0; id < CHEAT_COUNT; ++id) {
+		const std::string word  = Forward(id);
+		const std::string lines[] = {word, "i said " + word, word + " again",
+		                             "well " + word + " then"};
+		for (const std::string &text : lines) {
+			ChatKeyboard kb;
+			kb.Key('T');
+			kb.Type(text);
+			kb.Enter();
+			if (!kb.fired.empty())
+				++fired;
+			if (kb.sent.size() != 1)
+				++lost;
+		}
+	}
+	Check(fired == 0, "no cheat word fires from inside a chat line, whole or mid-sentence");
+	Check(lost == 0, "and every one of those lines is sent as chat");
+
+	ChatKeyboard hello;
+	hello.Key('T');
+	hello.Type("hello there, turtoise fans");
+	hello.Enter();
+	Check(hello.fired.empty() && hello.sent == std::vector<std::string>{"hello there, turtoise fans"},
+	      "an ordinary line with Ts in it goes out whole");
+
+	ChatKeyboard urtoise;
+	urtoise.Key('T');
+	urtoise.Type("URTOISE ");
+	Check(urtoise.fired == std::vector<uint8_t>{CHEAT_ARMOUR} && !urtoise.open,
+	      "TURTOISE finishes on its E, before anything after it can join the line");
+
+	char    keys[KEYBOARD_CHEAT_STRING_LEN];
+	uint8_t count = 0;
+	char    buffer[KEYBOARD_CHEAT_STRING_LEN] = {};
+	Check(CheatFinishedInChatLine(buffer, 'T', "urtoise", keys, &count) == CHEAT_ARMOUR &&
+	          count == 8 && std::memcmp(keys, "TURTOISE", 8) == 0,
+	      "the keys handed to the game are the chat key and the line, in capitals");
+	Check(CheatFinishedInChatLine(buffer, 'T', "Ur ToIse", keys, &count) == CHEAT_COUNT &&
+	          count == 0,
+	      "a space is not a letter of any cheat");
+	Check(CheatFinishedInChatLine(buffer, 'T', "", keys, &count) == CHEAT_COUNT,
+	      "an empty line is nothing");
+	Check(CheatFinishedInChatLine(buffer, '\0', "urtoise", keys, &count) == CHEAT_COUNT,
+	      "and a chat key the engine never sees rescues nothing");
+	Check(CheatFinishedInChatLine(buffer, 'T', "urtoiseurtoiseurtoise", keys, &count) ==
+	          CHEAT_COUNT,
+	      "a line longer than the buffer is never a cheat");
+}
+
 // The retail bug, kept. Sixteen compared for ten letters means the eleventh
 // has to be the zero the buffer started with.
 void TestBoooooringOnlyWorksAsTheFirstThingTyped() {
@@ -653,6 +833,41 @@ void TestTheHostTakesASkyAndSendsItAtOnce() {
 	Check(h.WorldSendPending(), "and its world packet goes without waiting out the second");
 }
 
+S_MissionState MissionRunning(uint8_t owner, uint8_t state = MISSION_STATE_RUNNING) {
+	S_MissionState s;
+	InitHeader(s, 1000);
+	s.campaignLog   = 77;
+	s.state         = state;
+	s.ownerId       = owner;
+	s.missionNumber = 19;
+	s.participants  = 0x03;
+	s.marginCm      = 500;
+	return s;
+}
+
+void TestASkyCheatGoesWhereTheSkyIs() {
+	std::printf("\na sky cheat while somebody's mission runs\n");
+	Client o;
+	o.SetBridge(CheatBridge());
+	o.HandleMessage(WrapCheat(Welcome(1, 0, CHEAT_RULE_SHARED)));
+	Check(!g_cheatRec.isHost, "a guest's seam is not told the sky is its own");
+	o.HandleMessage(WrapCheat(MissionRunning(1)));
+	Check(g_cheatRec.isHost, "until its mission is the session's, and then it is, at once");
+	o.HandleMessage(WrapCheat(Typed(0, CHEAT_RAINY, 0)));
+	Check(g_cheatRec.applied.size() == 1 && g_cheatRec.applied[0].cheat == CHEAT_RAINY,
+	      "the host's ILOVESCOTLAND is run by the mission's owner, whose sky everybody has");
+
+	Client h;
+	h.SetBridge(CheatBridge());
+	h.HandleMessage(WrapCheat(Welcome(0, 0, CHEAT_RULE_SHARED)));
+	h.HandleMessage(WrapCheat(MissionRunning(1)));
+	Check(!g_cheatRec.isHost, "the host's seam hears its sky has gone to the owner");
+	h.HandleMessage(WrapCheat(Typed(1, CHEAT_FOGGY, 0)));
+	Check(g_cheatRec.applied.empty(), "and a sky reaching the host then is dropped, not fought over");
+	h.HandleMessage(WrapCheat(MissionRunning(1, MISSION_STATE_IDLE)));
+	Check(g_cheatRec.isHost, "the mission over, it is the host's again");
+}
+
 void TestTheRuleIsKeptEvenIfTheServerDoesNot() {
 	std::printf("\na server that relays what the rule refuses\n");
 	Client c;
@@ -780,6 +995,8 @@ int RunCheatTests() {
 	TestEachCheatFiresOnItsLastKeyAndOnlyThen();
 	TestNoCheatFiresAnotherOnTheWay();
 	TestBoooooringOnlyWorksAsTheFirstThingTyped();
+	TestEveryCheatCanBeTypedPastTheChatKey();
+	TestChatTextNeverStartsACheat();
 	TestTheBufferKeepsTheLastTwentyNewestFirst();
 	TestWhatEachCheatTouches();
 	TestTheRuleDecidesWhatIsAllowed();
@@ -795,6 +1012,7 @@ int RunCheatTests() {
 	TestTheWelcomeTellsTheSeam();
 	TestARoutedCheatIsBroughtAboutHere();
 	TestTheHostTakesASkyAndSendsItAtOnce();
+	TestASkyCheatGoesWhereTheSkyIs();
 	TestTheRuleIsKeptEvenIfTheServerDoesNot();
 	TestTheTableAgainstTheImage();
 	return g_cheatFailures;

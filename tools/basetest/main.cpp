@@ -113,6 +113,12 @@ void TestConfigKeys() {
 	Check(Config::ParseKey("F0") == 0 && Config::ParseKey("F13") == 0 &&
 	          Config::ParseKey("F01") == 0 && Config::ParseKey("Fx") == 0,
 	      "an F-number outside 1-12, or not a number, is refused");
+	Check(Config{}.missions, "the missions are the session's unless they are turned off");
+	Config shared;
+	shared.ParseIni("missions = on\n");
+	Check(shared.missions, "and `missions = on` turns them on");
+	Check(Config::ParseKey("Tab") == 0x09 && Config::ParseKey("tab") == 0x09,
+	      "Tab, for the player list the way other games have it");
 	Check(Config::ParseKey("") == 0 && Config::ParseKey("?") == 0 &&
 	          Config::ParseKey("Enter") == 0,
 	      "punctuation and names without a table are refused");

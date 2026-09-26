@@ -10,8 +10,12 @@
 // is where the log lines go.
 #pragma once
 
+#include "cutscenevote.h"
+#include "objectrecords.h"
 #include "rampagevote.h"
+#include "lobby.h"
 #include "session.h"
+#include "stuntcam.h"
 
 #include "coopiii/net.h"
 #include "coopiii/version.h"
@@ -62,8 +66,9 @@ enum class LogKind : uint8_t {
 
 inline const char *TagOf(LogKind kind) { return kind == LogKind::Chat ? "[chat]" : "[coopiii]"; }
 
-// Connections the server takes: every slot, and two to say "full" on.
-constexpr uint8_t  SERVER_PEERS  = MAX_PLAYERS + 2;
+// Connections the server takes: every slot, a launcher waiting in the lobby
+// for each (docs/protocol.md 1.31), and two to say "full" on.
+constexpr uint8_t  SERVER_PEERS  = MAX_PLAYERS + LOBBY_MAX + 2;
 // How long a connection has to say hello before it is dropped.
 constexpr uint32_t HELLO_WAIT_MS = 10000;
 
@@ -127,16 +132,38 @@ public:
 		// sent went to the ghost.
 		m_session     = Session{};
 		m_vote        = RampageVote{};
+		m_cutscenes   = CutsceneVotes{};
+		m_lobby       = Lobby{};
 		m_events.clear();
 		for (uint32_t &at : m_connectedAtMs)
 			at = 0;
 		m_lastTickMs  = 0;
 		m_lastWorldMs = 0;
 		m_lastPingsMs = 0;
+		m_skyHolder   = INVALID_PLAYER;
 	}
 
 	// What a hello has to be followed by, or empty for nothing. protocol.h,
 	// C_Password. Takes effect for the next hello; nobody already in is asked.
+	// The server's missionFailOnDeath, missionMargin, missionEnemies and
+	// missionScale (config.h).
+	void SetMissionRules(bool failOnDeath, uint16_t marginCm,
+	                     uint8_t enemies = MISSION_ENEMIES_ORIGINAL,
+	                     uint16_t scalePct = MISSION_SCALE_DEFAULT) {
+		m_session.Mission().SetFailOnDeath(failOnDeath);
+		m_session.Mission().SetMarginCm(marginCm);
+		m_session.Mission().SetEnemies(enemies, scalePct);
+		Log(LogKind::Info,
+		    "missions: everybody has to be within %.1f m of a start or a checkpoint, and a "
+		    "death %s", MarginMetres(marginCm), failOnDeath ? "fails the mission" : "does not");
+		if (enemies != MISSION_ENEMIES_ORIGINAL)
+			Log(LogKind::Info, "missions: every player after the first makes the enemies %u%% "
+			    "tougher", static_cast<unsigned>(scalePct));
+	}
+	// How long a start waits for a game in its own intro. MISSION_BUSY_WAIT_MS
+	// but in a test.
+	void SetMissionBusyWaitMs(uint32_t ms) { m_session.Mission().SetBusyWaitMs(ms); }
+
 	void SetPassword(const std::string &password) {
 		m_password = password;
 		Log(LogKind::Info, m_password.empty() ? "no password: anybody with the address "
@@ -160,6 +187,8 @@ public:
 		// engine has had time to clear the shell and let the generator park a
 		// new car there. docs/roadmap.md 5.8 and WreckedUnownedCar.
 		m_session.ExpireUnownedWrecks(now);
+		// And the broken street objects nobody is near any more.
+		ExpireObjectRecords(now);
 		// And let go of session cars nobody has been in or near for a minute,
 		// on every machine. VEHICLE_RELEASE_MS in session.h has the rule.
 		ReleaseIdleVehicles(now);
@@ -179,6 +208,13 @@ public:
 		}
 		// And the vote before one, which runs out on this clock.
 		TickRampageVote(now);
+		// And a skipped mission scene's grace for a participant late into it.
+		FlushCutsceneVotes(now);
+
+		// A mission's claim nobody refreshed: its player walked out of the
+		// marker, and whoever was waited for is not any more.
+		m_session.Mission().Expire(now);
+		BroadcastMissionWaiting();
 
 		m_events.clear();
 		m_net.Service(m_events, waitMs);
@@ -207,7 +243,7 @@ public:
 			if (at == 0 || static_cast<int32_t>(heldUntil - at) < static_cast<int32_t>(HELLO_WAIT_MS))
 				continue;
 			m_connectedAtMs[peer] = 0;
-			if (m_session.FindByPeer(peer))
+			if (m_session.FindByPeer(peer) || m_lobby.Has(peer))
 				continue;
 			bool pending = false;
 			for (const PendingHello &h : m_pendingHellos)
@@ -255,7 +291,8 @@ private:
 	// Everybody, the claimer included. On the machine whose engine made the
 	// car the client only forgets the row and leaves the car to its engine
 	// (RemoteVehicle::ours); everywhere else the copy is destroyed. This is
-	// the only sender of S_VehicleDespawn.
+	// one of three senders of S_VehicleDespawn, with ReleaseMissionCars and
+	// OnVehicleRemoved.
 	void ReleaseIdleVehicles(uint32_t now) {
 		for (uint16_t netId : m_session.ReleaseIdleVehicles(now)) {
 			S_VehicleDespawn out;
@@ -271,12 +308,32 @@ private:
 		}
 	}
 
+	// The session's mission is over, however it ended: the cars it made that
+	// nobody is in go from every machine, the same way an idle one does.
+	// Nothing while a mission runs, whose cars are still its own.
+	void ReleaseMissionCars(uint32_t now) {
+		for (uint16_t netId : m_session.ReleaseMissionCars()) {
+			S_VehicleDespawn out;
+			InitHeader(out, now);
+			out.netId = netId;
+			m_net.Broadcast(out, CH_EVENT);
+			Log(LogKind::Detail, "vehicle %u released - the mission that made it is over and "
+			    "nobody is in it", netId);
+		}
+	}
+
 	void OnDisconnect(PeerId peer) {
 		for (size_t i = 0; i < m_pendingHellos.size(); ++i)
 			if (m_pendingHellos[i].peer == peer) {
 				m_pendingHellos.erase(m_pendingHellos.begin() + static_cast<std::ptrdiff_t>(i));
 				break;
 			}
+		if (const Lobby::Member *m = m_lobby.FindByPeer(peer)) {
+			Log(LogKind::Info, "%s left the lobby", m->nick.c_str());
+			m_lobby.Leave(peer);
+			BroadcastLobby();
+			return;
+		}
 		RemovePlayer(peer, LEAVE_QUIT);
 	}
 
@@ -314,12 +371,29 @@ private:
 		// seat before it hears who settles the car.
 		const std::vector<uint16_t> handed = m_session.HandOverVehiclesOf(p->id);
 		const std::string           nick   = p->nick;
+		const bool     ownedMission = m_session.Mission().Running() &&
+		                              m_session.Mission().Owner() == out.playerId;
+		const uint16_t mission      = m_session.Mission().Number();
+		const bool     missionMoved = m_session.Mission().Leave(out.playerId);
 		m_session.RemovePeer(peer);
 		m_net.SetMember(peer, false);
 		m_net.Broadcast(out, CH_EVENT, peer);
 		// A vote they started is off; one they were voting in is recounted
 		// without them.
 		TickRampageVote(NowMs());
+		// And so is the cutscene they were in.
+		m_cutscenes.Leave(out.playerId);
+		FlushCutsceneVotes(NowMs());
+		// After the leave, so every machine has them gone before it hears the
+		// mission end or lose a participant.
+		if (missionMoved) {
+			if (ownedMission)
+				Log(LogKind::Info, "%s left in the middle of %s, which fails for everybody",
+				    nick.c_str(), MissionName(mission));
+			BroadcastMissionState();
+			ReleaseMissionCars(NowMs());
+		}
+		BroadcastMissionWaiting();
 		for (uint16_t netId : handed) {
 			AnnounceCustody(netId, NowMs());
 			const Player *heir = m_session.FindById(m_session.CustodianOf(netId));
@@ -327,14 +401,18 @@ private:
 			    heir ? heir->nick.c_str() : "?");
 		}
 
-		// The host walking out hands the clock to whoever is left. Everyone
-		// finds out from the next world packet, at most a second away, which
-		// is also when the new host starts reporting.
+		// The host walking out hands the clock to whoever is left, unless a
+		// mission runs, whose owner keeps it. Everyone finds out from the next
+		// world packet, at most a second away, which is also when the new
+		// holder starts reporting.
 		if (wasHost == out.playerId && m_session.HostId() != INVALID_PLAYER) {
 			const Player *host = m_session.FindById(m_session.HostId());
-			Log(LogKind::Info, "the host left; %s has the clock now",
+			Log(LogKind::Info, "the host left; %s is the host now",
 			            host ? host->nick.c_str() : "?");
 		}
+		NoteSkyHolder();
+		// The lobby sees who is playing.
+		BroadcastLobby();
 	}
 
 	void OnMessage(PeerId peer, const Message &msg) {
@@ -351,6 +429,10 @@ private:
 			if (const auto *pkt = msg.as<C_PlayerState>())
 				OnPlayerState(peer, *pkt);
 			break;
+		case OP_C_PLAYER_STATE_RIDE:
+			if (const auto *pkt = msg.as<C_PlayerStateRide>())
+				OnPlayerStateRide(peer, *pkt);
+			break;
 		case OP_C_VEHICLE_STATE:
 			if (const auto *pkt = msg.as<C_VehicleState>())
 				OnVehicleState(peer, *pkt);
@@ -362,6 +444,10 @@ private:
 		case OP_C_PLAYER_LOOK:
 			if (const auto *pkt = msg.as<C_PlayerLook>())
 				OnPlayerLook(peer, *pkt);
+			break;
+		case OP_C_PLAYER_AWAY:
+			if (const auto *pkt = msg.as<C_PlayerAway>())
+				OnPlayerAway(peer, *pkt);
 			break;
 		case OP_C_PLAYER_AMMO:
 			if (const auto *pkt = msg.as<C_PlayerAmmo>())
@@ -387,6 +473,14 @@ private:
 			if (const auto *pkt = msg.as<C_Explosion>())
 				OnExplosion(peer, *pkt);
 			break;
+		case OP_C_MINE_BLAST:
+			if (const auto *pkt = msg.as<C_MineBlast>())
+				OnMineBlast(peer, *pkt);
+			break;
+		case OP_C_MISSION_BOMB:
+			if (const auto *pkt = msg.as<C_MissionBomb>())
+				OnMissionBomb(peer, *pkt);
+			break;
 		case OP_C_DAMAGE:
 			if (const auto *pkt = msg.as<C_Damage>())
 				OnDamage(peer, *pkt);
@@ -402,6 +496,10 @@ private:
 		case OP_C_EXIT_VEHICLE:
 			if (const auto *pkt = msg.as<C_ExitVehicle>())
 				OnExitVehicle(peer, *pkt);
+			break;
+		case OP_C_VEHICLE_REMOVED:
+			if (const auto *pkt = msg.as<C_VehicleRemoved>())
+				OnVehicleRemoved(peer, *pkt);
 			break;
 		case OP_C_VEHICLE_SETTLED:
 			if (const auto *pkt = msg.as<C_VehicleSettled>())
@@ -419,6 +517,22 @@ private:
 			if (const auto *pkt = msg.as<C_VehicleDamage>())
 				OnVehicleDamage(peer, *pkt);
 			break;
+		case OP_C_VEHICLE_BOMB:
+			if (const auto *pkt = msg.as<C_VehicleBomb>())
+				OnVehicleBomb(peer, *pkt);
+			break;
+		case OP_C_VEHICLE_RADIO:
+			if (const auto *pkt = msg.as<C_VehicleRadio>())
+				OnVehicleRadio(peer, *pkt);
+			break;
+		case OP_C_VEHICLE_ALARM:
+			if (const auto *pkt = msg.as<C_VehicleAlarm>())
+				OnVehicleAlarm(peer, *pkt);
+			break;
+		case OP_C_VEHICLE_AIM:
+			if (const auto *pkt = msg.as<C_VehicleAim>())
+				OnVehicleAim(peer, *pkt);
+			break;
 		case OP_C_VEHICLE_HIT:
 			if (const auto *pkt = msg.as<C_VehicleHit>())
 				OnVehicleHit(peer, *pkt);
@@ -434,6 +548,86 @@ private:
 		case OP_C_CHAT:
 			if (const auto *pkt = msg.as<C_Chat>())
 				OnChat(peer, *pkt);
+			break;
+		case OP_C_KICK:
+			if (const auto *pkt = msg.as<C_Kick>())
+				OnKick(peer, *pkt);
+			break;
+		case OP_C_LOBBY_JOIN:
+			if (const auto *pkt = msg.as<C_LobbyJoin>())
+				OnLobbyJoin(peer, *pkt);
+			break;
+		case OP_C_LOBBY_START:
+			if (const auto *pkt = msg.as<C_LobbyStart>())
+				OnLobbyStart(peer, *pkt);
+			break;
+		case OP_C_MISSION_CLAIM:
+			if (const auto *pkt = msg.as<C_MissionClaim>())
+				OnMissionClaim(peer, *pkt);
+			break;
+		case OP_C_MISSION_STARTED:
+			if (const auto *pkt = msg.as<C_MissionStarted>())
+				OnMissionStarted(peer, *pkt);
+			break;
+		case OP_C_MISSION_ENDED:
+			if (const auto *pkt = msg.as<C_MissionEnded>())
+				OnMissionEnded(peer, *pkt);
+			break;
+		case OP_C_MISSION_CHECKPOINT:
+			if (const auto *pkt = msg.as<C_MissionCheckpoint>())
+				OnMissionCheckpoint(peer, *pkt);
+			break;
+		case OP_C_MISSION_EFFECT:
+			if (const auto *pkt = msg.as<C_MissionEffect>())
+				OnMissionEffect(peer, *pkt);
+			break;
+		case OP_C_MISSION_WIDGET:
+			if (const auto *pkt = msg.as<C_MissionWidget>())
+				OnMissionWidget(peer, *pkt);
+			break;
+		case OP_C_MISSION_READY:
+			if (const auto *pkt = msg.as<C_MissionReady>())
+				OnMissionReady(peer, *pkt);
+			break;
+		case OP_C_MISSION_SEATS:
+			if (const auto *pkt = msg.as<C_MissionSeats>())
+				OnMissionSeats(peer, *pkt);
+			break;
+		case OP_C_MISSION_BOARD:
+			if (const auto *pkt = msg.as<C_MissionBoard>())
+				OnMissionBoard(peer, *pkt);
+			break;
+		case OP_C_MISSION_OBJECT_BREAK:
+			if (const auto *pkt = msg.as<C_MissionObjectBreak>())
+				OnMissionObjectBreak(peer, *pkt);
+			break;
+		case OP_C_MISSION_PICKUP:
+			if (const auto *pkt = msg.as<C_MissionPickup>())
+				OnMissionPickup(peer, *pkt);
+			break;
+		case OP_C_MISSION_KILL:
+			if (const auto *pkt = msg.as<C_MissionKill>())
+				OnMissionKill(peer, *pkt);
+			break;
+		case OP_C_MISSION_ANSWERS:
+			if (const auto *pkt = msg.as<C_MissionAnswers>())
+				OnMissionAnswers(peer, *pkt);
+			break;
+		case OP_C_MISSION_BUSY:
+			if (const auto *pkt = msg.as<C_MissionBusy>())
+				OnMissionBusy(peer, *pkt);
+			break;
+		case OP_C_MISSION_CATCH_UP:
+			if (const auto *pkt = msg.as<C_MissionCatchUp>())
+				OnMissionCatchUp(peer, *pkt);
+			break;
+		case OP_C_CAMPAIGN_DELTA:
+			if (const auto *pkt = msg.as<C_CampaignDelta>())
+				OnCampaignDelta(peer, *pkt);
+			break;
+		case OP_C_CAMPAIGN_SINCE:
+			if (const auto *pkt = msg.as<C_CampaignSince>())
+				OnCampaignSince(peer, *pkt);
 			break;
 		case OP_C_DESYNC_PROBE:
 			if (const auto *pkt = msg.as<C_DesyncProbe>())
@@ -482,6 +676,10 @@ private:
 		case OP_C_CAR_DESPAWN:
 			if (const auto *pkt = msg.as<C_CarDespawn>())
 				OnCarDespawn(peer, *pkt);
+			break;
+		case OP_C_CAR_LET_GO:
+			if (const auto *pkt = msg.as<C_CarLetGo>())
+				OnCarLetGo(peer, *pkt);
 			break;
 		case OP_C_CAR_STATES:
 			if (const auto *pkt = msg.as<C_CarStates>())
@@ -543,9 +741,21 @@ private:
 			if (const auto *pkt = msg.as<C_RampageArrived>())
 				OnRampageArrived(peer, *pkt);
 			break;
+		case OP_C_CUTSCENE_STATE:
+			if (const auto *pkt = msg.as<C_CutsceneState>())
+				OnCutsceneState(peer, *pkt);
+			break;
 		case OP_C_OBJECT_SETTLED:
 			if (const auto *pkt = msg.as<C_ObjectSettled>())
 				OnObjectSettled(peer, *pkt);
+			break;
+		case OP_C_OBJECT_REBUILT:
+			if (const auto *pkt = msg.as<C_ObjectRebuilt>())
+				OnObjectRebuilt(peer, *pkt);
+			break;
+		case OP_C_GATE_STATE:
+			if (const auto *pkt = msg.as<C_GateState>())
+				OnGateState(peer, *pkt);
 			break;
 		case OP_C_HELI_STATE:
 			if (const auto *pkt = msg.as<C_HeliState>())
@@ -566,6 +776,22 @@ private:
 		case OP_C_CHEAT:
 			if (const auto *pkt = msg.as<C_Cheat>())
 				OnCheat(peer, *pkt);
+			break;
+		case OP_C_PED_REVIVE:
+			if (const auto *pkt = msg.as<C_PedRevive>())
+				OnPedRevive(peer, *pkt);
+			break;
+		case OP_C_WATER_CANNON:
+			if (const auto *pkt = msg.as<C_WaterCannon>())
+				OnWaterCannon(peer, *pkt);
+			break;
+		case OP_C_CAR_LISTS:
+			if (const auto *pkt = msg.as<C_CarLists>())
+				OnCarLists(peer, *pkt);
+			break;
+		case OP_C_STUNT_CAMERA:
+			if (const auto *pkt = msg.as<C_StuntCamera>())
+				OnStuntCamera(peer, *pkt);
 			break;
 		case OP_C_MONEY_CHANGE:
 			if (const auto *pkt = msg.as<C_MoneyChange>())
@@ -697,6 +923,37 @@ private:
 		InitHeader(out, in.hdr.sendTimeMs);
 		out.body = in.body;
 		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// A medic on the sender's machine stood a dead pedestrian up. To everybody
+	// else, his host included, and only when the session agrees he was dead
+	// (Session::NotePedRevive): a revive the server does not record must not
+	// reach anybody either, or a joiner and the rest would disagree about him.
+	void OnPedRevive(PeerId peer, const C_PedRevive &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.NotePedRevive(in.body.netId))
+			return;
+
+		S_PedRevive out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.body     = in.body;
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// One frame of a fire truck's jet, from the machine that aims it
+	// (Session::MaySprayCannon), to everybody else. Nothing is kept: a jet is
+	// over a moment after it stops, so a joiner has nothing to be handed.
+	void OnWaterCannon(PeerId peer, const C_WaterCannon &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.MaySprayCannon(p->id, in.body.netId))
+			return;
+
+		S_WaterCannon out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.body     = in.body;
+		m_net.Broadcast(out, CH_SNAPSHOT, peer);
 	}
 
 	// A hit one player's machine landed on a pedestrian another player hosts.
@@ -872,10 +1129,11 @@ private:
 		}
 
 		for (const std::vector<AmbientAdoptRow> &batch : PackAdoptRows(verdicts)) {
-			S_AmbientAdopt out;
+			S_AmbientAdopt out{};
 			InitHeader(out, now);
 			out.wasOwnerPlayerId = leaver.id;
 			out.count            = static_cast<uint8_t>(batch.size());
+			out.why              = AMBIENT_ADOPT_LEFT;
 			for (size_t i = 0; i < batch.size(); ++i)
 				out.rows[i] = batch[i];
 			m_net.Broadcast(out, CH_EVENT);
@@ -893,6 +1151,104 @@ private:
 			const Player *heir = m_session.FindById(id);
 			Log(LogKind::Detail, "  %s takes %zu ped(s) and %zu car(s)",
 			    heir ? heir->nick.c_str() : "?", perP[id], perC[id]);
+		}
+	}
+
+	// A traffic car its host's engine dropped by distance with somebody else
+	// near it (protocol.h, C_CarLetGo). Session::LetGoCar has decided and moved
+	// the rows. Everybody but the sender is told the way a leaver's crowd is
+	// told; the sender, whose engine has already deleted its own car, is sent
+	// what it now watches as backfill under the new owner, so its screen can
+	// have a copy when it comes back into reach.
+	void OnCarLetGo(PeerId peer, const C_CarLetGo &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const uint32_t now = NowMs();
+		const size_t   n   = in.pedCount < MAX_LET_GO_PEDS ? in.pedCount : MAX_LET_GO_PEDS;
+		const std::vector<AdoptVerdict> verdicts =
+		    m_session.LetGoCar(in.netId, in.peds, n, p->id, now);
+
+		uint8_t adopter = INVALID_PLAYER;
+		size_t  keptP = 0, goneP = 0;
+		bool    carKept = false, carGone = false;
+		for (const AdoptVerdict &v : verdicts) {
+			const bool car = v.kind == AMBIENT_ADOPT_CAR;
+			if (v.adopter != INVALID_PLAYER) {
+				adopter = v.adopter;
+				if (car) {
+					carKept = true;
+					const AmbientCar *row = m_session.FindCar(v.netId);
+					if (!row)
+						continue;
+					S_CarSpawn spawn;
+					InitHeader(spawn, now);
+					spawn.ownerPlayerId = v.adopter;
+					spawn.tempId        = 0;
+					spawn.netId         = v.netId;
+					spawn.body          = row->body;
+					m_net.SendTo(peer, spawn, CH_EVENT);
+					if (row->damagePanels != 0 || row->damageDoors != 0) {
+						S_VehicleDamage dmg{};
+						InitHeader(dmg, now);
+						dmg.playerId    = INVALID_PLAYER;
+						dmg.body.netId  = v.netId;
+						dmg.body.panels = row->damagePanels;
+						dmg.body.doors  = row->damageDoors;
+						m_net.SendTo(peer, dmg, CH_EVENT);
+					}
+				} else {
+					++keptP;
+					const AmbientPed *row = m_session.FindPed(v.netId);
+					if (!row)
+						continue;
+					S_PedSpawn spawn;
+					InitHeader(spawn, now);
+					spawn.ownerPlayerId = v.adopter;
+					spawn.tempId        = 0;
+					spawn.netId         = v.netId;
+					spawn.body          = row->body;
+					m_net.SendTo(peer, spawn, CH_EVENT);
+				}
+				continue;
+			}
+			if (car) {
+				carGone = true;
+				S_CarDespawn out;
+				InitHeader(out, now);
+				out.netId = v.netId;
+				m_net.Broadcast(out, CH_EVENT, peer);
+			} else {
+				++goneP;
+				S_PedDespawn out;
+				InitHeader(out, now);
+				out.netId = v.netId;
+				m_net.Broadcast(out, CH_EVENT, peer);
+			}
+		}
+
+		for (const std::vector<AmbientAdoptRow> &batch : PackAdoptRows(verdicts)) {
+			S_AmbientAdopt out{};
+			InitHeader(out, now);
+			out.wasOwnerPlayerId = p->id;
+			out.count            = static_cast<uint8_t>(batch.size());
+			out.why              = AMBIENT_ADOPT_LET_GO;
+			for (size_t i = 0; i < batch.size(); ++i)
+				out.rows[i] = batch[i];
+			m_net.Broadcast(out, CH_EVENT, peer);
+		}
+
+		if (carKept) {
+			const Player *heir = m_session.FindById(adopter);
+			Log(LogKind::Detail,
+			    "%s's engine let go of traffic car %u with somebody near it; %s hosts it "
+			    "now, with %zu of its people",
+			    p->nick.c_str(), in.netId, heir ? heir->nick.c_str() : "?", keptP);
+		} else if (carGone) {
+			Log(LogKind::Detail,
+			    "%s's engine let go of traffic car %u and nobody who has not let go of it "
+			    "lately is near enough to keep it; gone, with %zu of its people",
+			    p->nick.c_str(), in.netId, goneP);
 		}
 	}
 
@@ -1005,6 +1361,8 @@ private:
 	void OnHello(PeerId peer, const C_Hello &hello) {
 		if (m_session.FindByPeer(peer))
 			return;   // duplicate hello, ignore
+		if (m_lobby.Has(peer))
+			return;   // a launcher is no player; its game connects on its own
 
 		// The version first: a client that speaks another protocol is told
 		// that, not asked for a password it may never have heard of.
@@ -1130,6 +1488,8 @@ private:
 			m_net.SendTo(peer, join, CH_EVENT);
 		for (const S_PlayerLook &look : back.looks)
 			m_net.SendTo(peer, look, CH_EVENT);
+		for (const S_PlayerAway &away : back.aways)
+			m_net.SendTo(peer, away, CH_EVENT);
 		for (const S_PlayerAmmo &ammo : back.ammo)
 			m_net.SendTo(peer, ammo, CH_EVENT);
 		for (const S_VehicleSpawn &spawn : back.vehicles)
@@ -1164,6 +1524,22 @@ private:
 		// second means it is never the thing that creates the row.
 		for (const S_VehicleDamage &dmg : back.vehicleDamage)
 			m_net.SendTo(peer, dmg, CH_EVENT);
+		// And the station each car's radio is on, after the spawns for the
+		// same reason.
+		for (const S_VehicleRadio &radio : back.radios)
+			m_net.SendTo(peer, radio, CH_EVENT);
+		// And the bombs they carry, after the spawns for the same reason.
+		for (const S_VehicleBomb &bomb : back.bombs)
+			m_net.SendTo(peer, bomb, CH_EVENT);
+		// And whose a mission's bomb is, after the bomb itself.
+		for (const S_MissionBomb &bomb : back.missionBombs)
+			m_net.SendTo(peer, bomb, CH_EVENT);
+		// And the alarms still going and where each tank's turret points, after
+		// the spawns for the same reason.
+		for (const S_VehicleAlarm &alarm : back.alarms)
+			m_net.SendTo(peer, alarm, CH_EVENT);
+		for (const S_VehicleAim &aim : back.aims)
+			m_net.SendTo(peer, aim, CH_EVENT);
 		// And which doors are currently open for somebody. Without it a
 		// joiner is the one player whose safehouse door is shut while
 		// somebody is standing inside it, until that somebody walks away -
@@ -1171,6 +1547,22 @@ private:
 		// closed.
 		for (const S_GarageState &garage : back.garages)
 			m_net.SendTo(peer, garage, CH_EVENT);
+		// The gates, for the same reason as the doors.
+		for (const Player &q : m_session.Players()) {
+			if (!q.active || q.id == p->id || q.gateMask == 0)
+				continue;
+			S_GateState g{};
+			InitHeader(g, NowMs());
+			g.playerId  = q.id;
+			g.body.open = q.gateMask;
+			m_net.SendTo(peer, g, CH_EVENT);
+		}
+		// And the street objects somebody near them still sees broken. The
+		// joiner's own copies are built pristine; it applies these to any it
+		// already has and asks again for the rest when it builds them.
+		for (size_t i = 0; i < OBJECT_RECORD_CAPACITY; ++i)
+			if (m_objects.Rows()[i].used)
+				SendObjectRecord(peer, m_objects.Rows()[i]);
 		// And the cheats every machine is running, at the state the last one
 		// left them. Without it a joiner walks into a riot as the one screen
 		// where nobody is rioting, and at normal speed while everybody else
@@ -1186,6 +1578,16 @@ private:
 		live.flags        = static_cast<uint8_t>(live.flags | PJF_ARRIVED);
 		m_net.Broadcast(live, CH_EVENT, peer);
 
+		// Everybody is in the session's mission, somebody who arrives in the
+		// middle of one too (missions.md 11). After the join, so nobody hears
+		// of a participant they have not been told about. Every joiner hears
+		// the state, idle or not: it is also how a client learns this server
+		// shares missions at all, and claims nothing from one that doesn't.
+		if (m_session.Mission().Join(p->id))
+			BroadcastMissionState();
+		else
+			m_net.SendTo(peer, MissionStateNow(), CH_EVENT);
+
 		Log(LogKind::Join, "%s joined (slot %u, net %u); backfilled %zu player(s), "
 		            "%zu vehicle(s), %zu seat(s)",
 		            p->nick.c_str(), p->id, p->netId, back.players.size(),
@@ -1193,6 +1595,9 @@ private:
 		if (m_session.HostId() == p->id)
 			Log(LogKind::Info, "%s is the host; the session's clock is theirs",
 			            p->nick.c_str());
+		NoteSkyHolder();
+		// The lobby sees who is playing.
+		BroadcastLobby();
 	}
 
 	// Player changed model. We store it, not just relay it, because the join
@@ -1222,6 +1627,14 @@ private:
 
 		Log(LogKind::Detail, "%s is wearing '%s'", p->nick.c_str(), p->look);
 		m_net.Broadcast(m_session.MakeLook(*p, in.hdr.sendTimeMs), CH_EVENT, peer);
+	}
+
+	// Their menu went up or down. Stored for joiners, same as the look.
+	void OnPlayerAway(PeerId peer, const C_PlayerAway &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.NotePlayerAway(*p, in.away != 0))
+			return;
+		m_net.Broadcast(m_session.MakeAway(*p, in.hdr.sendTimeMs), CH_EVENT, peer);
 	}
 
 	// A weapon slot this player is not holding changed. Stored as well as
@@ -1283,6 +1696,23 @@ private:
 		m_net.Broadcast(out, CH_EVENT, peer);
 	}
 
+	// A mine that went off on the sender's machine (protocol.h, C_MineBlast).
+	// Nobody owns a mine, so there is nothing to check but the place: a
+	// position that is not a number or not in the world is dropped, the way
+	// the client would drop it.
+	void OnMineBlast(PeerId peer, const C_MineBlast &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !MineBlastPlaceSane(in.pos))
+			return;
+		S_MineBlast out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.pos      = in.pos;
+		m_net.Broadcast(out, CH_EVENT, peer);
+		Log(LogKind::Detail, "%s's mine went off at %.1f %.1f %.1f", p->nick.c_str(), in.pos.x,
+		    in.pos.y, in.pos.z);
+	}
+
 	// ---- damage, death and respawn -----------------------------------------
 	//
 	// The server arbitrates one thing here and relays the rest. What it
@@ -1311,6 +1741,11 @@ private:
 		// stops here: no client is asked to hurt itself on another's behalf,
 		// so there's nothing to get wrong further down.
 		if (!m_session.FriendlyFire())
+			return;
+
+		// Nobody hurts somebody sitting in the car with them: a passenger's
+		// round goes out of the car, never into it (session.h, ShareACar).
+		if (ShareACar(*attacker, *victim))
 			return;
 
 		// Already on the floor. A burst that was in flight when they died
@@ -1364,6 +1799,7 @@ private:
 		// Dead, they can't start anything.
 		m_vote.CancelFor(p->id);
 		TickRampageVote(NowMs());
+		OrderMissionFail(*p, MISSION_FAIL_DIED);
 	}
 
 	// And back again. The position is theirs to decide too: GTA III picks the
@@ -1397,19 +1833,44 @@ private:
 		Player *p = m_session.FindByPeer(peer);
 		if (!p)
 			return;
-
-		// Position for the next joiner, and the condition fields that go with
-		// it. A snapshot is the only thing that ever tells the session what
-		// health somebody is on, and a joiner creating a ped needs that
-		// before their first snapshot arrives, not after it.
-		m_session.NotePlayerState(*p, in.body);
-		p->history.Note(in.hdr.sendTimeMs, in.body.pos, p->id, MoveSpeedMps(in.body.moveSpeed));
+		NoteSnapshot(*p, in.hdr.sendTimeMs, in.body);
 
 		S_PlayerState out;
 		InitHeader(out, in.hdr.sendTimeMs);
 		out.playerId = p->id;
 		out.body     = in.body;
 		m_net.Broadcast(out, CH_SNAPSHOT, peer);
+	}
+
+	// The same snapshot from somebody standing on something that moves
+	// (docs/protocol.md 1.7.1). A snapshot in every way that matters here; the
+	// ride is only passed on, since only a machine with the vehicle can use it.
+	void OnPlayerStateRide(PeerId peer, const C_PlayerStateRide &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		NoteSnapshot(*p, in.hdr.sendTimeMs, in.body);
+
+		S_PlayerStateRide out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.body     = in.body;
+		out.ride     = in.ride;
+		m_net.Broadcast(out, CH_SNAPSHOT, peer);
+	}
+
+	void NoteSnapshot(Player &p, uint32_t sendTimeMs, const PlayerStateBody &body) {
+		// Position for the next joiner, and the condition fields that go with
+		// it. A snapshot is the only thing that ever tells the session what
+		// health somebody is on, and a joiner creating a ped needs that
+		// before their first snapshot arrives, not after it.
+		m_session.NotePlayerState(p, body);
+		p.history.Note(sendTimeMs, body.pos, p.id, MoveSpeedMps(body.moveSpeed));
+		// Busted is the death rule's other half, and nothing but the
+		// snapshot says it. MissionSlot orders one failure per mission, so
+		// every snapshot of the arrest after the first is a no-op.
+		if (body.pedState == PEDSTATE_ON_WIRE_ARRESTED)
+			OrderMissionFail(p, MISSION_FAIL_BUSTED);
 	}
 
 	// What shape a car is in. docs/cardamage.md.
@@ -1426,6 +1887,114 @@ private:
 	//
 	// Relayed only when it added something, which is what keeps an absolute,
 	// near-static state from becoming a stream.
+	// A car's bomb, from the machine that simulates it (protocol.h,
+	// C_VehicleBomb): the same entitlement as its dents, relayed as it is.
+	//
+	// Kept on the car as well, so a joiner's copy has it (Session::NoteVehicleBomb).
+	void OnVehicleBomb(PeerId peer, const C_VehicleBomb &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.NoteVehicleBomb(p->id, in, NowMs()))
+			return;
+		S_VehicleBomb out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.bombType = in.bombType;
+		out.netId    = in.netId;
+		out.blame    = in.blame;
+		out.fuseMs   = in.fuseMs;
+		m_net.Broadcast(out, CH_EVENT, peer);
+		Log(LogKind::Detail, "%s's car %u has bomb %u now (player %u's, fuse %u ms)",
+		    p->nick.c_str(), in.netId, static_cast<unsigned>(in.bombType),
+		    static_cast<unsigned>(in.blame), static_cast<unsigned>(in.fuseMs));
+	}
+
+	// A bomb the mission's script fitted to a car (protocol.h,
+	// C_MissionBomb), from the mission's owner: the car's bomb is theirs,
+	// whoever simulates it. To everybody else, and kept for a joiner.
+	void OnMissionBomb(PeerId peer, const C_MissionBomb &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.NoteMissionBomb(p->id, in))
+			return;
+		S_MissionBomb out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.bombType = in.bombType;
+		out.netId    = in.netId;
+		m_net.Broadcast(out, CH_EVENT, peer);
+		Log(LogKind::Detail, "%s's mission fitted bomb %u to car %u; it is theirs on every copy",
+		    p->nick.c_str(), static_cast<unsigned>(in.bombType), in.netId);
+	}
+
+	// A car's radio, from somebody sitting in it. docs/protocol.md 1.33.
+	void OnVehicleRadio(PeerId peer, const C_VehicleRadio &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		uint8_t held = RADIO_STATION_UNKNOWN;
+		if (!m_session.NoteVehicleRadio(p->id, in.netId, in.station, held)) {
+			// Refused, or nothing new. The sender's copy is already on the
+			// station it named, so when the session holds a different one it
+			// is told that one, alone, and its copy goes back.
+			if (held != RADIO_STATION_UNKNOWN && held != in.station) {
+				S_VehicleRadio back{};
+				InitHeader(back, in.hdr.sendTimeMs);
+				back.playerId = INVALID_PLAYER;
+				back.station  = held;
+				back.netId    = in.netId;
+				m_net.SendTo(peer, back, CH_EVENT);
+			}
+			return;
+		}
+		S_VehicleRadio out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.station  = in.station;
+		out.netId    = in.netId;
+		// To everybody, the sender too: two players turning the dial at once
+		// end on the one this took last, on every machine.
+		m_net.Broadcast(out, CH_EVENT);
+		Log(LogKind::Detail, "%s put car %u's radio on station %u", p->nick.c_str(), in.netId,
+		    static_cast<unsigned>(in.station));
+	}
+
+	// A car's alarm, from the machine simulating it. docs/protocol.md 1.39.
+	void OnVehicleAlarm(PeerId peer, const C_VehicleAlarm &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		uint16_t remaining = in.remainingMs;
+		if (!m_session.NoteVehicleAlarm(p->id, in.netId, remaining, NowMs()))
+			return;
+		S_VehicleAlarm out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId    = p->id;
+		out.netId       = in.netId;
+		out.remainingMs = remaining;
+		m_net.Broadcast(out, CH_EVENT, peer);
+		if (remaining)
+			Log(LogKind::Detail, "%s's car %u has its alarm going, %u ms of it",
+			    p->nick.c_str(), in.netId, static_cast<unsigned>(remaining));
+		else
+			Log(LogKind::Detail, "%s's car %u has stopped its alarm", p->nick.c_str(),
+			    in.netId);
+	}
+
+	// Where a car's gun points, from its driver. docs/protocol.md 1.39.
+	void OnVehicleAim(PeerId peer, const C_VehicleAim &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		if (!m_session.NoteVehicleAim(p->id, in.netId, in.gunLR, in.gunUD))
+			return;
+		S_VehicleAim out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.netId    = in.netId;
+		out.gunLR    = in.gunLR;
+		out.gunUD    = in.gunUD;
+		m_net.Broadcast(out, CH_SNAPSHOT, peer);
+	}
+
 	void OnVehicleDamage(PeerId peer, const C_VehicleDamage &in) {
 		Player *p = m_session.FindByPeer(peer);
 		if (!p)
@@ -1673,10 +2242,27 @@ private:
 		// reports itself wrecked leaves the session's backfill here, and says
 		// so once rather than on every snapshot that follows.
 		//
-		// A wreck takes no more updates either: its driver is dead, so anything
-		// still arriving for it was sampled before the blast.
+		// A wreck takes one update: where it is coming to rest, from the
+		// machine settling it, flagged VEH_WRECKED (client/src/game/wreck.h).
+		// Anything else still arriving for it was sampled before the blast.
 		Vehicle *known = m_session.FindVehicle(in.body.netId);
-		if (known && known->destroyed)
+		if (known && known->destroyed) {
+			if (!m_session.NoteWreckState(p->id, in.body))
+				return;
+			known->history.Note(in.hdr.sendTimeMs, in.body.pos, p->id,
+			                    MoveSpeedMps(in.body.moveSpeed));
+			S_VehicleState wreck;
+			InitHeader(wreck, in.hdr.sendTimeMs);
+			wreck.playerId = p->id;
+			wreck.body     = in.body;
+			m_net.Broadcast(wreck, CH_SNAPSHOT, peer);
+			return;
+		}
+		// And a wreck's settle that overtook the event that makes it one: the
+		// C_VehicleBlowUp or C_UnownedBlowUp is reliable and right behind it.
+		// Taken here it would destroy the car without the event, and the event
+		// would then find a wreck and be dropped unrelayed.
+		if (in.body.flags & VEH_WRECKED)
 			return;
 		m_session.NoteVehicleState(in.body);
 		if (known && known->destroyed)
@@ -1790,6 +2376,9 @@ private:
 			// car has - its own engine chose them. docs/protocol.md §1.12.
 			v->extra1 = in.body.extra1;
 			v->extra2 = in.body.extra2;
+			// And the car generator it was parked on, which every other machine
+			// has a car of its own on (docs/protocol.md 1.44).
+			v->parkedSlot = in.body.parkedSlot;
 
 			// Everyone else needs to spawn it. Claimer's excluded, obviously
 			// (it's a car from their own world, they've already got it).
@@ -1811,6 +2400,7 @@ private:
 			spawn.flags   = v->flags;
 			spawn.extra1  = v->extra1;
 			spawn.extra2  = v->extra2;
+			spawn.parkedSlot = v->parkedSlot;
 			m_net.Broadcast(spawn, CH_EVENT, peer);
 
 			Log(LogKind::Detail, "vehicle %u claimed by %s (model %u, extras %d/%d)",
@@ -1905,12 +2495,11 @@ private:
 		if (!m_session.MayReportVehicle(p->id, v->netId))
 			return;
 
-		// The whole of a wreck's bookkeeping, passengers included, and the
-		// custody it ends said out loud: the custodian's own C_VehicleSettled
-		// is refused from here on, so without the word it would go on holding
-		// a burnt-out car.
-		const bool settling = v->custodianPlayerId != INVALID_PLAYER;
-		m_session.DestroyVehicle(v->netId);
+		// The whole of a wreck's bookkeeping, passengers included, and who
+		// settles it now said out loud, after the blast: the reporter, whose
+		// engine threw the car up and knows where it comes down
+		// (Session::DestroyVehicle).
+		m_session.DestroyVehicle(v->netId, p->id, NowMs());
 		v->pos = in.body.pos;
 		v->rot = in.body.rot;
 
@@ -1921,8 +2510,7 @@ private:
 		out.playerId = p->id;
 		out.body     = in.body;
 		m_net.Broadcast(out, CH_EVENT, peer);
-		if (settling)
-			AnnounceCustody(v->netId, in.hdr.sendTimeMs);
+		AnnounceCustody(v->netId, in.hdr.sendTimeMs);
 	}
 
 	// "I am getting into that car." Relayed, and written down nowhere.
@@ -2003,10 +2591,6 @@ private:
 		if (!p)
 			return;
 
-		// A session car its custodian reports burnt out: the custody ends
-		// with it, and is said to end.
-		const bool settling = in.key.kind == UNOWNED_SESSION &&
-		                      m_session.CustodianOf(in.key.id) != INVALID_PLAYER;
 		if (!m_session.NoteUnownedBlowUp(in.key, p->id, NowMs()))
 			return;   // already recorded, or a kind this build does not speak
 
@@ -2027,7 +2611,10 @@ private:
 		// Everyone but the reporter: their own engine has already done it,
 		// which is how they came to be the one telling us.
 		m_net.Broadcast(out, CH_EVENT, peer);
-		if (settling)
+		// A session car's wreck is the reporter's to settle now, whoever held
+		// it before (Session::DestroyVehicle). Said after the blast, on the
+		// same channel, so nobody takes its settle for a live car's snapshots.
+		if (in.key.kind == UNOWNED_SESSION)
 			AnnounceCustody(in.key.id, in.hdr.sendTimeMs);
 	}
 
@@ -2161,6 +2748,36 @@ private:
 		    in.netId, p->nick.c_str());
 	}
 
+	// A session car the sender's engine crushed, craned, delivered or stored
+	// (protocol.h, C_VehicleRemoved). Everybody else first hears why - which
+	// is what has a machine delete a car its own engine made, and merge the
+	// lists - and then everybody, the sender included, the ordinary despawn.
+	void OnVehicleRemoved(PeerId peer, const C_VehicleRemoved &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		VehicleRemovedBody relay{};
+		if (!m_session.RemoveVehicleOnPurpose(p->id, in.body, relay)) {
+			Log(LogKind::Detail,
+			    "refused %s's removal of vehicle %u (reason %u) - unknown, "
+			    "somebody else is driving it, or no such reason",
+			    p->nick.c_str(), in.body.netId, static_cast<unsigned>(in.body.reason));
+			return;
+		}
+		S_VehicleRemoved removed;
+		InitHeader(removed, in.hdr.sendTimeMs);
+		removed.playerId = p->id;
+		removed.body     = relay;
+		m_net.Broadcast(removed, CH_EVENT, peer);
+
+		S_VehicleDespawn out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.netId = in.body.netId;
+		m_net.Broadcast(out, CH_EVENT);
+		Log(LogKind::Detail, "vehicle %u taken away by %s's engine (reason %u)",
+		    in.body.netId, p->nick.c_str(), static_cast<unsigned>(in.body.reason));
+	}
+
 	void OnChat(PeerId peer, const C_Chat &in) {
 		Player *p = m_session.FindByPeer(peer);
 		if (!p)
@@ -2177,6 +2794,570 @@ private:
 		m_net.Broadcast(out, CH_EVENT);
 
 		Log(LogKind::Chat, "%s: %s", p->nick.c_str(), text.c_str());
+	}
+
+	// The host throwing somebody out from inside the game (protocol.h,
+	// C_Kick). Session::MayKick decides; the kick itself is the window's, so
+	// everybody reads "was kicked" and the player stays out.
+	void OnKick(PeerId peer, const C_Kick &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const Player *target = m_session.FindById(in.playerId);
+		switch (m_session.MayKick(p->id, in.playerId)) {
+		case Session::KickVerdict::Allowed:
+			Log(LogKind::Leave, "%s, the host, is throwing %s out", p->nick.c_str(),
+			    target ? target->nick.c_str() : "?");
+			Kick(in.playerId);
+			return;
+		case Session::KickVerdict::NotHost:
+			Log(LogKind::Warn, "%s asked to kick slot %u and is not the host - refused",
+			    p->nick.c_str(), in.playerId);
+			return;
+		case Session::KickVerdict::NoSuchPlayer:
+			Log(LogKind::Detail, "%s asked to kick slot %u, and nobody is in it",
+			    p->nick.c_str(), in.playerId);
+			return;
+		case Session::KickVerdict::Themselves:
+			Log(LogKind::Detail, "%s asked to kick themselves - refused", p->nick.c_str());
+			return;
+		}
+	}
+
+	// ---- the lobby (protocol.h, C_LobbyJoin; lobby.h) -------------------------
+	//
+	// Launchers waiting before anybody's game is running. Lobby decides who is
+	// in it and who its host is; what is here is the door and who hears what.
+
+	void OnLobbyJoin(PeerId peer, const C_LobbyJoin &in) {
+		if (m_session.FindByPeer(peer) || m_lobby.Has(peer))
+			return;   // a game's connection, or a second knock
+		const std::string nick = SanitizeText(in.nick, NICK_LEN);
+		RejectReason      reject = REJECT_NONE;
+		const Lobby::Member *m   = nullptr;
+		if (in.protocolVersion != PROTOCOL_VERSION)
+			reject = REJECT_BAD_VERSION;
+		else if (!m_password.empty() &&
+		         std::string(in.password, strnlen(in.password, PASSWORD_LEN)) != m_password)
+			reject = REJECT_BAD_PASSWORD;
+		else
+			m = m_lobby.Join(peer, in.nick, reject);
+
+		S_LobbyAnswer answer{};
+		InitHeader(answer, NowMs());
+		answer.reject          = reject;
+		answer.lobbyId         = m ? m->id : INVALID_PLAYER;
+		answer.protocolVersion = PROTOCOL_VERSION;
+		m_net.SendTo(peer, answer, CH_EVENT);
+		if (!m) {
+			m_net.Disconnect(peer, LEAVE_KICKED);
+			Log(LogKind::Warn, "turned %s away from the lobby: %s",
+			    nick.empty() ? "a launcher" : nick.c_str(), RejectText(reject));
+			return;
+		}
+		if (peer < SERVER_PEERS)
+			m_connectedAtMs[peer] = 0;
+		Log(LogKind::Info, "%s is waiting in the lobby%s", m->nick.c_str(),
+		    m_lobby.HostId() == m->id ? ", and starts everybody's game" : "");
+		BroadcastLobby();
+	}
+
+	void OnLobbyStart(PeerId peer, const C_LobbyStart &in) {
+		const Lobby::Member *m = m_lobby.FindByPeer(peer);
+		if (!m || (in.mode != LOBBY_START_MENU && in.mode != LOBBY_START_NEW_GAME))
+			return;
+		if (!m_lobby.MayStart(peer, NowMs())) {
+			if (m->id != m_lobby.HostId())
+				Log(LogKind::Warn, "%s asked to start everybody's game and is not the lobby's "
+				    "host - refused", m->nick.c_str());
+			return;
+		}
+		S_LobbyStart out{};
+		InitHeader(out, NowMs());
+		out.mode      = in.mode;
+		out.byLobbyId = m->id;
+		for (const Lobby::Member &w : m_lobby.Members())
+			if (w.active)
+				m_net.SendTo(w.peer, out, CH_EVENT);
+		Log(LogKind::Info, "%s started everybody's game%s, for the %zu in the lobby",
+		    m->nick.c_str(), in.mode == LOBBY_START_NEW_GAME ? ", a new game" : "",
+		    m_lobby.Count());
+	}
+
+	// Who is waiting and who is playing, to everybody waiting.
+	void BroadcastLobby() {
+		if (m_lobby.Count() == 0)
+			return;
+		S_Lobby out{};
+		InitHeader(out, NowMs());
+		m_lobby.FillRoster(out);
+		for (const Player &p : m_session.Players()) {
+			if (!p.active || out.count >= LOBBY_MAX + MAX_PLAYERS)
+				continue;
+			LobbyEntry &e = out.entries[out.count++];
+			e.id          = p.id;
+			e.flags       = LOBBY_ENTRY_PLAYING;
+			std::strncpy(e.nick, p.nick.c_str(), NICK_LEN - 1);
+		}
+		for (const Lobby::Member &w : m_lobby.Members())
+			if (w.active)
+				m_net.SendTo(w.peer, out, CH_EVENT);
+	}
+
+	// ---- the session's one mission (protocol.h; missionslot.h) ---------------
+	//
+	// MissionSlot decides everything; what is here is who hears it.
+
+	void OnMissionClaim(PeerId peer, const C_MissionClaim &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		MissionPresence present[MAX_PLAYERS];
+		const size_t    n = m_session.MissionPresences(present);
+		const MissionSlot::ClaimAnswer a =
+		    m_session.Mission().Claim(p->id, in, present, n, NowMs());
+		if (a.leftOut != 0) {
+			std::string who;
+			for (uint8_t id = 0; id < MAX_PLAYERS; ++id)
+				if (a.leftOut & PlayerBit(id))
+					if (const Player *m = m_session.FindById(id))
+						who += (who.empty() ? "" : ", ") + m->nick;
+			Log(LogKind::Info,
+			    "%s's start of %s goes on without %s, whose game is still in a mission of its "
+			    "own; they come into it once that is over",
+			    p->nick.c_str(), MissionName(in.missionHint), who.empty() ? "?" : who.c_str());
+		}
+
+		S_MissionClaim out;
+		InitHeader(out, NowMs());
+		out.launchKey   = in.launchKey;
+		out.verdict     = a.verdict;
+		out.ownerId     = a.ownerId;
+		out.missingMask = a.missing;
+		out.pad         = 0;
+		m_net.SendTo(peer, out, CH_EVENT);
+		BroadcastMissionWaiting();
+	}
+
+	void OnMissionStarted(PeerId peer, const C_MissionStarted &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		MissionSlot &slot = m_session.Mission();
+		if (!slot.Start(p->id, in.missionNumber, m_session.ReadyMask())) {
+			const Player *owner = m_session.FindById(slot.Owner());
+			Log(LogKind::Warn, "%s started %s while %s's %s runs - it stays theirs alone",
+			    p->nick.c_str(), MissionName(in.missionNumber),
+			    owner ? owner->nick.c_str() : "?", MissionName(slot.Number()));
+			return;
+		}
+		Log(LogKind::Info, "%s started %s", p->nick.c_str(), MissionName(in.missionNumber));
+		m_session.Campaign().MissionStarted();
+		BroadcastMissionState();
+		BroadcastMissionWaiting();
+	}
+
+	void OnMissionEnded(PeerId peer, const C_MissionEnded &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.Mission().End(p->id, in.missionNumber, in.outcome))
+			return;
+		Log(LogKind::Info, "%s %s %s", p->nick.c_str(),
+		    in.outcome == MISSION_OUTCOME_PASSED ? "passed" : "failed",
+		    MissionName(in.missionNumber));
+		BroadcastMissionState();
+		BroadcastMissionWaiting();
+		ReleaseMissionCars(NowMs());
+	}
+
+	void OnMissionCheckpoint(PeerId peer, const C_MissionCheckpoint &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (p && m_session.Mission().Checkpoint(p->id, in.missingMask, in.where, NowMs()))
+			BroadcastMissionWaiting();
+	}
+
+	// What the owner's mission shows, for everybody else's engine to show.
+	// Relayed as it came, in order on CH_EVENT: a blip's removal must never
+	// overtake its creation.
+	void OnMissionEffect(PeerId peer, const C_MissionEffect &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.Mission().MayRelayEffect(p->id))
+			return;
+		if (in.body.length > MISSION_EFFECT_CODE)
+			return;
+		S_MissionEffect out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.ownerId = p->id;
+		out.body    = in.body;
+		// What the mission has up, for somebody who has just come into it:
+		// to them alone.
+		if (in.body.onlyTo != 0) {
+			const uint8_t id = static_cast<uint8_t>(in.body.onlyTo - 1);
+			const Player *to = id < MAX_PLAYERS ? m_session.FindById(id) : nullptr;
+			if (to && to->id != p->id)
+				m_net.SendTo(to->peer, out, CH_EVENT);
+			return;
+		}
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// The value behind a widget the owner's HUD shows, for everybody else's to
+	// read. Only the running mission's owner has any.
+	void OnMissionWidget(PeerId peer, const C_MissionWidget &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.Mission().Running() || m_session.Mission().Owner() != p->id)
+			return;
+		S_MissionWidget out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.ownerId       = p->id;
+		out.missionNumber = in.missionNumber;
+		out.offset        = in.offset;
+		out.value         = in.value;
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// A participant has loaded what the owner's mission asked for, for the
+	// owner's mission to stop waiting on them: to the owner alone, and only
+	// from somebody in the running mission.
+	void OnMissionReady(PeerId peer, const C_MissionReady &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		const MissionSlot &slot = m_session.Mission();
+		if (!p || !slot.Running() || slot.Owner() == p->id ||
+		    (slot.Participants() & PlayerBit(p->id)) == 0 || in.missionNumber != slot.Number())
+			return;
+		const Player *owner = m_session.FindById(slot.Owner());
+		if (!owner)
+			return;
+		S_MissionReady out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId      = p->id;
+		out.missionNumber = in.missionNumber;
+		out.readySeq      = in.readySeq;
+		m_net.SendTo(owner->peer, out, CH_EVENT);
+	}
+
+	// A player's game went into a mission of its own, the intro of a new game
+	// say, or came out of it (docs/missions.md 11.6). In one, they are nobody
+	// the session's mission waits for or shows anything to; out of it, they
+	// are in the running one like a joiner, and the owner hands them what it
+	// has up. A game that started over while in the running mission is handed
+	// it again.
+	void OnMissionBusy(PeerId peer, const C_MissionBusy &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		MissionSlot &slot = m_session.Mission();
+		const bool   busy = in.busy != 0;
+		if (busy != p->missionBusy) {
+			p->missionBusy = busy;
+			Log(LogKind::Info,
+			    busy ? "%s's game is in a mission of its own, and the session's goes on without them"
+			         : "%s's game is out of its own mission",
+			    p->nick.c_str());
+			if (busy ? slot.StandAside(p->id) : slot.Join(p->id)) {
+				BroadcastMissionState();
+				ReleaseMissionCars(NowMs());
+			}
+			BroadcastMissionWaiting();
+		}
+		if (in.fresh != 0 && !busy && slot.Running() && slot.Owner() != p->id &&
+		    (slot.Participants() & PlayerBit(p->id)) != 0) {
+			if (const Player *owner = m_session.FindById(slot.Owner())) {
+				S_MissionHandOver out{};
+				InitHeader(out, in.hdr.sendTimeMs);
+				out.playerId      = p->id;
+				out.missionNumber = slot.Number();
+				m_net.SendTo(owner->peer, out, CH_EVENT);
+			}
+		}
+	}
+
+	// A participant who has just come into the running mission, late or back
+	// from its own game's mission, asks for what the mission has made: every
+	// pedestrian and car of it, to them alone, and then how many. Only while
+	// a mission runs; the answer's zeroes say so otherwise.
+	void OnMissionCatchUp(PeerId peer, const C_MissionCatchUp &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const MissionSlot &slot = m_session.Mission();
+		S_MissionCatchUp   out{};
+		InitHeader(out, NowMs());
+		out.ownerId       = slot.Running() ? slot.Owner() : INVALID_PLAYER;
+		out.missionNumber = slot.Running() ? slot.Number() : MISSION_NONE;
+		if (slot.Running() && slot.Owner() != p->id) {
+			const MissionCatchUp back = m_session.BuildMissionCatchUp(p->id, NowMs());
+			for (const S_PedSpawn &ped : back.peds)
+				m_net.SendTo(peer, ped, CH_EVENT);
+			for (const S_PedDeath &death : back.pedDeaths)
+				m_net.SendTo(peer, death, CH_EVENT);
+			for (const S_CarSpawn &car : back.cars)
+				m_net.SendTo(peer, car, CH_EVENT);
+			out.cars        = static_cast<uint16_t>(back.cars.size());
+			out.peds        = static_cast<uint16_t>(back.peds.size());
+			out.sessionCars = back.sessionCars;
+			Log(LogKind::Detail,
+			    "%s caught up with %s: %u car(s) and %u pedestrian(s) of it sent again, %u of its "
+			    "cars claimed",
+			    p->nick.c_str(), MissionName(slot.Number()), out.cars, out.peds, out.sessionCars);
+		}
+		(void)in;
+		m_net.SendTo(peer, out, CH_EVENT);
+	}
+
+	// One of the mission's floating packages was taken on somebody's machine,
+
+	// for the owner's mission to count and everybody else's copy to go. From
+	// anybody in the running mission.
+	void OnMissionPickup(PeerId peer, const C_MissionPickup &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		const MissionSlot &slot = m_session.Mission();
+		if (!p || !slot.Running() || (slot.Participants() & PlayerBit(p->id)) == 0 ||
+		    in.missionNumber != slot.Number())
+			return;
+		S_MissionPickup out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId      = p->id;
+		out.missionNumber = in.missionNumber;
+		out.handle        = in.handle;
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// A kill a participant's machine registered, for the owner's mission to
+	// count. From anybody in the running mission but its owner, to the owner
+	// alone.
+	void OnMissionKill(PeerId peer, const C_MissionKill &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		const MissionSlot &slot = m_session.Mission();
+		if (!p || !slot.Running() || slot.Owner() == p->id ||
+		    (slot.Participants() & PlayerBit(p->id)) == 0 || in.missionNumber != slot.Number())
+			return;
+		const Player *owner = m_session.FindById(slot.Owner());
+		if (!owner)
+			return;
+		S_MissionKill out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId      = p->id;
+		out.missionNumber = in.missionNumber;
+		out.model         = in.model;
+		m_net.SendTo(owner->peer, out, CH_EVENT);
+	}
+
+	// What a participant's engine answers to the mission's questions, its
+	// garages and its planes, for the owner's conditions to hear. From anybody
+	// in the running mission but its owner, to the owner alone.
+	void OnMissionAnswers(PeerId peer, const C_MissionAnswers &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		const MissionSlot &slot = m_session.Mission();
+		if (!p || !slot.Running() || slot.Owner() == p->id ||
+		    (slot.Participants() & PlayerBit(p->id)) == 0 || in.missionNumber != slot.Number())
+			return;
+		const Player *owner = m_session.FindById(slot.Owner());
+		if (!owner)
+			return;
+		S_MissionAnswers out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId      = p->id;
+		out.missionNumber = in.missionNumber;
+		out.shotDown      = in.shotDown;
+		out.hasCar        = in.hasCar;
+		out.resprayed     = in.resprayed;
+		m_net.SendTo(owner->peer, out, CH_EVENT);
+	}
+
+	// One of the mission's objects broke on somebody's machine, for everybody
+	// else's copy to break too. From anybody in the running mission.
+	void OnMissionObjectBreak(PeerId peer, const C_MissionObjectBreak &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		const MissionSlot &slot = m_session.Mission();
+		if (!p || !slot.Running() || (slot.Participants() & PlayerBit(p->id)) == 0 ||
+		    in.missionNumber != slot.Number())
+			return;
+		S_MissionObjectBreak out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId      = p->id;
+		out.state         = in.state;
+		out.missionNumber = in.missionNumber;
+		out.global        = in.global;
+		out.amount        = in.amount;
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// The session's cars whose seats the owner's mission's passengers need,
+	// for everybody else to stay out of. Only the running mission's owner
+	// has any.
+	void OnMissionSeats(PeerId peer, const C_MissionSeats &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.Mission().Running() || m_session.Mission().Owner() != p->id ||
+		    in.count > MISSION_SEAT_CARS)
+			return;
+		S_MissionSeats out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.ownerId       = p->id;
+		out.count         = in.count;
+		out.missionNumber = in.missionNumber;
+		for (uint8_t i = 0; i < in.count; ++i)
+			out.cars[i] = in.cars[i];
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// The seats in the car the owner's mission put its player in, handed to
+	// everybody else. Only the running mission's owner has any to hand out.
+	void OnMissionBoard(PeerId peer, const C_MissionBoard &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.Mission().Running() || m_session.Mission().Owner() != p->id ||
+		    in.netId == INVALID_NETID)
+			return;
+		S_MissionBoard out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.ownerId       = p->id;
+		out.flags         = in.flags;
+		out.missionNumber = in.missionNumber;
+		out.netId         = in.netId;
+		for (uint8_t id = 0; id < MAX_PLAYERS; ++id)
+			out.seats[id] = in.seats[id];
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// What the owner's mission left behind in the campaign, numbered, kept and
+	// sent to everybody, the owner too, who only notes the number. Only from
+	// the running mission's owner: it is sent before the end is.
+	void OnCampaignDelta(PeerId peer, const C_CampaignDelta &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_session.Mission().Running() || m_session.Mission().Owner() != p->id)
+			return;
+		if (in.body.valueCount > CAMPAIGN_VALUES || in.body.threadCount > CAMPAIGN_THREADS ||
+		    in.body.opLength > MISSION_EFFECT_CODE)
+			return;
+		CampaignLog &log = m_session.Campaign();
+		if (log.Count() >= CAMPAIGN_LOG_MAX || !log.TakePartFor(m_session.Mission().Number())) {
+			Log(LogKind::Detail, "%s's %s sent more of the campaign than a mission leaves; "
+			    "the rest is not kept", p->nick.c_str(), MissionName(in.body.missionNumber));
+			return;
+		}
+		S_CampaignDelta out;
+		InitHeader(out, NowMs());
+		out.ownerId  = p->id;
+		out.body     = in.body;
+		out.body.seq = log.Append(p->id, in.body);
+		m_net.Broadcast(out, CH_EVENT);
+		Log(LogKind::Detail, "%s's %s left %u global%s and %u thread%s behind (delta %u)",
+		    p->nick.c_str(), MissionName(in.body.missionNumber), in.body.valueCount,
+		    in.body.valueCount == 1 ? "" : "s", in.body.threadCount,
+		    in.body.threadCount == 1 ? "" : "s", out.body.seq);
+	}
+
+	// A machine that has just heard the session's mission state: every
+	// delta after the last one it has, which is all of them for one that
+	// has never been here or whose last log was another run's.
+	void OnCampaignSince(PeerId peer, const C_CampaignSince &in) {
+		if (!m_session.FindByPeer(peer))
+			return;
+		for (S_CampaignDelta &d : m_session.Campaign().Since(in.seq)) {
+			d.hdr.sendTimeMs = NowMs();
+			m_net.SendTo(peer, d, CH_EVENT);
+		}
+	}
+
+	// A machine's Import/Export and crane lists (C_CarLists). The session's
+	// are all of them put together: back to the sender, which asks once on
+	// every connection, and to everybody else when they grew.
+	void OnCarLists(PeerId peer, const C_CarLists &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const bool grew = MergeCarLists(m_carLists, in.collected);
+		S_CarLists out{};
+		InitHeader(out, NowMs());
+		for (uint8_t i = 0; i < CAR_LISTS; ++i)
+			out.collected[i] = m_carLists[i];
+		m_net.SendTo(peer, out, CH_EVENT);
+		if (!grew)
+			return;
+		m_net.Broadcast(out, CH_EVENT, peer);
+		Log(LogKind::Detail, "%s's game has delivered a car the session's lists lacked", p->nick.c_str());
+	}
+
+	// A participant died or was busted. The owner's own death is their
+	// engine's to fail, and MissionSlot never orders it.
+	void OrderMissionFail(const Player &p, MissionFailReason reason) {
+		MissionSlot  &slot = m_session.Mission();
+		S_MissionFail fail{};
+		if (!slot.FailFor(p.id, reason, &fail))
+			return;
+		const Player *owner = m_session.FindById(slot.Owner());
+		if (!owner)
+			return;
+		Stamp(fail, NowMs());
+		m_net.SendTo(owner->peer, fail, CH_EVENT);
+		Log(LogKind::Info, "%s %s, so %s fails for everybody", p.nick.c_str(),
+		    reason == MISSION_FAIL_BUSTED ? "was busted" : "died", MissionName(slot.Number()));
+	}
+
+	// InitHeader zeroes the packet, so what MissionSlot filled in only gets
+	// its header stamped.
+	template <class T>
+	static void Stamp(T &pkt, uint32_t sendTimeMs) {
+		pkt.hdr.opcode     = T::OPCODE;
+		pkt.hdr.sendTimeMs = sendTimeMs;
+	}
+
+	S_MissionState MissionStateNow() const {
+		S_MissionState s = m_session.Mission().State();
+		Stamp(s, NowMs());
+		s.campaignLog = m_session.Campaign().Id();
+		return s;
+	}
+
+	void BroadcastMissionState() {
+		m_net.Broadcast(MissionStateNow(), CH_EVENT);
+		NoteSkyHolder();
+	}
+
+	// Who the clock and the sky belong to moves with the session's mission
+	// (coopiii/sky.h). Nothing goes out for it: every client works it out
+	// from the S_MissionState it has just been sent. This only says so.
+	void NoteSkyHolder() {
+		const uint8_t holder = m_session.SkyHolderId();
+		if (holder == m_skyHolder)
+			return;
+		const bool first = m_skyHolder == INVALID_PLAYER;
+		m_skyHolder      = holder;
+		const Player *p  = m_session.FindById(holder);
+		if (first || !p)
+			return;   // the join says who the host is
+		if (holder != m_session.HostId())
+			Log(LogKind::Info, "%s's %s runs, so the clock and the sky are theirs until it ends",
+			    p->nick.c_str(), MissionName(m_session.Mission().Number()));
+		else
+			Log(LogKind::Info, "the clock and the sky are the host's, %s's", p->nick.c_str());
+	}
+
+	void BroadcastMissionWaiting() {
+		S_MissionWaiting w{};
+		if (!m_session.Mission().TakeWaitingChange(&w))
+			return;
+		Stamp(w, NowMs());
+		m_net.Broadcast(w, CH_EVENT);
+		if (w.what == MISSION_WAIT_NONE)
+			return;
+		std::string who;
+		for (uint8_t id = 0; id < MAX_PLAYERS; ++id)
+			if (w.missingMask & PlayerBit(id))
+				if (const Player *m = m_session.FindById(id))
+					who += (who.empty() ? "" : ", ") + m->nick;
+		const Player *owner = m_session.FindById(w.ownerId);
+		char busy[96] = "";
+		if (w.goesOnInS != 0 && w.what == MISSION_WAIT_START)
+			std::snprintf(busy, sizeof busy,
+			              ", still in a cutscene of their own; going on without them in %u s",
+			              static_cast<unsigned>(w.goesOnInS));
+		else if (w.goesOnInS != 0)
+			std::snprintf(busy, sizeof busy, "; going on without them in %u s",
+			              static_cast<unsigned>(w.goesOnInS));
+		Log(LogKind::Detail, "%s is waiting for %s at %s of %s%s",
+		    owner ? owner->nick.c_str() : "?", who.empty() ? "?" : who.c_str(),
+		    w.what == MISSION_WAIT_START ? "the start" : "a checkpoint",
+		    MissionName(w.missionHint), busy);
 	}
 
 	// The host's game telling the session what time it is.
@@ -2204,7 +3385,8 @@ private:
 		if (ClaimGoesToAVote(peer, *p, in.ident))
 			return;
 
-		if (m_session.ClaimPickup(p->id, in.ident, NowMs()) ==
+		uint8_t movedFrom = INVALID_PLAYER;
+		if (m_session.ClaimPickup(p->id, in.ident, NowMs(), &movedFrom) ==
 		    Session::PickupVerdict::DENIED) {
 			S_PickupDenied out;
 			InitHeader(out, NowMs());
@@ -2212,6 +3394,11 @@ private:
 			m_net.SendTo(peer, out, CH_EVENT);
 			return;
 		}
+		// A reservation that stood too long went to this claimant: whoever
+		// held it hears so, or their machine keeps offering it to its engine.
+		if (movedFrom != INVALID_PLAYER)
+			if (const Player *old = m_session.FindById(movedFrom))
+				DenyPickup(old->peer, in.ident);
 
 		// To the claimant alone. Nobody has picked anything up yet - this is
 		// a reservation, and a player who walks past a pickup they turn out
@@ -2231,6 +3418,18 @@ private:
 		// it, is dropped here and nothing goes out.
 		if (!m_session.NotePickupCollected(p->id, in.ident, NowMs()))
 			return;
+
+		// The mission's stash is everybody's own too, but the mission has to
+		// hear that somebody took one (protocol.h, PICKUP_F_STASH): everybody
+		// is told, and nobody's copy goes.
+		if ((in.ident.flags & PICKUP_F_STASH) != 0) {
+			S_PickupTaken out;
+			InitHeader(out, NowMs());
+			out.playerId = p->id;
+			out.ident    = in.ident;
+			m_net.Broadcast(out, CH_EVENT, peer);
+			return;
+		}
 
 		// A package under `perplayer` is theirs alone: everybody else's is
 		// still where it was.
@@ -2442,6 +3641,88 @@ private:
 		Log(LogKind::Detail, "rampage vote %u: %s %s", in.voteId, p->nick.c_str(), what);
 	}
 
+	// ---- skipping a cutscene together (cutscenevote.h) ------------------------
+
+	static std::string CutsceneName(const CutsceneKey &key) {
+		char name[CUTSCENE_NAME_LEN + 1] = {};
+		for (size_t i = 0; i < CUTSCENE_NAME_LEN && key.name[i] != '\0'; ++i)
+			name[i] = key.name[i] >= ' ' && key.name[i] <= '~' ? key.name[i] : '?';
+		return name;
+	}
+
+	static const char *CutsceneScopeName(uint8_t scope) {
+		return scope == CUTSCENE_SCOPE_SHARED ? "the mission's" : "their own";
+	}
+
+	void OnCutsceneState(PeerId peer, const C_CutsceneState &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const bool        was  = m_cutscenes.In(p->id);
+		const CutsceneKey prev = m_cutscenes.KeyOf(p->id);
+		const uint32_t    now  = NowMs();
+		m_cutscenes.Report(p->id, in.key, now);
+		// A press of skip comes in the same scene, and says nothing new here.
+		const bool moved = !was || !SameCutscene(prev, in.key);
+		if (moved && in.key.scope != CUTSCENE_SCOPE_NONE)
+			Log(LogKind::Detail, "cutscene '%s': %s is in it (%s), %u player(s) in it",
+			    CutsceneName(in.key).c_str(), p->nick.c_str(), CutsceneScopeName(in.key.scope),
+			    m_cutscenes.VotersWith(p->id));
+		else if (was && in.key.scope == CUTSCENE_SCOPE_NONE)
+			Log(LogKind::Detail, "cutscene: %s is out of theirs", p->nick.c_str());
+		if (in.skip)
+			CutsceneSkipPressed(*p, in.voteId);
+		FlushCutsceneVotes(now);
+	}
+
+	void CutsceneSkipPressed(const Player &player, uint8_t voteId) {
+		const Player *p = &player;
+		if (!m_cutscenes.Cast(p->id, voteId)) {
+			Log(LogKind::Detail, "cutscene: a skip from %s for vote %u that isn't theirs to cast",
+			    p->nick.c_str(), voteId);
+			return;
+		}
+		Log(LogKind::Info, "cutscene '%s': %s votes to skip it",
+		    CutsceneName(m_cutscenes.KeyOf(p->id)).c_str(), p->nick.c_str());
+	}
+
+	// Whatever the count decided, to whoever it is for.
+	void FlushCutsceneVotes(uint32_t now) {
+		CutsceneVoteSend sends[CutsceneVotes::MAX_SENDS];
+		const size_t     n = m_cutscenes.Evaluate(now, sends, CutsceneVotes::MAX_SENDS);
+		for (size_t i = 0; i < n; ++i) {
+			const CutsceneVoteSend &e = sends[i];
+			uint8_t sent = 0;
+			for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+				if ((e.to >> id & 1u) == 0)
+					continue;
+				const Player *p = m_session.FindById(id);
+				if (!p)
+					continue;
+				S_CutsceneVote out;
+				InitHeader(out, now);
+				out.kind = e.kind == CutsceneVoteSend::SKIP ? CUTSCENE_VOTE_SKIP : CUTSCENE_VOTE_COUNT;
+				out.body = e.body;
+				m_net.SendTo(p->peer, out, CH_EVENT);
+				++sent;
+			}
+			if (e.kind == CutsceneVoteSend::SKIP) {
+				if (e.body.voters != 0)
+					Log(LogKind::Info,
+					    "cutscene '%s' skipped for %u player(s): %u of %u said skip, %u needed",
+					    CutsceneName(e.body.key).c_str(), sent, e.body.yes, e.body.voters,
+					    e.body.needed);
+				else
+					Log(LogKind::Info,
+					    "cutscene '%s': %u player(s) came into it after it was skipped, and skip "
+					    "it too", CutsceneName(e.body.key).c_str(), sent);
+			} else {
+				Log(LogKind::Detail, "cutscene '%s': %u of %u say skip, %u needed",
+				    CutsceneName(e.body.key).c_str(), e.body.yes, e.body.voters, e.body.needed);
+			}
+		}
+	}
+
 	// Decides the vote if it can, and says so. Called on every tick and on
 	// anything that changes the count - a vote, a death, a leave.
 	void TickRampageVote(uint32_t now) {
@@ -2556,14 +3837,16 @@ private:
 
 	// A map object broke on somebody's machine. docs/objects.md.
 	//
-	// A pure relay, and the absence of a table here is the design rather than
-	// a gap in it. A break is a latch the engine itself throws away at 80 m -
-	// CPopulation::ManagePopulation turns any map object that far from a
-	// player back into a pristine dummy - so there is no session state to
-	// keep and nothing a late joiner could be told that would still be true
-	// by the time they finished loading. Exclusivity does not arise either:
-	// two players can both correctly break the same crate and the second
-	// break is a no-op on every machine, which is the opposite of a pickup.
+	// Relayed, and kept while a player is near it. The engine throws a break
+	// away at 80 m - CPopulation::ManagePopulation turns any map object that
+	// far from *its own* player back into a pristine dummy - and that horizon
+	// is per machine: a player who drove off and came back had his copy
+	// rebuilt standing while one who stayed still saw it broken. So the
+	// record lives exactly as long as somebody may still hold it broken
+	// (objectrecords.h), and a machine that rebuilds it asks. Exclusivity does
+	// not arise: two players can both correctly break the same crate and the
+	// second break is a no-op on every machine, which is the opposite of a
+	// pickup.
 	//
 	// The client decides who is entitled to speak, because only the client
 	// knows which car hit it. What the server does is exactly what it does
@@ -2577,6 +3860,73 @@ private:
 		InitHeader(out, NowMs());
 		out.playerId = p->id;
 		out.body     = in.body;
+		m_net.Broadcast(out, CH_EVENT, peer);
+		// And kept while anybody is near it, for a machine that rebuilds its
+		// copy pristine after going 80 m away (objectrecords.h).
+		m_objects.NoteBroken(p->id, in.body, NowMs());
+	}
+
+	// A machine rebuilt an object it was told was broken: the break and the
+	// resting place again, to it alone. Nothing when the record has gone,
+	// which means nobody has been near it and every copy is pristine.
+	void OnObjectRebuilt(PeerId peer, const C_ObjectRebuilt &in) {
+		if (!m_session.FindByPeer(peer))
+			return;
+		const ObjectRecord *r = m_objects.Find(in.ident);
+		if (!r)
+			return;
+		SendObjectRecord(peer, *r);
+	}
+
+	// Stamped with nobody rather than the reporter: the asker may be the
+	// reporter, whose client drops its own relayed break, and here it is
+	// exactly the one who needs it back.
+	void SendObjectRecord(PeerId peer, const ObjectRecord &r) {
+		S_ObjectBroken out;
+		InitHeader(out, NowMs());
+		out.playerId = INVALID_PLAYER;
+		out.body     = r.breakBody;
+		m_net.SendTo(peer, out, CH_EVENT);
+		if (!r.hasRest)
+			return;
+		S_ObjectSettled rest;
+		InitHeader(rest, NowMs());
+		rest.playerId = INVALID_PLAYER;
+		rest.body     = r.rest;
+		m_net.SendTo(peer, rest, CH_EVENT);
+	}
+
+	// The records nobody is near any more, once a second. Every machine's
+	// copy of those has gone back to a dummy, so they come back pristine
+	// everywhere and the record means nothing.
+	void ExpireObjectRecords(uint32_t now) {
+		if (now - m_objectsExpiredMs < 1000)
+			return;
+		m_objectsExpiredMs = now;
+		Vec3   where[MAX_PLAYERS];
+		size_t n = 0;
+		for (const Player &q : m_session.Players())
+			if (q.active && q.havePos && n < MAX_PLAYERS)
+				where[n++] = q.pos;
+		m_objects.ExpireFar(where, n);
+	}
+
+	// ---- the scripted gates (protocol.h, C_GateState) ----------------------
+	//
+	// The garages' shape exactly: a level per player, relayed on change, and
+	// kept only so a joiner can be told.
+	void OnGateState(PeerId peer, const C_GateState &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const uint8_t mask = static_cast<uint8_t>(in.body.open & ((1u << GATE_COUNT) - 1));
+		if (mask == p->gateMask)
+			return;
+		p->gateMask = mask;
+		S_GateState out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId  = p->id;
+		out.body.open = mask;
 		m_net.Broadcast(out, CH_EVENT, peer);
 	}
 
@@ -2600,13 +3950,13 @@ private:
 
 		switch (m_session.NoteCheat(p->id, in.body)) {
 		case CHEAT_RELAY_HOST: {
-			const Player *host = m_session.FindById(m_session.HostId());
-			if (!host)
+			const Player *sky = m_session.FindById(m_session.SkyHolderId());
+			if (!sky)
 				return;
-			m_net.SendTo(host->peer, out, CH_EVENT);
-			Log(LogKind::Detail, "%s used cheat %u; sent to the host, %s",
+			m_net.SendTo(sky->peer, out, CH_EVENT);
+			Log(LogKind::Detail, "%s used cheat %u; sent to %s, whose sky it is",
 			    p->nick.c_str(), static_cast<unsigned>(in.body.cheat),
-			    host->nick.c_str());
+			    sky->nick.c_str());
 			return;
 		}
 		case CHEAT_RELAY_OTHERS:
@@ -2624,6 +3974,34 @@ private:
 			                                                        : "shared");
 			return;
 		}
+	}
+
+	// ---- a unique jump's shot - stuntcam.h -----------------------------------
+	//
+	// To the players riding in the car, from its driver. Nothing is kept: a
+	// shot is a few seconds long, and somebody who gets in halfway through
+	// sees the rest of the jump from behind.
+	void OnStuntCamera(PeerId peer, const C_StuntCamera &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		if (!StuntShotSenderOk(*p, in.body)) {
+			Log(LogKind::Detail, "%s sent a stunt shot of vehicle %u from outside its "
+			    "driver's seat; dropped", p->nick.c_str(), static_cast<unsigned>(in.body.netId));
+			return;
+		}
+		S_StuntCamera out;
+		InitHeader(out, NowMs());
+		out.playerId = p->id;
+		out.body     = in.body;
+		const std::vector<uint8_t> to = StuntShotAudience(m_session.Players(), *p, in.body);
+		for (uint8_t id : to)
+			if (const Player *q = m_session.FindById(id))
+				m_net.SendTo(q->peer, out, CH_EVENT);
+		if (in.body.on && !to.empty())
+			Log(LogKind::Detail, "%s is in a unique jump in vehicle %u; the shot goes to %u "
+			    "riding with him", p->nick.c_str(), static_cast<unsigned>(in.body.netId),
+			    static_cast<unsigned>(to.size()));
 	}
 
 	// ---- money - protocol.h, MoneyRule ---------------------------------------
@@ -2674,13 +4052,9 @@ private:
 		    p->nick.c_str(), to->nick.c_str(), in.body.unit);
 	}
 
-	// Where a knocked-over one came to rest. Same job, same reasons, and
-	// deliberately the same amount of server: stamp the sender and pass it
-	// on. The server has no opinion about whether a lamp post fell over,
-	// holds no table of the ones that did, and tells no joiner - the engine
-	// converts the object back to a pristine dummy 80 m out and throws the
-	// whole transform away, so anything remembered here would be a fact with
-	// a shorter life than the packet that carried it.
+	// Where a knocked-over one came to rest. Same job and same reasons:
+	// stamp the sender, pass it on, and keep it beside the break for a
+	// machine that builds its copy again (objectrecords.h).
 	void OnObjectSettled(PeerId peer, const C_ObjectSettled &in) {
 		const Player *p = m_session.FindByPeer(peer);
 		if (!p)
@@ -2691,6 +4065,7 @@ private:
 		out.playerId = p->id;
 		out.body     = in.body;
 		m_net.Broadcast(out, CH_EVENT, peer);
+		m_objects.NoteSettled(p->id, in.body, NowMs());
 	}
 
 	void OnPickupRelease(PeerId peer, const C_PickupRelease &in) {
@@ -2707,8 +4082,8 @@ private:
 
 	void OnWorldState(PeerId peer, const C_WorldState &in) {
 		const Player *p = m_session.FindByPeer(peer);
-		if (!p || p->id != m_session.HostId())
-			return;   // not the host, so not the session's clock
+		if (!p || p->id != m_session.SkyHolderId())
+			return;   // not the host, or not the running mission's owner
 
 		if (!m_session.Clock().Set(in.body.hour, in.body.minute))
 			return;
@@ -2840,6 +4215,8 @@ public:
 
 	Session       &SessionRef() { return m_session; }
 	const Session &SessionRef() const { return m_session; }
+	const NetServer &Net() const { return m_net; }
+	const Lobby   &LobbyRef() const { return m_lobby; }
 
 	uint16_t Port() const { return m_port; }
 
@@ -2891,13 +4268,23 @@ private:
 
 	NetServer                m_net;
 	Session                  m_session;
+	// Broken and knocked-over street objects while anybody is near them.
+	ObjectRecords            m_objects;
+	uint32_t                 m_objectsExpiredMs = 0;
+	Lobby                    m_lobby;
 	std::vector<ServerEvent> m_events;
 	uint32_t                 m_lastTickMs  = 0;
 	uint32_t                 m_lastWorldMs = 0;
 	uint32_t                 m_lastPingsMs = 0;
+	uint8_t                  m_skyHolder   = INVALID_PLAYER;   // as last logged
+	// The session's Import/Export and crane lists (OnCarLists), for as long
+	// as the server runs, like the campaign log.
+	uint32_t                 m_carLists[CAR_LISTS] = {};
 
 	// The vote before a rampage. rampagevote.h has the rules.
 	RampageVote m_vote;
+	// Who is in which cutscene, and who said skip. cutscenevote.h.
+	CutsceneVotes m_cutscenes;
 
 	std::string               m_password;
 	std::vector<PendingHello> m_pendingHellos;

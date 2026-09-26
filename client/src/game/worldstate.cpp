@@ -52,10 +52,20 @@ void ApplyWorldTime(uint8_t hour, uint8_t minute) {
 	// starts timing the next game minute from now instead of finishing the
 	// one that was already part-way through.
 	Func<SetGameClockFn>(CClock__SetGameClock)(hour, minute);
+
+	// CWeather::Update takes minutes/60 falling below the blend it stored last
+	// frame as the top of the hour, and turns the weather over: old = new, new
+	// = the pin (addresses.h, CWeather__InterpolationValue). A clock moved
+	// back within its hour, or on to another, would do that here, and our sky
+	// would sit a type ahead of the session's until the next packet. Storing
+	// the blend the new minute gives, the same float the engine computes,
+	// leaves the pair the packet brings where it is.
+	Global<float>(CWeather__InterpolationValue) = static_cast<float>(minute) * (1.0f / 60.0f);
 }
 
-void ApplyWorldWeather(uint8_t weather, uint8_t weatherOld) {
-	if (!WorldIsUp() || weather >= WEATHER_TOTAL || weatherOld >= WEATHER_TOTAL)
+void ApplyWorldWeather(uint8_t weather, uint8_t weatherOld, uint8_t forced) {
+	if (!WorldIsUp() || weather >= WEATHER_TOTAL || weatherOld >= WEATHER_TOTAL ||
+	    forced >= WEATHER_TOTAL)
 		return;
 
 	// CWeather::ForceWeatherNow would do two thirds of this, but it sets old
@@ -70,8 +80,9 @@ void ApplyWorldWeather(uint8_t weather, uint8_t weatherOld) {
 	// And pin it. Without this the local rotation picks its own next type
 	// when the hour rolls over, which would fight the session for the second
 	// or so before the next world packet arrives - a visible flicker of the
-	// wrong sky, once every game hour.
-	Global<int16_t>(CWeather__ForcedWeatherType) = static_cast<int16_t>(weather);
+	// wrong sky, once every game hour. Usually the new type; the one after
+	// it when the session has turned the hour and we haven't yet.
+	Global<int16_t>(CWeather__ForcedWeatherType) = static_cast<int16_t>(forced);
 }
 
 void ReleaseWorldWeather() {
@@ -85,7 +96,8 @@ void AddWorldToBridge(WorldBridge &bridge) {
 	bridge.ApplyWorldTime      = &ApplyWorldTime;
 	bridge.ApplyWorldWeather   = &ApplyWorldWeather;
 	bridge.ReleaseWorldWeather = &ReleaseWorldWeather;
-	Log("bridge: time of day and weather follow the session host");
+	Log("bridge: time of day and weather follow the session host, or the owner of the "
+	    "session's mission while it runs");
 }
 
 } // namespace coopiii::game

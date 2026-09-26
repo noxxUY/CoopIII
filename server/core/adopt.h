@@ -68,6 +68,9 @@
 namespace coopiii {
 
 constexpr float AMBIENT_CAR_ADOPT_RADIUS_M = 130.0f * 1.5f;
+// The host asks for a let-go by the same distance the server decides it by.
+static_assert(AMBIENT_CAR_ADOPT_RADIUS_M == AMBIENT_CAR_KEEP_RADIUS_M,
+              "a let-go is asked for and decided at one radius");
 constexpr float AMBIENT_PED_ADOPT_RADIUS_M = 65.0f * 1.5f;
 
 // A remaining player who could take something: connected, known position,

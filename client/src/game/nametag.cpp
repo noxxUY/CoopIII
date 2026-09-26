@@ -61,7 +61,10 @@
 #include "nametag.h"
 
 #include "chat.h"
+#include "cutsceneskip.h"
+#include "mission.h"
 #include "client.h"
+#include "fontcull.h"
 #include "scoreboard.h"
 #include "hook/hook.h"
 #include "log.h"
@@ -251,6 +254,7 @@ struct Tag {
 	uint8_t weapon  = 0;
 	bool    hasIcon = false;
 	float   health  = 0.0f;
+	bool    hasArmour = false;
 
 	// Where a line of sight ray would be aimed for this player, kept so the
 	// probe pass doesn't have to go back to the ped for it.
@@ -258,11 +262,16 @@ struct Tag {
 
 	uint16_t name[TAG_NAME_MAX + 1]{};
 	uint16_t hp[16]{};
+	uint16_t ap[16]{};
 
 	// Everything derived, in one place, from the screen height and the
 	// distance. The two widths are the exception: only CFont can answer those.
 	TagMetrics m;
-	float      nameW = 0.0f, hpW = 0.0f;
+	float      nameW = 0.0f, hpW = 0.0f, apW = 0.0f;
+
+	// The health line: the health, then the armour after a gap the size of
+	// the icon's.
+	float HealthLineW() const { return hasArmour ? hpW + m.iconGap + apW : hpW; }
 
 	TagBox box;
 };
@@ -310,8 +319,7 @@ void DrawIcon(const Tag &tag) {
 void DrawText(const Tag &tag) {
 	const float textX =
 	    tag.box.left + (tag.hasIcon ? tag.m.icon + tag.m.iconGap : 0.0f);
-	const float textY =
-	    tag.box.top + (tag.box.bottom - tag.box.top - tag.m.columnH) * 0.5f;
+	const float textY = TagTextTop(tag.box, tag.m);
 
 	FontScale(tag.m.nameScaleX, tag.m.nameScaleY);
 	PrintShadowed(textX, textY, tag.name, TagNameColor(tag.health), tag.alpha,
@@ -320,6 +328,9 @@ void DrawText(const Tag &tag) {
 	FontScale(tag.m.hpScaleX, tag.m.hpScaleY);
 	PrintShadowed(textX, textY + tag.m.nameH + tag.m.lineGap, tag.hp,
 	              TagHealthColor(tag.health), tag.alpha, tag.m.shadow);
+	if (tag.hasArmour)
+		PrintShadowed(textX + tag.hpW + tag.m.iconGap, textY + tag.m.nameH + tag.m.lineGap,
+		              tag.ap, TAG_ARMOUR_COLOR, tag.alpha, tag.m.shadow);
 }
 
 void DrawTags() {
@@ -336,6 +347,7 @@ void DrawTags() {
 	// reasoning, and the short version is that this install has a widescreen
 	// fix whose whole job is undoing the aspect stretch the HUD's own 640x448
 	// grid produces, so a tag must not put that stretch back.
+	const float cullY   = CurrentTextCullLine(screenW, screenH);
 	const float wrapWas = Global<float>(CFont__Details + FONTDETAILS_WRAPX);
 	FontStateForTags(screenW);
 
@@ -407,10 +419,15 @@ void DrawTags() {
 
 		char name[TAG_NAME_MAX + 1];
 		char hp[16];
+		char ap[16];
 		TagName(player.nick.c_str(), name, sizeof(name));
 		TagHealth(tag.health, hp, sizeof(hp));
+		if (player.away)
+			TagPaused(hp, sizeof(hp));
+		tag.hasArmour = TagArmour(player.last.armour, tag.health, ap, sizeof(ap));
 		Widen(name, tag.name, TAG_NAME_MAX + 1);
 		Widen(hp, tag.hp, 16);
+		Widen(ap, tag.ap, 16);
 
 		// GetStringWidth answers in screen pixels at whatever scale is set, so
 		// it has to be asked once per line.
@@ -418,6 +435,7 @@ void DrawTags() {
 		tag.nameW = FontWidth(tag.name);
 		FontScale(tag.m.hpScaleX, tag.m.hpScaleY);
 		tag.hpW = FontWidth(tag.hp);
+		tag.apW = tag.hasArmour ? FontWidth(tag.ap) : 0.0f;
 
 		++count;
 	}
@@ -488,7 +506,7 @@ void DrawTags() {
 	for (int i = 0; i < count; ++i) {
 		Tag &tag = tags[i];
 
-		const float colW = tag.nameW > tag.hpW ? tag.nameW : tag.hpW;
+		const float colW = tag.nameW > tag.HealthLineW() ? tag.nameW : tag.HealthLineW();
 		const float fullW =
 		    colW + (tag.hasIcon ? tag.m.icon + tag.m.iconGap : 0.0f);
 		const float fullH =
@@ -499,12 +517,30 @@ void DrawTags() {
 		tag.box.bottom = tag.baseY;
 		tag.box.top    = tag.baseY - fullH;
 
+		// Nothing, unless PrintChar's y test is still retail and the window is
+		// taller than it is wide. Then a tag below y = width goes up to the
+		// line rather than vanish. Before the lift, so two of them pinned
+		// there still get pulled apart.
+		const float cull = LiftAboveCull(TagLowestGlyphTop(tag.box, tag.m), cullY, screenH);
+		tag.box.top -= cull;
+		tag.box.bottom -= cull;
+
 		const float pad  = tag.m.lineGap;
 		const float lift = TagLift(tag.box, placed, placedCount, pad);
 		tag.box.top -= lift;
 		tag.box.bottom -= lift;
 
 		placed[placedCount++] = tag.box;
+
+		// Once: the first tag drawn where retail would have dropped it.
+		static bool saidLow = false;
+		const float low     = TagLowestGlyphTop(tag.box, tag.m);
+		if (!saidLow && (cull > 0.0f || (low >= screenW && low < screenH))) {
+			saidLow = true;
+			Log("nametag: a tag at y = %.0f on a %.0fx%.0f screen, %s", low, screenW, screenH,
+			    cull > 0.0f ? "moved up to the cull line, since PrintChar's test is still retail"
+			                : "below y = width, where retail PrintChar would have dropped it");
+		}
 	}
 
 	// Furthest first, so on anything the lift did not fully separate the
@@ -541,6 +577,31 @@ void __cdecl HookedHudDraw() {
 		if (!reported) {
 			reported = true;
 			Log("chat: draw threw; the chat may be missing from here on");
+		}
+	}
+
+	// The cutscene skip count, which has to show under a cutscene's bars
+	// where the chat is not drawn.
+	try {
+		if (g_client)
+			DrawCutsceneSkip();
+	} catch (...) {
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			Log("cutscene: draw threw; the skip count may be missing from here on");
+		}
+	}
+
+	// Who the session's mission is waiting for, in the same corner.
+	try {
+		if (g_client)
+			DrawMissionWait();
+	} catch (...) {
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			Log("missions: draw threw; who a mission waits for may be missing from here on");
 		}
 	}
 

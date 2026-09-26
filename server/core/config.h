@@ -125,6 +125,19 @@ struct ServerConfig {
 	WantedLevelRule wantedLevel        = WantedLevelRule::PerPlayer; // §5.1
 	bool            missionFailOnDeath = true;                      // §5.4
 
+	// How far outside a mission's start or one of its checkpoints still
+	// counts as there, in centimetres: everybody has to be there before a
+	// mission starts or moves on (docs/missions.md 5.6 and 9). 5 m, the
+	// owner's number, so a friend parked beside you counts. The file says it
+	// in metres.
+	uint16_t        missionMarginCm    = MISSION_MARGIN_CM_DEFAULT;
+
+	// How a mission's enemies stand up to more than one player, and what each
+	// participant after the first adds to them, in percent (docs/missions.md
+	// 10.4). Single player's by default.
+	uint8_t         missionEnemies     = MISSION_ENEMIES_ORIGINAL;
+	uint16_t        missionScale       = MISSION_SCALE_DEFAULT;
+
 	// Whether a player's real ammunition is reported to everyone else
 	// (docs/protocol.md 1.9.6). Off by default, which is the behaviour
 	// CoopIII has always had: a remote player's gun is handed a fixed
@@ -185,6 +198,8 @@ struct ServerConfig {
 		return port == other.port && friendlyFire == other.friendlyFire &&
 		       wantedLevel == other.wantedLevel &&
 		       missionFailOnDeath == other.missionFailOnDeath &&
+		       missionMarginCm == other.missionMarginCm &&
+		       missionEnemies == other.missionEnemies && missionScale == other.missionScale &&
 		       ammoSync == other.ammoSync && rampage == other.rampage &&
 		       cheats == other.cheats && money == other.money &&
 		       hiddenPackages == other.hiddenPackages && password == other.password;

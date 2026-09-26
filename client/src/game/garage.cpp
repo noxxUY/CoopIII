@@ -1,6 +1,7 @@
 #include "garage.h"
 
 #include "addresses.h"
+#include "carremoval.h"
 #include "../hook/hook.h"
 #include "../log.h"
 
@@ -178,7 +179,13 @@ void __fastcall HookedGarageUpdate(void *self, void * /*edx*/) {
 	const uint8_t before = Field<uint8_t>(self, offs::GARAGE_STATE);
 	const bool    mayRun = GarageUpdateMayRun(type, before, held);
 	if (mayRun)
+	{
+		// Only the machine holding a session car lets this engine take it
+		// (game/carremoval.h).
+		CarRemovalBeforeGarageUpdate(self);
 		g_garageUpdate.Original<void(__thiscall *)(void *)>()(self);
+		CarRemovalAfterGarageUpdate(self, before);
+	}
 
 	const uint8_t after = Field<uint8_t>(self, offs::GARAGE_STATE);
 
@@ -320,20 +327,14 @@ uint8_t DrainLocalRespraysImpl(LocalRespray *out, uint8_t max) {
 void ApplyRemoteResprayImpl(RemoteVehicle *vehicle, const ResprayBody &body) {
 	// SEAM (wanted level). Nothing here clears anybody's stars, on purpose.
 	//
-	// The wanted level travels on its own, in PlayerFlags since version 18
-	// (docs/wanted.md), and this packet has no field for it. The respray
-	// already clears the stars of the player who paid for it, on their own
-	// machine, through the engine's own CWanted::Reset inside the arm that
-	// produced this packet - CoopIII does nothing to make that happen and
-	// must do nothing to undo it. What an observer must not do is clear its
-	// *own* player's stars because somebody else bought a paint job, and it
-	// does not, because HookedGarageUpdate never lets the arm that would run
-	// here.
-	//
-	// The `shared` wanted rule did land, and this place did not have to
-	// change: the payer's own engine clears the payer's level, and
-	// game/wanted.h (PlanWanted) decides what that does to the session's
-	// floor. Never a second CWanted::Reset of CoopIII's own here.
+	// The payer's own engine clears the payer's stars, through CWanted::Reset
+	// inside the arm that produced this packet. Whether the respray clears
+	// ours too is the wanted rule's question, not the paint's: under `shared`
+	// it does, under `perplayer` only if we are in this car, and it is
+	// answered in Client::OnRespray and carried out in Client::TickWanted
+	// (docs/wanted.md §4.9). Never by letting our own garage arm run, which
+	// would also repaint and bill our own player, and never by a
+	// CWanted::Reset of CoopIII's own here.
 
 	if (!vehicle || vehicle->poolHandle < 0)
 		return;

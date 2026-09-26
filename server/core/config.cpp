@@ -1,6 +1,9 @@
 #include "config.h"
 
+#include <coopiii/mission.h>
+
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <windows.h>
@@ -230,6 +233,26 @@ bool ServerConfig::Parse(const std::string &text) {
 				wantedLevel = rule;
 		} else if (_stricmp(key.c_str(), "missionfailondeath") == 0) {
 			missionFailOnDeath = TruthY(value);
+		} else if (_stricmp(key.c_str(), "missionmargin") == 0) {
+			// Metres, a fraction allowed, up to 50: past that "there" means
+			// the whole neighbourhood and the rule means nothing.
+			char        *end = nullptr;
+			const double m   = std::strtod(value.c_str(), &end);
+			if (end != value.c_str() && m >= 0.0 && m <= 50.0)
+				missionMarginCm = static_cast<uint16_t>(m * 100.0 + 0.5);
+		} else if (_stricmp(key.c_str(), "missionenemies") == 0) {
+			const std::string t = Trim(value);
+			if (_stricmp(t.c_str(), "original") == 0)
+				missionEnemies = MISSION_ENEMIES_ORIGINAL;
+			else if (_stricmp(t.c_str(), "tougher") == 0)
+				missionEnemies = MISSION_ENEMIES_TOUGHER;
+			else if (_stricmp(t.c_str(), "more") == 0)
+				missionEnemies = MISSION_ENEMIES_MORE;
+		} else if (_stricmp(key.c_str(), "missionscale") == 0) {
+			char       *end = nullptr;
+			const long  pct = std::strtol(value.c_str(), &end, 10);
+			if (end != value.c_str() && pct >= 0 && pct <= MISSION_SCALE_MAX)
+				missionScale = static_cast<uint16_t>(pct);
 		} else if (_stricmp(key.c_str(), "ammosync") == 0) {
 			ammoSync = TruthY(value);
 		} else if (_stricmp(key.c_str(), "rampages") == 0) {
@@ -310,11 +333,23 @@ std::string ServerConfig::ToIni() const {
 	    ";   off        no wanted level at all\n"
 	    "wantedLevel = %s\n"
 	    "\n"
-	    "; If anyone dies during a mission, it fails for everyone, as it does\n"
-	    "; in single player. For missions the session shares, which is not yet:\n"
-	    "; today every game runs its own missions and fails them when its own\n"
-	    "; player dies, whatever this says.\n"
+	    "; If anyone dies or is busted during a mission, it fails for everyone,\n"
+	    "; as it does in single player. For the missions the session shares,\n"
+	    "; which the players' games do with `missions = on` in their CoopIII.ini.\n"
 	    "missionFailOnDeath = %s\n"
+	    "\n"
+	    "; How far outside a mission's start or one of its checkpoints still\n"
+	    "; counts as being there, in metres. Everybody has to be there before a\n"
+	    "; mission starts or moves on; 5 lets a friend parked beside you count.\n"
+	    "missionMargin = %g\n"
+	    "\n"
+	    "; How a shared mission's enemies stand up to more than one player:\n"
+	    ";   original   as in single player\n"
+	    ";   tougher    their health and armour grow with the players\n"
+	    ";   more       tougher, and more of them (not built yet: as tougher)\n"
+	    "; and what each player after the first adds to them, in percent.\n"
+	    "missionEnemies = %s\n"
+	    "missionScale = %u\n"
 	    "\n"
 	    "; Whether everybody sees everybody else's real ammunition. Off by\n"
 	    "; default, and with it off a remote player's gun never runs dry on\n"
@@ -365,7 +400,12 @@ std::string ServerConfig::ToIni() const {
 	    "; strangers out and nothing more; up to 31 characters.\n"
 	    "password = %s\n",
 	    port, friendlyFire ? "true" : "false", Name(wantedLevel),
-	    missionFailOnDeath ? "true" : "false", ammoSync ? "true" : "false",
+	    missionFailOnDeath ? "true" : "false", MarginMetres(missionMarginCm),
+	    missionEnemies == MISSION_ENEMIES_MORE      ? "more"
+	    : missionEnemies == MISSION_ENEMIES_TOUGHER ? "tougher"
+	                                                : "original",
+	    static_cast<unsigned>(missionScale),
+	    ammoSync ? "true" : "false",
 	    Name(rampage), Name(cheats), Name(money), Name(hiddenPackages), password.c_str());
 	return out;
 }

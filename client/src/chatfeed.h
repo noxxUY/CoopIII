@@ -136,6 +136,43 @@ inline void FormatLeft(char *out, size_t cap, const char *nick, uint8_t reason) 
 	FeedCopy(out, cap, raw);
 }
 
+// A player's end, for the feed: "X was wasted", "X was killed by Y", "X was
+// busted". `nickLen` is how much of the result is the victim's name, which
+// the feed draws in that player's colour. A killer that is the victim, or
+// nobody, is no killer.
+inline void FormatWasted(char *out, size_t cap, const char *nick, const char *killer,
+                         size_t *nickLen = nullptr) {
+	char      raw[2 * NICK_LEN + 20];
+	const int n = std::snprintf(raw, sizeof raw, "%.*s", static_cast<int>(NICK_LEN - 1),
+	                            nick && nick[0] ? nick : "?");
+	if (killer && killer[0] && !(nick && std::strcmp(nick, killer) == 0))
+		std::snprintf(raw + n, sizeof raw - static_cast<size_t>(n), " was killed by %.*s",
+		              static_cast<int>(NICK_LEN - 1), killer);
+	else
+		std::snprintf(raw + n, sizeof raw - static_cast<size_t>(n), " was wasted");
+	FeedCopy(out, cap, raw);
+	if (nickLen)
+		*nickLen = static_cast<size_t>(n) < cap ? static_cast<size_t>(n) : 0;
+}
+
+inline void FormatBusted(char *out, size_t cap, const char *nick, size_t *nickLen = nullptr) {
+	char      raw[NICK_LEN + 16];
+	const int n = std::snprintf(raw, sizeof raw, "%.*s", static_cast<int>(NICK_LEN - 1),
+	                            nick && nick[0] ? nick : "?");
+	std::snprintf(raw + n, sizeof raw - static_cast<size_t>(n), " was busted");
+	FeedCopy(out, cap, raw);
+	if (nickLen)
+		*nickLen = static_cast<size_t>(n) < cap ? static_cast<size_t>(n) : 0;
+}
+
+// Once per arrest: a player seen going into PED_ARRESTED from a state that
+// was not, and not again until the state has left it. The snapshot repeats
+// the state 25 times a second; the first sample of somebody we have just
+// been told about is not a change.
+inline bool BustedJustNow(bool hadState, uint8_t before, uint8_t now, uint8_t arrested) {
+	return hadState && before != arrested && now == arrested;
+}
+
 // Where the next line of a long message ends: at FEED_WRAP characters, pulled
 // back to the last space if there is one in the back two thirds of the line,
 // so a word is only split when it is longer than that.
@@ -146,6 +183,66 @@ inline size_t FeedBreak(const char *text, size_t len, size_t room) {
 		if (text[i] == ' ')
 			return i;
 	return room;
+}
+
+// ---- rows on the screen ---------------------------------------------------------
+//
+// FEED_WRAP counts characters, and the font does not: the feed's text is sized
+// by the screen's height and its room by the width, so on a window taller than
+// it is wide a notice well under FEED_WRAP ran off the edge and was cut ("noxx3
+// is on Give Me Liberty, and you are in it" lost its last words at 958x1000).
+// So a line is broken again where it is drawn, by what the font measures.
+constexpr size_t FEED_ROWS_MAX = 4;
+
+// How much of `text` goes on one row: as much as `fits(n)` says fits, pulled
+// back to the last space there is past the first third of it, so a word is
+// only split when it is wider than the whole row. At least one character.
+template <class Fits>
+inline size_t FeedRowBreak(const char *text, size_t len, Fits fits) {
+	if (len == 0 || fits(len))
+		return len;
+	size_t lo = 1, hi = len - 1;
+	while (lo < hi) {
+		const size_t mid = (lo + hi + 1) / 2;
+		if (fits(mid))
+			lo = mid;
+		else
+			hi = mid - 1;
+	}
+	for (size_t i = lo; i > lo / 3; --i)
+		if (text[i] == ' ')
+			return i;
+	return lo;
+}
+
+struct FeedRow {
+	size_t from  = 0;
+	size_t count = 0;
+};
+
+// A line as the rows it takes, at most FEED_ROWS_MAX: `fits(from, n, lead)`
+// says whether n characters from `from` fit a row that starts with `lead`
+// characters of FEED_CONTINUED. The rows after the first carry on under the
+// first the way a long message's lines do, and the spaces a row was broken at
+// start nothing. Whatever is left past the last row stays on it, to be cut
+// where it is drawn.
+template <class Fits>
+inline size_t FeedRows(const char *text, Fits fits, FeedRow (&rows)[FEED_ROWS_MAX]) {
+	const size_t len  = std::strlen(text);
+	const size_t lead = std::strlen(FEED_CONTINUED);
+	size_t       at = 0, n = 0;
+	while (n < FEED_ROWS_MAX && (n == 0 || at < len)) {
+		const size_t indent = n == 0 ? 0 : lead;
+		size_t       take   = len - at;
+		if (n + 1 < FEED_ROWS_MAX)
+			take = FeedRowBreak(text + at, len - at,
+			                    [&](size_t count) { return fits(at, count, indent); });
+		rows[n++] = FeedRow{at, take};
+		at += take;
+		while (at < len && text[at] == ' ')
+			++at;
+	}
+	return n;
 }
 
 // The last FEED_LINES lines, oldest first.
@@ -457,6 +554,132 @@ inline void AppendDesync(char *raw, size_t cap, uint16_t offCm) {
 		std::snprintf(raw + n, cap - n, "  off %u m", static_cast<unsigned>(offCm / 100));
 }
 
+// The number the player list puts beside a player, and the one /kick takes:
+// their slot, counted from one.
+inline unsigned ListNumber(uint8_t playerId) { return static_cast<unsigned>(playerId) + 1; }
+
+// ---- commands ----------------------------------------------------------------
+//
+// A typed line that starts with '/' is a command. It is read here and never
+// goes out as chat, so a mistyped one is nobody's business but the typist's.
+// There is one: /kick, which is the host's (protocol.h, C_Kick).
+
+enum class ChatCommand : uint8_t {
+	None,      // not a command: chat
+	Kick,      // "/kick 3", "/kick bob"
+	Unknown,   // a '/' and anything else
+};
+
+struct ParsedCommand {
+	ChatCommand kind = ChatCommand::None;
+	char        word[CHAT_LEN] = {};   // the command as typed, without the '/'
+	char        arg[CHAT_LEN]  = {};   // what follows it, without the spaces round it
+};
+
+inline bool CommandWordIs(const char *word, const char *name) {
+	for (; *word && *name; ++word, ++name) {
+		const char a = *word >= 'A' && *word <= 'Z' ? static_cast<char>(*word - 'A' + 'a') : *word;
+		if (a != *name)
+			return false;
+	}
+	return *word == '\0' && *name == '\0';
+}
+
+inline ParsedCommand ParseChatCommand(const char *text) {
+	ParsedCommand out;
+	if (!text || text[0] != '/')
+		return out;
+	const char *at = text + 1;
+	size_t      n  = 0;
+	while (at[n] != '\0' && at[n] != ' ' && n + 1 < sizeof out.word) {
+		out.word[n] = at[n];
+		++n;
+	}
+	out.word[n] = '\0';
+	at += n;
+	while (*at == ' ')
+		++at;
+	size_t len = std::strlen(at);
+	while (len > 0 && at[len - 1] == ' ')
+		--len;
+	if (len >= sizeof out.arg)
+		len = sizeof out.arg - 1;
+	std::memcpy(out.arg, at, len);
+	out.arg[len] = '\0';
+	out.kind = CommandWordIs(out.word, "kick") ? ChatCommand::Kick : ChatCommand::Unknown;
+	return out;
+}
+
+// Somebody in the session, as /kick sees them.
+struct RosterEntry {
+	uint8_t     playerId = INVALID_PLAYER;
+	const char *nick     = nullptr;
+};
+
+enum class KickTarget : uint8_t { Found, Nobody, SeveralNames };
+
+inline bool NickEquals(const char *a, const char *b, size_t n) {
+	for (size_t i = 0; i < n; ++i) {
+		char x = a[i], y = b[i];
+		if (x >= 'A' && x <= 'Z')
+			x = static_cast<char>(x - 'A' + 'a');
+		if (y >= 'A' && y <= 'Z')
+			y = static_cast<char>(y - 'A' + 'a');
+		if (x != y)
+			return false;
+		if (x == '\0')
+			return true;
+	}
+	return true;
+}
+
+// Who "/kick 3" or "/kick bob" means. A number is the one the list shows
+// (ListNumber). Anything else is a name, first matched whole, then as the
+// start of exactly one name, both without regard to case, so "/kick bo" finds
+// bob while nobody else's name starts that way. A number nobody has is tried
+// as a name too, for somebody who calls themselves 1234.
+inline KickTarget ResolveKickTarget(const char *arg, const RosterEntry *roster, size_t count,
+                                    uint8_t *playerId) {
+	*playerId = INVALID_PLAYER;
+	if (!arg || arg[0] == '\0')
+		return KickTarget::Nobody;
+
+	bool     digits = true;
+	unsigned value  = 0;
+	for (const char *c = arg; *c; ++c) {
+		if (*c < '0' || *c > '9' || value > 1000) {
+			digits = false;
+			break;
+		}
+		value = value * 10 + static_cast<unsigned>(*c - '0');
+	}
+	if (digits)
+		for (size_t i = 0; i < count; ++i)
+			if (ListNumber(roster[i].playerId) == value) {
+				*playerId = roster[i].playerId;
+				return KickTarget::Found;
+			}
+
+	const size_t len = std::strlen(arg);
+	for (size_t i = 0; i < count; ++i)
+		if (roster[i].nick && std::strlen(roster[i].nick) == len &&
+		    NickEquals(roster[i].nick, arg, len)) {
+			*playerId = roster[i].playerId;
+			return KickTarget::Found;
+		}
+	size_t starts = 0;
+	for (size_t i = 0; i < count; ++i)
+		if (roster[i].nick && std::strlen(roster[i].nick) >= len &&
+		    NickEquals(roster[i].nick, arg, len)) {
+			*playerId = roster[i].playerId;
+			++starts;
+		}
+	if (starts == 1)
+		return KickTarget::Found;
+	*playerId = INVALID_PLAYER;
+	return starts == 0 ? KickTarget::Nobody : KickTarget::SeveralNames;
+}
+
 // ---- the version mark --------------------------------------------------------
 //
 // "CoopIII 0.0.1", small and grey in the bottom-left corner, under the radar:
@@ -483,13 +706,14 @@ constexpr float RADAR_TOP_UNITS    = 47.0f + 76.0f;
 // Scaled with the screen alone it was 10 px tall in a 960x540 window, which
 // is no mark at all. Never smaller than this many pixels.
 constexpr float MARK_MIN_TEXT_PX = 14.0f;
-// CFont::PrintChar drops a glyph whose top is at or past SCREEN_WIDTH, on the
-// y axis as well as the x one (addresses.h, CFont__PrintChar). A 958x1000
-// window has its whole strip under the radar past that line, so the mark
-// printed nothing there. It is kept this many pixels above it.
+// Retail CFont::PrintChar drops a glyph whose top is at or past SCREEN_WIDTH,
+// on the y axis as well as the x one (game/fontcull.h). A 958x1000 window has
+// its whole strip under the radar past that line, so the mark printed nothing
+// there. `cullY` is where the line is on this screen, and the mark is kept
+// this many pixels above it.
 constexpr float MARK_CULL_CLEARANCE_PX = 2.0f;
 
-inline MarkLayout MeasureVersionMark(float screenW, float screenH) {
+inline MarkLayout MeasureVersionMark(float screenH, float cullY) {
 	MarkLayout m;
 	const float unit = screenH / 448.0f;
 	float       grow = 1.0f;
@@ -500,7 +724,7 @@ inline MarkLayout MeasureVersionMark(float screenW, float screenH) {
 	m.x      = MARK_MARGIN_UNITS * unit;
 	m.y      = screenH - FEED_CELL_HEIGHT * m.scaleY - MARK_MARGIN_UNITS * unit;
 
-	const float lowest = screenW - MARK_CULL_CLEARANCE_PX;
+	const float lowest = cullY - MARK_CULL_CLEARANCE_PX;
 	if (m.y > lowest) {
 		// Still under the radar if the line is below its bottom edge, and over
 		// the top of it otherwise, never across it.
@@ -511,6 +735,24 @@ inline MarkLayout MeasureVersionMark(float screenW, float screenH) {
 		if (m.y < 1.0f)
 			m.y = 1.0f;
 	}
+	return m;
+}
+
+// The same mark in the bottom-right corner, `textW` wide at the mark's scale:
+// the cutscene skip count. Nothing is drawn on that side for it to keep out
+// of, so past the cull line it only goes up to it.
+inline MarkLayout MeasureCornerMark(float screenW, float screenH, float cullY, float textW) {
+	MarkLayout  m    = MeasureVersionMark(screenH, cullY);
+	const float unit = screenH / 448.0f;
+	m.x              = screenW - MARK_MARGIN_UNITS * unit - textW;
+	if (m.x < MARK_MARGIN_UNITS * unit)
+		m.x = MARK_MARGIN_UNITS * unit;
+	m.y               = screenH - FEED_CELL_HEIGHT * m.scaleY - MARK_MARGIN_UNITS * unit;
+	const float lowest = cullY - MARK_CULL_CLEARANCE_PX;
+	if (m.y > lowest)
+		m.y = lowest;
+	if (m.y < 1.0f)
+		m.y = 1.0f;
 	return m;
 }
 

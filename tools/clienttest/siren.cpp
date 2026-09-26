@@ -136,8 +136,8 @@ void TestWhatTheHostPutsOnTheWire() {
 	Check(TrafficHornOnWire(110, false, 44) && TrafficHornOnWire(110, false, 1),
 	      "a taxi with its timer running is honking, first frame to last");
 	Check(!TrafficHornOnWire(110, false, 0), "no timer, no honk");
-	Check(!TrafficHornOnWire(MODEL_POLICE, true, 30),
-	      "a police car with its siren on is wailing faster, not honking");
+	Check(TrafficHornOnWire(MODEL_POLICE, true, 30),
+	      "a police car with its siren on sends it too: the replica wails fast with it");
 	Check(TrafficHornOnWire(MODEL_POLICE, false, 30),
 	      "the same car with the siren off is honking");
 	Check(TrafficHornOnWire(MODEL_FIRETRUK, true, 30),

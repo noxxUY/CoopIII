@@ -29,6 +29,7 @@ void TestDefaults() {
 	Check(c.friendlyFire == false, "friendly fire is off (5.2)");
 	Check(c.wantedLevel == WantedLevelRule::PerPlayer, "wanted level is per player (5.1)");
 	Check(c.missionFailOnDeath == true, "a mission fails on death (5.4)");
+	Check(c.missionMarginCm == 500, "5 m outside a start or a checkpoint still counts");
 	Check(c.ammoSync == false, "ammo sync is off (protocol 1.9.6)");
 	// roadmap.md 5.10 decided shared, so shared is the default. The other two
 	// values are a group disagreeing about difficulty, not about the rule.
@@ -221,6 +222,25 @@ void TestParse() {
 	Check(future.port == 2005, "and the key it did know still landed");
 
 	Check(!ServerConfig{}.Parse(""), "an empty file parses as nothing");
+
+	ServerConfig margin;
+	margin.Parse("missionMargin = 7.5\n");
+	Check(margin.missionMarginCm == 750, "the mission margin is in metres, a fraction allowed");
+	margin.Parse("missionMargin = 0\n");
+	Check(margin.missionMarginCm == 0, "and 0 is the area exactly as the game has it");
+	margin.Parse("missionMargin = -1\nmissionMargin = 80\nmissionMargin = far\n");
+	Check(margin.missionMarginCm == 0,
+	      "a negative one, one past 50 m and one that is not a number are ignored");
+
+	ServerConfig enemies;
+	Check(enemies.missionEnemies == MISSION_ENEMIES_ORIGINAL && enemies.missionScale == 50,
+	      "a mission's enemies are single player's unless the server says, at 50% a player");
+	enemies.Parse("missionEnemies = tougher\nmissionScale = 75\n");
+	Check(enemies.missionEnemies == MISSION_ENEMIES_TOUGHER && enemies.missionScale == 75,
+	      "tougher, and 75% for each player after the first");
+	enemies.Parse("missionEnemies = harder\nmissionScale = 500\nmissionScale = lots\n");
+	Check(enemies.missionEnemies == MISSION_ENEMIES_TOUGHER && enemies.missionScale == 75,
+	      "an unknown rule, a scale past 200% and one that is not a number are ignored");
 }
 
 void TestRoundTrip() {
@@ -235,6 +255,9 @@ void TestRoundTrip() {
 	written.rampage            = RampageMode::Scaled;
 	written.money              = MoneyMode::Own;
 	written.hiddenPackages     = PackageMode::PerPlayer;
+	written.missionMarginCm    = 333;
+	written.missionEnemies     = MISSION_ENEMIES_MORE;
+	written.missionScale       = 120;
 
 	const std::string ini = written.ToIni();
 	Check(ini.find("[CoopIII]") != std::string::npos, "the file has its section header");

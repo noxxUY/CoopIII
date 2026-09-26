@@ -148,6 +148,18 @@ void TestIni() {
 	CheckEq(nick, "noxx", "nick reads back");
 	Check(port == 2010, "port reads back");
 
+	// The server's password, for the lobby: read the way the client reads
+	// it, and never written.
+	std::string password = "x";
+	ReadIni(path, nullptr, nullptr, nullptr, &password);
+	CheckEq(password, "x", "no password in the file leaves it alone");
+	Write(path, after + "password = open\x01 sesame 0123456789012345678901234567890123\n");
+	ReadIni(path, nullptr, nullptr, nullptr, &password);
+	CheckEq(password, "open sesame 0123456789012345678", "a password is cleaned and cut to 31");
+	Check(UpdateIni(path, "192.168.1.40", 2010, "noxx") &&
+	          ReadWhole(path).find("password = open") != std::string::npos,
+	      "and the launcher's own writes leave it as it was");
+
 	// A missing file is created, and reads like a config rather than three
 	// bare lines.
 	DeleteFileA(path.c_str());

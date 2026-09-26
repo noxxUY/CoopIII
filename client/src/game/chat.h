@@ -14,6 +14,12 @@
 // list key (F9) pins the scoreboard up or lets it go (game/scoreboard.h).
 // Nothing here is an engine address.
 //
+// **The chat key is also a letter of eleven cheats.** When it would finish
+// one it goes to the game and the line stays shut; when the line typed after
+// it is exactly the rest of one, the keys go to the game and the line is not
+// sent. Chat text on its own never reaches the cheat buffer. game/cheats.h,
+// "the chat key inside a cheat", has the rule and why it is safe.
+//
 // **While a line is open the game is kept off the keyboard** three ways, each
 // through something addresses.h already proves: CPad::DisablePlayerControls'
 // CoopIII bit (game/pause.h, HoldControlsForChat), which every movement,
@@ -49,6 +55,12 @@ void TickChat();
 
 // From the CHud::Draw detour.
 void DrawChatOverlay(const Client &client);
+
+// A line in the bottom-right corner, in the version mark's face and size
+// (chatfeed.h, MeasureCornerMark). Drawn under a cutscene's bars too, which
+// the chat is not. From the CHud::Draw detour. `row` 1 is the line above the
+// corner's own, for a second line at once.
+void DrawCornerMark(const char *text, int row = 0);
 
 // Fills the chat half of the bridge.
 void AddChatToBridge(WorldBridge &bridge);

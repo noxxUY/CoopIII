@@ -87,6 +87,7 @@ constexpr uint8_t StreamDeadlineTicks(uint32_t freshMs) {
 
 constexpr uint8_t STREAM_HONK_DEADLINE = StreamDeadlineTicks(HORN_FRESH_MS);
 constexpr uint8_t STREAM_FIRE_DEADLINE = StreamDeadlineTicks(REMOTE_FIRE_MS);
+constexpr uint8_t STREAM_DOOR_DEADLINE = StreamDeadlineTicks(AMBIENT_DOOR_SAID_MS);
 
 // What the observer holds from one row to the next, packed so a change is one
 // compare. A ped's seat and flags; a car's health, siren and horn.

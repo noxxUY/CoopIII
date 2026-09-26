@@ -142,6 +142,8 @@ bool Config::ParseIni(const std::string &text) {
 				scoreboardKey = vk;
 		} else if (IEquals(key, "showversion")) {
 			showVersion = ParseBool(value, showVersion);
+		} else if (IEquals(key, "missions")) {
+			missions = ParseBool(value, missions);
 		} else if (IEquals(key, "password")) {
 			// Control characters out and no longer than the packet carries,
 			// the way the server cleans its own.

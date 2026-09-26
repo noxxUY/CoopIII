@@ -433,7 +433,8 @@ bool UpdateIni(const std::string &path, const std::string &host, int port,
 	return true;
 }
 
-void ReadIni(const std::string &path, std::string *host, uint16_t *port, std::string *nick) {
+void ReadIni(const std::string &path, std::string *host, uint16_t *port, std::string *nick,
+             std::string *password) {
 	FILE *fh = std::fopen(path.c_str(), "rb");
 	if (!fh)
 		return;
@@ -469,6 +470,16 @@ void ReadIni(const std::string &path, std::string *host, uint16_t *port, std::st
 			uint16_t parsed = 0;
 			if (ParsePort(value, &parsed))
 				*port = parsed;
+		} else if (password && _stricmp(key.c_str(), "password") == 0) {
+			// PASSWORD_LEN is 32 including the terminator, so 31 travel.
+			password->clear();
+			for (const char c : value) {
+				if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F)
+					continue;
+				if (password->size() >= 31)
+					break;
+				password->push_back(c);
+			}
 		}
 	}
 }
@@ -524,7 +535,7 @@ bool ValidHost(const std::string &text) {
 
 // ---- starting the game ----------------------------------------------------
 
-bool LaunchGame(const std::string &gameDir, std::string *error) {
+bool LaunchGame(const std::string &gameDir, std::string *error, bool newGame) {
 	const std::string exe = Join(gameDir, "gta3.exe");
 
 	// docs/roadmap.md §5.6: the mod only activates when the game was started
@@ -536,6 +547,10 @@ bool LaunchGame(const std::string &gameDir, std::string *error) {
 			*error = "could not set the co-op marker in the environment";
 		return false;
 	}
+	// And the lobby's new game, the same way, or nothing: a marker left
+	// behind from an earlier start in this process would start a new game
+	// nobody asked for.
+	SetEnvironmentVariableA(ENV_NEW_GAME, newGame ? "1" : nullptr);
 
 	STARTUPINFOA        si = {sizeof(si)};
 	PROCESS_INFORMATION pi = {};
@@ -549,6 +564,7 @@ bool LaunchGame(const std::string &gameDir, std::string *error) {
 	// Out of the parent's own environment again, so anything else this process
 	// starts later is not accidentally a co-op session.
 	SetEnvironmentVariableA(ENV_LAUNCHED, nullptr);
+	SetEnvironmentVariableA(ENV_NEW_GAME, nullptr);
 
 	if (!ok) {
 		if (error) {

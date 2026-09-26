@@ -129,6 +129,27 @@ constexpr float kIdentToleranceSq = kIdentTolerance * kIdentTolerance;
 constexpr float kClaimRadius   = 4.0f;
 constexpr float kClaimRadiusSq = kClaimRadius * kClaimRadius;
 
+// Only the one pickup in reach that the player is nearest is claimed, never
+// everything inside the radius. A radius claim held the whole Ammu-Nation
+// counter and the hideout's weapon rack for whoever walked up first, so a
+// second player standing at the next gun could not buy it until the first
+// had walked away.
+//
+// The one already held keeps its claim until another is nearer by more than
+// this, so a player standing between two guns does not claim and give back
+// each of them every frame.
+constexpr float kClaimSwitchMargin = 0.5f;
+
+// Distances, not squares: the margin is metres.
+constexpr bool ShouldSwitchClaim(float heldDist, float candidateDist) {
+	return candidateDist + kClaimSwitchMargin < heldDist;
+}
+
+// After a denial, no claim on that pickup before this many frames have
+// passed. Without it a refused player asked again every round trip for as
+// long as he stood there (~1.5 s at 60 fps).
+constexpr uint32_t kDenyRetryFrames = 90;
+
 // Do these two idents name the same pickup?
 //
 // Pure, so tools/clienttest covers it without the game.
@@ -398,6 +419,27 @@ void OnPickupDroppedElsewhere(const PickupDropBody &drop);
 // goes back to being the local engine's own business and single player
 // behaves exactly as it always did.
 void ReleaseAllPickups();
+
+// Whether the pickup a script holds `handle` for is still up on this machine:
+// its slot has not been reused since (the same generation test as
+// CPickups::GetActualPickupIndex), and nobody has taken it, the engine's
+// removal having freed the slot or marked it removed. For the owner of the
+// session's mission, handing somebody who comes in late only what the
+// mission still has out (docs/missions.md 11.5).
+bool PickupStillUp(int32_t handle);
+
+// Whether `handle` names a pickup of this machine's table at all, taken and
+// waiting to come back included: a shop gun somebody bought a moment ago is
+// still the shop's. -1, a handle past the table, or one whose slot has been
+// used again since, names none.
+bool PickupInUse(int32_t handle);
+
+// One of the session's mission's floating packages, taken on somebody else's
+// machine (docs/missions.md 5.3): gone here the way the engine takes one and,
+// with `tellTheScript`, pushed into the ring HAS_PICKUP_BEEN_COLLECTED reads,
+// for the machine whose mission holds the handle to count it. False when it
+// is not up here any more.
+bool TakeMissionPickup(int32_t handle, bool tellTheScript);
 
 // ---------------------------------------------------------------------------
 // Diagnostics

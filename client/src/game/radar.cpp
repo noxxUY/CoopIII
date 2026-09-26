@@ -322,8 +322,13 @@ void DrawArrows() {
 		                                     ArrowAngle(arrow.heading, cameraHeading),
 		                                     halfX, halfY);
 
-		const ArrowRgb rgb = PlayerArrowRgb(id, arrow.inVehicle);
-		const Rgba colour{rgb.r, rgb.g, rgb.b, alpha};
+		ArrowRgb rgb   = PlayerArrowRgb(id, arrow.inVehicle);
+		uint8_t  shown = alpha;
+		if (player.dead) {
+			rgb   = DeadArrowRgb(rgb);
+			shown = DeadArrowAlpha(alpha);
+		}
+		const Rgba colour{rgb.r, rgb.g, rgb.b, shown};
 
 		const int *o = ARROW_DRAW_ORDER;
 		Func<SpriteQuadFn>(CSprite2d__DrawFourCorners)(

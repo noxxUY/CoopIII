@@ -79,6 +79,27 @@ bool LocalIsPassenger();
 // frame with nothing in flight.
 int32_t PollLocalSeatEntry();
 
+// A passenger slot free among the four CPed::WarpPedIntoCar looks at, of a
+// car with that many (seatplan.h, SEAT_PLAN_PASSENGER_SLOTS).
+bool PassengerSeatFree(void *vehicle);
+
+// A script of ours was putting the local player at the wheel another player
+// holds, with a warp (game/mission.cpp, seatplan.h PlanScriptedWheel): the
+// same warp into a free passenger seat instead, the way the seat key's
+// fallback does it. The wire seat he got, or -1 with nothing changed: not on
+// foot, no such car, or no free slot.
+int32_t WarpLocalPlayerIntoPassengerSeat(int32_t vehicleHandle);
+
+// The seat the owner's machine handed our player in the car its mission put
+// its player in (protocol.h, C_MissionBoard), the same warp: `given` if it is
+// free here, or another free one nobody else was given (game/mission.h,
+// PickBoardSeat). The wire seat he got, or -1 with nothing changed.
+int32_t WarpLocalPlayerIntoGivenSeat(int32_t vehicleHandle, uint8_t given, uint16_t givenToOthers);
+
+// The car the local player rides in as a passenger and the wire seat he holds
+// in it (1 + passenger slot). False on foot or at a wheel.
+bool LocalPassengerSeat(int32_t &vehicleHandle, uint8_t &seat);
+
 void AddSeatToBridge(WorldBridge &bridge);
 
 } // namespace coopiii::game

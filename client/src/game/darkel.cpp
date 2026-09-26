@@ -1,6 +1,7 @@
 #include "darkel.h"
 
 #include "addresses.h"
+#include "mission.h"
 #include "vehicle.h"
 #include "../clock.h"
 #include "../hook/hook.h"
@@ -224,6 +225,13 @@ void __cdecl HookedRegisterKillByPlayer(void *victim, int32_t weapon,
 	const int32_t killsBefore = Global<int32_t>(CDarkel__KillsNeeded);
 
 	g_registerKill.Original<RegisterKillFn>()(victim, weapon, headshot);
+
+	// The session's mission counts its kills on the owner's machine alone, so
+	// a participant's go there (mission-audit.md R11). Not the occupants of a
+	// wreck this machine is replaying: the machine that decided the wreck
+	// registers those.
+	if (victim && !ReplayingVehicleBlast())
+		MissionKillRegistered(victim);
 
 	if (!Sharing() || !g_localFrenzy || !victim || !wasOngoing)
 		return;
@@ -529,7 +537,10 @@ void CreditRampageCar(uint16_t model, const UnownedVehicleKey &key) {
 }
 
 void CreditRemotePedKill(void *ped, uint8_t weapon, uint8_t piece) {
-	if (!ped || !FrenzyOngoing())
+	// During a rampage, and during the session's mission, whose kills Uzi
+	// Rider and Bait count (mission-audit.md R11). Anywhere else a kill
+	// somebody else made stays theirs, as it was.
+	if (!ped || !(FrenzyOngoing() || MissionCreditsRemoteKills()))
 		return;
 
 	// The gap this closes is the one named at CDarkel__KILL_CREDIT_TEST: this

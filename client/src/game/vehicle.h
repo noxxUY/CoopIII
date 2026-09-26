@@ -107,6 +107,21 @@ void MakeCopyAMissionCar(void *vehicle);
 // off the copy list. Counters moved through UpdateCarCount.
 void HandCopyToEngine(void *vehicle);
 
+// ---- parked cars somebody takes (docs/protocol.md 1.44) ---------------------
+//
+// Once a frame: remembers which car generator the car the local player is
+// getting into stands on. By the time the claim goes out the generator has
+// already let go of it (CCarGenerator::Process, STATUS_PLAYER), so the name
+// has to be taken on the way in.
+void NoteCarBeingEntered();
+// The generator the car the local player claims came off, plus one, or 0.
+uint16_t ParkedSlotOfLocalCar(void *vehicle);
+// Somebody else took the parked car on generator `parkedSlot - 1`. Our own
+// car on it goes (unless the local player is in it or getting in, or it is
+// already a session car), and the generator lets go the way the engine does
+// for its own player: the timer a minute on, no handle, blocking.
+void TakeOverParkedCar(uint16_t parkedSlot);
+
 // The detour on CPools::SaveVehiclePool that keeps copies out of the
 // single-player save. Installed from InstallVehicleHooks; a failure is logged
 // on its own line and left out of that function's result.
@@ -262,6 +277,25 @@ bool SampleLocalVehicleDamage(VehicleDamageBody &out);
 // already a wreck.
 bool SampleObservedVehicleDamage(RemoteVehicle &vehicle, VehicleDamageBody &out);
 
+// The bomb a car carries (protocol.h, C_VehicleBomb, mission-audit.md R6): of
+// the one the local player drives, and of the one a roster row names, and our
+// copy of that one given somebody else's word on it. A car only, never a
+// wreck.
+//
+// The word is more than the type. Every copy names the session's bomber as
+// the car's m_pBombRigger, registered with that ped so it cannot outlive it:
+// the ignition blames that pointer on whichever machine somebody sits down in
+// the car, and CWorld::UseDetonator matches on it. A fuse somebody else lit is
+// lit on our copy too, blaming the same ped, unless ours already burns.
+bool SampleLocalVehicleBomb(VehicleBombSample *out);
+bool SampleObservedVehicleBomb(RemoteVehicle &vehicle, VehicleBombSample *out);
+bool ApplyRemoteVehicleBomb(RemoteVehicle &vehicle, const VehicleBombWrite &write);
+// What CWorld::UseDetonator does to a car it matches, done to our copy of one
+// a detonator somewhere set off: bomb off, 500 ms, the rigger to blame - our
+// own player when `blameUs`, otherwise `by`'s ped (addresses.h,
+// CWorld__UseDetonator).
+bool DetonateRemoteVehicleBomb(RemoteVehicle &vehicle, bool blameUs, RemotePlayer *by);
+
 // Make an observed car wear the damage the session says it has.
 //
 // Writing the status bytes is NOT enough, which is the same lesson as the
@@ -308,6 +342,18 @@ void ApplyAmbientCarDamage(RemoteAmbientCar &car, const VehicleDamageBody &body,
 // Without it an observer's own collisions keep denting a car it does not own,
 // and because damage only climbs those invented dents are permanent.
 void SetVehicleObserved(void *vehicle, bool observed);
+
+// The session's name for a car this machine has here, for the fire truck's
+// water cannon (game/emergency.h): a session car, a replica of somebody else's
+// traffic, or traffic this machine hosts and the session has named.
+// `othersMoveIt` is true when another machine moves it - another player
+// drives or settles the session car, or it is a replica. False for a car the
+// session has no name for here.
+bool SessionCarFor(const void *vehicle, uint16_t &netId, bool &othersMoveIt);
+
+// This machine's copy of a session car or of somebody else's traffic, or
+// null. Never this machine's own traffic.
+void *CopyOfCar(uint16_t netId);
 
 // ---------------------------------------------------------------------------
 // Destruction
@@ -407,6 +453,24 @@ bool ReadCarBlastTransform(void *vehicle, BlastTransform &out);
 // afterwards moves its shell and leaves all three in the wrong street.
 void PlaceCarForBlast(void *vehicle, const BlastTransform &where);
 
+// A car's model index, or false when it has none yet.
+//
+// CEntity::m_modelIndex is an int16 and the engine only ever reads it as one
+// (GenerateOneRandomCar's `movsx esi,word ptr [ebx+5Ch]` at 0x00417BEF). The
+// word behind it is CEntity::m_level, and nothing initialises that for a
+// vehicle: CEntity::CEntity (0x004BC3E0) writes +0x4C, +0x50 and +0x58 and
+// leaves +0x5C..+0x5F alone, and the vehicle pool (0x004A3580) is 110 slots
+// of 0x5A8 bytes from operator new that nobody clears. Read as a dword, a car
+// in a slot with anything left in that word looked like "no model yet" and was
+// never hosted - on one machine, for a whole session.
+inline bool VehicleModelIndex(void *vehicle, uint16_t &out) {
+	const int16_t model = Field<int16_t>(vehicle, offs::MODEL_INDEX);
+	if (model <= 0)
+		return false;
+	out = static_cast<uint16_t>(model);
+	return true;
+}
+
 // Everything that describes what a car *is*, for the spawn announcement:
 // model, both colours, both extras, and where it is right now.
 bool SampleAmbientCarIdentity(void *vehicle, AmbientCarBody &out);
@@ -443,6 +507,12 @@ uint8_t DrainLocalVehicleBlasts(LocalVehicleBlast *out, uint8_t max);
 // rather than an error - Client marks the entry destroyed either way, because
 // a car whose owner says it is wrecked must never be respawned as a new one.
 bool BlowUpRemoteVehicle(RemoteVehicle &vehicle, const Vec3 &pos, const Quat &rot);
+
+// The burning car we settle, blown up here because its custody ran out first
+// (client.h, BurnOutlastedCustody); and a backfilled wreck made one without
+// the blast (game/wreck.h). WorldBridge has both.
+bool BlowUpSettlingVehicle(RemoteVehicle &vehicle);
+bool WreckRemoteVehicleQuietly(RemoteVehicle &vehicle);
 
 // ---------------------------------------------------------------------------
 // Shooting a car somebody else is driving (protocol.h, VehicleHitBody)
@@ -704,8 +774,9 @@ inline float HealthToWrite(float wire, bool blasted, float blastHealth) {
 
 // BlowUpCar has no proof flag to test (it only reads bCanBeDamaged, at
 // 0x0053BC69), so this is the whole gate. A car nobody holds may still go up
-// here: a blast that kills it does so on every machine, and so does the fire
-// timer of one whose custodian left while it burned.
+// here: a blast that kills it does so on every machine. Its fire timer only
+// runs at the host (game/wreck.h, FireTimerRunsHere), so a burning one whose
+// custodian left goes up there and reaches everybody else as UNOWNED_SESSION.
 inline bool MayBlowUpCar(CarOwner owner) {
 	return owner == CarOwner::Local || owner == CarOwner::Nobody;
 }
@@ -740,6 +811,10 @@ WreckDecider WhoDecidesWreckHere(void *vehicle, UnownedVehicleKey &key);
 // driver - or INVALID_PLAYER. Only compares pointers, so it is safe on a
 // CEntity* that is not a car or no longer exists.
 uint8_t RemoteDriverOf(const void *vehicle);
+
+// Whose engine moves this car, by ClassifyCar over the Observed table, the
+// replica table and CVehicle::m_pDriver. Local for a null car.
+CarOwner CarOwnerHere(void *vehicle);
 
 // Our flame has just reached a car (combat.h, IsOurFlame): does the car's
 // owner need telling? Only when it isn't us. A session car nobody holds goes

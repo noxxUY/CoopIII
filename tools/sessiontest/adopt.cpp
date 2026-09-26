@@ -299,6 +299,90 @@ void TestTheSessionHandsTheCrowdOn() {
 	Check(named, "somebody joining later is told the new owner");
 }
 
+// A traffic car its host's engine drops beside somebody else (C_CarLetGo).
+void TestALetGoGoesToTheNearestOtherPlayer() {
+	std::printf("\na car its host's engine drops is handed to the nearest other player\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Player *carol = Join(s, 3, "carol");
+	Stand(s, *alice, 90.0f);    // nearest of all, and the one letting go
+	Stand(s, *bob, 60.0f);
+	Stand(s, *carol, 1000.0f);
+
+	const uint16_t car    = s.AddCar(alice->id, CarBody(100.0f))->netId;
+	const uint16_t driver = s.AddPed(alice->id, PedBody(100.0f))->netId;
+	const uint16_t rider  = s.AddPed(alice->id, PedBody(100.0f))->netId;
+	const uint16_t bobs   = s.AddPed(bob->id, PedBody(100.0f))->netId;
+	const uint16_t list[] = {driver, rider, bobs, driver};
+
+	std::vector<AdoptVerdict> v = s.LetGoCar(car, list, 4, alice->id, 1000);
+	Check(v.size() == 3, "the car and alice's two in it, bob's own and the repeat left out");
+	Check(AdopterOf(v, car) == bob->id && AdopterOf(v, driver) == bob->id &&
+	          AdopterOf(v, rider) == bob->id,
+	      "all three to bob - alice is nearer, but she is the one letting go");
+	Check(s.FindCar(car)->ownerPlayerId == bob->id && s.FindPed(driver)->ownerPlayerId == bob->id,
+	      "and the session files them under him");
+	Check(s.FindPed(bobs)->ownerPlayerId == bob->id, "bob's own pedestrian is untouched");
+	Check(!s.NoteCarState(AmbientCarState{car, 0, {101.0f, 0, 0}, {0, 0, 0, 1}, {}}, alice->id),
+	      "a row of alice's still in flight is refused");
+
+	// Bob's engine does not want it either, a second later: alice let go of
+	// it a moment ago and carol is a kilometre off.
+	v = s.LetGoCar(car, list, 2, bob->id, 2000);
+	Check(AdopterOf(v, car) == INVALID_PLAYER && AdopterOf(v, driver) == INVALID_PLAYER,
+	      "not back to alice, and nobody else is near: let go of");
+	Check(s.FindCar(car) == nullptr && s.FindPed(driver) == nullptr && s.FindPed(rider) == nullptr,
+	      "car and people gone from the session");
+}
+
+void TestALetGoIsForgottenInTime() {
+	std::printf("\na player who let go of a car may take it back later\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Stand(s, *alice, 0.0f);
+	Stand(s, *bob, 50.0f);
+	const uint16_t car = s.AddCar(alice->id, CarBody(30.0f))->netId;
+
+	std::vector<AdoptVerdict> v = s.LetGoCar(car, nullptr, 0, alice->id, 1000);
+	Check(AdopterOf(v, car) == bob->id, "alice lets go, bob takes it");
+	v = s.LetGoCar(car, nullptr, 0, bob->id, 1000 + CAR_LET_GO_MEMORY_MS + 1);
+	Check(AdopterOf(v, car) == alice->id,
+	      "bob lets go past the memory: alice has had time to turn round and takes it");
+	v = s.LetGoCar(car, nullptr, 0, alice->id, 1000 + CAR_LET_GO_MEMORY_MS + 500);
+	Check(AdopterOf(v, car) == INVALID_PLAYER && s.FindCar(car) == nullptr,
+	      "and within it, both having let go, it goes");
+}
+
+void TestALetGoOfSomebodyElsesCar() {
+	std::printf("\na let-go of a car that is not the sender's\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Stand(s, *alice, 0.0f);
+	Stand(s, *bob, 10.0f);
+	const uint16_t car    = s.AddCar(alice->id, CarBody(5.0f))->netId;
+	const uint16_t hisPed = s.AddPed(bob->id, PedBody(5.0f))->netId;
+	const uint16_t list[] = {hisPed};
+
+	const std::vector<AdoptVerdict> v = s.LetGoCar(car, list, 1, bob->id, 1000);
+	Check(s.FindCar(car) && s.FindCar(car)->ownerPlayerId == alice->id,
+	      "alice's car is not bob's to hand anywhere");
+	Check(v.size() == 1 && AdopterOf(v, hisPed) == INVALID_PLAYER && s.FindPed(hisPed) == nullptr,
+	      "the pedestrian of his he named goes - his engine takes him whatever we say");
+	Check(s.LetGoCar(999, nullptr, 0, alice->id, 1000).empty() &&
+	          s.LetGoCar(car, nullptr, 0, INVALID_PLAYER, 1000).empty(),
+	      "no such car, or nobody, decides nothing");
+
+	// A wreck is let go of wherever anybody stands.
+	const uint16_t wreck = s.AddCar(alice->id, CarBody(5.0f))->netId;
+	s.FindCar(wreck)->destroyed = true;
+	const std::vector<AdoptVerdict> w = s.LetGoCar(wreck, nullptr, 0, alice->id, 1000);
+	Check(AdopterOf(w, wreck) == INVALID_PLAYER && s.FindCar(wreck) == nullptr,
+	      "and a wreck is nobody's to keep");
+}
+
 void TestAHostOfNothingHandsOnNothing() {
 	std::printf("\nnothing to hand on\n");
 	Session s;
@@ -316,6 +400,9 @@ int RunAdoptTests() {
 	TestACarGoesWithItsOccupants();
 	TestAPacketNeverSplitsACar();
 	TestTheSessionHandsTheCrowdOn();
+	TestALetGoGoesToTheNearestOtherPlayer();
+	TestALetGoIsForgottenInTime();
+	TestALetGoOfSomebodyElsesCar();
 	TestAHostOfNothingHandsOnNothing();
 	return g_adoptFailures;
 }

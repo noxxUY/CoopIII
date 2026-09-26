@@ -62,6 +62,13 @@ struct Config {
 	// the first thing anybody reporting a bug gets asked is which build.
 	bool showVersion = true;
 
+	// Whether this machine's missions are the session's (docs/missions.md):
+	// everybody at the start and at every checkpoint, one mission at a time,
+	// a participant's $ONMISSION following it and the death rule. On by
+	// default; `missions = off` makes every mission this machine's own. The
+	// script engine's addresses it needs are in game/missionaddr.h.
+	bool missions = true;
+
 	// The server's password, when it has one (protocol.h, C_Password). Empty
 	// sends nothing, which is what a server without one expects.
 	std::string password;

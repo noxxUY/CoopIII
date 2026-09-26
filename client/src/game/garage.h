@@ -60,15 +60,13 @@
 // **4. The wanted seam.**
 //
 // CWanted::Reset (0x004AD790) is in addresses.h and is deliberately never
-// called from here. The wanted level has its own sync (wanted.h), and the
-// respray already clears the stars of the player who paid,
-// through the engine's own code, on their own machine - that needs nothing
-// from CoopIII. The only thing CoopIII does about it is *not* clear an
-// observer's stars, which falls out of (3) for free.
-//
-// The single line to change if §5.1 ever lands a shared wanted level is marked
-// `SEAM (wanted level)` in garage.cpp. It is one place, in
-// ApplyRemoteRespray, and it is empty on purpose.
+// called from here. The respray clears the stars of the player who paid,
+// through the engine's own code, on their own machine. Whose *other* stars it
+// clears is the wanted rule's decision - everybody's under `shared`, the
+// car's occupants under `perplayer` - and it is made in Client::OnRespray and
+// carried out by Client::TickWanted (docs/wanted.md §4.9), never by letting an
+// observer's own arm run, which (3) still refuses. `SEAM (wanted level)` in
+// garage.cpp marks the place and stays empty on purpose.
 #pragma once
 
 #include <cstdint>

@@ -538,10 +538,23 @@ because in both the two are never live at the same time:
 The 100 hidden packages are all at least **30.9 m** apart, so they are not
 close to the problem at all.
 
-So a live-at-once collision does not occur in the retail script. A ped dropping
-two weapons of the same type onto the same spot is still conceivable, so the
-client logs the collision once and refuses to claim either rather than claiming
-the wrong one.
+So a live-at-once collision of two *different* pickups does not occur in the
+retail script. Two cases of the same spot do, and neither is a guess:
+
+- **An out-of-stock sign and the gun in stock.** A pickup only ever matches
+  one of its own type, so `PICKUP_OUT_OF_STOCK` and `PICKUP_IN_SHOP` of the
+  same model at the same place are two keys. Cipriani's Chauffeur takes the
+  Uzi's sign down (`27_joey4.sc:1022`) before it puts the Uzi up, but on a
+  machine whose sign is still there, it never makes a claim for the gun
+  refused.
+- **The same pickup made twice.** Cipriani's Chauffeur makes the shop's Uzi
+  (`27_joey4.sc:1023`) and starts `UZI_MESSAGE` (`help.sc:66`), which makes it
+  again into the same global. Two identical pickups at exactly the same spot
+  are one pickup to anybody: the nearest is the one claimed, and the other
+  never claims.
+
+Two of the same model and type within the tolerance but *not* at the same
+spot are still refused, logged once, rather than the wrong one claimed.
 
 ### A key is reused over time, and the server has to let go of it
 
@@ -927,3 +940,26 @@ Two things worth keeping from this:
   like a moment to go and read the log. The lesson is not "add a log line";
   it is that a diagnostic written for one failure will describe a different
   one, and the first live run of anything is the moment to read all of it.
+
+## 12. One reservation at a time, and the holder is told when it moves
+
+The claim radius used to reserve everything inside 4 m. At the Ammu-Nation
+counter and the hideout's weapon rack that was every gun at once, so a second
+player standing at the next one could not have it until the first walked away
+or 15 s passed. Three changes (`client/src/game/pickup.cpp`,
+`server/core/session.cpp`):
+
+- **Only the nearest pickup in reach is claimed.** What is already held keeps
+  its claim unless another is more than 0.5 m nearer (`kClaimSwitchMargin`),
+  and a grant that stops being the nearest is given back. Skulls are still
+  asked for on the touch.
+- **A moved reservation is announced.** After 15 s the next claimant still
+  gets it, and `ClaimPickup` now names the holder it was taken from; the
+  server sends him `S_PickupDenied`, which his client applies to a grant as
+  well as a pending claim, hiding the pickup from his engine again. If his
+  engine took it before the denial arrived, his collection within 2 s
+  (`PICKUP_DISPLACED_GRACE_MS`) still counts and the new holder is told it
+  was taken, so the race ends with one player holding it rather than two.
+- **A denial backs off.** 1.5 s before the same pickup is claimed again
+  (`kDenyRetryFrames`); only skulls waited before, and everything else asked
+  again every round trip.

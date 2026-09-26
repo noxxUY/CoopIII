@@ -126,15 +126,16 @@ inline float BoardHeightUnits(int rows, int footLines) {
 	       static_cast<float>(footLines) * BOARD_FOOT_H + BOARD_PAD * 0.5f;
 }
 
-// CFont drops a glyph whose top is at or past SCREEN_WIDTH - on the y axis,
-// not just the x one (CFont::PrintChar, addresses.h). So on a window taller
-// than it is wide nothing prints below y = width, and the panel is kept above
-// that line as well as on the screen.
-inline float PrintableHeight(float screenW, float screenH) {
-	return screenW < screenH ? screenW : screenH;
+// Retail CFont drops a glyph whose top is at or past SCREEN_WIDTH - on the y
+// axis, not just the x one (game/fontcull.h). Where that has not been fixed,
+// nothing prints below y = width on a window taller than it is wide, so the
+// panel is kept above `cullY`, where the line is, as well as on the screen.
+inline float PrintableHeight(float screenH, float cullY) {
+	return cullY < screenH ? cullY : screenH;
 }
 
-inline BoardLayout MeasureBoard(float screenW, float screenH, int rows, int footLines = 1) {
+inline BoardLayout MeasureBoard(float screenW, float screenH, int rows, int footLines,
+                                float cullY) {
 	BoardLayout b;
 	if (rows < 1)
 		rows = 1;
@@ -159,7 +160,7 @@ inline BoardLayout MeasureBoard(float screenW, float screenH, int rows, int foot
 		unit = minUnit;
 
 	// Room wins over readability: a panel off the edge is read by nobody.
-	const float usableH = PrintableHeight(screenW, screenH);
+	const float usableH = PrintableHeight(screenH, cullY);
 	const float roomW   = screenW - 2.0f * BOARD_MARGIN_PX;
 	const float roomH   = usableH - 2.0f * BOARD_MARGIN_PX;
 	const float fitW    = roomW / wantW;
@@ -204,13 +205,16 @@ inline int BoardOrder(uint8_t localId, const bool (&active)[MAX_PLAYERS],
 	return n;
 }
 
-enum class BoardState : uint8_t { OnFoot, Driving, Passenger, Wasted, Away };
+enum class BoardState : uint8_t { OnFoot, Driving, Passenger, Wasted, Away, Paused };
 
-// Quiet first: whatever else the last snapshot said is that old.
+// Quiet first: whatever else the last snapshot said is that old. Then the
+// menu, which leaves the ped standing wherever it was.
 inline BoardState StateOf(bool dead, float health, bool seated, uint8_t seat,
-                          uint32_t quietMs) {
+                          uint32_t quietMs, bool paused = false) {
 	if (quietMs >= QUIET_AFTER_MS)
 		return BoardState::Away;
+	if (paused)
+		return BoardState::Paused;
 	if (dead || !(health > 0.0f))
 		return BoardState::Wasted;
 	if (seated)
@@ -228,6 +232,7 @@ inline void StateLabel(char *out, size_t cap, BoardState s, uint32_t quietMs = 0
 	case BoardState::Driving:   std::snprintf(out, cap, "DRIVING");   return;
 	case BoardState::Passenger: std::snprintf(out, cap, "PASSENGER"); return;
 	case BoardState::Wasted:    std::snprintf(out, cap, "WASTED");    return;
+	case BoardState::Paused:    std::snprintf(out, cap, "PAUSED");    return;
 	case BoardState::Away: {
 		const uint32_t sec = quietMs / 1000;
 		if (sec > 999)

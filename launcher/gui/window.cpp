@@ -2,7 +2,10 @@
 //
 // design/screens/Main.dc.html is the screen when everything is in place, and
 // LauncherBlocked.dc.html is the same screen with problems on it. Every
-// position and size below is out of those files.
+// position and size below is out of those files, but for the lobby's column
+// (docs/protocol.md 1.31), which has no screen of its own yet and is built
+// out of the same parts: the checks' card for the list, the options dialog's
+// segmented control and the start button where it always was.
 //
 // All the thinking lives in launcher-core, which the console launcher uses
 // too. This file is layout, and the one decision the window makes that the
@@ -11,6 +14,7 @@
 #include "run.h"
 
 #include "launcher/core.h"
+#include "launcher/lobby.h"
 
 #include "ui/anim.h"
 #include "ui/app.h"
@@ -51,6 +55,12 @@ struct State {
 	std::string startError;
 	bool        launched = false;
 	float       checkedAt = -10.0f;   // when the list was last re-run
+
+	// The lobby (docs/protocol.md 1.31): the right column shows it instead
+	// of the form while this is set.
+	LobbyClient lobby;
+	bool        lobbyView = false;
+	int         startMode = 0;   // the host's choice: 0 a new game, 1 the menu
 };
 
 State g_state;
@@ -221,6 +231,234 @@ bool FormIsValid(uint16_t *port) {
 	       ParsePort(g_state.port, port);
 }
 
+// ---- starting -------------------------------------------------------------
+
+uint32_t NowMs() { return static_cast<uint32_t>(GetTickCount()); }
+
+// Writes the form into CoopIII.ini and starts the game: alone, or because the
+// lobby's host started everybody's, into a new game with `newGame`. The
+// window closes behind a game that started.
+bool StartGame(bool newGame) {
+	uint16_t port = 0;
+	if (!FormIsValid(&port)) {
+		g_state.startError = "Fill in your name, the server address and the port.";
+		return false;
+	}
+	const std::string nick = SanitizeNick(g_state.nick);
+	CopyInto(g_state.nick, sizeof(g_state.nick), nick);
+	g_state.startError.clear();
+	if (!UpdateIni(Join(g_state.gameDir, "CoopIII.ini"), g_state.host, port, nick)) {
+		g_state.startError = "Could not write CoopIII.ini in the game folder.";
+		return false;
+	}
+	if (!LaunchGame(g_state.gameDir, &g_state.startError, newGame))
+		return false;   // LaunchGame filled in why
+	g_state.launched = true;
+	return true;
+}
+
+// Into the server's lobby with what the form says, and the password
+// CoopIII.ini has, if any.
+void JoinLobby(uint16_t port) {
+	const std::string nick = SanitizeNick(g_state.nick);
+	CopyInto(g_state.nick, sizeof(g_state.nick), nick);
+	std::string password;
+	ReadIni(Join(g_state.gameDir, "CoopIII.ini"), nullptr, nullptr, nullptr, &password);
+	g_state.startError.clear();
+	g_state.lobbyView = true;
+	g_state.lobby.Join(g_state.host, port, nick, password, NowMs());
+}
+
+// ---- the lobby ------------------------------------------------------------
+
+constexpr float kLobbyRowH = 40.0f;
+
+// Who is waiting and who is playing, in a card like the checks'. As many rows
+// as fit in `maxH`, the last one saying how many more there are.
+float DrawPeople(Rect area, const LobbyClient &lobby, const Theme &theme) {
+	const std::vector<LobbyClient::Person> &people = lobby.People();
+	if (people.empty())
+		return 0.0f;
+	size_t rows = people.size();
+	const size_t fit = static_cast<size_t>((area.size.y - 2.0f) / (kLobbyRowH + 1.0f));
+	const bool   more = rows > fit && fit >= 1;
+	if (rows > fit)
+		rows = fit;
+	if (rows == 0)
+		return 0.0f;
+	const float h = 2.0f + rows * kLobbyRowH + (rows - 1) * 1.0f;
+	const Rect  box{area.pos, ImVec2(area.size.x, h)};
+	Card(box, theme);
+
+	ImDrawList *draw = ImGui::GetWindowDrawList();
+	float       y    = box.pos.y + 1.0f;
+	for (size_t i = 0; i < rows; ++i) {
+		if (more && i + 1 == rows) {
+			char left[48];
+			std::snprintf(left, sizeof(left), "and %zu more", people.size() - i);
+			TextMiddle(ImVec2(box.pos.x + 34.0f, y), kLobbyRowH, Type::BodySmall,
+			           theme.textTertiary, left);
+			break;
+		}
+		const LobbyClient::Person &p = people[i];
+		const ImU32 dot = p.playing ? theme.statusOk : p.host ? theme.brandRed : theme.actionBg;
+		draw->AddCircleFilled(ImVec2(box.pos.x + 18.0f, y + kLobbyRowH * 0.5f), 4.0f, dot);
+		TextMiddle(ImVec2(box.pos.x + 34.0f, y), kLobbyRowH, Type::FieldLabel, theme.textPrimary,
+		           p.nick.empty() ? "?" : p.nick.c_str());
+		const char *what = p.playing ? "Playing"
+		                   : p.host && p.you ? "Host \xC2\xB7 you"
+		                   : p.host        ? "Host"
+		                   : p.you         ? "Waiting \xC2\xB7 you"
+		                                   : "Waiting";
+		TextRight(box.Max().x - 14.0f, y + (kLobbyRowH - 16.0f) * 0.5f, Type::Hint,
+		          theme.textTertiary, what);
+		y += kLobbyRowH;
+		if (i + 1 < rows) {
+			draw->AddLine(ImVec2(box.pos.x + 1.0f, y + 0.5f), ImVec2(box.Max().x - 1.0f, y + 0.5f),
+			              theme.border, 1.0f);
+			y += 1.0f;
+		}
+	}
+	return h;
+}
+
+// The right column while in the lobby: who is there, and for its host the
+// start of everybody's game.
+// The lobby's network and the host's start, every turn of the window's loop,
+// minimised or not: somebody waiting with the window down still starts with
+// everybody else. True when this game started.
+bool ServiceLobby() {
+	if (!g_state.lobbyView)
+		return false;
+	LobbyClient &lobby = g_state.lobby;
+	lobby.Service(NowMs());
+	uint8_t     mode = 0;
+	std::string by;
+	return lobby.TakeStart(&mode, &by) && StartGame(mode == LOBBY_START_NEW_GAME);
+}
+
+void DrawLobby(const Theme &theme, float rightX, float rightW, float top, float bottom) {
+	LobbyClient &lobby = g_state.lobby;
+
+	using Phase       = LobbyClient::Phase;
+	const Phase phase = lobby.GetPhase();
+	const bool  in    = phase == Phase::In;
+	const bool  trying = phase == Phase::Connecting || phase == Phase::Asking;
+
+	float       y     = top;
+	const float headW = Text(ImVec2(rightX, y), Type::WindowHeading, theme.textPrimary, "Lobby");
+	if (in)
+		Pill(ImVec2(rightX + headW + 14.0f, y + 4.0f), "Waiting", theme.statusOk, theme.okPillBg,
+		     theme.okPillBorder, true);
+	else if (trying)
+		Pill(ImVec2(rightX + headW + 14.0f, y + 4.0f), "Connecting", theme.textTertiary,
+		     theme.bgSubtle, theme.borderControl, true);
+	else
+		Pill(ImVec2(rightX + headW + 14.0f, y + 4.0f),
+		     phase == Phase::Refused ? "Turned away" : "Not connected", theme.statusFail,
+		     theme.bgSubtle, theme.borderControl);
+	y += 34.0f + 10.0f;
+
+	char where[256];
+	if (in)
+		std::snprintf(where, sizeof(where), "%s:%s as %s \xC2\xB7 %zu waiting \xC2\xB7 %zu playing",
+		              g_state.host, g_state.port, g_state.nick, lobby.Waiting(), lobby.Playing());
+	else
+		std::snprintf(where, sizeof(where), "%s:%s as %s", g_state.host, g_state.port,
+		              g_state.nick);
+	y += TextWrapped(ImVec2(rightX, y), rightW, Type::Body, theme.textSecondary, where);
+	y += 24.0f;
+
+	// The bottom block: the host's choice and the button, then one line.
+	const float buttonY = bottom - 18.0f - 10.0f - 60.0f;
+	const float choiceY = buttonY - 14.0f - 36.0f - 8.0f - 40.0f;
+	const bool  host    = in && lobby.WeAreHost();
+
+	if (in) {
+		const float listBottom = (host ? choiceY : buttonY) - 20.0f;
+		DrawPeople({ImVec2(rightX, y), ImVec2(rightW, listBottom - y)}, lobby, theme);
+	} else if (trying) {
+		TextWrapped(ImVec2(rightX, y), rightW, Type::Body, theme.textTertiary,
+		            "Getting into the server's lobby...");
+	} else {
+		TextWrapped(ImVec2(rightX, y), rightW, Type::Body, theme.statusFail,
+		            lobby.Problem().c_str());
+	}
+
+	if (host) {
+		static const char *const kModes[] = {"New game", "Load a save"};
+		Segmented("##lobbymode", {ImVec2(rightX, choiceY), ImVec2(rightW, 40.0f)}, kModes, 2,
+		          &g_state.startMode, theme);
+		TextWrapped(ImVec2(rightX, choiceY + 40.0f + 8.0f), rightW, Type::BodySmall,
+		            theme.textTertiary,
+		            g_state.startMode == 0
+		                ? "Everybody's game goes past the menu into a new game. The first mission "
+		                  "waits at the bridge until everybody's intro is over."
+		                : "Everybody's game opens at the menu, where each player loads their own "
+		                  "save.");
+	}
+
+	const bool ready = g_state.checks.Ready();
+	if (host) {
+		if (PrimaryButton("##lobbystart", {ImVec2(rightX, buttonY), ImVec2(rightW, 60.0f)},
+		                  "Start everybody's game", Icon::Play, ready, theme))
+			lobby.Start(g_state.startMode == 0 ? LOBBY_START_NEW_GAME : LOBBY_START_MENU, NowMs());
+	} else if (!in && !trying) {
+		uint16_t port = 0;
+		if (PrimaryButton("##lobbyretry", {ImVec2(rightX, buttonY), ImVec2(rightW, 60.0f)},
+		                  "Join the lobby again", Icon::RotateCcw, FormIsValid(&port), theme))
+			JoinLobby(port);
+	} else {
+		char label[96];
+		const std::string hostNick = lobby.HostNick();
+		if (in && !hostNick.empty())
+			std::snprintf(label, sizeof(label), "Waiting for %s", hostNick.c_str());
+		else
+			std::snprintf(label, sizeof(label), "Waiting");
+		PrimaryButton("##lobbywait", {ImVec2(rightX, buttonY), ImVec2(rightW, 60.0f)}, label,
+		              Icon::Users, false, theme);
+	}
+
+	// One line under the button: what is going on on the left, the ways out
+	// on the right.
+	const float noteY  = buttonY + 60.0f + 10.0f;
+	const char *leave  = "Leave the lobby";
+	const char *alone  = "Start on my own";
+	const float leaveW = MeasureText(Type::BodySmall, leave).x;
+	const float aloneW = MeasureText(Type::BodySmall, alone).x;
+	const float linksX = rightX + rightW - leaveW - 20.0f - aloneW;
+	if (LinkText("##lobbyleave", ImVec2(rightX + rightW - leaveW, noteY), Type::BodySmall,
+	             theme.textButton, leave)) {
+		lobby.Leave();
+		g_state.lobbyView = false;
+	}
+	if (ready && LinkText("##lobbyalone", ImVec2(linksX, noteY), Type::BodySmall,
+	                      theme.textButton, alone))
+		StartGame(false);
+
+	char note[160];
+	const char *text = note;
+	ImU32       colour = theme.textTertiary;
+	if (!g_state.startError.empty()) {
+		text   = g_state.startError.c_str();
+		colour = theme.statusFail;
+	} else if (!ready) {
+		text   = "Fix the problems on the left first.";
+		colour = theme.textSecondary;
+	} else if (host) {
+		text = "You start everybody's game.";
+	} else if (in) {
+		std::snprintf(note, sizeof(note), "%s starts everybody's game.",
+		              lobby.HostNick().empty() ? "The host" : lobby.HostNick().c_str());
+	} else {
+		text = "";
+	}
+	ImDrawList *draw = ImGui::GetWindowDrawList();
+	draw->PushClipRect(ImVec2(rightX, noteY), ImVec2(linksX - 16.0f, noteY + 20.0f), true);
+	Text(ImVec2(rightX, noteY), Type::BodySmall, colour, text);
+	draw->PopClipRect();
+}
+
 } // namespace
 
 int RunWindow(const Startup &startup) {
@@ -329,92 +567,97 @@ int RunWindow(const Startup &startup) {
 			g_state.checkedAt = app.Seconds();
 		}
 
-		// ---- right: the form ----------------------------------------------
+		// ---- right: the form, or the lobby ------------------------------
 		const float rightX = kLeftW + kRightPadX;
 		const float rightW = screen.x - kLeftW - kRightPadX * 2.0f;
 		float       y      = bodyTop + kRightPadT;
 
-		Text(ImVec2(rightX, y), Type::WindowHeading, theme.textPrimary, "Join a server");
-		y += 34.0f + 10.0f;
-		y += TextWrapped(ImVec2(rightX, y), 470.0f, Type::Body, theme.textSecondary,
-		                 "Co-op only runs when GTA III starts from here. Your name and server "
-		                 "are saved to CoopIII.ini.");
-
-		y += 32.0f;   // the form's margin-top
-
-		// Your name, with the character counter the protocol's NICK_LEN sets.
-		char counter[16];
-		std::snprintf(counter, sizeof(counter), "%d / 23",
-		              static_cast<int>(SanitizeNick(g_state.nick).size()));
-		Field("##nick", ImVec2(rightX, y), rightW, "Your name", counter, g_state.nick,
-		      sizeof(g_state.nick), theme);
-		y += 72.0f + 22.0f;
-
-		// Server address and port, 112 px for the port.
-		const float portW = 112.0f;
-		const float hostW = rightW - portW - 12.0f;
-		Field("##host", ImVec2(rightX, y), hostW, "Server address", nullptr, g_state.host,
-		      sizeof(g_state.host), theme);
-		Field("##port", ImVec2(rightX + hostW + 12.0f, y), portW, "Port", nullptr, g_state.port,
-		      sizeof(g_state.port), theme, 46.0f, ImGuiInputTextFlags_CharsDecimal);
-		y += 72.0f + 8.0f;
-		Text(ImVec2(rightX, y), Type::BodySmall, theme.textTertiary,
-		     "Ask whoever runs the server. The default port is 2001.");
-		y += 18.0f + 22.0f;
-
-		// Game folder, with Browse.
-		Text(ImVec2(rightX, y), Type::FieldLabel, theme.textSecondary, "Game folder");
-		const float browseW = 110.0f;
-		const Rect  dirBox{ImVec2(rightX, y + 26.0f), ImVec2(rightW - browseW - 8.0f, 46.0f)};
-		if (TextInput("##gamedir", dirBox, g_state.gameDir, sizeof(g_state.gameDir), theme))
-			Recheck();
-		if (OutlineButton("##browse",
-		                  {ImVec2(dirBox.Max().x + 8.0f, dirBox.pos.y), ImVec2(browseW, 46.0f)},
-		                  "Browse", Icon::Folder, theme)) {
-			const std::string picked =
-			    App::PickFolder("Where is GTA III installed?", g_state.gameDir);
-			if (!picked.empty()) {
-				CopyInto(g_state.gameDir, sizeof(g_state.gameDir), picked);
-				Recheck();
-			}
-		}
-
-		// ---- the start button, pinned to the bottom -----------------------
-		uint16_t    port    = 0;
-		const bool  ready   = g_state.checks.Ready() && FormIsValid(&port);
-		const float buttonY = screen.y - kRightPadB - 18.0f - 10.0f - 60.0f;
-
-		if (PrimaryButton("##start", {ImVec2(rightX, buttonY), ImVec2(rightW, 60.0f)},
-		                  "Start GTA III", Icon::Play, ready, theme)) {
-			const std::string nick = SanitizeNick(g_state.nick);
-			CopyInto(g_state.nick, sizeof(g_state.nick), nick);
-
-			if (!UpdateIni(Join(g_state.gameDir, "CoopIII.ini"), g_state.host, port, nick)) {
-				g_state.startError = "Could not write CoopIII.ini in the game folder.";
-			} else if (!LaunchGame(g_state.gameDir, &g_state.startError)) {
-				// LaunchGame filled in why.
-			} else {
-				g_state.launched = true;
-			}
-		}
-
-		const float noteY = buttonY + 60.0f + 10.0f;
-		if (!g_state.startError.empty()) {
-			Text(ImVec2(rightX, noteY), Type::BodySmall, theme.statusFail,
-			     g_state.startError.c_str());
-		} else if (g_state.checks.problems > 0) {
-			char note[96];
-			std::snprintf(note, sizeof(note), "Fix the %d problem%s on the left, then check again.",
-			              g_state.checks.problems, g_state.checks.problems == 1 ? "" : "s");
-			Text(ImVec2(rightX, noteY), Type::BodySmall, theme.textSecondary, note);
-		} else if (!ready) {
-			Text(ImVec2(rightX, noteY), Type::BodySmall, theme.textSecondary,
-			     "Fill in your name, the server address and the port.");
+		if (g_state.lobbyView) {
+			DrawLobby(theme, rightX, rightW, y, screen.y - kRightPadB);
 		} else {
-			char note[256];
-			std::snprintf(note, sizeof(note), "Joins %s:%u as %s.", g_state.host, port,
-			              g_state.nick);
-			Text(ImVec2(rightX, noteY), Type::BodySmall, theme.textTertiary, note);
+			Text(ImVec2(rightX, y), Type::WindowHeading, theme.textPrimary, "Join a server");
+			y += 34.0f + 10.0f;
+			y += TextWrapped(ImVec2(rightX, y), 470.0f, Type::Body, theme.textSecondary,
+			                 "Co-op only runs when GTA III starts from here. Your name and server "
+			                 "are saved to CoopIII.ini.");
+
+			y += 32.0f;   // the form's margin-top
+
+			// Your name, with the character counter the protocol's NICK_LEN sets.
+			char counter[16];
+			std::snprintf(counter, sizeof(counter), "%d / 23",
+			              static_cast<int>(SanitizeNick(g_state.nick).size()));
+			Field("##nick", ImVec2(rightX, y), rightW, "Your name", counter, g_state.nick,
+			      sizeof(g_state.nick), theme);
+			y += 72.0f + 22.0f;
+
+			// Server address and port, 112 px for the port.
+			const float portW = 112.0f;
+			const float hostW = rightW - portW - 12.0f;
+			Field("##host", ImVec2(rightX, y), hostW, "Server address", nullptr, g_state.host,
+			      sizeof(g_state.host), theme);
+			Field("##port", ImVec2(rightX + hostW + 12.0f, y), portW, "Port", nullptr, g_state.port,
+			      sizeof(g_state.port), theme, 46.0f, ImGuiInputTextFlags_CharsDecimal);
+			y += 72.0f + 8.0f;
+			Text(ImVec2(rightX, y), Type::BodySmall, theme.textTertiary,
+			     "Ask whoever runs the server. The default port is 2001.");
+			y += 18.0f + 22.0f;
+
+			// Game folder, with Browse.
+			Text(ImVec2(rightX, y), Type::FieldLabel, theme.textSecondary, "Game folder");
+			const float browseW = 110.0f;
+			const Rect  dirBox{ImVec2(rightX, y + 26.0f), ImVec2(rightW - browseW - 8.0f, 46.0f)};
+			if (TextInput("##gamedir", dirBox, g_state.gameDir, sizeof(g_state.gameDir), theme))
+				Recheck();
+			if (OutlineButton("##browse",
+			                  {ImVec2(dirBox.Max().x + 8.0f, dirBox.pos.y), ImVec2(browseW, 46.0f)},
+			                  "Browse", Icon::Folder, theme)) {
+				const std::string picked =
+				    App::PickFolder("Where is GTA III installed?", g_state.gameDir);
+				if (!picked.empty()) {
+					CopyInto(g_state.gameDir, sizeof(g_state.gameDir), picked);
+					Recheck();
+				}
+			}
+
+			// ---- the lobby button, pinned to the bottom -----------------------
+			// Everybody waits there and the host starts everybody's game; the
+			// link beside the note starts this one alone, as the button used to.
+			uint16_t    port    = 0;
+			const bool  ready   = g_state.checks.Ready() && FormIsValid(&port);
+			const float buttonY = screen.y - kRightPadB - 18.0f - 10.0f - 60.0f;
+
+			if (PrimaryButton("##lobby", {ImVec2(rightX, buttonY), ImVec2(rightW, 60.0f)},
+			                  "Join the lobby", Icon::Users, ready, theme))
+				JoinLobby(port);
+
+			const float noteY  = buttonY + 60.0f + 10.0f;
+			const char *alone  = "Start on my own";
+			const float aloneW = MeasureText(Type::BodySmall, alone).x;
+			const float noteW  = ready ? rightW - aloneW - 16.0f : rightW;
+			if (ready && LinkText("##alone", ImVec2(rightX + rightW - aloneW, noteY), Type::BodySmall,
+			                      theme.textButton, alone))
+				StartGame(false);
+
+			draw->PushClipRect(ImVec2(rightX, noteY), ImVec2(rightX + noteW, noteY + 20.0f), true);
+			if (!g_state.startError.empty()) {
+				Text(ImVec2(rightX, noteY), Type::BodySmall, theme.statusFail,
+				     g_state.startError.c_str());
+			} else if (g_state.checks.problems > 0) {
+				char note[96];
+				std::snprintf(note, sizeof(note), "Fix the %d problem%s on the left, then check again.",
+				              g_state.checks.problems, g_state.checks.problems == 1 ? "" : "s");
+				Text(ImVec2(rightX, noteY), Type::BodySmall, theme.textSecondary, note);
+			} else if (!ready) {
+				Text(ImVec2(rightX, noteY), Type::BodySmall, theme.textSecondary,
+				     "Fill in your name, the server address and the port.");
+			} else {
+				char note[256];
+				std::snprintf(note, sizeof(note), "Waits in %s:%u's lobby as %s.", g_state.host, port,
+				              g_state.nick);
+				Text(ImVec2(rightX, noteY), Type::BodySmall, theme.textTertiary, note);
+			}
+			draw->PopClipRect();
 		}
 
 		ImGui::End();
@@ -424,8 +667,14 @@ int RunWindow(const Startup &startup) {
 		// The game is starting; there is nothing left for this window to do.
 		if (g_state.launched)
 			app.Close();
+	}, [&] {
+		if (ServiceLobby())
+			app.Close();
 	});
 
+	// Out of the lobby before the window goes, so the others see this
+	// launcher leave at once rather than when its connection times out.
+	g_state.lobby.Leave();
 	return result;
 }
 

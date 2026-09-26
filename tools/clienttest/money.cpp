@@ -83,6 +83,40 @@ void TestWhereAnAwardGoes() {
 	      "and nobody's pays nobody");
 }
 
+// A bomb somebody else set off goes off on the machine simulating the car,
+// whose bomb timer asks only about its own player. With money on it asks
+// about the bomber, and the award then goes where RouteExplosionAward sends
+// any other: once, to him.
+void TestABombPaysItsBomber() {
+	std::printf("\nwhat a bomb pays, and to whom\n");
+	Check(BombGateAsksBomber(true, MONEY_RULE_OWN, true, true) &&
+	          BombGateAsksBomber(true, MONEY_RULE_SHARED, true, true),
+	      "under own and shared the gate asks about another player who set it off");
+	Check(!BombGateAsksBomber(true, MONEY_RULE_OFF, true, true),
+	      "with money off it does not: the award would be paid to whoever sits here");
+	Check(!BombGateAsksBomber(false, MONEY_RULE_OWN, true, true) &&
+	          !BombGateAsksBomber(true, MONEY_RULE_OWN, false, true),
+	      "nor out of a session, nor without the award's detour to route it");
+	Check(!BombGateAsksBomber(true, MONEY_RULE_OWN, true, false),
+	      "our own bomb, a pedestrian's blast or nobody's is the engine's own question");
+
+	const AwardCulprit U = AwardCulprit::Us, T = AwardCulprit::Them;
+	// Bob drives the car alice rigged, and alice presses the detonator.
+	Check(RouteExplosionAward(WreckDecider::OnlyHere, false, T) == AwardRoute::Forward,
+	      "bob's machine, which decides his car, forwards alice's pay to her");
+	Check(RouteExplosionAward(WreckDecider::Elsewhere, false, U) == AwardRoute::Drop,
+	      "and alice's own copy, which her engine also blew up, pays her nothing: bob's "
+	      "machine decides it");
+	// A parked car every machine has: each one asks, and the key makes it once.
+	Check(RouteExplosionAward(WreckDecider::Everywhere, true, T) == AwardRoute::Forward &&
+	          RouteExplosionAward(WreckDecider::Everywhere, true, U) == AwardRoute::Forward,
+	      "a parked car's award goes through the server from every copy, alice's too, "
+	      "under the car's name, and is delivered once");
+	Check(RouteExplosionAward(WreckDecider::Everywhere, false, T) == AwardRoute::Drop &&
+	          RouteExplosionAward(WreckDecider::Everywhere, false, U) == AwardRoute::PayHere,
+	      "a car no name reaches is paid by alice's copy alone");
+}
+
 void TestTheEnginesArithmetic() {
 	std::printf("\nAwardMoneyForExplosion's arithmetic\n");
 	Check(ExplosionAwardUnit(25000) == 50 && ExplosionAwardUnit(9000) == 18,
@@ -654,6 +688,63 @@ void TestTheAwardAgainstTheImage() {
 	          Dword(img, 0x0054A0E2) == CWorld__Players + offs::PLAYERINFO_MONEY &&
 	          Dword(img, 0x0054A0E6) == uint32_t(HELI_REWARD_EACH.money),
 	      "and UpdateHelis pays $250 into the same field");
+
+	// The bomb timer's pay gate, the two calls game/money.cpp takes.
+	Check(at(CVehicle__ProcessDelayedExplosion + 2, {0x89, 0xCD}),
+	      "ProcessDelayedExplosion keeps the car in ebp");
+	Check(at(0x00551D38, {0x66, 0x83, 0xBD}) && Dword(img, 0x00551D3B) == offs::VEH_BOMB_TIMER &&
+	          at(0x00551D40, {0x75}),
+	      "the gate is behind the fuse having run out");
+	Check(img[BombTimer_FindPlayerVehicleCall - IMAGE_BASE] == 0xE8 &&
+	          CallTarget(img, BombTimer_FindPlayerVehicleCall) == FindPlayerVehicle &&
+	          at(0x00551D47, {0x39, 0xC5, 0x74, 0x26}),
+	      "a car the bomber sits in pays nothing: FindPlayerVehicle() against ebp");
+	Check(img[BombTimer_FindPlayerPedCall - IMAGE_BASE] == 0xE8 &&
+	          CallTarget(img, BombTimer_FindPlayerPedCall) == FindPlayerPed &&
+	          at(0x00551D50, {0x39, 0x85}) && Dword(img, 0x00551D52) == offs::VEH_BLOW_UP_ENTITY &&
+	          at(0x00551D56, {0x75, 0x19}),
+	      "and m_pBlowUpEntity has to be FindPlayerPed()");
+	Check(img[BombTimer_AwardCall - IMAGE_BASE] == 0xE8 &&
+	          CallTarget(img, BombTimer_AwardCall) == CPlayerInfo__AwardMoneyForExplosion &&
+	          BombTimer_AwardCall + 5 == AWARD_RETURN_BOMB_TIMER && at(0x00551D5F, {0x55}),
+	      "before the award for the car itself");
+	Check(at(0x004A10D5, {0x80, 0xB9}) && Dword(img, 0x004A10D7) == offs::PED_IN_VEHICLE &&
+	          at(0x004A10DE, {0x8B, 0x81}) && Dword(img, 0x004A10E0) == offs::PED_MY_VEHICLE,
+	      "FindPlayerVehicle is the ped's bInVehicle and m_pMyVehicle, which the gate "
+	      "reads off the bomber's");
+
+	// And nothing but that award pays for what a bomb does: every instruction
+	// that names m_nMoney by address.
+	const uint32_t money   = CWorld__Players + offs::PLAYERINFO_MONEY;
+	const uint32_t known[] = {
+	    0x00422495, 0x00422A85, 0x00422A96, 0x00422C55, 0x00422E03, 0x00422E14, 0x004236DB,
+	    0x00424140, 0x0042415E, 0x00426E98, 0x00426EE4, 0x00430EFA, 0x00430F20, 0x00431270,
+	    0x004312B5, 0x0043132C, 0x0043DF35, 0x0043DF66, 0x0043DFA8, 0x00491446, 0x004A168A,
+	    0x004A16B0, 0x004AB2B4, 0x004C021A, 0x004C041D, 0x004C042F, 0x004CED11, 0x004CED20,
+	    0x004D67CD, 0x0052FDE7, 0x0054428F, 0x0054A0DF, 0x00551FAC, 0x0059641B, 0x005969B7};
+	int named = 0;
+	for (uint32_t va = IMAGE_BASE + 0x1000; va + 4 < 0x005E4000; ++va)
+		if (Dword(img, va) == money)
+			++named;
+	bool placed = true;
+	for (uint32_t insn : known) {
+		bool found = false;
+		for (uint32_t off = 1; off <= 3 && !found; ++off)
+			found = Dword(img, insn + off) == money;
+		placed = placed && found;
+	}
+	Check(named == int(sizeof known / sizeof known[0]) && placed,
+	      "35 instructions name it, and each is one of the known ones");
+	bool noneInKills = true;
+	for (uint32_t insn : known)
+		if ((insn >= CPed__InflictDamage && insn < CPed__InflictDamage + 0x1000) ||
+		    (insn >= CPed__SetDie && insn < CPed__SetDie + 0x400) ||
+		    (insn >= CDarkel__RegisterKillByPlayer && insn < CDarkel__RegisterKillByPlayer + 0x110) ||
+		    (insn >= CExplosion__AddExplosion && insn < CExplosion__AddExplosion + 0x800))
+			noneInKills = false;
+	Check(noneInKills,
+	      "none of them in the damage, the death, the kill register or the explosion: a "
+	      "bomb's kills pay nothing, as in single player");
 }
 
 } // namespace
@@ -661,6 +752,7 @@ void TestTheAwardAgainstTheImage() {
 int RunMoneyTests() {
 	TestWhoDecidesAWreck();
 	TestWhereAnAwardGoes();
+	TestABombPaysItsBomber();
 	TestTheEnginesArithmetic();
 	TestThePoolArithmetic();
 	TestOffIsNothing();

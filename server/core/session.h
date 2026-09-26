@@ -6,6 +6,8 @@
 #include "adopt.h"
 #include "coopiii/protocol.h"
 #include "desync.h"
+#include "campaignlog.h"
+#include "missionslot.h"
 
 #include <cstdint>
 #include <string>
@@ -17,6 +19,10 @@ struct Player {
 	bool        active = false;
 	uint32_t    peer   = 0;
 	uint8_t     id     = INVALID_PLAYER;
+	// Their game runs a mission of its own that is not the session's, the
+	// intro of a new game say (C_MissionBusy): nowhere, as far as the
+	// session's mission is concerned (docs/missions.md 11.6).
+	bool        missionBusy = false;
 	uint16_t    netId  = INVALID_NETID;
 	std::string nick;
 	uint16_t    modelId = 0;
@@ -86,6 +92,9 @@ struct Player {
 	// The server arbitrates nothing here; a garage belongs to the map and
 	// there is no owner to check a report against.
 	uint32_t    garageMask = 0;
+	// The same for main.scm's seven gates (protocol.h, C_GateState): which of
+	// them this player's own GATES threads want open.
+	uint8_t     gateMask = 0;
 
 	// The name their model 0 is loaded under, "player" or "playerp" in the
 	// stock game (protocol.h, C_PlayerLook). Empty until they say, which a
@@ -93,6 +102,10 @@ struct Player {
 	// reason as the mask above: it is sent on change, and a joiner has to
 	// hear the prison clothes somebody put on twenty minutes ago.
 	char        look[PLAYER_LOOK_LEN] = {};
+
+	// Their pause menu is up (protocol.h, C_PlayerAway). A level sent on
+	// change, kept for a joiner the way the look above is.
+	bool        away = false;
 
 	// Whether `pos`/`heading` mean anything yet.
 	//
@@ -133,6 +146,14 @@ struct Player {
 	// own S_Money so their machine knows which of its changes are counted.
 	uint32_t    moneySeq = 0;
 };
+
+// Two players in the same car, whatever the seats. A round fired from inside a
+// car never lands on anybody sitting in it (client/src/game/passengeraim.h),
+// and the server holds to that too: OnDamage drops the hit, friendly fire or
+// not. The seats are the ones the reliable enter and exit events wrote down.
+inline bool ShareACar(const Player &a, const Player &b) {
+	return a.vehicleNetId != INVALID_NETID && a.vehicleNetId == b.vehicleNetId;
+}
 
 // A vehicle the session knows about, meaning one a player has actually been
 // in at some point.
@@ -209,9 +230,12 @@ struct Vehicle {
 	// for: a snapshot still in flight for a car that has just exploded must
 	// not be able to register a *second* car under the same number.
 	//
-	// A destroyed car is left out of the backfill entirely. That is a
-	// decision and it is reversible in one branch - see BuildBackfill.
+	// A joiner is handed a destroyed car as a wreck, where it came to rest,
+	// and builds the shell without the blast (BuildBackfill).
 	bool     destroyed = false;
+	// When, on the server's clock. A joiner is handed a wreck only while the
+	// engines that watched it go up still have it (BuildBackfill).
+	uint32_t destroyedAtMs = 0;
 
 	// The last time the session had a reason to keep this car: somebody in a
 	// seat, somebody settling it, or a player within VEHICLE_KEEP_RADIUS_M.
@@ -219,7 +243,44 @@ struct Vehicle {
 	// AddVehicle and PromoteCar don't need a clock.
 	bool     neededKnown = false;
 	uint32_t neededAtMs  = 0;
+
+	// The session's mission made it and a player took its wheel while that
+	// mission ran (PromoteCar from an AMBIENT_MISSION row). It goes with the
+	// mission unless somebody is still in it (ReleaseMissionCars).
+	bool     missionMade = false;
+
+	// The station its radio is on, as the session has it (protocol.h,
+	// S_VehicleRadio), or RADIO_STATION_UNKNOWN until somebody in it says.
+	uint8_t  radio = RADIO_STATION_UNKNOWN;
+
+	// Its bomb as whoever simulates it last said (protocol.h, C_VehicleBomb),
+	// whose it is, and when a fuse they said was lit runs out, by the
+	// server's clock, 0 for none.
+	uint8_t  bomb          = CARBOMB_NONE;
+	uint8_t  bombBlame     = INVALID_PLAYER;
+	uint32_t bombFuseEndMs = 0;
+	// The bomb is the one the mission's script fitted, for its owner
+	// (C_MissionBomb), until a word on it changes it (KeepsMissionBomb).
+	bool     bombMission   = false;
+	// When its alarm stops, on this server's clock, or 0 for no alarm
+	// (protocol.h, S_VehicleAlarm). A joiner is told what is left of it.
+	uint32_t alarmEndsAtMs = 0;
+
+	// Where its gun last pointed (protocol.h, S_VehicleAim), once its driver
+	// has said.
+	bool     aimKnown = false;
+	float    gunLR    = 0.0f;
+	float    gunUD    = 0.0f;
+
+	// EnterVehicleBody::parkedSlot from the claim: the car generator it came
+	// out of, plus one, or 0. Every spawn of it says so, the backfill
+	// included, so a joiner lets go of its own car on that generator too.
+	uint16_t parkedSlot = 0;
 };
+
+// What is left of a fuse that runs out at `endMs` (0 for none), capped at
+// the longest the engine lights.
+uint16_t FuseLeftMs(uint32_t endMs, uint32_t nowMs);
 
 // How many session cars can exist at once. Rows are freed by
 // ReleaseIdleVehicles and reused, so this caps cars that are alive at the same
@@ -342,7 +403,19 @@ struct AmbientCar {
 	uint16_t damageDoors  = 0;
 
 	PoseHistory history{CAR_SNAP_M, false};
+
+	// Who has let go of it lately (C_CarLetGo), a bit per player id, and when
+	// the last of them did. A car no engine near it wants to keep is released
+	// rather than passed between the same machines at the round trip's rate.
+	uint8_t  letGoMask = 0;
+	uint32_t letGoAtMs = 0;
 };
+
+// How long a let-go is remembered against the player who made it
+// (Session::LetGoCar). Long enough to outlast the round trips of a car two
+// machines' engines both want rid of; short enough that the player who let
+// it go can take it back once he has turned round.
+constexpr uint32_t CAR_LET_GO_MEMORY_MS = 15000;
 
 // Fewer than the peds, and lower than the vehicle cap for a different reason
 // than the vehicle cap exists.
@@ -395,12 +468,24 @@ struct WreckedUnownedCar {
 // branch: `add eax,0EA60h` on m_nTimeOfDeath. Not a tuning constant.
 constexpr uint32_t WRECK_BACKFILL_MS = 60000;
 
+// What a participant who has just come into the running mission is sent of
+// what it made (C_MissionCatchUp), in the backfill's order: the spawns, then
+// the dead among the pedestrians.
+struct MissionCatchUp {
+	std::vector<S_PedSpawn> peds;
+	std::vector<S_PedDeath> pedDeaths;
+	std::vector<S_CarSpawn> cars;
+	uint16_t                sessionCars = 0;
+};
+
 struct Backfill {
 	std::vector<S_PlayerJoin>   players;
 	// What each of them is wearing, for everybody who has said. Right behind
 	// the joins, so the look is known before the ped is first built and the
 	// joiner doesn't build it twice.
 	std::vector<S_PlayerLook>   looks;
+	// Who has the menu up, right behind the looks for the same reason.
+	std::vector<S_PlayerAway>   aways;
 	std::vector<S_VehicleSpawn> vehicles;
 	std::vector<S_EnterVehicle> seats;
 	// Who is settling which car nobody drives, after the seats. Not told, a
@@ -438,6 +523,20 @@ struct Backfill {
 	// - and because keeping S_VehicleSpawn's layout alone keeps this change to
 	// two new opcodes. docs/cardamage.md §3.4.
 	std::vector<S_VehicleDamage> vehicleDamage;
+	// And the station each of those cars' radios is on, for every car
+	// somebody has said one for. Without it a joiner's copy keeps the
+	// station its own engine rolled, and he gets in beside a friend and
+	// hears something else.
+	std::vector<S_VehicleRadio>  radios;
+	// And the bomb each of those cars carries, whose it is and what is left
+	// of a burning fuse, so a joiner's copy goes off with everybody else's.
+	std::vector<S_VehicleBomb>   bombs;
+	// And of those, the ones a mission fitted, said after them.
+	std::vector<S_MissionBomb>   missionBombs;
+	// And the alarms still sounding, with what is left of each, and where the
+	// turret of every tank somebody has aimed points.
+	std::vector<S_VehicleAlarm>  alarms;
+	std::vector<S_VehicleAim>    aims;
 	// Which doors every other player currently has away from rest. One per
 	// player with a non-zero mask, skipped entirely for the common case where
 	// nobody is standing in a garage.
@@ -490,7 +589,17 @@ struct TakenPickup {
 	uint8_t     byPlayerId = INVALID_PLAYER;
 	uint32_t    sinceMs    = 0;   // server monotonic; reserved or taken at
 	uint32_t    respawnMs  = 0;   // 0 = never comes back
+	// Who held this reservation before it was moved to byPlayerId, and when.
+	// They are told (S_PickupDenied), but the telling takes a round trip and
+	// their engine may take it in between: a collection from them inside
+	// PICKUP_DISPLACED_GRACE_MS still counts, and the new holder is told it
+	// went, rather than both players keeping it.
+	uint8_t     displacedPlayerId = INVALID_PLAYER;
+	uint32_t    displacedAtMs     = 0;
 };
+
+// How long a displaced holder's collection is still honoured.
+constexpr uint32_t PICKUP_DISPLACED_GRACE_MS = 2000;
 
 // How long a reservation stands before the server takes it back.
 //
@@ -773,6 +882,32 @@ public:
 	// player still here. Nothing votes on it: one server, one answer.
 	uint8_t HostId() const { return m_hostId; }
 
+	// Whose game the clock and the sky are right now (coopiii/sky.h): the
+	// host's, or the running mission's owner's while it runs. C_WorldState is
+	// taken from this player alone, and a sky cheat is sent to them.
+	uint8_t SkyHolderId() const;
+
+	// Whether `askerId` may throw `targetId` out (protocol.h, C_Kick). The
+	// host may, anybody but themselves. Nobody else may, whoever they name:
+	// the client only asks when its player is the host, so a refusal here is
+	// a race with the host changing hands or a client that lied.
+	enum class KickVerdict : uint8_t { Allowed, NotHost, NoSuchPlayer, Themselves };
+	KickVerdict MayKick(uint8_t askerId, uint8_t targetId) const;
+
+	// ---- the session's one mission (missionslot.h) ---------------------------
+	MissionSlot       &Mission() { return m_mission; }
+	const MissionSlot &Mission() const { return m_mission; }
+	// What every mission left behind, numbered (campaignlog.h).
+	CampaignLog       &Campaign() { return m_campaign; }
+	const CampaignLog &Campaign() const { return m_campaign; }
+	// Every connected player and where they are, for MissionSlot::Claim.
+	size_t MissionPresences(MissionPresence (&out)[MAX_PLAYERS]) const;
+	// Everybody connected: bit i is player i.
+	uint8_t ConnectedMask() const;
+	// Everybody connected whose game is free to be in the session's mission:
+	// not in a mission of its own.
+	uint8_t ReadyMask() const;
+
 	// ---- vehicles ---------------------------------------------------------
 	//
 	// A vehicle joins the session the first time a player gets into it, and
@@ -806,6 +941,21 @@ public:
 	// late snapshot or claim naming it is refused like any unknown number.
 	std::vector<uint16_t> ReleaseIdleVehicles(uint32_t nowMs);
 
+	// A car the engine of the machine holding it has crushed, craned,
+	// delivered or stored (protocol.h, C_VehicleRemoved). Refused when the car
+	// is unknown, when somebody else is driving it, or for a reason that is not
+	// one. On success the row is gone and `relay` is what everybody else is
+	// told.
+	bool RemoveVehicleOnPurpose(uint8_t byPlayerId, const VehicleRemovedBody &body,
+	                            VehicleRemovedBody &relay);
+
+	// The session's mission is over: every session car it made (missionMade)
+	// that no player sits in goes, a wreck included, and the ones somebody is
+	// still in stay as ordinary session cars. The netIds, for the caller to
+	// send S_VehicleDespawn for; none while a mission runs. A retry then
+	// starts with none of the last try's cars on anybody's screen.
+	std::vector<uint16_t> ReleaseMissionCars();
+
 	// ---- ambient peds ------------------------------------------------------
 	//
 	// docs/population.md §1.2. The server's whole job here is naming: a
@@ -836,6 +986,16 @@ public:
 	// first kind, S_PedDespawn / S_CarDespawn for the second.
 	std::vector<AdoptVerdict> HandOverAmbientOf(uint8_t playerId);
 
+	// A traffic car its host's engine is dropping by distance, with the host's
+	// peds sitting in it (protocol.h, C_CarLetGo). The same rule and the same
+	// bookkeeping as HandOverAmbientOf, over one car, with the sender and
+	// anybody else who let go of it in the last CAR_LET_GO_MEMORY_MS left out
+	// of the choice. A car that is not the sender's decides nothing about the
+	// car; the peds named with it that are his are released, since his engine
+	// takes them with the car whatever the session says.
+	std::vector<AdoptVerdict> LetGoCar(uint16_t netId, const uint16_t *peds, size_t pedCount,
+	                                   uint8_t byPlayerId, uint32_t nowMs);
+
 	// Writes one streamed pose into the session's copy, so a joiner is
 	// handed a pedestrian where he is now rather than where he was born two
 	// minutes and a street corner ago. Exactly NoteCarState's job, and the
@@ -859,6 +1019,16 @@ public:
 	// duplicate or a host that has lost track, and relaying it would run
 	// CPed::SetDie a second time over a state that is already the death's.
 	bool NotePedDeath(const PedDeathBody &death, uint8_t byPlayerId);
+
+	// A medic stood one of the session's dead pedestrians up (C_PedRevive).
+	// Anybody may say it, the host included: the medic is whoever's pedestrian
+	// he is and the patient whoever's his is, and the machine that ran the CPR
+	// is the medic's. What is checked is the patient - one the session holds,
+	// reported dead, and not the mission's, whom no medic in the engine will
+	// treat. Marks him alive again, so his next death is taken like his first
+	// and a joiner is handed him on his feet. False, recording nothing, for
+	// everything else, a second revive of one life included.
+	bool NotePedRevive(uint16_t netId);
 
 	// Who a hit on an ambient pedestrian goes to, or null for nobody.
 	//
@@ -1008,6 +1178,37 @@ public:
 	// what one machine happened to see.
 	bool NoteVehicleDamage(const VehicleDamageBody &in, VehicleDamageBody &out);
 
+	// A player's C_VehicleRadio. True when the car is now on `station` and
+	// everybody is to be told. False when nothing changed or it is refused -
+	// the player is not in that car, the car is a wreck or unknown, the
+	// station is not one - and then `held` is what the session still has for
+	// the car, RADIO_STATION_UNKNOWN for nothing, which is what the sender's
+	// copy goes back to.
+	bool NoteVehicleRadio(uint8_t playerId, uint16_t netId, uint8_t station, uint8_t &held);
+
+	// A car's bomb, from the machine simulating it (MayReportVehicle). True
+	// when it is kept and is to be relayed; false for anybody else, a wreck,
+	// a bomb or a fuse there is none of, or blame on a player the session
+	// does not have.
+	bool NoteVehicleBomb(uint8_t playerId, const C_VehicleBomb &in, uint32_t nowMs);
+	// A bomb the mission's script fitted (C_MissionBomb), from the player
+	// whose mission may show things (MissionSlot::MayRelayEffect): the car's
+	// bomb is that type and that player's, whoever simulates it. True when it
+	// is kept and is to be relayed; false for anybody else, a wreck, an
+	// unknown car or a bomb there is none of.
+	bool NoteMissionBomb(uint8_t playerId, const C_MissionBomb &in);
+	// A car's alarm (C_VehicleAlarm), from whoever MayReportVehicle takes it
+	// from. True when it is kept and everybody else is to be told; false for
+	// anybody else, a wreck, an unknown car and a stop for an alarm the
+	// session never heard start. `remainingMs` is clamped to
+	// VEHICLE_ALARM_MS on the way in.
+	bool NoteVehicleAlarm(uint8_t playerId, uint16_t netId, uint16_t &remainingMs,
+	                      uint32_t nowMs);
+
+	// Where a car's gun points (C_VehicleAim), from the same player. False for
+	// anybody else, a wreck, an unknown car, and angles that are not finite.
+	bool NoteVehicleAim(uint8_t playerId, uint16_t netId, float gunLR, float gunUD);
+
 	// The same for a traffic car, from its host and nobody else: the same
 	// C_VehicleDamage, for a netId that names an AmbientCar. The host's engine
 	// is the only one simulating the car, so its dents are the car's. False
@@ -1030,6 +1231,11 @@ public:
 	// session to delete any car from every future backfill. A snapshot is
 	// believed because of who sent it, not because nothing contradicts it.
 	bool MayReportVehicle(uint8_t playerId, uint16_t netId) const;
+
+	// Is `playerId` the machine that aims `netId`'s water cannon (C_WaterCannon)?
+	// A session car's driver or custodian, by MayReportVehicle, or the host of
+	// a traffic car that has not blown up.
+	bool MaySprayCannon(uint8_t playerId, uint16_t netId) const;
 
 	// Who should be told that `byPlayerId` just shot `netId`, or null if
 	// nobody should.
@@ -1159,7 +1365,21 @@ public:
 	// there is one place to look and one place for the vehicle seam's own
 	// destruction event to land when it arrives (see the report and
 	// docs/roadmap.md §5.8). Takes the driver out of it on the way.
-	void DestroyVehicle(uint16_t netId);
+	//
+	// `settlerId` is the machine that decided the wreck, and it is made the
+	// wreck's custodian: its engine threw the car up and knows where it comes
+	// down, and every other machine follows its settle rather than holding the
+	// shell where the blast happened (client/src/game/wreck.h). `nowMs` dates
+	// the wreck for the backfill, which hands a joiner the wrecks the engines
+	// have not cleared away yet (WRECK_BACKFILL_MS).
+	void DestroyVehicle(uint16_t netId, uint8_t settlerId = INVALID_PLAYER,
+	                    uint32_t nowMs = 0);
+
+	// Where a wreck is, from the machine settling it. Only a destroyed car,
+	// only its custodian, and only a snapshot that says VEH_WRECKED: anything
+	// else about a wreck was sampled before the blast. The transform is all
+	// that is kept; the health and the flags stay the wreck's.
+	bool NoteWreckState(uint8_t playerId, const VehicleStateBody &body);
 
 	// A player died, or came back. Both clear the seat, because a dead player
 	// is taken out of their car on every machine that was watching and the
@@ -1171,6 +1391,9 @@ public:
 	// worth relaying; false for a repeat or a name nobody's engine would take.
 	bool NotePlayerLook(Player &p, const char (&look)[PLAYER_LOOK_LEN]);
 	S_PlayerLook MakeLook(const Player &p, uint32_t sendTimeMs) const;
+	// A player's menu going up or down. True when it is a change.
+	bool NotePlayerAway(Player &p, bool away);
+	S_PlayerAway MakeAway(const Player &p, uint32_t sendTimeMs) const;
 
 	// The announcement for one player: who they are, and what condition
 	// they're in. Used both for the live "someone joined" fan-out and for
@@ -1181,6 +1404,12 @@ public:
 	// Everything `joinerId` has to be told about the session that was already
 	// running. Excludes the joiner themselves.
 	Backfill BuildBackfill(uint8_t joinerId, uint32_t sendTimeMs) const;
+
+	// What the running mission has made, for a participant who asks
+	// (C_MissionCatchUp): every AMBIENT_MISSION pedestrian and car somebody
+	// other than `askerId` hosts, as the backfill spawns them, and how many of
+	// the session cars the mission made somebody has claimed since.
+	MissionCatchUp BuildMissionCatchUp(uint8_t askerId, uint32_t sendTimeMs) const;
 
 	// ---- pickups -----------------------------------------------------------
 	//
@@ -1200,8 +1429,13 @@ public:
 	// claimant and says nothing to anybody else, because at that point
 	// nothing has been picked up.
 	enum class PickupVerdict : uint8_t { GRANTED, DENIED };
+	//
+	// A reservation older than PICKUP_RESERVATION_MS is moved to the new
+	// claimant even while its holder is still here; `movedFrom` then names
+	// the holder it was taken from, whom the caller tells with S_PickupDenied
+	// so their machine stops offering it to its engine.
 	PickupVerdict ClaimPickup(uint8_t playerId, const PickupIdent &ident,
-	                          uint32_t nowMs);
+	                          uint32_t nowMs, uint8_t *movedFrom = nullptr);
 
 	// The holder's engine actually took it. Turns their reservation into a
 	// removal and starts the respawn window; the caller then broadcasts
@@ -1237,7 +1471,8 @@ public:
 		m_packageRule = rule == PACKAGES_PERPLAYER ? PACKAGES_PERPLAYER : PACKAGES_SHARED;
 	}
 	bool PickupIsPerPlayer(const PickupIdent &ident) const {
-		return m_packageRule == PACKAGES_PERPLAYER && ident.type == PICKUP_TYPE_PACKAGE;
+		return (m_packageRule == PACKAGES_PERPLAYER && ident.type == PICKUP_TYPE_PACKAGE) ||
+		       (ident.flags & PICKUP_F_STASH) != 0;
 	}
 
 	// Drop records whose respawn window has passed, and reservations nobody
@@ -1289,6 +1524,12 @@ public:
 	}
 
 private:
+	// What HandOverAmbientOf and LetGoCar both do with a decision: an adopted
+	// row changes owner and starts a fresh history, a released one is cleared.
+	void ApplyAdoptVerdicts(const std::vector<AdoptVerdict> &verdicts);
+
+	MissionSlot             m_mission;
+	CampaignLog             m_campaign;
 	std::vector<Player>     m_players;
 	std::vector<Vehicle>    m_vehicles;
 	std::vector<AmbientPed> m_peds;

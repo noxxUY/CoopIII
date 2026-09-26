@@ -302,6 +302,21 @@ inline ArrowRgb PlayerArrowRgb(uint8_t playerId, bool inVehicle) {
 	                static_cast<uint8_t>(c.b * ARROW_IN_VEHICLE_SHADE / 255)};
 }
 
+// A player who is dead keeps an arrow, since where they lie is where their
+// team-mates are headed, but not a live one: the arrow goes grey at the
+// brightness of their own colour, and half as solid, until they respawn.
+constexpr uint8_t ARROW_DEAD_SHADE = 150;   // of 255
+
+inline ArrowRgb DeadArrowRgb(ArrowRgb live) {
+	const unsigned luma  = (live.r * 77u + live.g * 150u + live.b * 29u) >> 8;
+	const uint8_t  grey  = static_cast<uint8_t>(luma * ARROW_DEAD_SHADE / 255);
+	return ArrowRgb{grey, grey, grey};
+}
+
+inline uint8_t DeadArrowAlpha(uint8_t alpha) {
+	return static_cast<uint8_t>(alpha / 2);
+}
+
 // Whether a roster slot should have an arrow on the radar this frame.
 //
 // Two predicates where the blip table needed three. `hasPed` is gone: an

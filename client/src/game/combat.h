@@ -385,7 +385,9 @@ inline bool IsProjectileExplosion(uint8_t type) {
 //                          machine's camera is in first-person, and
 //                          otherwise fires along that camera's Front. Its
 //                          round is heard instead (SniperProbe below).
-//   DETONATOR              sets off bombs that were never synced.
+//   DETONATOR              fires nothing; it sets off bombs, and the client
+//                          does that from the shot instead
+//                          (Client::SetOffBombsFor).
 //
 // The flamethrower used to be on that list and no longer is. The reason it
 // was there is real and still stands: CWeapon::FireAreaEffect hands the shot
@@ -1178,6 +1180,14 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot);
 // from one it is only watching. docs/objects.md 5.
 bool ReplayingRemoteShot();
 
+// One round of the local passenger's gun (game/passengeraim.h), through
+// CWeapon::Fire like a round on foot, so every sampler and the C_Shot are the
+// on-foot ones. CWorld::pIgnoreEntity holds `car` for the call, and `aim`
+// turns the round through DoDoomAiming if the engine takes the branch that
+// asks it; the mouse-camera branch aims off the crosshair by itself. A hit on
+// anybody sitting in `car` is refused for the length of it (SameCarHit).
+bool FirePassengerRound(void *ped, void *weapon, void *car, float *source, const Vec3 &aim);
+
 // Is CWeapon::Fire running for the local player's own trigger pull right now?
 // For game/heli.cpp: CHeli::TestBulletCollision is called from inside Fire
 // and is never told who fired.
@@ -1258,6 +1268,7 @@ void KillRemotePed(RemotePlayer &player, uint16_t animId);
 // by refusing to relay a C_Damage; this covers the blast an observer replays
 // for itself, which never goes near the server (docs/protocol.md §1.10.3).
 void SetFriendlyFire(bool enabled);
+bool FriendlyFireOn();
 
 // Ends every projectile we are animating for `playerId`, before their ped
 // goes (ped.cpp, DespawnRemote).

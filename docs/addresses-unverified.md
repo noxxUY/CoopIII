@@ -26,6 +26,11 @@ nobody can miss them.
 |---|---|---|
 | `CStreaming::HasModelLoaded` exists as a callable function | **REFUTED** | re3 declares it inline; the compiler inlined it at 38+ sites. `addresses.h` inlines the comparison instead. |
 | `CRecordDataForChase::StoreInfoForCar` is at `0x00435140` | **REFUTED**, the real address is `0x00435000` | `0x00435140` is the *last byte* of `or byte ptr [esp+5],0Ch`, which starts at `0x0043513C`. Calling it would execute from the middle of an instruction. The region end in the old row (`0x0043525A`) was right (the `ret` is at `0x00435259`), so what got lost was a function *start*, not a bad range. Disassembling from `0x00435000` gives re3 Record.cpp:331-348 statement for statement: `127.0f * GetRight().x` first, then forward, then `pos`, then `16383.5f *` the three move-speed components, then wheel/gas/brake, then the handbrake bit. This is the third hand-derived address in this analysis pass to be flat wrong. |
+| `IS_CAR_IN_MISSION_GARAGE` is opcode `03D4` (`missionaddr.h`, 2026-09-24) | **REFUTED**, it is `021C` | `03D4` is `HAS_IMPORT_GARAGE_SLOT_BEEN_FILLED`: its handler (`0x0044F40E`) collects **two** operands and calls `0x00426CB0`, the import garage's collected-cars mask. `021C`'s handler (`0x00443759`) collects one and calls `0x00426C20`, `aGarages[g].state == 5` (`GS_CLOSEDCONTAINSCAR`). re3's enum and the SCM decompile (`021C: car_inside_garage`, asked by Luigi 2, Joey 3, Toni 3 and Frank 1) agree. With `03D4` the helpers' garages were never heard, and every participant asked the import garage its question with an operand missing. Fixed in `missionaddr.h`; the interception moved to the 500 handler. |
+| `OVERRIDE_NEXT_RESTART` is opcode `016C` (`missionaddr.h`, `replay.h`) | **REFUTED**, it is `016E` | `016C`'s handler calls `0x00436100`, which appends to the hospital restart points with no bound (re3 `ADD_HOSPITAL_RESTART`). `016E`'s calls `0x004366C0`, which sets `bOverrideRestart` (`0x0095CD5D`) to 1, the flag `CANCEL_OVERRIDE_RESTART` (`01F6`, `0x004366F0`) sets to 0. 8-Ball's `016E` was never replayed, and nothing put a participant's restart back. Fixed in both places. |
+| `MISSION_HAS_FINISHED` (`00D8`) clears `bAlreadyRunningAMissionScript` | **REFUTED**, `TERMINATE_THIS_SCRIPT` (`004E`) does | `00D8` (`0x0043D5F2`) removes the floating pickups for `love3` and runs `MissionCleanup.Process`, nothing else. `004E` (`0x0043A533`) clears `0x0095CDB3` when the script's `+0x85` is set, then moves it to the idle list. The address was right; only the comment was wrong. |
+| `ProcessCommands100To199` at `0x0043AEA4` (`addresses.h`'s ped note) | **REFUTED**, it is `0x0043AEA0` | `0x0043AEA4` is the `sub esp,160h` four bytes in. The dispatcher's call at `0x0043956B` lands on `0x0043AEA0`. Nothing called it at the wrong address; the note is fixed. |
+| `CTimer::m_FrameCounter` going back means this machine's game started over (`mission.cpp` `WatchOwnGame`) | **REFUTED** as a witness, the address is right | Only three things write `0x009412EC`: `CTimer::Initialise` zeroes it (`0x004ACF34`), `CTimer::Update` increments it, and `CReplay::RestoreStuffFromMem` (`0x00596FE3`, from `FinishPlayback` `0x00595B20`) puts back the value from before an instant replay. And `GenericLoad` reads it out of the save (`mov edi,9412ECh / movsd` at `0x00590C57`), after `InitialiseWhenRestarting` zeroed it. So a load of a save with a higher count than this session's is not seen, and the end of every instant replay is taken for a start-over. Not changed in code: `WatchOwnGame` still relies on it. |
 
 `CRecordDataForChase::RestoreInfoForCar` at `0x00435330`, from the same row
 pair, is correct: it opens `fld [ebp+0x3C] / [ebp+0x38] / [ebp+0x34]`
@@ -128,7 +133,6 @@ afternoon to them.
 | `HOOK_OUTBOUND_UNCONDITIONAL (Idle, immediately after CGame::Process returns)` | `0x0048E4A0` | function | high | src/core/main.cpp:1594-1599 (CGame::Process(); then DMAudio.Service();) |
 | `CPad::UpdatePads` | `0x00492720` | function | high | src/core/Pad.cpp:1098 |
 | `CPad::GetPad` | `0x00492F60` | function | high | src/core/Pad.h (static CPad *GetPad(int32 pad)) |
-| `FrontendIdle` | `0x0048E700` | function | high | src/core/main.cpp:1753 |
 | `AppEventHandler` | `0x0048E800` | function | high | src/core/main.cpp:1795 |
 | `RsEventHandler` | `0x00584A20` | function | high | src/skel/skeleton.cpp (RsEventHandler) / src/skel/win/win.cpp:1033 |
 | `WinMain` | `0x00582710` | function | high | src/skel/win/win.cpp (WinMain) |
@@ -145,14 +149,12 @@ afternoon to them.
 | `CPad::DoCheats` | `0x00492F00` | function | medium | src/core/Game.cpp:1030 |
 | `CClock::Update` | `0x00473460` | function | medium | src/core/Game.cpp:1031 |
 | `CWeather::Update` | `0x00522C10` | function | medium | src/core/Game.cpp:1032 |
-| `CTheScripts::Process` | `0x00439040` | function | medium | src/core/Game.cpp:1035 |
 | `RenderMenus` | `0x0048E450` | function | high | src/core/main.cpp:1525 |
 | `DoFade` | `0x0048D120` | function | medium | src/core/main.cpp:1731 |
 | `Render2dStuffAfterFade` | `0x0048E470` | function | high | src/core/main.cpp:1538 |
 | `g_SlowMode / ProcessSlowMode` | `0x0048DD60` | function | medium | src/core/main.cpp:1745-1746 |
 | `TheCamera` | `0x006FACF8` | global | high | src/core/Game.cpp:1008 (TheCamera.SetMotionBlurAlpha) |
 | `CCamera::m_BlurType` | `0x006FADA0` | field-offset | high | src/core/Game.cpp:1009 |
-| `FrontEndMenuManager` | `0x008F59D8` | global | high | src/core/Game.cpp:1018, src/core/main.cpp:1527/1764 |
 | `DMAudio (cAudioManager instance)` | `0x0095CDBE` | global | high | src/core/main.cpp:1599 |
 | `ControlsManager (CControllerConfigManager)` | `0x008F43A4` | global | high | src/core/Pad.cpp:1100-1104 |
 | `Scene.camera` | `0x0072676C` | global | high | src/core/main.cpp:386-389 (RwCameraEndUpdate(Scene.camera)) |
@@ -245,17 +247,13 @@ afternoon to them.
 | `RECOMMENDED inbound+outbound hook site: the only call to Idle's CGame::Process` | `0x0048E49B` | constant | high | - |
 | `RECOMMENDED one-shot deferred-init hook (install detours after the mod stack settles)` | `0x0048E7F6` | constant | high | - |
 | `House convention in this stack: redirect an existing call's rel32, never splice a prologue` | `` | constant | high | - |
-| `CLEO III's init hook (one-shot, inside CGame::Initialise)` | `0x0048C26B` | constant | high | - |
-| `CLEO III's per-frame work rides inside CTheScripts::Process` | `0x00439040` | constant | high | - |
 | `Mod Loader's hook: the CRT's call to WinMain` | `0x005C1F39` | constant | high | - |
 | `This exe is detected as GTA III 1.0, not 1.1; a 1.1 target assumption is wrong for this install` | `0x005C1E70` | constant | high | - |
 | `CGame::Process` | `0x0048C850` | function | high | src/core/Game.cpp:1002 |
 | `Idle` | `0x0048E480` | function | high | src/core/main.cpp:1551 |
 | `CPad::UpdatePads` | `0x00492720` | function | high | src/core/Game.cpp:1004 |
-| `CTheScripts::Process` | `0x00439040` | function | high | src/core/Game.cpp:1918 |
 | `CGame::Initialise(const char* datFile)` | `0x0048BED0` | function | high | src/core/Game.cpp:392 |
 | `WinMain` | `0x00582710` | function | medium | - |
-| `FrontendIdle` | `0x0048E700` | function | medium | src/core/main.cpp |
 | `Where to physically put CoopIII.asi, and the ordering it buys you` | `` | constant | medium | - |
 | `What NOT to pattern-scan for, concretely` | `` | constant | medium | - |
 
@@ -371,6 +369,35 @@ nothing else - it is read, never written, and only ever reaches
 | What | Value | Confidence | Why, and what is wrong with it |
 |---|---|---|---|
 | highest gear the transmission table takes | `5` (reverse plus five forward) | low | `CVehicle::m_nCurrentGear` (`+0x204`, in `addresses.h`) is an index into the handling's gear table; re3 has `tTransmissionGear Gears[6]` in `cTransmission`. Not read in the image, and neither is the table's size. `ApplyRemoteVehicle` writes a gear off the wire only when it is `<= 5` and otherwise leaves the copy's own, so a wrong bound costs a gear indicator, never a write past the table. To verify: the `cTransmission` layout in `CHandlingDataMgr::LoadHandlingData`, and the reads of `+0x204` in `CAutomobile::ProcessControl`. |
+
+## The script engine, for the session's mission (2026-09-24)
+
+Everything that was here came from III.CLEO and plugin-sdk, and was read out
+of the exe on 2026-09-24: the script space and its two sizes,
+`pActiveScripts`, `OnAMissionFlag`, `bAlreadyRunningAMissionScript`, the
+eleven range handlers and their tables, the whole `CRunningScript` layout,
+the operand types, the and/or states, `CPool<CPed>::GetAt`, the ground-z
+sentinel, where a new script goes in the list, that a handler's 1 ends the
+script's frame, that a held condition is read again whole, running one
+instruction from a buffer of our own, the garages' and the Cessnas'
+questions, `m_bombType`, `APPLY_BRAKES_TO_PLAYERS_CAR`, the cutscene's
+skip buttons, and the lobby's `CMenuManager::DoSettingsBeforeStartingAGame`.
+All of it is in `addresses.h` with the instruction that proves it, and
+`missionaddr.h` only names it. The `FrontendIdle`, `FrontEndMenuManager`,
+`CTheScripts::Process` and two CLEO rows left the tables above for the same
+reason. Two opcodes, two notes and one witness were wrong; they are in the
+REFUTED table at the top.
+
+`COOPIII_GTA3_EXE=<path> clienttest` reads every one of those instructions
+again ("the script engine's addresses against gta3.exe"), with the operand
+count of every opcode the missions intercept, run or replay, and the prologue
+of each function they detour.
+
+What is left:
+
+| What | Value | Confidence | Why, and what would prove it |
+|---|---|---|---|
+| a load or a new game | changes the player's pool reference or jumps `CTimer::m_snTimeInMilliseconds` | clock proved, pool reference not provable statically | `GenericLoad` reads the clock out of the save (`mov edi,885B48h / movsd` at `0x00590C0B`), and `InitialiseWhenRestarting` (`0x0048C740`) runs `CTimer::Initialise`, which sets it to 1 (`0x004ACEBB`). That the player's ped comes back with another pool reference is the pool's slot counter at work and can only be seen running. The end of an instant replay also moves the clock back (`0x00596FA9`), which costs one look at the campaign. |
 
 ## Pickups - what could not be proved statically (2026-09-22)
 

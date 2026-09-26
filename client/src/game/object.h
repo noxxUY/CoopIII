@@ -77,9 +77,14 @@
 //   reporting is enough, because the owner's report is coming and applying a
 //   break twice is a no-op.
 //
-// - **It does not keep a table, and the server does not either.** The engine
-//   throws the state away at 80 m. There is nothing to back-fill a joiner
-//   with and nothing to remember.
+// - **The 80 m horizon is each machine's own.** The engine throws the state
+//   away when *its* player is 80 m off, so a player who drove away and came
+//   back had his copy rebuilt standing while a teammate who stayed saw it
+//   broken. The session keeps breaks and resting places while any player is
+//   near them (server/core/objectrecords.h); this machine remembers which
+//   ones it has heard of (KnownObjects) and, when its engine rebuilds one of
+//   those, asks for them again. The rebuild is seen at the population
+//   manager's own call to ConvertToRealObject, redirected at its call site.
 #pragma once
 
 #include "client.h"
@@ -391,9 +396,50 @@ struct ObjectCallbacks {
 	// that has not wired these behaves exactly like single player.
 	bool (*HaveSession)() = nullptr;
 	bool (*IsHost)()      = nullptr;
+
+	// Our engine has just built an object again that the session told us
+	// was broken (or that we broke): ask for its break and resting place.
+	// protocol.h, C_ObjectRebuilt.
+	void (*Rebuilt)(const ObjectIdent &ident) = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// The objects worth asking about when they are rebuilt
+// ---------------------------------------------------------------------------
+//
+// Every break and resting place this machine has heard of or reported, so
+// that a rebuild asks the session about those and nothing else: driving
+// through a street of intact lamp posts rebuilds dozens a second and asks
+// about none. A ring, because an entry nobody is near any more is forgotten
+// by the session anyway, and asking about it once costs one small packet
+// that gets no answer.
+constexpr size_t kKnownObjects = 128;
+
+struct KnownObjects {
+	ObjectIdent ring[kKnownObjects] = {};
+	size_t      next  = 0;
+	size_t      count = 0;
+
+	bool Contains(const ObjectIdent &ident) const;
+	void Add(const ObjectIdent &ident);   // no-op for one already there
+	void Clear() { next = count = 0; }
 };
 
 void SetObjectCallbacks(const ObjectCallbacks &callbacks);
+
+// One of the session's mission's own objects broke here (mission-audit.md
+// R3), which the map's identity cannot name: game/mission.cpp names it by
+// the global that holds it. `ours` when this machine's own player, car or
+// hosted entity did it, false for nobody's doing. A replica's doing never
+// comes here, nor a blast's: that machine says so, and a blast breaks every
+// copy by itself.
+using MissionObjectBrokenFn = void (*)(void *object, float amount, uint8_t state, bool ours);
+void SetMissionObjectBroken(MissionObjectBrokenFn fn);
+
+// Somebody else broke their copy of one of the mission's objects: the
+// engine's own damage is run on ours until it is as broken, the way
+// OnObjectBrokenElsewhere does it for a map object.
+void ApplyMissionObjectBreak(void *object, float amount, uint8_t state);
 
 // ---------------------------------------------------------------------------
 // Installation
@@ -520,6 +566,7 @@ struct ObjectStats {
 	uint32_t restsApplied      = 0;
 	uint32_t restsRefused      = 0;   // the matrix on the wire was not one
 	uint32_t looseFromWire     = 0;   // dropped a standing post on a break
+	uint32_t rebuildsAsked     = 0;   // rebuilt one we had heard of, and asked
 };
 
 const ObjectStats &GetObjectStats();

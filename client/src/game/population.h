@@ -73,6 +73,11 @@ void NoteHostedPedDeath(void *ped, uint16_t animId);
 // bullet wounds reported to the session as somebody else's pedestrian's.
 bool AmbientReplicaForPed(const void *ped, uint16_t &netId);
 
+// The same test, plus the ePedType the host's engine gave the original
+// (AmbientPedBody::pedType). The replica is built as a civilian whatever that
+// was, so this is how a policeman hosted elsewhere is still told apart here.
+bool AmbientReplicaHostPedType(const void *ped, uint16_t &netId, uint8_t &pedType);
+
 // The live CPed of a pedestrian *this* machine hosts and the session has
 // already named, or null.
 //
@@ -107,10 +112,65 @@ void RestartHostedNames();
 bool HostedPedFor(const void *ped, bool &named);
 bool HostedCarFor(const void *vehicle, bool &named);
 
+// A pedestrian or car this machine hosts that the session's mission made
+// here (docs/missions.md 5.3).
+bool HostedMissionEntity(const void *entity);
+
+// One of the owner's mission's cars, on the session: hosted here now as the
+// mission's (AMBIENT_MISSION) if it is not already, and watched from then on
+// like everything the mission's instructions added (KeepMissionEntitiesHosted).
+// False, with `why` saying so, for one that cannot be: the local player at its
+// wheel (the claim path's), a wreck, a full table. `hostedNow` is true when
+// this call is what hosted it.
+bool HostMissionCar(void *vehicle, bool &hostedNow, const char *&why);
+
+// Once a frame on the mission's owner, while its mission runs: every
+// pedestrian and car the mission made that is still in its pool and hosted by
+// nobody for a moment is announced to the session again. The engine takes an
+// entity out of the world and puts it back to move it (a teleport, a
+// pedestrian sitting down in a car), and an Add outside the mission's own
+// instructions used to leave it this machine's alone. Forgets them all once
+// the mission is over.
+void KeepMissionEntitiesHosted(uint32_t nowMs);
+
+// How many pedestrians and cars of the mission are watched so, and how many
+// of them are cars.
+size_t MissionEntitiesKept(size_t *cars);
+
+// Every live pedestrian the session's mission made here, at most `max` of
+// them: HostedPedFor's liveness test, named by the session or not yet.
+size_t HostedMissionPeds(void **out, size_t max);
+
+// A participant's hit on one of the session's mission's own entities, while
+// it runs here: SET_CHAR_ONLY_DAMAGED_BY_PLAYER and its car twin refuse any
+// culprit that is not this machine's player, and in a session mission every
+// participant is the player (mission-audit.md R1). The flag is lifted around
+// the engine's own damage call and put back; nothing outside a session
+// mission changes.
+//
+// The second form is for the engine's own blast or fire on the owner's
+// machine, which names the participant's replica (or the car it sits in) as
+// the culprit: lifted only for a cause ParticipantBlastCounts lets through
+// (missioncombat.h) and a culprit that is a participant's.
+class MissionHitScope {
+public:
+	explicit MissionHitScope(void *entity);
+	MissionHitScope(void *entity, const void *culprit, uint32_t cause);
+	~MissionHitScope();
+	MissionHitScope(const MissionHitScope &)            = delete;
+	MissionHitScope &operator=(const MissionHitScope &) = delete;
+
+private:
+	void Lift(void *entity, bool blast);
+	void *m_entity = nullptr;
+};
+
 // The netId of a pedestrian this machine hosts and the session has named, for
 // the hits and rounds combat.cpp forwards on his behalf (protocol.h,
 // C_NpcShot). HostedPedFor's liveness test.
 bool HostedPedNetIdFor(const void *ped, uint16_t &netId);
+// The same for a traffic car, or one of the session's mission's cars.
+bool HostedCarNetIdFor(const void *vehicle, uint16_t &netId);
 
 // The live CPed of a replica this machine built for somebody else's
 // pedestrian, or null: the pool handle has to resolve and the vtable has to be

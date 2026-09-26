@@ -8,6 +8,7 @@
 #include "hook/hook.h"
 #include "log.h"
 #include "melee.h"
+#include "passengeraim.h"
 #include "ped.h"
 #include "pedanim.h"
 // For NoteHostedPedDeath. The CPed::SetDie detour lives here and the ambient
@@ -115,6 +116,12 @@ struct ReplayGuard {
 // with no shooter argument, and game/heli.cpp needs to know whose bullet it
 // is testing.
 bool g_localFiring = false;
+
+// The car the local passenger's round is being fired from, for the length of
+// FirePassengerRound's CWeapon::Fire, or null. passengeraim.h.
+void *g_passengerRoundCar = nullptr;
+bool  g_saidSameCarRefused = false;
+bool  g_saidPassengerReplayed = false;
 
 // Set while CoopIII is applying a hit that already came off the wire.
 //
@@ -2368,6 +2375,22 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 	                  HitIsOurs(damagedBy == localPed, culpritIsOurCar,
 	                            static_cast<uint8_t>(method));
 
+	// A passenger's round never touches anybody in the car it is fired from:
+	// the driver, the other passengers, a replica or one of ours alike. The
+	// line leaves them out already (passengeraim.h); this is the backstop, and
+	// it refuses before anything below can forward it.
+	if (ours && g_passengerRoundCar && self && self != localPed &&
+	    SameCarHit(g_passengerRoundCar, Field<bool>(self, offs::PED_IN_VEHICLE)
+	                                        ? Field<void *>(self, offs::PED_MY_VEHICLE)
+	                                        : nullptr)) {
+		if (!g_saidSameCarRefused) {
+			g_saidSameCarRefused = true;
+			Log("combat: a round of ours from a passenger seat found somebody sitting in "
+			    "the same car (cause %u, %.0f); refused and not forwarded", method, damage);
+		}
+		return false;
+	}
+
 	uint16_t victimNetId = INVALID_NETID;
 	if (self && RemotePlayerForPed(self, victimNetId)) {
 		// Somebody else's player. Their health is theirs.
@@ -2533,6 +2556,10 @@ bool __fastcall HookedInflictDamage(void *self, void * /*edx*/, void *damagedBy,
 	if (localPed && self == localPed)
 		NoteLocalDamage(method);
 
+	// A participant's blast or fire on one of our mission's own pedestrians
+	// counts as the player's (mission-audit.md R1): the fire's source is the
+	// replica, which SET_CHAR_ONLY_DAMAGED_BY_PLAYER refuses.
+	const MissionHitScope missionTarget(self, damagedBy, method);
 	return g_inflictDamage.Original<InflictHookFn>()(self, nullptr, damagedBy, method,
 	                                                 damage, piece, direction);
 }
@@ -2836,6 +2863,7 @@ bool CombatHooksInstalled() {
 }
 
 void SetFriendlyFire(bool enabled) { g_friendlyFire = enabled; }
+bool FriendlyFireOn() { return g_friendlyFire; }
 
 uint8_t DrainLocalCombat(CombatEvent *out, uint8_t max) {
 	uint8_t n = 0;
@@ -2853,6 +2881,35 @@ bool ReplayingRemoteShot() { return g_replaying; }
 
 bool LocalPlayerFiring() { return g_localFiring; }
 
+bool FirePassengerRound(void *ped, void *weapon, void *car, float *source, const Vec3 &aim) {
+	if (!ped || !weapon || !car || !source)
+		return false;
+
+	// The same seam the replay aims through: DoDoomAiming is only reached on
+	// FireInstantHit's heading branch, and there it is turned onto the aim.
+	// The mouse-camera branch never asks, and aims off the crosshair itself.
+	g_replayAim = ReplayAim{};
+	Vec3 nominal, dir;
+	if (UnitDirection(aim, dir) &&
+	    FlatHeadingDirection(ReadVec3(ped, offs::MATRIX_FWD), nominal)) {
+		g_replayAim.ped     = ped;
+		g_replayAim.dir     = dir;
+		g_replayAim.nominal = nominal;
+	}
+
+	void *&ignored     = Global<void *>(CWorld__pIgnoreEntity);
+	void *const before = ignored;
+	ignored             = car;
+	g_passengerRoundCar = car;
+	const bool fired    = Func<FireThisFn>(CWeapon__Fire)(weapon, ped, source);
+	g_passengerRoundCar = nullptr;
+	ignored             = before;
+	g_replayAim         = ReplayAim{};
+	return fired;
+}
+
+void *PassengerRoundCar() { return g_passengerRoundCar; }
+
 bool IsRemotePlayersProjectile(const void *info) { return TrackedSlotOf(info) >= 0; }
 
 namespace {
@@ -2863,7 +2920,8 @@ namespace {
 // already put the weapon in the hand and forced the slot into a state Fire
 // cannot refuse, and puts the slot back afterwards; everything else a replay
 // needs is here, and all of it is undone before this returns.
-void FireReplayedRound(void *ped, void *weapon, const ShotBody &shot, uint16_t netId) {
+void FireReplayedRound(void *ped, void *weapon, const ShotBody &shot, uint16_t netId,
+                       void *ignore = nullptr) {
 	// Clamped for the same reason every other wire position is: the fire
 	// source becomes one end of a CWorld::ProcessLineOfSight call, which
 	// turns it into a subscript into ms_aSectors with no bounds check of its
@@ -2922,10 +2980,17 @@ void FireReplayedRound(void *ped, void *weapon, const ShotBody &shot, uint16_t n
 	// The health is refused inside the call (HookedInflictDamage); the
 	// reaction the fire path plays before that is fenced here and in
 	// HookedReactToAttack / HookedSetFall. combat.h, LocalPlayerHitReaction.
+	// A passenger's round is fired from inside a car, and the car is the one
+	// thing in its line that has to be left out of it (passengeraim.h).
 	{
 		ReplayGuard     guard;
 		ReplayBodyFence fence(localPed);
+		void *&ignored     = Global<void *>(CWorld__pIgnoreEntity);
+		void *const before = ignored;
+		if (ignore)
+			ignored = ignore;
 		Func<FireThisFn>(CWeapon__Fire)(weapon, ped, source);
+		ignored = before;
 	}
 
 	if (pointGunAt)
@@ -2988,14 +3053,21 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
 		return;
 	}
 
-	// A seated ped's gun is the car's business - a drive-by arrives as weapon
-	// 19 and is drawn above, so anything else from a seat is a round fired on
-	// foot that raced the seating here. A dying ped has already stopped:
-	// CWeapon::Fire would still go through, and a muzzle flash out of a
-	// corpse looks worse than nothing at all.
-	if (Field<bool>(ped, offs::PED_IN_VEHICLE)) {
-		RefuseShot(GATE_SEATED, "their ped is in a car here and the round was not a "
-		           "drive-by", player, shot.weapon);
+	// A seated ped's gun is the car's business. The driver's drive-by arrives
+	// as weapon 19 and is drawn above; a passenger's gun is replayed below
+	// with the car left out of its line (passengeraim.h). Anything else from a
+	// seat is a round fired on foot that raced the seating. A dying ped has
+	// already stopped: CWeapon::Fire would still go through, and a muzzle
+	// flash out of a corpse looks worse than nothing at all.
+	void *const seatCar = Field<bool>(ped, offs::PED_IN_VEHICLE)
+	                          ? Field<void *>(ped, offs::PED_MY_VEHICLE)
+	                          : nullptr;
+	const SeatedRound seated = ClassifySeatedRound(
+	    Field<bool>(ped, offs::PED_IN_VEHICLE),
+	    seatCar != nullptr && Field<void *>(seatCar, offs::VEH_DRIVER) == ped, shot.weapon);
+	if (seated == SeatedRound::Refuse || (seated == SeatedRound::Passenger && !seatCar)) {
+		RefuseShot(GATE_SEATED, "their ped is in a car here and the round was neither a "
+		           "drive-by nor a passenger's gun", player, shot.weapon);
 		return;
 	}
 	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
@@ -3041,7 +3113,37 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot) {
 	const bool projectile = IsProjectileWeapon(shot.weapon);
 	const uint32_t before = projectile ? InUseMask() : 0u;
 
-	FireReplayedRound(ped, weapon, shot, player.netId);
+	if (seated == SeatedRound::Passenger) {
+		// From the hand this screen shows rather than the wire's point: the
+		// car here is where its driver's stream put it a moment ago, and at
+		// speed the two are metres apart. The line is the shooter's.
+		ShotBody fromSeat = shot;
+		float    hand[3]  = {};
+		using CompFn      = void(__thiscall *)(void *, float *, uint32_t);
+		Func<CompFn>(CPedIK__GetComponentPosition)(
+		    reinterpret_cast<uint8_t *>(ped) + offs::PED_IK, hand, PED_NODE_HANDR);
+		Vec3 aim;
+		if (UnitDirection(shot.dir, aim) && std::isfinite(hand[0]) &&
+		    std::isfinite(hand[1]) && std::isfinite(hand[2]))
+			fromSeat.origin = PassengerMuzzle(Vec3{hand[0], hand[1], hand[2]}, aim);
+		FireReplayedRound(ped, weapon, fromSeat, player.netId, seatCar);
+
+		// The arm out of the window that faces the round, as a round out of a
+		// driver's window holds it (DRIVEBY_SHOT_HOLD_MS).
+		if (UnitDirection(shot.dir, aim)) {
+			player.driveByShotAnim = DriveByAnimForShot(aim, ReadVec3(seatCar, offs::MATRIX_RIGHT));
+			player.driveByShotMs   = WallClock::NowMs();
+		}
+		if (!g_saidPassengerReplayed) {
+			g_saidPassengerReplayed = true;
+			Log("combat: replayed our first round from a passenger seat - player net %u, "
+			    "weapon %u, from their hand here along (%.2f %.2f %.2f), with their car "
+			    "left out of the line",
+			    player.netId, shot.weapon, shot.dir.x, shot.dir.y, shot.dir.z);
+		}
+	} else {
+		FireReplayedRound(ped, weapon, shot, player.netId);
+	}
 
 	// Undo what the engine just spent.
 	//
@@ -3474,8 +3576,13 @@ void ApplyRemotePedDamage(RemotePlayer *attacker, const PedDamageBody &body) {
 	// The rule it exists to get past is the one about the *local player's*
 	// health, and `self` is not the local player; taking the guard anyway would
 	// widen a session-wide flag over a call that does not need it.
-	Func<InflictThisFn>(CPed__InflictDamage)(ped, culprit, body.weapon, amount,
-	                                         body.piece, direction);
+	{
+		// One of the session's mission's own targets takes a participant's
+		// hit as the player's (mission-audit.md R1).
+		const MissionHitScope missionTarget(ped);
+		Func<InflictThisFn>(CPed__InflictDamage)(ped, culprit, body.weapon, amount,
+		                                         body.piece, direction);
+	}
 
 	if (fight.play) {
 		MeleeAfterDamage(ped, false, culprit, melee, body.weapon, direction, fight);

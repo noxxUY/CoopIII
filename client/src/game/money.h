@@ -94,6 +94,20 @@ inline int32_t ChainExplosionAward(ExplosionChain &chain, uint32_t nowMs, int32_
 	return chain.count > 1 ? unit * chain.count : unit;
 }
 
+// Whom the bomb timer's pay gate (addresses.h, BombTimer_*) asks about. The
+// engine asks about our own player alone, so a bomb another player set off
+// pays nobody on the machine it goes off on - and that machine is usually the
+// only one that decides the car. With money on and the award detour in, a
+// car whose m_pBlowUpEntity is another player's ped asks about that ped: the
+// award is made here as it would be on his machine, and RouteExplosionAward
+// sends it to him, or drops it when this machine does not decide the car.
+// With money off nothing changes, since the award would then be paid to
+// whoever sits at this machine.
+inline bool BombGateAsksBomber(bool inSession, uint8_t rule, bool awardHooked,
+                               bool bomberIsAnotherPlayer) {
+	return inSession && rule != MONEY_RULE_OFF && awardHooked && bomberIsAnotherPlayer;
+}
+
 // Installs the detour. False if it failed, in which case money is each
 // machine's own whatever the server says, and the log says so.
 bool InstallMoneyHook();

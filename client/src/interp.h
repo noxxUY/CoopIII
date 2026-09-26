@@ -153,6 +153,16 @@ public:
 		return m_samples.empty() ? 0 : m_samples.back().timeMs;
 	}
 
+	// The instant the last SampleDelayed rendered, on the sender's clock,
+	// including while it is still behind the oldest sample. What a remote
+	// player's body is picked at, so it matches the pose (remotebody.h).
+	bool PlaybackAt(uint32_t &out) const {
+		if (m_samples.empty() || !m_clock.Running())
+			return false;
+		out = m_clock.RenderTimeMs();
+		return true;
+	}
+
 	// The instant of the sender's clock the last SampleDelayed rendered, for
 	// a desync probe. False before the first one, once the buffer is empty,
 	// and while the clock is still behind the oldest sample: the copy is held

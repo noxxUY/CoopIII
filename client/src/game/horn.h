@@ -201,21 +201,28 @@ inline bool ReplicaHornSounds(uint8_t flags, bool hasDriver, bool destroyed,
 // to: every rhythm opens with two silent columns and ends with at least one,
 // so a honk that starts a few frames off sounds the same.
 
-// Would the host's own audio play this car's horn right now? The three early
-// outs of ProcessVehicleHorn, so the bit never asks a replica to honk where
-// the host is doing something else:
+// Does the bit go out for this car? Whenever its timer runs, Mr Whoopee
+// apart. The bit is the timer, not the honk: the replica does with it what
+// the host's audio does, which ProcessVehicleHorn's three early outs decide.
 //
-//   - a siren-switching car with its siren on (0x0056C23C): the timer is the
-//     fast wail on the host. The siren travels with traffic now, so a new
-//     replica given the timer would wail too, but a build from before the
-//     siren bit has no siren on it and would honk. So the replica wails at
-//     the ordinary rate while the host's is on the fast one.
-//   - Mr Whoopee (0x0056C257).
-//   - no timer (0x0056C26C).
-inline constexpr bool TrafficHornOnWire(uint16_t model, bool sirenOn, uint8_t timer) {
-	if (timer == 0 || model == MODEL_MRWHOOP)
-		return false;
-	return !(sirenOn && AudioSwitchesSirenForHorn(model));
+//   - no timer (0x0056C26C): nothing.
+//   - Mr Whoopee (0x0056C257): the audio plays no horn on him, and his jingle
+//     is the alarm path, which never reads the timer. Nothing to send.
+//   - a siren-switching car with its siren on (0x0056C23C): no horn, and the
+//     timer is what makes the siren the fast wail instead (0x0056C4D4, every
+//     siren model but the fire truck). This used to be held back, because a
+//     build from before the siren bit would have honked with it - the bit
+//     reaching a replica with no siren on it. Every build since has the siren
+//     too: its row carries the siren bit beside the horn bit, and
+//     CorrectAmbientCarReplica writes m_bSirenOrAlarm onto the replica in the
+//     same pass as the timer, after CGame::Process and before
+//     DMAudio.Service reads either. So the replica takes the same early out
+//     and wails fast, as its host does. The builds that read one mask and not
+//     the other are 32 to 34, and a server at 35 or later turns them away.
+//     A police car stuck in traffic with its lights going used to wail
+//     fast on its host and at the ordinary rate everywhere else.
+inline constexpr bool TrafficHornOnWire(uint16_t model, bool /*sirenOn*/, uint8_t timer) {
+	return timer != 0 && model != MODEL_MRWHOOP;
 }
 
 // Is a traffic replica honking this frame?

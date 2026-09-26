@@ -1269,8 +1269,8 @@ namespace coopiii {
 //    is simply granted, the skull goes at the touch and nobody is moved.
 //
 // 38: a leaver's crowd is adopted. One new
-//    opcode, S_AmbientAdopt (0xD0), no layout moves. When a player leaves,
-//    each of his ambient peds and traffic cars that another player is near
+//    opcode, S_AmbientAdopt (0xD0 then, 0xCC since 39), no layout moves.
+//    When a player leaves, each of his ambient peds and traffic cars that another player is near
 //    enough to keep is given to the nearest one (server/core/adopt.h), whose
 //    machine turns its replica into a ped or car of its own and streams it
 //    under the same netId; the rest are despawned as before. A mix
@@ -1292,8 +1292,562 @@ namespace coopiii {
 //    opcode and an older client ignores it; either way the jack looks the way
 //    it did before - the victim put beside the car and an ordinary get-in -
 //    because the claim and the seat handover are unchanged.
+//
+// Not a version: the host kicks from inside the game. One new opcode, C_Kick
+//    (0xB6), which a client sends when its player is the session's host and
+//    types "/kick" and a number from the player list. The server takes it
+//    from the host alone and throws the player out the way its window does.
+//    An older server drops the opcode and nobody is kicked; an older client
+//    never sends it.
+//
+// Not a version: the session's one mission (docs/missions.md 5, 9, 11, 12;
+//    docs/protocol.md 1.29, 1.30). Twelve opcodes in 0x42..0x4D, free until
+//    now: the claim at a start gate and its answer, who the mission waits
+//    for, the start, the session's mission as everybody sees it, the end,
+//    the death rule's order to fail it, a checkpoint's wait, what the
+//    owner's mission shows, one instruction at a time, and the values behind
+//    its HUD's widgets. Two more, 0x4E and 0x4F, for a participant saying
+//    its models are in before a cutscene, 0x52 and 0x53 for the seats the
+//    mission's passengers need, 0x54 and 0x55 for one of its objects
+//    broken, 0x56 and 0x57 for one of its floating packages taken, 0xB7
+//    and 0xB8 for a game in a mission of its own, or started over, 0x98
+//    and 0x99 for a kill somebody else made, and 0x9A and 0x9B for what a
+//    participant's engine answers to the owner's questions. Three
+//    more in 0xD0..0xD2 for what a mission leaves behind in the campaign.
+//    The server sends every joiner S_MissionState, and a client claims nothing before
+//    it has one, so behind an older server every machine's missions stay
+//    its own, as they always were. A client only reaches the script engine
+//    with `missions = on` in its CoopIII.ini; an older client never sends
+//    any of this and plays its missions alone.
+//
+// 39: the missions and the free roam work meet. Two values had been handed
+//    out twice while they were apart, and they are moved here: S_AmbientAdopt
+//    goes from 0xD0 to 0xCC, because C_CampaignDelta has 0xD0, and
+//    PICKUP_F_STASH goes from bit 1 to bit 3, because PICKUP_F_RAMPAGE has
+//    bit 1. A 38 build reads a campaign delta as an adoption and a mission's
+//    stash as a rampage skull, so the number moves with them.
+//
+// Not a version: a start waits for a game in its own intro for
+//    MISSION_BUSY_WAIT_MS at most. S_MissionWaiting's two pads become
+//    busyMask, which of the missing are in a mission of their own, and
+//    goesOnInS, how long until the start goes on without them. An older
+//    server sends zeros there and waits for them as it always did; an older
+//    client reads neither and says who is missing, as before.
+//
+// 40: the sky follows the session's mission
+//    (sky.h). No layout moves and no opcode is added. While the session's
+//    mission runs, the server takes C_WorldState from its owner instead of
+//    the host and sends a sky cheat there, and every client works out the
+//    same holder from S_MissionState; the owner takes it from its own
+//    START_MISSION, before the server has answered. A mix misbehaves both
+//    ways round. An older client that is the host never applies a world
+//    packet, so during somebody else's mission its screen keeps its own
+//    clock and weather while every other screen shows the mission's, and
+//    its reports are dropped. A newer client behind an older server keeps
+//    the sky its own mission set while the server goes on sending everybody
+//    else the host's, so the two halves of the session see different skies
+//    for the whole mission - the thing this change is for.
+//
+// 41: a pedestrian rides in a player's car.
+//    No opcode and no layout moves. AmbientPedState::vehicleNetId, which only
+//    ever named the sender's own traffic, may now name a session car: the
+//    mission's 8-Ball in the Kuruma once a participant has its wheel, Misty
+//    in the owner's car. The receiver seats its copy there, in the seat the
+//    row names or another free one, and never over a player; with no seat
+//    free it keeps the copy out of sight and out of the car's collision
+//    instead of standing it in the car. A mix misbehaves one way round. An
+//    older receiver finds no traffic of that number and stands the copy where
+//    the seat is, inside the car: up through its roof on every screen, and on
+//    the driver's own machine in the car's way every frame, so a participant
+//    at the wheel of the mission's car can barely move it - the thing this
+//    change is for. An older sender never names a session car, and a newer
+//    receiver behind it shows what an older one would.
+//
+// 42: a failed mission and its retry. No
+//    layout moves and no opcode is added; what the same packets mean does.
+//    The owner sends C_MissionEnded when its mission's script ends
+//    (TERMINATE_THIS_SCRIPT), not at the first MISSION_HAS_FINISHED, which a
+//    failure runs twice; everything its cleanup does in between goes to
+//    everybody as C_MissionEffect, and its campaign delta is read at the
+//    end, after the cleanup has put its flags back. On S_MissionState going
+//    idle the server lets go of every session car the mission made that
+//    nobody is in (S_VehicleDespawn), and a claim's players must be alive
+//    to be at the start. The owner sends each participant who gets out of
+//    the car its mission asks IS_PLAYER_IN_CAR about a PRINT_NOW of its own
+//    (MissionEffectBody::onlyTo), and never sends anybody its own "get back
+//    in the vehicle". Two instructions join the replay list:
+//    REMOVE_PARTICLE_EFFECTS_IN_AREA and DONT_REMOVE_OBJECT. A mix
+//    misbehaves the old way: an older owner ends the session's mission at the
+//    first MISSION_HAS_FINISHED, so a retry can start while its game is still
+//    cleaning up and respawning, and its delta carries flags the cleanup
+//    would have put back; an older participant runs neither new instruction
+//    and lets go of the objects a mission keeps; an older server releases no
+//    car and counts a dead player at the start.
+//
+// 43: the mission's player changes clothes on
+//    every participant. No layout moves and no opcode is added; one
+//    instruction joins the replay list. The owner sends UNDRESS_CHAR as a
+//    C_MissionEffect when its mission runs it on the owner's own player -
+//    Give Me Liberty's 'playerp' back to 'player' - with the char operand
+//    blanked to 0 and the eight-byte label as it stood. A participant never
+//    runs it as sent: it takes the label as the look its own player should
+//    wear, and changes into it with its own engine's UNDRESS_CHAR and
+//    DRESS_CHAR once that player is on foot and out of any door, death or
+//    arrest (game/outfit.h). The look sync then carries the change to every
+//    other screen, as it does any change of model 0. A mix misbehaves the
+//    old way: an older owner never sends it, so only the owner changes; an
+//    older participant finds no such instruction on its list and drops it,
+//    and keeps the clothes it had.
+//
+// 44: the car radio (docs/radio.md,
+//    docs/protocol.md 1.33). Two opcodes out of the free 0x9C..0x9F:
+//    C_VehicleRadio, a player in a session car saying the station his
+//    listener just put it on - the radio key, F9's user tracks, switching it
+//    off - or, from the driver, the station a car the session has no station
+//    for already had; and S_VehicleRadio, the session's station for that car,
+//    to everybody, the sender included, and in the backfill. Every copy of
+//    the car carries it in CVehicle::m_nRadioStation, so everybody in it
+//    hears one station, and whoever gets in later hears it too. Where in a
+//    station's one long stream a machine starts playing is not on the wire at
+//    all: it is the session clock modulo the stream's length, so two cars on
+//    the same station play the same moment. No layout moves. A mix misbehaves
+//    one way round: an older server drops both opcodes, so each copy of a car
+//    keeps its own station, as before, and only the position follows the
+//    clock; an older client never sends one and ignores what it is sent, so
+//    it keeps its own station and its own positions, and a newer passenger
+//    riding with it hears the station the newer machines agreed on.
+//
+// 45: the mission's pedestrians and cars
+//    catch up. Two opcodes out of the free 0xDE..0xDF: C_MissionCatchUp, a
+//    participant who has just come into the session's running mission -
+//    starting it with the others, late, back from a mission of its own game's
+//    or from a dropped connection, or after its game started over - asking
+//    for what the mission has made; and S_MissionCatchUp, the server's count
+//    of what it sent back to that player alone just before it: an S_PedSpawn
+//    and an S_CarSpawn, tempId 0 as in the backfill, for every AMBIENT_MISSION
+//    pedestrian and car it has from somebody else, and an S_PedDeath for each
+//    of those lying dead. No layout moves. The owner's side changes without a
+//    new packet: every car its mission's CREATE_CAR makes is hosted as the
+//    mission's, whether or not it went past the CWorld::Add detour inside the
+//    instruction, and whatever the mission made that the engine takes out of
+//    the world and puts back (a teleport, a pedestrian sitting down in a car)
+//    keeps its netId, where it used to go from every other screen. A mix
+//    misbehaves the old way: an older server drops the ask, so a late
+//    participant has only what the backfill and the live spawns gave it; an
+//    older client never asks and ignores the answer.
+//
+// 46: skipping a cutscene together. Two
+//    opcodes, the last two free of 0x98..0x9F, no layout moves:
+//    C_CutsceneState (0x9E), which cutscene the sender's game is in whenever
+//    the engine's own skip test would let it be skipped, or none, and a press
+//    of skip as a yes in its count; S_CutsceneVote (0x9F), the count, to
+//    everybody in that cutscene, or the order to skip it now
+//    (server/core/cutscenevote.h has the rules). With another player in the
+//    same cutscene the skip input no longer skips on its own machine. A mix
+//    falls back to the old rule rather than misbehaving: an older client
+//    never reports a cutscene, so it counts for nobody and the newer players
+//    beside it find themselves alone and skip as before; an older owner
+//    skips alone and its CLEAR_CUTSCENE ends everybody's scene, as before;
+//    behind an older server nobody hears a count and every machine skips on
+//    its own, a participant of the session's mission not at all.
+//
+// 47: a pedestrian in a car nobody else
+//    can see. AmbientPedState's flags byte gains AMBIENT_PED_IN_UNSEEN_CAR
+//    (bit 5), set by the host of a pedestrian sitting in a car the session has
+//    no name for; the observer keeps its replica hidden and out of the
+//    collision instead of drawing a driver in mid-air where the seat is. No
+//    opcode and no layout moves. A mix misbehaves the old way: an older sender
+//    never sets the bit, so its unseen drivers still float on a newer screen,
+//    and an older receiver ignores it. The same change makes a machine host
+//    its own traffic again whatever happens to be in the pool slot beside the
+//    model index (client/src/game/vehicle.cpp, SampleAmbientCarIdentity), with
+//    nothing on the wire changing for it.
+//
+// 48: a unique stunt jump's shot reaches
+//    the players riding in the car. Two opcodes out of the free 0xF8..0xF9,
+//    no layout moves: C_StuntCamera (0xF8), the driver's USJ thread pointing
+//    its fixed camera at the car, with the camera's position, and the end of
+//    it; S_StuntCamera (0xF9), the same to every player the session has in a
+//    passenger seat of that car, and to nobody else (docs/protocol.md
+//    §1.35). Without a packet, three things change for a passenger: the
+//    sub-mission key starts no odd job from a passenger seat, a car he rides
+//    in is never in the air to his own stunt threads (so no unique jump and
+//    no insane stunt bonus but the driver's), and the car he rides in is put
+//    where the session says before this frame's camera looks at it. A mix
+//    misbehaves the old way: an older server drops the shot and the riders
+//    see the jump from behind; an older driver sends none.
+//
+// 49: a car bomb goes off on every screen,
+//    and so does a mine. C_VehicleBomb and S_VehicleBomb grow from 9 to 13
+//    bytes: `blame`, the player whose bomb it is (whoever set the fuse going
+//    while it burns, whoever had it fitted otherwise), and `fuseMs`, what is
+//    left of a lit fuse. Every copy of the car names that player's ped as its
+//    rigger and lights its own fuse with it, so the ignition goes off
+//    whoever gets in and blames the bomber, and a timer outlives a change of
+//    driver. The server keeps each car's last word and hands it to a joiner.
+//    A detonator press already travelled as a C_Shot with
+//    WEAPONTYPE_DETONATOR; every machine now answers it by setting off the
+//    remote bombs that player rigged on its own copies, where it used to
+//    refuse it. A replayed wreck is blamed on whoever its copy's bomb names,
+//    no longer on nobody. Two opcodes out of the free 0xEC..0xEF, the other
+//    two still free: C_MineBlast (0xEC), where the sender's mine went off,
+//    and S_MineBlast (0xED), relayed to everybody else, who take their own
+//    mine there out of the world and set off the engine's explosion in its
+//    place. DROP_MINE and DROP_NAUTICAL_MINE join the mission replay list.
+//    A mix misbehaves: the bomb packets' length changed, so a newer machine
+//    and an older one drop each other's bomb reports and each keeps its own
+//    copy's bomb, as before bombs travelled; an older client refuses the
+//    detonator shot and never sends nor applies a mine blast, so its mines
+//    stay its own.
+//
+// 50: a medic's revive and a fire truck's
+//    hose on every screen (docs/protocol.md 1.37). Four opcodes, 0xF2..0xF5,
+//    out of the cheat block's free six, no layout moves. C_PedRevive, from
+//    the machine whose medic stood a dead pedestrian up - one it hosts or
+//    its replica of somebody else's - and S_PedRevive to everybody else, the
+//    pedestrian's host included, whose engine stands him up with the medic's
+//    own instructions; the session marks him alive again, so a joiner is not
+//    handed a corpse. C_WaterCannon, unreliable at the snapshot rate while a
+//    fire truck sprays, from the machine that aims it (its driver's, or the
+//    host of a truck nobody drives), the jet's start and direction in the
+//    truck's own frame; and S_WaterCannon to everybody else, whose copy of
+//    the truck sprays the same jet through CWaterCannons::UpdateOne. What the
+//    water does is then each engine's to decide about what it owns. A mix
+//    misbehaves the old way: an older server drops all four, so a revive
+//    stays on the medic's machine and a hose on the aimer's; an older client
+//    never sends either and ignores both, so its medics treat only its own
+//    pedestrians, a revive of one it hosts leaves him dead there, and its
+//    copies of other people's trucks go on spraying by themselves.
+//
+// 51: a car's end (docs/protocol.md
+//    1.38, client/src/game/wreck.h). No opcode and no layout
+//    moves; what changes is what three packets may say. S_VehicleSpawn in the
+//    backfill now carries a session wreck, VEH_WRECKED and zero health, for
+//    WRECK_BACKFILL_MS after it went up, and the joiner builds the shell
+//    without the blast. The machine that decided a wreck - its driver's
+//    C_VehicleBlowUp, the first C_UnownedBlowUp for a car nobody drove - is
+//    made its custodian on the S_VehicleCustody after the blast, and streams
+//    it on C_VehicleState with VEH_WRECKED set until it lies still; the
+//    server takes and relays those for a destroyed car from its custodian
+//    alone, and drops a VEH_WRECKED snapshot for a car that is not yet one.
+//    Two things ride packets whose meaning does not change: the thrower of a
+//    blast that left a car nobody holds standing sends C_VehicleHit with the
+//    blast's cause (18), which makes it the custodian as a shot does and is
+//    applied by nobody; and only the session host runs the fire timer of a
+//    car nobody holds, where every machine used to. A mix misbehaves one way
+//    round: an older client handed a VEH_WRECKED spawn builds an intact car,
+//    which is the bug the backfill used to avoid by leaving wrecks out. The
+//    rest degrades to the old behaviour: an older server gives nobody a
+//    wreck, so every machine holds it where it went up; an older client given
+//    one ends the settle at once and drops a wreck's snapshots.
+//
+// 52: a car's own state (docs/protocol.md
+//    1.39). Four opcodes, the block 0xE8..0xEB: C_VehicleAlarm /
+//    S_VehicleAlarm, reliable, the milliseconds a session car's alarm has
+//    left when the engine simulating it sets it off (0 when it stops early),
+//    from the driver or the settler, kept by the server and backfilled with
+//    what is left; C_VehicleAim / S_VehicleAim, on the snapshot channel, where
+//    the driver's tank turret or fire truck cannon points (m_fCarGunLR/UD),
+//    kept and backfilled too. Two bits of VehicleStateBody::flags that were
+//    free: VEH_TAXI_LIGHT (5) and VEH_HANDBRAKE (6), sampled and applied with
+//    the engine and siren, and replayed in S_VehicleSpawn like them. No
+//    layout moves. And a sender-only change: a traffic car's horn bit now
+//    goes out for a police car, ambulance or Enforcer with its siren on,
+//    where the timer is the fast wail, which the replica - given the siren
+//    bit in the same row - plays as its host does. A mix misbehaves only by
+//    missing things: an older server drops the four opcodes and keeps the
+//    flags byte as it comes, so nobody hears an alarm or sees a turret turn
+//    but the taxi light and the handbrake still travel; an older client
+//    never sends them, ignores them and the two bits, and a newer host's
+//    stuck police car wails fast on it too, because every build since the
+//    siren bit writes the siren beside the horn.
+//
+// 53: a pedestrian's door. Bits 6
+//    and 7 of AmbientPedState::flags that every sender left zero, no layout
+//    moves and no opcode. AMBIENT_PED_ENTERING: the host's pedestrian is
+//    opening a door of the car `vehicleNetId` names, and `seat` packs the seat
+//    he ends in with the door he goes in by (AmbientPedEntrySeatByte); the
+//    observer's copy plays the same door, then sits where the entry leaves
+//    him. AMBIENT_PED_EXITING: he is climbing out of the seat the row names,
+//    and the copy climbs out with him. Misty getting into the car a player
+//    drives is the case that showed it: every other screen only ever saw her
+//    appear in her seat. A mix misbehaves one way round: an older observer
+//    reads an entering row as a seat and warps the copy in while its host is
+//    still at the door, a second early; an older host never sets either bit
+//    and every copy warps as before.
+//
+// 54: a mission's bomb and a bomber's pay
+//    (docs/protocol.md 1.36). Two opcodes, the rest of the mines' block, no
+//    layout moves. C_MissionBomb (0xEE), from the owner's machine when its
+//    mission's ARM_CAR_WITH_BOMB fits a bomb to a car the session names, and
+//    S_MissionBomb (0xEF) to everybody else: the bomb is the owner's on every
+//    copy, the one the receiver simulates included. A participant's replay
+//    of the same instruction names the owner as the rigger rather than its
+//    own player, so the first machine to hold the car no longer claims it.
+//    The server keeps the flag with the car's bomb and backfills it; a later
+//    C_VehicleBomb that changes the type or whose it is ends it. A detonator
+//    press (C_Shot, WEAPONTYPE_DETONATOR) also sets off a remote bomb the
+//    running mission fitted when it comes from anybody in that mission,
+//    blamed on the owner, the rigger. No packet for the pay: the machine a
+//    bomb goes off on now makes CVehicle::ProcessDelayedExplosion's award
+//    when the bomber is another player's ped, under money own or shared, and
+//    it goes to the bomber through the existing C_MoneyAward. A mix
+//    misbehaves the old way: an older server drops both opcodes, an older
+//    client ignores S_MissionBomb and claims the bomb for itself as before,
+//    and an older machine a bomb goes off on pays nobody for it.
+//
+// 55: everybody into the car the mission
+//    puts its player in, and only as many out of a car as a mission's
+//    passengers need (docs/protocol.md 1.40). Two opcodes, the rest of the
+//    money block: C_MissionBoard (0xE4), from the owner's machine once its
+//    mission's WARP_PLAYER_INTO_CAR or WARP_CHAR_INTO_CAR has put its player
+//    in a car the session names, with the passenger seat it gives each
+//    participant, and S_MissionBoard (0xE5), relayed to everybody else.
+//    MissionSeatCar's pad byte is now `leave`: the players who are to get
+//    out of the car when MISSION_SEAT_LEAVE is set, no layout moves. A mix
+//    misbehaves the old way: an older owner sends `leave` as 0, which a newer
+//    participant reads as everybody out, an older participant ignores it and
+//    gets out whether he was named or not, and an older server drops both
+//    opcodes, so nobody follows the owner into the car.
+//
+// 56: a mission with three or four players
+//    in it (docs/protocol.md 1.29, docs/missions.md 15). No opcode is added
+//    and no layout moves. S_MissionWaiting's goesOnInS now counts a
+//    checkpoint down too: a checkpoint waits MISSION_CHECKPOINT_WAIT_MS at
+//    most, and then the owner's machine reports it over (missingMask 0) and
+//    its mission goes on. An owner whose connection dropped sends
+//    C_MissionStarted again, launch key 0, for the mission its script still
+//    runs, and the server takes it up as the session's as it takes any
+//    start it did not grant. The server drops a silent connection in 5 to
+//    10 s (net.h, NET_PEER_TIMEOUT_*) instead of ENet's 5 to 30. A mix
+//    misbehaves the old way: an older server never counts a checkpoint down
+//    and an older client never shows it, an older owner's checkpoint waits
+//    for ever, and an older owner back from a dropped connection keeps its
+//    mission to itself.
+//
+// 57: a contact's marker and the odd jobs'
+//    rewards (docs/protocol.md 1.30). No opcode and no layout moves; what a
+//    C_MissionEffect and a C_CampaignDelta op may say changes. A blip operand
+//    may now be `02 lo hi`, a main-script global each machine reads for its
+//    own, where it was always a literal handle: REMOVE_BLIP and the other
+//    blip instructions on a live blip the mission did not make go that way,
+//    as MISSION_EFFECT_RUN, and in the delta's ops. ADD_SPRITE_BLIP_FOR_
+//    CONTACT_POINT (02A7) joins the replay list with its output a global, in
+//    the delta's ops too, and every machine takes off what that global holds
+//    before making it. SET_PLAYER_NEVER_GETS_TIRED becomes a delta op and is
+//    no longer put back when the mission ends. The odd jobs' stat counters
+//    (0315, 0316, 03FD..0404) join the list. A mix misbehaves one way round:
+//    an older participant drops a blip by global and a 02A7, and has none of
+//    the stats, as before; an older machine applying a newer delta runs its
+//    02A7 without taking the old marker off first, so a marker it already
+//    had live is left twice on its radar.
+//
+// 58: what a mission does to the streets
+//    and says out loud, on every participant's machine, and fewer packets
+//    for it (docs/protocol.md 1.29). One new MissionEffectKind,
+//    MISSION_EFFECT_SPHERE_NEW (8): ADD_SPHERE's result is the participant's
+//    for `ownerBlip`, and REMOVE_SPHERE names the owner's handle, the way a
+//    blip does. The replay list grows by CLEAR_AREA, both density
+//    multipliers, SET_ZONE_CAR_INFO, SET_ZONE_PED_INFO and SET_GANG_WEAPONS
+//    (the last three kept in the campaign delta as world instructions), the
+//    mission audio (LOAD, PLAY, SET_POSITION, CLEAR), ADD_PAGER_MESSAGE,
+//    PRINT_STRING_IN_STRING, ADD_BLIP_FOR_CHAR_OLD, ADD_SPHERE,
+//    REMOVE_SPHERE, LOAD_SCENE, the credits' start and stop, and
+//    RESTART_CRITICAL_MISSION as a TELEPORT. SET_ZONE_CAR_INFO's sixteen
+//    numbers only fit the 64-byte code as 16-bit literals (type 5), which
+//    the interpreter reads like any other. A corona the mission draws every
+//    frame goes the way a blue marker does: a RUN of DRAW_CORONA with nine
+//    literals and a tenth that says up or down, resent every 2 s while it
+//    stays, never run as it stands by a newer participant. No layout moves.
+//    And the owner sends less: an identical repeat of an instruction that
+//    sets something is dropped, a changing one goes at most ten times a
+//    second with its last value kept for when the gap is up, and a blip the
+//    mission takes off and puts back in the same frame stays one blip, moved
+//    at most twice a second. A mix misbehaves only by missing things: an
+//    older client finds none of the new instructions on its list and runs
+//    none of them, the corona and the sphere included; an older owner sends
+//    none of it, and every repeat as before.
+//
+// 59: who is in the menu, and a mission's
+//    gangs turning on everybody (docs/protocol.md 1.42). One opcode pair,
+//    C_PlayerAway / S_PlayerAway (0xBE/0xBF): a byte, 1 while the sender's
+//    pause menu is up, relayed to everybody else and given to a joiner after
+//    the joins. SET_THREAT_FOR_PED_TYPE and CLEAR_THREAT_FOR_PED_TYPE (03F1,
+//    03F2) join the replay list as world instructions, so the campaign delta
+//    carries them too. No layout moves. A mix misbehaves only by missing
+//    things: an older server drops C_PlayerAway and an older client never
+//    shows it; an older participant runs neither threat instruction, so only
+//    the owner is set on, as before.
+//
+// 60: the owner's scenes on everybody's
+//    screen (docs/protocol.md 1.29). No layout moves. CAMERA_ON_PED (0159)
+//    pointed at the owner's own player ped goes with WIRE_OWN_PLAYER
+//    (0x10000, game/mission.h) in place of a netId, and each participant's
+//    camera goes to its own player; it used to be dropped. A light and a
+//    shadow the mission draws every frame, DRAW_LIGHT (0250) and DRAW_SHADOW
+//    (016F), go the way the corona does: a RUN of the instruction with its
+//    own six or ten operands as literals and one more that says up or down,
+//    resent every 2 s while it stays. A mix misbehaves: an older participant
+//    reads 0x10000 as netId 0, so its camera may go to whichever pedestrian
+//    has that name, and it runs none of the lights or shadows; an older owner
+//    sends neither.
+//
+// 61: the 1100..1154 instructions a
+//    mission runs (docs/missions.md 15). No opcode is added and no layout
+//    moves; what a C_MissionEffect may say grows. LOAD_COLLISION_WITH_SCREEN
+//    (044C), MAKE_CRAIGS_CAR_A_BIT_STRONGER (044F, the car as its netId),
+//    SET_JAMES_CAR_ON_PATH_TO_PLAYER (0450, to the car's holder alone) and
+//    LOAD_END_OF_GAME_TUNE (0451) join the replay list, all as
+//    MISSION_EFFECT_RUN. A participant runs 044C only while standing on that
+//    island or between islands, and a TELEPORT to another island loads it
+//    first on the participant's own. A mix misbehaves only by missing
+//    things: an older client finds none of the four on its list, and an
+//    older owner never sends them.
+//
+// 62: the pickups a mission leaves the
+//    world (docs/protocol.md 1.30). No opcode and no layout moves; what a
+//    C_MissionEffect and a C_CampaignDelta op may say changes, the way 57
+//    changed it for blips. A CREATE_PICKUP or CREATE_PICKUP_WITH_AMMO of a
+//    type that comes back (in a shop, on the street, on the street slow)
+//    whose result the mission keeps in a global goes with that global as its
+//    output, `02 lo hi`, as MISSION_EFFECT_RUN and in the delta's ops: every
+//    machine makes its own into its own global, takes off what that global
+//    held first, and never takes it away when the mission ends. It is no
+//    stash any more. A REMOVE_PICKUP on a pickup the mission did not lay out
+//    through the map goes by its global the same way. So Cipriani's
+//    Chauffeur's Uzi, Phil's guns and Phil's armour stay, the out-of-stock
+//    Uzi goes everywhere, and a late joiner or a loaded save gets both. A
+//    mix misbehaves one way round: an older participant drops a REMOVE_PICKUP
+//    by global, so its out-of-stock sign stays beside the gun, and an older
+//    machine applying a newer delta makes the pickup without taking the old
+//    one off first.
+//
+// 63: what a mission may not do to its
+//    helpers, and the Import/Export lists as the session's (docs/protocol.md
+//    1.29, docs/missions.md 5.6, 6.1, 12.1). Two opcodes, the last of the
+//    cheat block: C_CarLists (0xF6), a machine's own collected bits when it
+//    has one the session lacks and once on every connection, and S_CarLists
+//    (0xF7), the session's union, to the sender and to everybody when it
+//    grew. What a C_MissionEffect may say changes, no layout moves:
+//    STORE_WANTED_LEVEL (01C0) joins the replay list with its output a
+//    global, which each participant fills with its own level, and
+//    ALTER_WANTED_LEVEL's (010D) level may be `02 lo hi`, a global each
+//    machine reads for its own, where it was always a literal. An ADD_SCORE
+//    that takes money is no longer sent, and a participant drops one that
+//    comes. Nothing new travels for the checkpoints: a mission with a
+//    countdown on the screen, a race, an odd job or an RC, 4x4 or Mayhem run
+//    no longer reports anybody missing from one. A mix misbehaves the old
+//    way: an older server drops both car-list opcodes and every machine's
+//    lists stay its own; an older participant never stores its level and
+//    gets back whatever its global held, and pays a charge an older owner
+//    sends; an older owner's checkpoints still wait.
+//
+// 64: the rest of what a mission shows,
+//    sets for a while and counts (docs/protocol.md 1.29, 1.30). No layout
+//    moves. PLAYER_MADE_PROGRESS and REGISTER_MISSION_PASSED are no longer
+//    RUN live: they, and the three islands' PASSED instructions with the
+//    radio's "island open", go in the campaign delta as world instructions
+//    alone, which every machine applies once. SET_GET_OUT_OF_JAIL_FREE is a
+//    world instruction like SET_PLAYER_NEVER_GETS_TIRED. The replay list
+//    grows by PRINT_BIG_Q, PRINT_WITH_NUMBER_BIG_Q,
+//    PRINT_WITH_2_NUMBERS_SOON, SET_PHONE_MESSAGE, the launch's
+//    MAKE_PLAYER_SAFE_FOR_CUTSCENE, SET_FREE_RESPRAYS,
+//    SET_WANTED_MULTIPLIER, both restart overrides, SWITCH_WORLD_PROCESSING,
+//    SET_ALL_CARS_CAN_BE_DAMAGED, SET_GENERATE_CARS_AROUND_CAMERA,
+//    SET_NEAR_CLIP, SET_MUSIC_DOES_FADE, CLEAR_AREA_OF_CHARS, SHAKE_CAM,
+//    ADD_MOVING_PARTICLE_EFFECT, CREATE_SINGLE_PARTICLE, the end of the
+//    game's tune, and ADD_CONTINUOUS_SOUND and REMOVE_SOUND, whose handle
+//    goes as the global that holds it, each machine's own. A mix misbehaves
+//    by missing or doubling stats: an older owner still RUNs the two stats
+//    and never puts them in its delta, so a newer participant counts them
+//    live only; a newer owner's delta reaches an older participant that
+//    counted nothing live, once. An older client runs none of the new list.
+//
+// 65: a passenger's gun (docs/protocol.md
+//    1.42). No opcode and no layout moves. A C_Shot from a player in a
+//    passenger seat with the pistol or the uzi is now a real round, fired
+//    through CWeapon::Fire from the seat with the car out of its line, and an
+//    observer replays it from its copy's hand where it used to refuse any
+//    seated round but weapon 19. A seated player's drive-by overlay (animId2
+//    DRIVEBY_L/R) now holds the gun on the wire when it is one of those two,
+//    the uzi otherwise. The server drops a C_Damage between two players in the
+//    same car, friendly fire or not. A mix misbehaves only by missing things:
+//    an older observer draws no passenger round and poses the uzi, and an
+//    older server relays a hit inside one car that a newer shooter never
+//    sends.
+//
+// 66: a player standing on something that
+//    moves (docs/protocol.md 1.7.1). C_PlayerStateRide / S_PlayerStateRide
+//    (0xAE/0xAF) are the ordinary snapshot with a PlayerRideBody after it:
+//    the session car, boat or traffic car under the player's feet by netId,
+//    or the El or subway wagon they stand on or sit in by track and wagon
+//    id, and where on it they are in its own frame. Sent instead of
+//    C_PlayerState while that is true, so the ride can never arrive apart
+//    from the snapshot it belongs to. The observer rebuilds the position off
+//    its own copy of that vehicle, which is where its screen draws it; the
+//    world position in the body is still right and is what everything else
+//    reads. No existing layout moves. A mix: an older server drops the new
+//    opcode, so a rider stops being seen until they step off; an older
+//    observer never gets one.
+//
+// 67: gates, street objects that stand up
+//    again, and pickup reservations (docs/protocol.md 1.43). C_GateState /
+//    S_GateState (0xC8/0xC9): one bit per scripted gate, "my own GATES thread
+//    wants it open", OR'd like the garages and replayed to a joiner.
+//    C_ObjectRebuilt (0xCD): a machine that rebuilds a street object it was
+//    told was broken asks, and the server, which now keeps breaks and resting
+//    places while a player is within 120 m, answers with S_ObjectBroken and
+//    S_ObjectSettled to it alone; a joiner is handed the breaks. No layout
+//    moves. S_PickupDenied can now arrive for a pickup the client holds a
+//    grant on: its reservation stood 15 s and was moved to somebody else, and
+//    the old holder's collection inside 2 s still counts (the new holder is
+//    sent S_PickupTaken). A client claims only the nearest pickup in reach
+//    and backs off 1.5 s after a denial. A mix misbehaves only as before: an
+//    older client neither sends nor reads a gate mask, never asks about a
+//    rebuilt object, and ignores a denial for a grant, keeping it as it
+//    always did.
+//
+// 68: a session car the engine takes away on purpose (docs/protocol.md
+//    1.44). Two opcodes, the garages' 0xAC and 0xAD: C_VehicleRemoved
+//    (0xAC), from the one machine that may let its engine crush, crane,
+//    deliver or store a session car - its driver, else its custodian, else
+//    whoever drove it last, else the session host - once its engine has done
+//    it, with the reason; and S_VehicleRemoved (0xAD) to everybody else, just
+//    ahead of the S_VehicleDespawn that drops the car. A receiver deletes its
+//    CVehicle even when its own engine made the car. The lists the delivery
+//    adds to go the way 63 sends them. Two layouts grow by two bytes:
+//    EnterVehicleBody and S_VehicleSpawn carry `parkedSlot`, the car
+//    generator a claimed parked car came out of plus one (0 for none), and
+//    every receiver of the spawn lets go of its own car on that generator the
+//    way the engine does when a player takes one. A mix cannot connect.
+//
+// 69: a traffic car its host's engine drops
+// by distance while another player is near it is handed on rather than
+// despawned (docs/protocol.md 1.45). One opcode, 0xDC: C_CarLetGo, the car
+// and the host's peds sitting in it. The server gives them to the nearest
+// player within 195 m who has not let go of the car in the last 15 s, with an
+// S_AmbientAdopt to everybody but the sender, and backfill spawns under the
+// new owner to the sender; nobody near, the despawns. S_AmbientAdopt's first
+// pad byte is `why` now, AMBIENT_ADOPT_LEFT (0, what every older server sent)
+// or AMBIENT_ADOPT_LET_GO. No layout moves. A mix cannot connect; were one to,
+// an older server would drop the let-go and the car and its driver would
+// stand frozen on the other screens until the sender left.
+//
+// 70: a Pay'n'Spray and a bribe clear the
+//    stars they should (docs/wanted.md 4.9, docs/protocol.md 1.16). No layout
+//    moves and no opcode is added; what two packets mean grows. S_Respray
+//    now clears the receiver's wanted level when the session's rule reaches
+//    it - always under `shared`, and under `perplayer` when the receiver is
+//    in the car the respray names - and S_PickupTaken for a PICKUP_F_BRIBE
+//    takes one star off on the same terms, the car being the one the
+//    collector is seated in. A client whose stars come down, by its own
+//    engine or by one of those two, counts everybody who was reporting more
+//    for no more than what it now has until they report less or 3 s pass.
+//    A mix misbehaves the old way: an older receiver keeps its stars through
+//    somebody else's respray or bribe, and after 3 s puts them back on the
+//    newer machine that paid for it.
 
-constexpr uint16_t PROTOCOL_VERSION = 38;
+constexpr uint16_t PROTOCOL_VERSION = 70;
 constexpr uint16_t DEFAULT_PORT     = 2001;
 constexpr uint8_t  MAX_PLAYERS      = 8;
 constexpr uint8_t  SNAPSHOT_HZ      = 25;   // docs/protocol.md §1.2
@@ -1372,10 +1926,62 @@ enum Opcode : uint8_t {
 	// is sent by a driver and a parked car has no driver.
 	OP_C_VEHICLE_DAMAGE  = 0x3A,
 	OP_S_VEHICLE_DAMAGE  = 0x3B,
-	// 0x3C-0x3F stay free for the rest of the vehicle block.
+	// A car's bomb: vehicle state like its shape, from whoever simulates the
+	// car (docs/mission-audit.md R6). 0x3E-0x3F stay free for the rest of the
+	// vehicle block.
+	OP_C_VEHICLE_BOMB    = 0x3C,
+	OP_S_VEHICLE_BOMB    = 0x3D,
 
 	OP_S_WORLD_STATE     = 0x40,
 	OP_C_WORLD_STATE     = 0x41,
+
+	// The session's one mission. 0x42..0x4F is the block; 0x4E..0x4F stay
+	// free for the rest of what the mission sends while it runs.
+	OP_C_MISSION_CLAIM      = 0x42,
+	OP_S_MISSION_CLAIM      = 0x43,
+	OP_S_MISSION_WAITING    = 0x44,
+	OP_C_MISSION_STARTED    = 0x45,
+	OP_S_MISSION_STATE      = 0x46,
+	OP_C_MISSION_ENDED      = 0x47,
+	OP_S_MISSION_FAIL       = 0x48,
+	OP_C_MISSION_CHECKPOINT = 0x49,
+	// What the owner's mission shows, for every participant's engine to show
+	// too: one instruction at a time (docs/missions.md 5.4).
+	OP_C_MISSION_EFFECT     = 0x4A,
+	OP_S_MISSION_EFFECT     = 0x4B,
+	// The value behind a timer or a counter the owner's mission has on the
+	// HUD, which every participant's HUD reads out of the same global.
+	OP_C_MISSION_WIDGET     = 0x4C,
+	OP_S_MISSION_WIDGET     = 0x4D,
+	OP_C_MISSION_READY      = 0x4E,
+	OP_S_MISSION_READY      = 0x4F,
+	OP_C_MISSION_SEATS      = 0x52,
+	OP_S_MISSION_SEATS      = 0x53,
+	OP_C_MISSION_OBJECT_BREAK = 0x54,
+	OP_S_MISSION_OBJECT_BREAK = 0x55,
+	OP_C_MISSION_PICKUP     = 0x56,
+	OP_S_MISSION_PICKUP     = 0x57,
+	// A game in a mission of its own, and one that started over in the
+	// middle of the session's. Out of the free 0xB7..0xBF, since 0x58..0x5F
+	// is the vehicle custody block's.
+	OP_C_MISSION_BUSY       = 0xB7,
+	OP_S_MISSION_HAND_OVER  = 0xB8,
+	// A kill a participant's machine registered, for the owner's mission to
+	// count. Out of the free 0x98..0x9F, past the NPC block's 0x96/0x97.
+	OP_C_MISSION_KILL       = 0x98,
+	OP_S_MISSION_KILL       = 0x99,
+	// What a participant's engine answers to the owner's mission's
+	// questions: its garages, and the planes it flies.
+	OP_C_MISSION_ANSWERS    = 0x9A,
+	OP_S_MISSION_ANSWERS    = 0x9B,
+	// The station a session car's radio is on (docs/radio.md). 0x9E and
+	// 0x9F are the cutscene vote's.
+	OP_C_VEHICLE_RADIO      = 0x9C,
+	OP_S_VEHICLE_RADIO      = 0x9D,
+	// Skipping a cutscene together, the last two of that block. See
+	// CutsceneKey.
+	OP_C_CUTSCENE_STATE     = 0x9E,
+	OP_S_CUTSCENE_VOTE      = 0x9F,
 
 	OP_C_CHAT            = 0x50,
 	OP_S_CHAT            = 0x51,
@@ -1525,7 +2131,15 @@ enum Opcode : uint8_t {
 	OP_S_HELI_HIT         = 0xA9,
 	OP_C_HELI_SHOT        = 0xAA,
 	OP_S_HELI_SHOT        = 0xAB,
-	// 0xAC..0xAF stay free for the garages.
+	// A session car an engine took away on purpose: crushed, craned,
+	// delivered or stored (docs/protocol.md 1.44).
+	OP_C_VEHICLE_REMOVED  = 0xAC,
+	OP_S_VEHICLE_REMOVED  = 0xAD,
+
+	// The snapshot of a player standing on or riding in something that moves,
+	// with where on it they are. PlayerRideBody.
+	OP_C_PLAYER_STATE_RIDE = 0xAE,
+	OP_S_PLAYER_STATE_RIDE = 0xAF,
 
 	// Ammunition for an inventory slot the player is NOT currently holding.
 	// The held weapon's count rides the snapshot instead - see
@@ -1545,6 +2159,20 @@ enum Opcode : uint8_t {
 	// The server's password, right behind the hello, when the player has one
 	// to give. A server with a password holds the hello until it arrives.
 	OP_C_PASSWORD         = 0xB5,
+	// The host throwing somebody out from inside the game. Taken from the
+	// session's host and nobody else.
+	OP_C_KICK             = 0xB6,
+	// 0xB7 and 0xB8 are the session's mission's (C_MissionBusy above).
+	// The lobby: a launcher's own connection, made before anybody's game is
+	// running, to wait with the others and be started together.
+	OP_C_LOBBY_JOIN       = 0xB9,
+	OP_S_LOBBY_ANSWER     = 0xBA,
+	OP_S_LOBBY            = 0xBB,
+	OP_C_LOBBY_START      = 0xBC,
+	OP_S_LOBBY_START      = 0xBD,
+	// Somebody's menu is up. See C_PlayerAway. The last two of the B block.
+	OP_C_PLAYER_AWAY      = 0xBE,
+	OP_S_PLAYER_AWAY      = 0xBF,
 
 	// 0xC0..0xCF is the breakable-street-object block. docs/objects.md.
 	// Four of the sixteen are used here, 0xC4-0xC7 went to the rampage vote
@@ -1563,21 +2191,33 @@ enum Opcode : uint8_t {
 	OP_S_RAMPAGE_VOTE     = 0xC5,
 	OP_C_RAMPAGE_ARRIVED  = 0xC6,
 	OP_S_RAMPAGE_TELEPORT = 0xC7,
+	// The seven gates main.scm's GATES threads open, the two the vote left.
+	// See GateMaskBody.
+	OP_C_GATE_STATE       = 0xC8,
+	OP_S_GATE_STATE       = 0xC9,
 
 	// Claude's outfit, out of the top of that block. See C_PlayerLook.
 	OP_C_PLAYER_LOOK      = 0xCA,
 	OP_S_PLAYER_LOOK      = 0xCB,
 
 	// A player left and somebody else hosts his crowd now. See S_AmbientAdopt.
-	// 0xD0-0xD5 is the block; one is used. Server to client only: a machine
+	// 0xCC, out of the free end of that block (0xD0 went to the campaign
+	// first). Server to client only: a machine
 	// that cannot take a pedestrian it was given says so with the
 	// C_PedDespawn / C_CarDespawn it already has, as the new owner.
-	OP_S_AMBIENT_ADOPT    = 0xD0,
+	OP_S_AMBIENT_ADOPT    = 0xCC,
+	// A street object this machine has just built again, which it was told
+	// was broken: send me what you have. See C_ObjectRebuilt.
+	OP_C_OBJECT_REBUILT   = 0xCD,
+	// What a mission leaves behind in the campaign, and a way back to it after
+	// a dropped connection (docs/missions.md 5.5). 0xD0..0xD7 is the block.
+	OP_C_CAMPAIGN_DELTA   = 0xD0,
+	OP_S_CAMPAIGN_DELTA   = 0xD1,
+	OP_C_CAMPAIGN_SINCE   = 0xD2,
 
-	// An ambient pedestrian dying. 0xD8-0xDF is the block reserved for it;
-	// two of the eight are used and the other six stay free, because the
-	// thing that would want them next is the same shape - a hosted ped
-	// reaching a state only its host can witness.
+	// An ambient pedestrian dying. 0xD8-0xDF was the block reserved for it;
+	// the carjack took 0xDA/0xDB, the mission's catch-up 0xDE/0xDF and a
+	// traffic car's host letting go of it 0xDC, and 0xDD stays free.
 	//
 	// Not folded into the 0x7x ambient block, which is full: 0x70..0x7D are
 	// the ped and car handshakes and their two streams, and squeezing a
@@ -1587,6 +2227,15 @@ enum Opcode : uint8_t {
 	// A carjack, as it starts. See C_JackingVehicle.
 	OP_C_JACKING_VEHICLE  = 0xDA,
 	OP_S_JACKING_VEHICLE  = 0xDB,
+	// A traffic car its host's engine is taking away by distance while
+	// somebody else is near it (C_CarLetGo). Client to server only; what comes
+	// back is an S_AmbientAdopt or the despawns.
+	OP_C_CAR_LET_GO       = 0xDC,
+	// A participant who has just come into the session's running mission, late
+	// or back from its own, asks for every pedestrian and car the mission has
+	// (C_MissionCatchUp).
+	OP_C_MISSION_CATCH_UP = 0xDE,
+	OP_S_MISSION_CATCH_UP = 0xDF,
 
 	// Money, behind the server's MoneyRule. 0xE0-0xE5 is the block; four of
 	// the six are used. Nothing here is sent in a session with money off.
@@ -1595,13 +2244,47 @@ enum Opcode : uint8_t {
 	OP_S_MONEY            = 0xE1,
 	OP_C_MONEY_AWARD      = 0xE2,
 	OP_S_MONEY_AWARD      = 0xE3,
+	// The other two: everybody into the car the mission puts its player in
+	// (C_MissionBoard).
+	OP_C_MISSION_BOARD    = 0xE4,
+	OP_S_MISSION_BOARD    = 0xE5,
+
+	// A mine the mission dropped has gone off (C_MineBlast). 0xEC-0xEF is the
+	// block, and the other two are the bomb a mission fits to a car
+	// (C_MissionBomb).
+	OP_C_MINE_BLAST       = 0xEC,
+	OP_S_MINE_BLAST       = 0xED,
+	OP_C_MISSION_BOMB     = 0xEE,
+	OP_S_MISSION_BOMB     = 0xEF,
+	// A session car's own state that a snapshot has no room for. 0xE8-0xEB is
+	// the block: its alarm, reliable, and the aim of its gun - the tank's
+	// turret, the fire truck's water cannon - on the snapshot channel.
+	OP_C_VEHICLE_ALARM    = 0xE8,
+	OP_S_VEHICLE_ALARM    = 0xE9,
+	OP_C_VEHICLE_AIM      = 0xEA,
+	OP_S_VEHICLE_AIM      = 0xEB,
 
 	// A cheat somebody typed that changes something their machine does not
-	// own. 0xF0-0xF7 is the cheat block; two of the eight are used. What
+	// own. 0xF0-0xF7 is the cheat block; cheats use two of the eight. What
 	// travels is which cheat and what it left behind, never the keystrokes -
 	// docs/cheats.md.
 	OP_C_CHEAT            = 0xF0,
 	OP_S_CHEAT            = 0xF1,
+
+	// Emergency services, out of the rest of that block: a medic's revive and
+	// a fire truck's hose (docs/protocol.md 1.37).
+	OP_C_PED_REVIVE       = 0xF2,
+	OP_S_PED_REVIVE       = 0xF3,
+	OP_C_WATER_CANNON     = 0xF4,
+	OP_S_WATER_CANNON     = 0xF5,
+	// The Import/Export garages' lists and the emergency crane's, as the
+	// session's campaign (docs/missions.md 6.1): the last two of the block.
+	OP_C_CAR_LISTS        = 0xF6,
+	OP_S_CAR_LISTS        = 0xF7,
+	// A unique stunt jump's slow-motion shot, from the driver to the players
+	// riding with him (docs/protocol.md §1.35).
+	OP_C_STUNT_CAMERA     = 0xF8,
+	OP_S_STUNT_CAMERA     = 0xF9,
 };
 
 enum LeaveReason : uint8_t {
@@ -1963,7 +2646,8 @@ enum CheatRoute : uint8_t {
 	CHEAT_ROUTE_LOCAL    = 0,
 	// On the host alone. The host's sky is the session's (§2.7) and reaches
 	// everybody on the next S_WorldState, so the host is the one machine that
-	// has to act on it.
+	// has to act on it. While the session's mission runs, "the host" here is
+	// its owner, whose sky is the session's then (sky.h).
 	CHEAT_ROUTE_HOST     = 1,
 	// On every machine, the typist's first. Each machine's own engine owns its
 	// own CTimer, CClock and CPedType, so nobody could apply it for anybody
@@ -2219,6 +2903,25 @@ struct S_PlayerLook {
 	char    look[PLAYER_LOOK_LEN];
 };
 
+// The sender has the pause menu up. With the pause policy the world keeps
+// running under the menu, so his ped stands in the street with its controls
+// taken away and nothing on anybody else's screen says why. A level, not a
+// count: sent reliably on every change, stored by the server and given to a
+// joiner, and dropped with the player. Not a snapshot bit, because
+// PlayerFlags has none left and a menu is opened a few times an hour.
+struct C_PlayerAway {
+	static constexpr uint8_t OPCODE = OP_C_PLAYER_AWAY;
+	PacketHeader hdr;
+	uint8_t away;   // 1 while the menu is up, 0 once it is closed
+};
+
+struct S_PlayerAway {
+	static constexpr uint8_t OPCODE = OP_S_PLAYER_AWAY;
+	PacketHeader hdr;
+	uint8_t playerId;
+	uint8_t away;
+};
+
 // Puts a look into the one shape both ends accept: lower case, [a-z0-9_]
 // only, terminated, zero after the terminator. False, and the buffer
 // zeroed, for anything else or for an empty name. The engine compares these
@@ -2437,6 +3140,48 @@ struct S_PlayerState {
 	PlayerStateBody body;
 };
 
+// What a player is standing on, when it moves (docs/protocol.md 1.7.1).
+//
+// A snapshot's position is a world position, and the observer draws it 100 ms
+// and a round trip after it was true. For somebody on foot that is the whole
+// point of the delay. For somebody on the roof of a moving bus it is a player
+// left `speed * (100 ms + latency)` behind the bus they are standing on: the
+// bus is drawn on its own timeline, the player on theirs, and nothing ties the
+// two together. So while they ride, the owner also says what they ride and
+// where on it, and the observer puts them there on its own copy.
+//
+// The owner reads it off the engine rather than working it out:
+// CPed::m_pCurrentPhysSurface (+0x2FC) is the vehicle under a standing ped's
+// feet, and a ped riding a train is bInVehicle with m_pMyVehicle on the wagon.
+enum RideKind : uint8_t {
+	RIDE_NONE    = 0,
+	RIDE_VEHICLE = 1,   // `id` is the session's netId: a session car or boat, or traffic
+	RIDE_TRAIN   = 2,   // `track` is CTrain::m_nTrackId, `id` CTrain::m_nWagonId
+};
+
+struct PlayerRideBody {
+	uint8_t  kind;      // RideKind
+	uint8_t  track;     // RIDE_TRAIN only: 0 the El, 1 the subway
+	uint16_t id;
+	Vec3     offset;    // position in the vehicle's own frame: right, forward, up
+	float    heading;   // CPed::m_fRotationCur less the vehicle's heading
+};
+
+struct C_PlayerStateRide {
+	static constexpr uint8_t OPCODE = OP_C_PLAYER_STATE_RIDE;
+	PacketHeader    hdr;
+	PlayerStateBody body;
+	PlayerRideBody  ride;
+};
+
+struct S_PlayerStateRide {
+	static constexpr uint8_t OPCODE = OP_S_PLAYER_STATE_RIDE;
+	PacketHeader    hdr;
+	uint8_t         playerId;
+	PlayerStateBody body;
+	PlayerRideBody  ride;
+};
+
 enum VehicleFlags : uint8_t {
 	VEH_ENGINE_ON = 1 << 0,   // CVehicle::bEngineOn
 	VEH_SIREN     = 1 << 1,   // CVehicle::m_bSirenOrAlarm
@@ -2468,6 +3213,18 @@ enum VehicleFlags : uint8_t {
 	// last snapshot's flags and replays them in S_VehicleSpawn, so a spawn can
 	// carry this bit, and a receiver must not honk off it.
 	VEH_HORN = 1 << 4,
+
+	// The taxi light is on: bit 3 of CAutomobile's flags byte at +0x4D9, which
+	// only the script turns on (SET_TAXI_LIGHTS, the taxi side job) and which
+	// PreRender draws as the corona on the roof. A state like the siren, so it
+	// rides the spawn as well and a joiner sees it.
+	VEH_TAXI_LIGHT = 1 << 5,
+
+	// The handbrake is on: CVehicle::bIsHandbrakeOn, bit 5 of +0x1F5, which
+	// the driver's own ProcessControlInputs takes from his pad. It locks the
+	// rear wheels, which is the skid, the smoke and the squeal of a handbrake
+	// turn. Only a snapshot means anything by it.
+	VEH_HANDBRAKE = 1 << 6,
 };
 
 struct VehicleStateBody {
@@ -2778,6 +3535,14 @@ struct EnterVehicleBody {
 
 	Vec3     pos;
 	Quat     rot;
+
+	// The car generator a parked car came out of, plus one; 0 for any other
+	// car. Only a claim fills it in (netId INVALID_NETID). Every machine has
+	// its own car standing on that generator, so every receiver of the spawn
+	// has to let go of its own or the parked car stays on its screen beside
+	// the one being driven away (docs/protocol.md 1.44). Plus one so that a
+	// zeroed body means "not a parked car" and never generator 0.
+	uint16_t parkedSlot;
 };
 
 struct C_EnterVehicle {
@@ -2906,12 +3671,64 @@ struct S_VehicleSpawn {
 	int8_t   extra1, extra2;     // CVehicle::m_aExtras, -1 for none
 	float    health;             // CVehicle::m_fHealth, 1000 = full
 	uint8_t  flags;              // VehicleFlags, same bits the snapshot uses
+	// EnterVehicleBody::parkedSlot from the claim, for a claim and for the
+	// backfill alike: a joiner has a car on that generator too.
+	uint16_t parkedSlot;
 };
 
 struct S_VehicleDespawn {
 	static constexpr uint8_t OPCODE = OP_S_VEHICLE_DESPAWN;
 	PacketHeader hdr;
 	uint16_t netId;
+};
+
+// ---- a session car an engine took away on purpose (CH_EVENT) ---------------
+//
+// docs/protocol.md 1.44. The engine deletes cars by itself for reasons that
+// are the player's doing and not an accident: the crusher, the military
+// crane at the Portland docks, Craig's import/export garages, the police and
+// bank-van garage, a mission garage, and a safehouse garage storing what is
+// parked in it. Each of those runs on every machine, on that machine's own
+// copy, and each pays that machine's player - so a car driven into the
+// crusher used to pay everybody standing near it, and then came back, because
+// a session car that leaves the pool without being a wreck is rebuilt.
+//
+// Now one machine may let its engine do it: the one that holds the car (the
+// driver, else the custodian, else whoever drove it last, else the session
+// host). Every other machine's crusher and crane cannot see the car and its
+// garages leave it alone. The holder's engine does what it does, pays its
+// own player through its own code, and this packet ends the car everywhere
+// else. The server then sends S_VehicleDespawn like any release. What the
+// delivery added to Craig's lists or the crane's goes as every change to
+// them does (C_CarLists).
+enum VehicleRemovedReason : uint8_t {
+	VEHICLE_REMOVED_NONE     = 0,   // never sent
+	VEHICLE_REMOVED_CRUSHED  = 1,   // GARAGE_CRUSHER
+	VEHICLE_REMOVED_CRANE    = 2,   // the military crane (CCrane::Update)
+	VEHICLE_REMOVED_EXPORTED = 3,   // Craig: GARAGE_COLLECTCARS_1..3
+	VEHICLE_REMOVED_COLLECTED= 4,   // GARAGE_COLLECTSPECIFICCARS
+	VEHICLE_REMOVED_MISSION  = 5,   // GARAGE_MISSION, a mission's delivery
+	VEHICLE_REMOVED_STORED   = 6,   // a safehouse garage stored it
+	VEHICLE_REMOVED_COUNT
+};
+
+struct VehicleRemovedBody {
+	uint16_t netId;
+	uint8_t  reason;   // VehicleRemovedReason
+	uint8_t  pad;
+};
+
+struct C_VehicleRemoved {
+	static constexpr uint8_t OPCODE = OP_C_VEHICLE_REMOVED;
+	PacketHeader       hdr;
+	VehicleRemovedBody body;
+};
+
+struct S_VehicleRemoved {
+	static constexpr uint8_t OPCODE = OP_S_VEHICLE_REMOVED;
+	PacketHeader       hdr;
+	uint8_t            playerId;   // whose engine did it
+	VehicleRemovedBody body;
 };
 
 // ---------------------------------------------------------------------------
@@ -2958,9 +3775,18 @@ struct S_VehicleDespawn {
 // custodian may report it wrecked (as UNOWNED_SESSION, since nobody drives it).
 //
 // It is also granted to whoever shoots a session car nobody holds, and sent
-// just ahead of their own hit coming back (Session::CustodyForHit). And a
-// custodian keeps a burning car until it goes up rather than until it stops:
-// its fire timer is the only one running, so it is the one BlowUpCar.
+// just ahead of their own hit coming back (Session::CustodyForHit), and that
+// includes the thrower of a blast that left the car standing, whose hit is the
+// blast's own cause and is applied nowhere. And a custodian keeps a burning
+// car until it goes up rather than until it stops: its fire timer is the only
+// one running, so it is the one BlowUpCar - and if the timer has not gone off
+// in CUSTODY_BURN_CAP_MS the custodian blows the car up itself.
+//
+// And a wreck has one: whoever decided it, told right after the blast
+// (Session::DestroyVehicle). Its snapshots carry VEH_WRECKED and a transform,
+// every other machine follows them, and the settle ends as any other does.
+// A car nobody holds at all has its fire timer counted by the host alone
+// (client/src/game/wreck.h).
 struct S_VehicleCustody {
 	static constexpr uint8_t OPCODE = OP_S_VEHICLE_CUSTODY;
 	PacketHeader hdr;
@@ -3263,6 +4089,261 @@ struct S_VehicleDamage {
 	VehicleDamageBody body;
 };
 
+// A car's bomb (docs/mission-audit.md R6): CAutomobile's bomb type, which a
+// bomb shop fits on the machine whose player drove in, the mission fits with
+// ARM_CAR_WITH_BOMB, and the car's own controls set ticking. The machine that
+// simulates the car says when it changes, from the same seat C_VehicleDamage
+// comes from: the driver, or with nobody driving it the player settling it.
+// So IS_CAR_ARMED_WITH_BOMB reads the same on every copy, and the car goes up
+// on that machine, whose blow-up already travels. On change only.
+//
+// The bomb is also whose it is and whether it is burning. `blame` is the
+// player the car's copy names: the one who pressed the button while the fuse
+// burns (m_pBlowUpEntity), and otherwise the one who had it fitted
+// (m_pBombRigger). Every copy writes that player's ped in both, which is what
+// lets the ignition blame the rigger wherever the car is driven, lets the
+// rigger's detonator (a C_Shot with WEAPONTYPE_DETONATOR, relayed as it always
+// was) find the car on the machine that simulates it, and credits the wreck
+// to the bomber on every screen. `fuseMs` is what was left of a lit fuse when
+// it was said, 0 when none is lit: every copy lights its own with it, so the
+// car ticks everywhere and still goes up when whoever simulates it changes
+// before the end.
+constexpr uint8_t CARBOMB_NONE             = 0;
+constexpr uint8_t CARBOMB_TIMED            = 1;
+constexpr uint8_t CARBOMB_ONIGNITION       = 2;
+constexpr uint8_t CARBOMB_REMOTE           = 3;
+constexpr uint8_t CARBOMB_TIMEDACTIVE      = 4;
+constexpr uint8_t CARBOMB_ONIGNITIONACTIVE = 5;
+constexpr uint8_t CARBOMB_MAX = 5;   // 0 none .. 5 on the ignition and ticking
+// The longest fuse the engine lights: the timed bomb's 7000 ms.
+constexpr uint16_t CARBOMB_FUSE_MAX_MS = 7000;
+
+struct C_VehicleBomb {
+	static constexpr uint8_t OPCODE = OP_C_VEHICLE_BOMB;
+	PacketHeader hdr;
+	uint16_t     netId;
+	uint8_t      bombType;   // CARBOMB_*, 0..CARBOMB_MAX
+	uint8_t      blame;      // a player id, INVALID_PLAYER for nobody
+	uint16_t     fuseMs;     // 0..CARBOMB_FUSE_MAX_MS
+	uint16_t     pad;
+};
+
+// Relayed to everyone except the reporter, once the server has checked it is
+// the car's driver or settler, as for C_VehicleDamage. The server keeps the
+// last one for every car and hands it to a joiner after the car, from
+// INVALID_PLAYER, with what is left of the fuse by its own clock.
+struct S_VehicleBomb {
+	static constexpr uint8_t OPCODE = OP_S_VEHICLE_BOMB;
+	PacketHeader hdr;
+	uint8_t      playerId;   // who said so
+	uint8_t      bombType;
+	uint16_t     netId;
+	uint8_t      blame;
+	uint8_t      pad;
+	uint16_t     fuseMs;
+};
+
+// A bomb the mission's own script fitted, ARM_CAR_WITH_BOMB (docs/protocol.md
+// 1.36). The handler writes FindPlayerPed() as the car's rigger, and it is
+// replayed, so every participant's copy named its own player and the bomb
+// became whoever first held the car. It is the mission owner's: the owner's
+// machine says so when its script runs it, for a car the session names, and
+// every participant's own replay names the owner rather than itself.
+struct C_MissionBomb {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_BOMB;
+	PacketHeader hdr;
+	uint16_t     netId;
+	uint8_t      bombType;   // CARBOMB_*, 0..CARBOMB_MAX
+	uint8_t      pad;
+};
+
+// Relayed to everybody but the owner, once the server has checked the sender
+// is the one whose mission may show things (MissionSlot::MayRelayEffect).
+// The car's bomb is `bombType` and `playerId`'s, on every copy, the one its
+// receiver simulates included: the script's word is not the holder's to keep
+// or refuse. The server keeps it with the car's bomb and hands it to a joiner
+// after the S_VehicleBomb it already sends.
+struct S_MissionBomb {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_BOMB;
+	PacketHeader hdr;
+	uint8_t      playerId;   // the mission's owner, whose bomb it is
+	uint8_t      bombType;
+	uint16_t     netId;
+};
+
+// Whether a car's bomb is still the one the mission fitted after a word that
+// says `type` and `blame` about it: the same bomb and the same player. Its
+// timer set going, the detonator taking it off, a bomb shop fitting another
+// or the owner leaving make it a bomb like any other.
+inline bool KeepsMissionBomb(bool mission, uint8_t type, uint8_t blame, uint8_t newType,
+                             uint8_t newBlame) {
+	return mission && newType == type && newBlame == blame && newType != CARBOMB_NONE;
+}
+
+// Whether `presser`'s detonator sets off a car's bomb. Their own remote bomb,
+// as CWorld::UseDetonator matches it; and a remote bomb the running mission
+// fitted, for anybody in that mission: GIVE_WEAPON_TO_PLAYER is replayed, so
+// every participant holds the mission's detonator, and the bomb still goes
+// off blamed on its rigger, the owner, as UseDetonator blames the rigger and
+// not the presser.
+inline bool DetonatorSetsOff(uint8_t bombType, uint8_t blame, bool missionBomb, uint8_t presser,
+                             bool missionRunning, uint8_t missionOwner, uint8_t participants) {
+	if (bombType != CARBOMB_REMOTE || presser >= MAX_PLAYERS || blame >= MAX_PLAYERS)
+		return false;
+	if (blame == presser)
+		return true;
+	if (!missionBomb || !missionRunning || blame != missionOwner)
+		return false;
+	return presser == missionOwner || (participants & (1u << presser)) != 0;
+}
+
+// A mine went off (docs/protocol.md 1.36). DROP_MINE and DROP_NAUTICAL_MINE
+// are replayed, so every participant's engine lays its own mine at the
+// owner's spot, and each one arms and goes off by what its own engine sees:
+// a car over it, or its ten seconds running out. The first machine whose mine
+// goes off says where, and everybody else takes theirs out of the world and
+// sets off the engine's own explosion there. A mine is nobody's, like a
+// parked car, so there is nobody to wait for.
+struct C_MineBlast {
+	static constexpr uint8_t OPCODE = OP_C_MINE_BLAST;
+	PacketHeader hdr;
+	Vec3         pos;   // the mine object's position when it went off
+};
+
+// Relayed to everyone except the sender.
+struct S_MineBlast {
+	static constexpr uint8_t OPCODE = OP_S_MINE_BLAST;
+	PacketHeader hdr;
+	uint8_t      playerId;
+	uint8_t      pad[3];
+	Vec3         pos;
+};
+
+// A place a mine could be: numbers, and inside the map with room to spare.
+// Liberty City's streets are within 2000 m of the origin either way.
+constexpr float MINE_BLAST_MAX_XY = 4000.0f;
+constexpr float MINE_BLAST_MIN_Z  = -200.0f;
+constexpr float MINE_BLAST_MAX_Z  = 1000.0f;
+
+inline bool MineBlastPlaceSane(const Vec3 &p) {
+	return p.x == p.x && p.y == p.y && p.z == p.z && p.x > -MINE_BLAST_MAX_XY &&
+	       p.x < MINE_BLAST_MAX_XY && p.y > -MINE_BLAST_MAX_XY && p.y < MINE_BLAST_MAX_XY &&
+	       p.z > MINE_BLAST_MIN_Z && p.z < MINE_BLAST_MAX_Z;
+}
+
+// ---- the car radio (docs/radio.md, docs/protocol.md 1.33) -----------------
+//
+// CVehicle::m_nRadioStation (+0x229) is what cMusicManager plays in a car the
+// local player sits in, and every machine rolls its own: the constructor
+// picks GetRandomNumber() % 10, and a driver who is not the player picks from
+// his model's radio category when he gets in (CPed::SetRadioStation). So two
+// players in one car heard two stations. The session keeps one per car and
+// every copy carries it.
+//
+// The values are the engine's eRadioStation: 0..8 the nine stations, 9 the
+// user-track player, 10 the police scanner (which a police car plays whatever
+// the byte says), 11 off.
+constexpr uint8_t RADIO_STATION_USERTRACK = 9;
+constexpr uint8_t RADIO_STATION_POLICE    = 10;
+constexpr uint8_t RADIO_STATION_OFF       = 11;
+// Not a station: the session has not been told one for this car.
+constexpr uint8_t RADIO_STATION_UNKNOWN   = 0xFF;
+
+constexpr bool RadioStationValid(uint8_t station) { return station <= RADIO_STATION_OFF; }
+
+// From a player in that car, driver or passenger: his listener put it on
+// `station`, or - from the driver only - the session had no station for it
+// and this is the one his copy already had. On change only.
+struct C_VehicleRadio {
+	static constexpr uint8_t OPCODE = OP_C_VEHICLE_RADIO;
+	PacketHeader hdr;
+	uint16_t     netId;
+	uint8_t      station;   // 0..RADIO_STATION_OFF
+	uint8_t      pad;
+};
+
+// The session's station for a car. To everybody, the sender included, so
+// that two players turning the dial in the same instant end on whichever the
+// server took last on every machine; and to a sender the server refused, with
+// the station it still holds, so that his copy goes back. `playerId` is who
+// changed it, INVALID_PLAYER for the session's own record (the backfill, a
+// refusal).
+struct S_VehicleRadio {
+	static constexpr uint8_t OPCODE = OP_S_VEHICLE_RADIO;
+	PacketHeader hdr;
+	uint8_t      playerId;
+	uint8_t      station;
+	uint16_t     netId;
+};
+
+// ---- a car's alarm (docs/protocol.md 1.39) --------------------------------
+//
+// CVehicle::m_nAlarmState (+0x1A0, int16) is 0 for no alarm, -1 for a car a
+// generator parked with its alarm set (0x00542884), and otherwise the
+// milliseconds it has left to sound. The driver sitting down in an armed car
+// (0x004CF3EF) and an armed car touching another car (0x004971BE) both put
+// 15000 there; CVehicle::ProcessCarAlarm (0x005525A0) takes the frame's time
+// off it; the audio (0x0056C44F) and PreRender's flashing lights (0x00538150)
+// read "not 0 and not -1" as sounding.
+//
+// Only a car its own machine's generator made can be armed, so a copy of it
+// anywhere else never goes off by itself: every other copy is built by
+// CoopIII, and the constructor writes 0. The machine that simulates the car
+// says so once, when it starts, with how long it has left.
+constexpr uint16_t VEHICLE_ALARM_MS = 15000;   // 0x3A98, both arming sites
+
+// From the car's driver, or with nobody driving it the player settling it
+// (C_VehicleDamage's entitlement): its alarm has `remainingMs` left, or with
+// 0 has stopped. Once per alarm, not a stream.
+struct C_VehicleAlarm {
+	static constexpr uint8_t OPCODE = OP_C_VEHICLE_ALARM;
+	PacketHeader hdr;
+	uint16_t     netId;
+	uint16_t     remainingMs;   // 0..VEHICLE_ALARM_MS
+};
+
+// To everybody else, and in the backfill with what is left of it then.
+// `playerId` is INVALID_PLAYER for the session's own record.
+struct S_VehicleAlarm {
+	static constexpr uint8_t OPCODE = OP_S_VEHICLE_ALARM;
+	PacketHeader hdr;
+	uint8_t      playerId;
+	uint8_t      pad;
+	uint16_t     netId;
+	uint16_t     remainingMs;
+};
+
+// ---- where a car's gun points (docs/protocol.md 1.39) ----------------------
+//
+// CAutomobile::m_fCarGunLR (+0x580) and m_fCarGunUD (+0x584), radians. The
+// Rhino's turret turns with the first: CAutomobile::Render (0x00539EA0,
+// vtable slot 13) rotates its turret frame by it, and TankControl
+// (0x0053D530) aims the shell with it. The fire truck's water cannon uses
+// both (FireTruckControl, 0x00522590). Each is changed only by the machine
+// whose player is driving - both functions leave at once for any car that is
+// not FindPlayerVehicle - so a copy's turret faced forward for good.
+//
+// Unreliable, on the snapshot channel, from the driver of one of those two,
+// whenever it moved and once a second besides. The server keeps the last one
+// for the backfill.
+struct C_VehicleAim {
+	static constexpr uint8_t OPCODE = OP_C_VEHICLE_AIM;
+	PacketHeader hdr;
+	uint16_t     netId;
+	float        gunLR;
+	float        gunUD;
+};
+
+struct S_VehicleAim {
+	static constexpr uint8_t OPCODE = OP_S_VEHICLE_AIM;
+	PacketHeader hdr;
+	uint8_t      playerId;   // INVALID_PLAYER for the session's record
+	uint8_t      pad;
+	uint16_t     netId;
+	float        gunLR;
+	float        gunUD;
+};
+
 // How many of each the wire speaks. These are the engine's own counts -
 // CDamageManager has uint8 m_doorStatus[6], and ApplyDamage reaches seven
 // panel indices (four wings, the windscreen, two bumpers) - but they are
@@ -3417,22 +4498,29 @@ inline bool DamageGrew(uint32_t havePanels, uint16_t haveDoors,
 // server keeps on its own. The server has no GTA III running, so a clock it
 // invented is nobody's; the host has one, the campaign's script can move it
 // (SET_TIME_OF_DAY, FORCE_WEATHER), and docs/campaign.md already puts the
-// script on the host. §2.7 is the argument in full.
+// script on the host. §2.7 is the argument in full. A mission's script runs
+// on its owner's machine instead, so while one runs that player is the one
+// followed (sky.h).
 //
 // Two weather types because CWeather doesn't have one. It blends from
 // OldWeatherType to NewWeatherType across a game hour, so a single type
 // describes the destination and not the sky. The blend position isn't sent:
 // CWeather::Update recomputes it as CClock::GetMinutes()/60 every frame, so
-// once the clock matches, the blend matches for free.
+// once the clock matches, the blend matches for free. ForcedWeatherType isn't
+// either: a follower pins its own to what it is told, and GTA III has no
+// extra colours (SET_EXTRA_COLOURS is Vice City's), so CTimeCycle::Update
+// reads nothing past the hour, the minute, the two types and the blend.
 struct WorldStateBody {
 	uint8_t hour, minute;
 	uint8_t weather;        // eWeatherType: 0 sunny, 1 cloudy, 2 rainy, 3 foggy
 	uint8_t weatherOld;     // the one being blended out of
 };
 
-// Only the host sends this, once a second. The server drops it from anyone
-// else, the same way it drops a vehicle snapshot from a player who isn't
-// driving that vehicle.
+// Only the host sends this, once a second, and at once when its clock jumps or
+// its weather turns. While the session's mission runs it is the mission's
+// owner who sends it instead (sky.h). The server drops it from anyone else,
+// the same way it drops a vehicle snapshot from a player who isn't driving
+// that vehicle.
 struct C_WorldState {
 	static constexpr uint8_t OPCODE = OP_C_WORLD_STATE;
 	PacketHeader   hdr;
@@ -3471,11 +4559,19 @@ struct S_WorldState {
 // `tempId` is 32-bit and never leaves the creator's machine except in these
 // two packets. It is not a netId, it is not unique across the session, and
 // nothing may key on it after S_PedSpawn has been handled.
+//
+// A pedestrian or a car the session's mission made on its owner's machine
+// (docs/missions.md 5.3) travels the same way, hosted by that machine, with
+// AMBIENT_MISSION in `flags`: the mission's enemies, its targets and their
+// cars exist on every participant's machine and are fought there.
+constexpr uint8_t AMBIENT_MISSION = 0x01;
+
 struct AmbientPedBody {
 	uint16_t modelId;
 	uint8_t  pedType;    // ePedType, so the replica lands in the same engine
 	                     // counter as the original - see population.md §1.3
-	uint8_t  pad;        // keeps pos 4-aligned and the layout explicit
+	uint8_t  flags;      // AMBIENT_MISSION; 0 from a build before it, and pos
+	                     // stays 4-aligned
 	Vec3     pos;
 	float    heading;
 };
@@ -4024,6 +5120,10 @@ struct AmbientPedState {
 	// be lost and rebuilt, and a restated fact heals all of that by itself
 	// where an event has to handle each race by hand. That is the lesson
 	// docs/protocol.md 2.8.2 records from the player seating work.
+	//
+	// A session car is named too: a car a player has claimed can have the
+	// host's pedestrian in it, and the host is still the only machine that
+	// knows which seat he is in (the history entry above PROTOCOL_VERSION).
 	uint16_t vehicleNetId;  // INVALID_NETID when on foot
 	uint8_t  seat;          // 0 = driver, 1.. = passenger
 	// AMBIENT_PED_* bits. This byte was padding and every sender zeroed it,
@@ -4046,6 +5146,16 @@ constexpr uint8_t AMBIENT_PED_ON_FIRE = 1 << 0;
 constexpr uint8_t AMBIENT_PED_WEAPON_SHIFT = 1;
 constexpr uint8_t AMBIENT_PED_WEAPON_MASK  = 0x1E;
 
+// Bit 5: the host's pedestrian sits in a car the session has no name for, so
+// vehicleNetId cannot say which - a car his host does not host, or one it
+// hosts and the server has not named yet. Where he is is that car's seat, so
+// the observer keeps its replica out of sight and out of the collision rather
+// than standing him in mid-air there, driving nothing. An older sender never
+// sets it and an older receiver never reads it.
+constexpr uint8_t AMBIENT_PED_IN_UNSEEN_CAR = 1 << 5;
+static_assert((AMBIENT_PED_IN_UNSEEN_CAR & (AMBIENT_PED_ON_FIRE | AMBIENT_PED_WEAPON_MASK)) == 0,
+              "the unseen-car bit is clear of the fire bit and the weapon bits");
+
 inline uint8_t AmbientPedFlagsWithWeapon(uint8_t flags, uint8_t weapon) {
 	if (weapon >= INVENTORY_SLOTS)
 		weapon = 0;
@@ -4059,6 +5169,34 @@ inline uint8_t AmbientPedWeapon(uint8_t flags) {
 	const uint8_t w = static_cast<uint8_t>((flags & AMBIENT_PED_WEAPON_MASK) >>
 	                                       AMBIENT_PED_WEAPON_SHIFT);
 	return w < INVENTORY_SLOTS ? w : 0;
+}
+
+// Bit 6: the host's pedestrian is opening a door of `vehicleNetId` and is not
+// in it yet (PED_ENTER_CAR). `seat` is then AmbientPedEntrySeatByte: the seat
+// the entry ends in, low nibble, and the door he goes in by as a seat, high
+// nibble - a driver can go in by the front passenger's door and shuffle
+// across. The observer's copy opens the same door (Client::UpdateAmbientPedSeats).
+constexpr uint8_t AMBIENT_PED_ENTERING = 1 << 6;
+// Bit 7: he is climbing out of the seat `vehicleNetId` and `seat` name
+// (PED_EXIT_CAR, still in it). The copy climbs out with him.
+constexpr uint8_t AMBIENT_PED_EXITING = 1 << 7;
+static_assert(((AMBIENT_PED_ENTERING | AMBIENT_PED_EXITING) &
+               (AMBIENT_PED_ON_FIRE | AMBIENT_PED_WEAPON_MASK | AMBIENT_PED_IN_UNSEEN_CAR)) == 0,
+              "the door bits are clear of the fire, weapon and unseen-car bits");
+
+// How long an observer takes either bit at its word, and so how often the
+// host restates it while it holds: a door takes about two seconds and a row
+// can be lost.
+constexpr uint32_t AMBIENT_DOOR_SAID_MS = 1500;
+
+inline uint8_t AmbientPedEntrySeatByte(uint8_t seat, uint8_t door) {
+	return static_cast<uint8_t>((seat & 0x0F) | ((door & 0x0F) << 4));
+}
+inline uint8_t AmbientPedEntrySeat(uint8_t seatByte) {
+	return static_cast<uint8_t>(seatByte & 0x0F);
+}
+inline uint8_t AmbientPedEntryDoor(uint8_t seatByte) {
+	return static_cast<uint8_t>(seatByte >> 4);
 }
 
 // Twelve, against the traffic stream's eight, and both numbers come out of
@@ -4114,7 +5252,8 @@ struct AmbientCarBody {
 	uint16_t modelId;
 	uint8_t  colour1, colour2;
 	int8_t   extra1, extra2;   // CVehicle::m_aExtras, -1 for an empty slot
-	uint8_t  pad[2];           // keeps pos 4-aligned and the layout explicit
+	uint8_t  flags;            // AMBIENT_MISSION, as for a pedestrian
+	uint8_t  pad;              // keeps pos 4-aligned and the layout explicit
 	Vec3     pos;
 	Quat     rot;
 };
@@ -4223,13 +5362,58 @@ struct AmbientAdoptRow {
 // its occupants.
 constexpr uint8_t MAX_ADOPT_ROWS = 32;
 
+// Why the rows changed hands. The old owner is still in the session for both:
+// a leaver's batch goes out just ahead of his S_PlayerLeave.
+constexpr uint8_t AMBIENT_ADOPT_LEFT   = 0;   // he is leaving
+constexpr uint8_t AMBIENT_ADOPT_LET_GO = 1;   // his engine dropped it (C_CarLetGo)
+
 struct S_AmbientAdopt {
 	static constexpr uint8_t OPCODE = OP_S_AMBIENT_ADOPT;
 	PacketHeader    hdr;
 	uint8_t         wasOwnerPlayerId;
 	uint8_t         count;
-	uint8_t         pad[2];
+	uint8_t         why;             // AMBIENT_ADOPT_LEFT / _LET_GO
+	uint8_t         pad;
 	AmbientAdoptRow rows[MAX_ADOPT_ROWS];
+};
+
+// ---------------------------------------------------------------------------
+// A traffic car its host's engine drops while somebody else can see it
+// (CH_EVENT)
+// ---------------------------------------------------------------------------
+//
+// Each machine's CCarCtrl::PossiblyRemoveVehicle measures a traffic car
+// against that machine's own player and camera: 25 m behind him for one
+// stopped in traffic, 50 m off his screen, 130 m on it. The machine that made
+// a car hosts it, so a car can be past all of that for its host and right in
+// front of another player, and the host's despawn took it off his screen.
+//
+// So a host whose engine drops a car by distance while another player is
+// within AMBIENT_CAR_KEEP_RADIUS_M of it sends this instead of C_CarDespawn.
+// The server hands the car, and the host's pedestrians named here with it
+// (its driver and passengers, whom ~CVehicle takes with the car), to the
+// player nearest it who has not let go of it lately, with an S_AmbientAdopt
+// to everybody else (why AMBIENT_ADOPT_LET_GO) - the same handover a leaver's
+// crowd gets. The sender is sent the car and the peds as backfill spawns
+// under their new owner, since its engine has already deleted its own. With
+// nobody to take it, it goes with S_CarDespawn / S_PedDespawn as before.
+//
+// The receiver's own engine then keeps it by its own player and camera, which
+// is the only camera that can say whether the car is in view.
+constexpr uint8_t MAX_LET_GO_PEDS = 9;   // a driver and eight passengers
+
+// The engine's widest distance for keeping a traffic car, 130 m on screen
+// times 1.5 for bExtendedRange (client addresses.h, CCarCtrl::
+// PossiblyRemoveVehicle). Past it nobody's engine keeps the car anyway.
+constexpr float AMBIENT_CAR_KEEP_RADIUS_M = 130.0f * 1.5f;
+
+struct C_CarLetGo {
+	static constexpr uint8_t OPCODE = OP_C_CAR_LET_GO;
+	PacketHeader hdr;
+	uint16_t     netId;
+	uint8_t      pedCount;
+	uint8_t      pad;
+	uint16_t     peds[MAX_LET_GO_PEDS];
 };
 
 // Which pedestrians can be handed on at all. A replica is always built as a
@@ -4312,10 +5496,12 @@ constexpr uint8_t MAX_CAR_STATES = 8;
 
 // A traffic car's horn, one bit per row, kept in the batch's own padding
 // (C_CarStates::hornMask, S_CarStates::hornMask). The host sets bit i when the
-// car in cars[i] has a running m_nCarHornTimer that its own audio would play
-// (client/src/game/horn.h, TrafficHornOnWire). It means "honking now" and says
-// nothing about how long - the receiver runs the engine's own 44-frame
-// countdown for as long as the newest row says so.
+// car in cars[i] has a running m_nCarHornTimer (client/src/game/horn.h,
+// TrafficHornOnWire). It means "the timer is running now" and says nothing
+// about how long - the receiver runs the engine's own 44-frame countdown for
+// as long as the newest row says so. On a car the host's audio honks, that is
+// the horn; on a police car, an ambulance or an Enforcer with its siren on
+// (the siren bit beside it) it is the fast wail, on the replica as on the host.
 //
 // AmbientCarState itself has no room left: 28 turned its last two padding
 // bytes into `health` and the other 40 are the transform. The batch header
@@ -4441,6 +5627,12 @@ enum PickupIdentFlags : uint8_t {
 	// standing on it: the vote was the say, and the others are already being
 	// moved.
 	PICKUP_F_VOTED   = 1 << 2,
+	// A weapon, armour, health or cash pickup the session's mission laid out
+	// (mission-audit.md R2, the owner's decision): every player takes their
+	// own. A claim is weighed against the claimant's own record, and a
+	// collection is told to everybody so the mission's HAS_PICKUP_BEEN_COLLECTED
+	// moves on, but nobody else's copy is taken away.
+	PICKUP_F_STASH = 1 << 3,
 };
 
 // "I am near this pickup and I want it."
@@ -4968,6 +6160,43 @@ struct S_GarageState {
 	GarageMaskBody body;
 };
 
+// ---- the scripted gates (CH_EVENT) ------------------------------------------
+//
+// Not garages. main.scm's GATES thread starts seven threads (gates.sc), one
+// per gate object init.sc creates: the two Staunton police HQ gates, the
+// Colombians' two, Phil's, the fish factory's and the dog-food factory's.
+// Each wakes once a second and slides its gate open for the *local* player in
+// the right car or the right box and shut when he is in the zone but not the
+// box - so a gate open on one screen was shut on the teammate's, who drove
+// into it. They are main-script threads, so the mission replay never saw
+// them (its SLIDE_OBJECT entry replays mission scripts only).
+//
+// The same union as the garages: one bit per gate, "my own GATES thread wants
+// this gate open", and every machine holds a gate open while anybody's bit is
+// set (client/src/game/gates.h). A gate is its index in GATE_COUNT's table,
+// named there by the positions gates.sc slides it between. Sent reliably on
+// change, relayed, and replayed to a joiner.
+constexpr uint8_t GATE_COUNT = 7;
+
+struct GateMaskBody {
+	uint8_t open;     // bit i: gate i
+	uint8_t pad[3];
+};
+
+struct C_GateState {
+	static constexpr uint8_t OPCODE = OP_C_GATE_STATE;
+	PacketHeader hdr;
+	GateMaskBody body;
+};
+
+struct S_GateState {
+	static constexpr uint8_t OPCODE = OP_S_GATE_STATE;
+	PacketHeader hdr;
+	uint8_t      playerId;
+	uint8_t      pad[3];
+	GateMaskBody body;
+};
+
 // A Pay'n'Spray finished. The door half of this already travels as a mask
 // bit; this is the part a door cannot carry.
 //
@@ -4989,17 +6218,16 @@ struct S_GarageState {
 //      are read back off the car *after* the owner's engine chose them and
 //      written straight onto the observer's copy; no observer ever calls
 //      ChooseVehicleColour.
-//   3. **The wanted level.** Does NOT travel, and this packet has no field
-//      for it. The wanted level is not on the wire at all yet
-//      (roadmap.md §5.1, designed and unbuilt, and being worked on right
-//      now by somebody else). The respray clears the wanted level of the
-//      player who paid for it, on their own machine, through the engine's
-//      own CWanted::Reset - which already happens and needs nothing from
-//      CoopIII. What an observer must *not* do is clear its own player's
-//      stars because somebody else visited a spray shop, and the seam in
-//      client/src/game/garage.cpp is written so that it does not: it skips
-//      the arm that would. If §5.1 ever lands a shared wanted level, that
-//      skip is the one place that has to change.
+//   3. **The wanted level.** No field for it: every respray is a clear,
+//      because the engine's respray arm calls CWanted::Reset whatever the
+//      payer had (0x004226FB). The payer's own engine does that on the
+//      payer's machine. A receiver clears its own stars only when the
+//      session's wanted rule says the respray reaches it - always under
+//      `shared`, under `perplayer` only when it is sitting in the car
+//      `vehicleNetId` names - and it does so from Client::TickWanted through
+//      CPlayerPed::SetWantedLevel(0), never by letting its own garage arm
+//      run, which client/src/game/garage.cpp still refuses (docs/wanted.md
+//      §4.9).
 //
 // vehicleNetId is INVALID_NETID when the car being sprayed is not a session
 // car - a player can drive an unclaimed traffic car into a Pay'n'Spray, and
@@ -5115,6 +6343,967 @@ struct C_Password {
 	PacketHeader hdr;
 	char         password[PASSWORD_LEN];   // not necessarily terminated
 };
+
+// ---------------------------------------------------------------------------
+// The host's kick
+// ---------------------------------------------------------------------------
+//
+// The server's window could always throw a player out, and a server run with
+// --nogui never could. A mission waits for every player at its start
+// (docs/missions.md 9), so somebody who never comes has to be thrown out from
+// inside the game, by the host (Session::HostId). The client sends this when
+// its player is the host; the server checks that again, because the client's
+// word for it is only a claim, and kicks through the same path its window
+// uses, so everybody reads "was kicked".
+
+struct C_Kick {
+	static constexpr uint8_t OPCODE = OP_C_KICK;
+	PacketHeader hdr;
+	uint8_t      playerId;   // who goes
+};
+
+// ---------------------------------------------------------------------------
+// The lobby (docs/protocol.md 1.31)
+// ---------------------------------------------------------------------------
+//
+// A new game has everybody starting at once, and nobody's game is running
+// yet to connect with. So the launcher connects instead, before any game:
+// it waits in the server's lobby, sees who else is waiting and who is
+// already playing, and the lobby's host, the one who has waited longest,
+// starts everybody's game at once. Every launcher in the lobby then starts
+// its own gta3.exe and goes, and each game connects as it always does. A
+// lobby member is no player: it holds no slot, has no ped and hears nothing
+// of the session but this.
+//
+// Not a version. An older server drops C_LobbyJoin, and the launcher, hearing
+// no answer, says so and leaves the player to start their game alone.
+
+// Launchers waiting at once, besides the players in the game.
+constexpr uint8_t  LOBBY_MAX              = MAX_PLAYERS;
+// How long a start from the host keeps another one out, so one click is one
+// start however often it arrives.
+constexpr uint32_t LOBBY_START_COOLDOWN_MS = 5000;
+
+// What the lobby's host starts everybody's game into.
+enum LobbyStartMode : uint8_t {
+	LOBBY_START_MENU     = 1,   // the menu: each player loads a save of their own, or picks
+	LOBBY_START_NEW_GAME = 2,   // a new game, straight past the menu
+};
+
+// A launcher asking into the lobby. The password is the server's, if it has
+// one (C_Password's), and travels as typed.
+struct C_LobbyJoin {
+	static constexpr uint8_t OPCODE = OP_C_LOBBY_JOIN;
+	PacketHeader hdr;
+	uint16_t     protocolVersion;
+	char         nick[NICK_LEN];
+	char         password[PASSWORD_LEN];
+};
+
+// The answer. Refused with the S_Welcome reasons: another version, a full
+// lobby, or the wrong password, and the server hangs up behind it.
+struct S_LobbyAnswer {
+	static constexpr uint8_t OPCODE = OP_S_LOBBY_ANSWER;
+	PacketHeader hdr;
+	uint8_t      reject;            // RejectReason
+	uint8_t      lobbyId;           // this launcher's place in the lobby
+	uint16_t     protocolVersion;   // the server's
+};
+
+enum LobbyEntryFlags : uint8_t {
+	LOBBY_ENTRY_HOST    = 1 << 0,   // may start everybody's game
+	LOBBY_ENTRY_PLAYING = 1 << 1,   // in the game already, not in the lobby
+};
+
+struct LobbyEntry {
+	uint8_t id;      // a lobby id, or a player id for somebody playing
+	uint8_t flags;   // LobbyEntryFlags
+	char    nick[NICK_LEN];
+};
+
+// Who is there: the lobby, longest waiting first, then everybody already in
+// the game. To every lobby member whenever either changes.
+struct S_Lobby {
+	static constexpr uint8_t OPCODE = OP_S_LOBBY;
+	PacketHeader hdr;
+	uint8_t      count;         // entries used
+	uint8_t      hostLobbyId;   // the lobby id of its host, INVALID_PLAYER with nobody waiting
+	uint8_t      waiting;       // how many of the entries are the lobby's
+	uint8_t      pad;
+	LobbyEntry   entries[LOBBY_MAX + MAX_PLAYERS];
+};
+
+// The lobby's host starting everybody's game. Taken from the host alone.
+struct C_LobbyStart {
+	static constexpr uint8_t OPCODE = OP_C_LOBBY_START;
+	PacketHeader hdr;
+	uint8_t      mode;   // LobbyStartMode
+	uint8_t      pad[3];
+};
+
+// To everybody in the lobby, the host included: start your game now.
+struct S_LobbyStart {
+	static constexpr uint8_t OPCODE = OP_S_LOBBY_START;
+	PacketHeader hdr;
+	uint8_t      mode;        // LobbyStartMode
+	uint8_t      byLobbyId;   // the host who started it
+	uint8_t      pad[2];
+};
+
+// ---------------------------------------------------------------------------
+// The session's one mission
+// ---------------------------------------------------------------------------
+//
+// docs/missions.md is the design and docs/protocol.md 1.29 the wire. Every
+// machine runs its own main.scm, so every machine's triggers see its own
+// player walk into a marker. The session adds the owner's rule: one mission
+// at a time, with everybody in it. The machine that starts a mission owns
+// and runs it; every other player is a participant.
+//
+// **Starting is a claim.** A start gate is the last check a trigger makes
+// before its START_MISSION: CAN_PLAYER_START_MISSION for a contact or a
+// payphone, the sub-mission button for an odd job. While its player keeps
+// satisfying one, a machine sends C_MissionClaim every
+// MISSION_CLAIM_REFRESH_MS with the start's area, and answers the gate false
+// until S_MissionClaim says GRANTED. The server grants the slot when it is
+// free and every other player is inside the area or within the session's
+// margin of it (coopiii/mission.h, InMissionArea). Until then it answers
+// WAITING with who is missing, and S_MissionWaiting tells everybody the
+// same, so the players who are missing know they are waited for. A claim
+// nobody refreshes lapses after MISSION_CLAIM_TTL_MS: its player walked away.
+//
+// **Then it runs.** When the owner's START_MISSION runs, C_MissionStarted
+// names the mission and S_MissionState tells everybody, a joiner included.
+// When it ends, C_MissionEnded says how and S_MissionState goes back to
+// idle with that outcome. A participant who dies or is busted with the
+// server's missionFailOnDeath on earns the owner an S_MissionFail, and the
+// owner's script fails the mission the way it would for the owner's own
+// death. The owner leaving fails it for everybody (missions.md 12.3).
+//
+// **Checkpoints.** A mission's location check whose area holds one of its
+// coordinate blips waits for everybody too. The owner's machine has every
+// player's position already and decides that itself; C_MissionCheckpoint
+// only tells the others who is still missing, through S_MissionWaiting.
+
+constexpr uint32_t MISSION_CLAIM_TTL_MS      = 2000;
+constexpr uint32_t MISSION_CLAIM_REFRESH_MS  = 500;
+// How far outside a start or a checkpoint still counts as there, unless the
+// server says otherwise. 5 m, decided 2026-09-24 (missions.md 9).
+constexpr uint16_t MISSION_MARGIN_CM_DEFAULT = 500;
+// No mission, or one the claim does not know the number of yet.
+constexpr uint16_t MISSION_NONE              = 0xFFFF;
+
+// PlayerStateBody::pedState for a player the police have arrested
+// (PED_ARRESTED, which only the respawn at the police station takes off
+// again). The server reads it for the death rule, since a bust is the other
+// half of it (missions.md 12.2). client.h's WIRE_PEDSTATE_ARRESTED is held to it.
+constexpr uint8_t PEDSTATE_ON_WIRE_ARRESTED = 56;
+
+enum MissionKind : uint8_t {
+	MISSION_KIND_STORY  = 0,   // a contact or a payphone
+	MISSION_KIND_ODDJOB = 1,   // paramedic, firefighter, vigilante, taxi
+	MISSION_KIND_RC     = 2,   // the RC toy van, and Toyminator's
+	MISSION_KIND_4X4    = 3,   // the three 4x4 runs and Multistorey Mayhem
+};
+
+// The engine's locates are boxes: a centre and a half-size on each axis. A
+// 2D one ignores height. An odd job has no area at all, since its button
+// works anywhere, so its area is the owner: `centre` is where they are.
+enum MissionAreaShape : uint8_t {
+	MISSION_AREA_BOX2D = 0,
+	MISSION_AREA_BOX3D = 1,
+	MISSION_AREA_OWNER = 2,
+};
+
+struct MissionArea {
+	Vec3    centre;
+	Vec3    half;     // unused for MISSION_AREA_OWNER
+	uint8_t shape;    // MissionAreaShape
+	uint8_t pad[3];
+};
+
+struct C_MissionClaim {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_CLAIM;
+	PacketHeader hdr;
+	// Names the gate, so a claim is refreshed rather than repeated: the
+	// asking script's instruction pointer at the gate. Opaque to the server.
+	uint32_t     launchKey;
+	uint16_t     missionHint;   // the mission it launches, or MISSION_NONE
+	uint8_t      kind;          // MissionKind
+	uint8_t      pad;
+	MissionArea  area;
+};
+
+enum MissionClaimVerdict : uint8_t {
+	MISSION_CLAIM_GRANTED = 0,
+	MISSION_CLAIM_WAITING = 1,   // everybody is not there yet: `missingMask`
+	MISSION_CLAIM_BUSY    = 2,   // somebody else's claim or mission: `ownerId`
+};
+
+// To the claimant alone.
+struct S_MissionClaim {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_CLAIM;
+	PacketHeader hdr;
+	uint32_t     launchKey;
+	uint8_t      verdict;       // MissionClaimVerdict
+	uint8_t      ownerId;       // whose it is, for BUSY; the claimant otherwise
+	uint8_t      missingMask;   // bit i: player i is not there yet
+	uint8_t      pad;
+};
+
+enum MissionWaitKind : uint8_t {
+	MISSION_WAIT_NONE       = 0,   // nobody is waited for any more
+	MISSION_WAIT_START      = 1,
+	MISSION_WAIT_CHECKPOINT = 2,
+};
+
+// To everybody, whenever who is waited for changes.
+struct S_MissionWaiting {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_WAITING;
+	PacketHeader hdr;
+	uint8_t      ownerId;       // who is waiting
+	uint8_t      missingMask;   // for whom
+	uint8_t      what;          // MissionWaitKind
+	// Of missingMask, the ones whose game is in a mission of its own, a new
+	// game's intro say (C_MissionBusy). A start only.
+	uint8_t      busyMask;
+	uint16_t     missionHint;   // MISSION_NONE when it is not known
+	// Seconds from now until the wait goes on without whoever it is still
+	// for; 0 when it does not. A start does only when the busyMask ones are
+	// all it still waits for; a checkpoint always does, after
+	// MISSION_CHECKPOINT_WAIT_MS from when it began to wait.
+	uint16_t     goesOnInS;
+	Vec3         where;         // the start or the checkpoint
+};
+
+// A start that waits only for players whose game is in a mission of its own
+// goes on without them after this long. Their game may be in a two-minute
+// intro nobody else can end for them, or stuck in one; they come into the
+// running mission as a joiner does once it is over. Somebody who is simply
+// somewhere else is still waited for, and is the host's to kick.
+constexpr uint32_t MISSION_BUSY_WAIT_MS = 60000;
+
+// A checkpoint waits this long for the participants who are not in it, and
+// then the owner's mission goes on without them. Somebody across the map, or
+// stuck behind a wall, would otherwise hold it for ever while the owner stands
+// in it and the mission's own timer runs out. The owner's machine decides it
+// (MissionSync::AskCheckpoint); the server counts the same time down for
+// everybody's screen (S_MissionWaiting::goesOnInS).
+constexpr uint32_t MISSION_CHECKPOINT_WAIT_MS = 60000;
+
+struct C_MissionStarted {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_STARTED;
+	PacketHeader hdr;
+	uint32_t     launchKey;
+	uint16_t     missionNumber;   // START_MISSION's operand
+	uint16_t     pad;
+};
+
+enum MissionState : uint8_t {
+	MISSION_STATE_IDLE    = 0,
+	MISSION_STATE_RUNNING = 1,
+};
+
+enum MissionOutcome : uint8_t {
+	MISSION_OUTCOME_NONE       = 0,
+	MISSION_OUTCOME_PASSED     = 1,
+	MISSION_OUTCOME_FAILED     = 2,
+	MISSION_OUTCOME_OWNER_LEFT = 3,   // missions.md 12.3: it fails for everybody
+};
+
+// S_MissionState::flags
+constexpr uint8_t MISSION_FLAG_FAIL_ON_DEATH = 0x01;   // the server's missionFailOnDeath
+
+// How the session's mission's enemies stand up to more than one player
+// (docs/missions.md 10), the server's missionEnemies. The owner's machine
+// applies it, as its mission gives each enemy a KILL_PLAYER objective.
+enum MissionEnemies : uint8_t {
+	MISSION_ENEMIES_ORIGINAL = 0,   // single player's, exactly
+	MISSION_ENEMIES_TOUGHER  = 1,   // their health and armour grow with the players
+	MISSION_ENEMIES_MORE     = 2,   // tougher, and copies beside them (§10.5)
+};
+// The server's missionScale: what each participant after the first adds to
+// an enemy, in percent. 50 makes two players' enemies 1.5 times as tough.
+constexpr uint16_t MISSION_SCALE_DEFAULT = 50;
+constexpr uint16_t MISSION_SCALE_MAX     = 200;
+// With `more`, each generic enemy gets one copy for each player past the
+// first, at most this many (docs/missions.md 10.5).
+constexpr uint8_t  MISSION_ENEMY_COPIES_MAX = 3;
+
+// To everybody on every change, and to a joiner in the backfill. Idle with an
+// outcome is the end of the mission `missionNumber`.
+struct S_MissionState {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_STATE;
+	PacketHeader hdr;
+	uint8_t      state;          // MissionState
+	uint8_t      ownerId;
+	uint16_t     missionNumber;
+	uint8_t      participants;   // bit i: player i is in it
+	uint8_t      flags;          // MISSION_FLAG_*
+	uint8_t      outcome;        // MissionOutcome, for the mission that just ended
+	uint8_t      enemies;        // MissionEnemies
+	uint16_t     marginCm;       // how far outside an area still counts as there
+	uint16_t     scalePct;       // missionScale
+	// Which run of the server this is, as its campaign log names itself
+	// (C_CampaignSince). Another one than last time is a server that has
+	// started over, and so has its log.
+	uint32_t     campaignLog;
+};
+
+struct C_MissionEnded {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_ENDED;
+	PacketHeader hdr;
+	uint16_t     missionNumber;
+	uint8_t      outcome;        // MISSION_OUTCOME_PASSED or _FAILED
+	uint8_t      pad;
+};
+
+enum MissionFailReason : uint8_t {
+	MISSION_FAIL_DIED   = 0,
+	MISSION_FAIL_BUSTED = 1,
+};
+
+// To the owner alone: fail it, the way the engine does for the owner's death.
+struct S_MissionFail {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_FAIL;
+	PacketHeader hdr;
+	uint16_t     missionNumber;
+	uint8_t      reason;         // MissionFailReason
+	uint8_t      playerId;       // who died or was busted
+};
+
+// The owner, at a checkpoint the mission is waiting at for somebody. A
+// missingMask of 0 is the wait being over.
+struct C_MissionCheckpoint {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_CHECKPOINT;
+	PacketHeader hdr;
+	uint8_t      missingMask;
+	uint8_t      pad[3];
+	Vec3         where;
+};
+
+// **What the mission shows** travels as the instructions that show it. The
+// owner's engine runs its mission; each instruction of it on a short list
+// (game/replay.h: the words on the screen, the pay and the stats, the blips,
+// the HUD's timers and counters, the cutscenes, the fades and the camera,
+// the player's moves) goes out as C_MissionEffect with its operands as the
+// owner's engine read them, and every participant's own interpreter runs it.
+// A blip or a cutscene object is the owner's handle on the wire and each
+// participant's own on its machine: a BLIP_NEW or an OBJECT_NEW says which of
+// the owner's the new one stands for, and an instruction that uses one names
+// the owner's. A TELEPORT is SET_PLAYER_COORDINATES, which every participant
+// runs on its own player a little way from where the owner is put. The
+// server relays one only from the running mission's owner, or from the
+// player whose start it has just granted, whose trigger prints the mission's
+// title.
+
+constexpr size_t MISSION_EFFECT_CODE = 64;
+
+enum MissionEffectKind : uint8_t {
+	MISSION_EFFECT_RUN      = 0,
+	MISSION_EFFECT_BLIP_NEW = 1,   // run it; its result is ours for `ownerBlip`
+	MISSION_EFFECT_BLIP_USE = 2,   // `ownerBlip` at code[handleAt], ours in its place
+	MISSION_EFFECT_PAY      = 3,   // ADD_SCORE: not under a shared wallet
+	MISSION_EFFECT_OBJECT_NEW = 4, // run it; its result is ours for `ownerBlip`
+	MISSION_EFFECT_TELEPORT   = 5, // SET_PLAYER_COORDINATES, beside the owner's spot
+	MISSION_EFFECT_PICKUP_NEW = 6, // run it; the pickup it made is ours for `ownerBlip`
+	MISSION_EFFECT_FIRE_NEW   = 7, // run it; the script fire it lit is ours for `ownerBlip`
+	MISSION_EFFECT_SPHERE_NEW = 8, // run it; the sphere it put up is ours for `ownerBlip`
+};
+
+struct MissionEffectBody {
+	uint16_t missionNumber;   // MISSION_NONE for a title before the launch
+	uint8_t  kind;            // MissionEffectKind
+	uint8_t  length;          // bytes of `code` in use
+	uint8_t  handleAt;        // BLIP_USE: where the handle's four bytes are
+	// 0 for everybody; a player id plus one for that player alone, which is
+	// how the owner hands a participant who has just come back what the
+	// mission still has up: its blips, pickups, fires, objects and widgets.
+	// Zero means everybody so that a body left zeroed goes to everybody.
+	uint8_t  onlyTo;
+	// Nonzero on the owner's LOAD_ALL_MODELS_NOW, numbered from 1 in each
+	// mission: every participant says with C_MissionReady that it has run
+	// it, and the owner's mission waits for its models until everybody has.
+	uint16_t readySeq;
+	int32_t  ownerBlip;
+	// One instruction: the opcode, then every operand a literal, a text
+	// label, a global by offset or the runner's local 0.
+	uint8_t  code[MISSION_EFFECT_CODE];
+};
+
+struct C_MissionEffect {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_EFFECT;
+	PacketHeader      hdr;
+	MissionEffectBody body;
+};
+
+struct S_MissionEffect {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_EFFECT;
+	PacketHeader      hdr;
+	uint8_t           ownerId;
+	uint8_t           pad[3];
+	MissionEffectBody body;
+};
+
+// **A widget's value** (mission-audit.md R16). DISPLAY_ONSCREEN_TIMER and the
+// counters register a global, and the HUD reads it out of the script space
+// every frame (and counts a timer down itself). The instruction is replayed,
+// so a participant's HUD shows the widget, reading the participant's copy of
+// that global, which only this keeps up to date: the owner sends its value
+// whenever it is not what the participant's copy would be by now, a counter
+// on every change and a timer when it stops following its own countdown (a
+// bonus, a pause), every two seconds at least, and ten times a second at
+// most. The participant writes it into the same global, and only into one
+// its own HUD is showing.
+constexpr uint32_t MISSION_WIDGET_MIN_MS    = 100;
+constexpr uint32_t MISSION_WIDGET_RESYNC_MS = 2000;
+constexpr int32_t  MISSION_WIDGET_DRIFT_MS  = 250;
+
+struct C_MissionWidget {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_WIDGET;
+	PacketHeader hdr;
+	uint16_t     missionNumber;
+	uint16_t     offset;   // the global's, in the script space
+	int32_t      value;
+};
+
+struct S_MissionWidget {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_WIDGET;
+	PacketHeader hdr;
+	uint8_t      ownerId;
+	uint8_t      pad;
+	uint16_t     missionNumber;
+	uint16_t     offset;
+	uint16_t     pad2;
+	int32_t      value;
+};
+
+// **Everybody's models are in** (docs/missions.md 11.3). A cutscene is every
+// machine's own playback, of models every machine loads for itself, and the
+// owner's mission loads them with LOAD_ALL_MODELS_NOW and waits in a loop on
+// HAS_MODEL_LOADED and HAS_SPECIAL_CHARACTER_LOADED before it starts. Its
+// LOAD_ALL_MODELS_NOW goes out with a `readySeq`, a participant's replay of it
+// loads everything the mission asked for before anything after it runs, and
+// the participant then says so with C_MissionReady, which the server passes to
+// the owner alone. Until every participant has, and for no longer than
+// MISSION_READY_WAIT_MS, the owner's mission is held in its own wait, so
+// nobody's cutscene starts behind everybody else's. A participant says it
+// whether it could load anything or not: it is only ever "go ahead".
+constexpr uint32_t MISSION_READY_WAIT_MS = 5000;
+
+struct C_MissionReady {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_READY;
+	PacketHeader hdr;
+	uint16_t     missionNumber;
+	uint16_t     readySeq;
+};
+
+struct S_MissionReady {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_READY;
+	PacketHeader hdr;
+	uint8_t      playerId;   // the participant who is ready
+	uint8_t      pad;
+	uint16_t     missionNumber;
+	uint16_t     readySeq;
+	uint16_t     pad2;
+};
+
+// **The seats a mission's passengers need** (mission-audit.md R4). In 25
+// missions one of the mission's pedestrians gets into the owner's car:
+// Misty, the bank manager, the patients and the fares with
+// SET_CHAR_OBJ_ENTER_CAR_AS_PASSENGER, and the thugs, the girls and the
+// others who follow the player, whose engine sends them to the player's car
+// the same way. A participant riding in it can sit in the seat the mission
+// needs, and the pedestrian then waits beside the car for ever. So while one
+// of the owner's mission pedestrians is heading for a session car's seats,
+// the owner's machine says so: nobody else sits down in it, and when the
+// seats its engine has free are fewer than the pedestrians heading for them,
+// only as many of the players riding in it as it takes get out, the ones the
+// owner's machine names in `leave`: the players whose copies sit in its
+// passenger seats there, from the last seat forward. The whole list goes each
+// time it changes and every MISSION_SEATS_RESYNC_MS while it is not empty,
+// and an empty one ends it. Taken from the running mission's owner alone and
+// relayed to everybody else.
+constexpr uint8_t  MISSION_SEAT_CARS        = 4;
+constexpr uint32_t MISSION_SEATS_RESYNC_MS  = 2000;
+
+enum MissionSeatFlags : uint8_t {
+	MISSION_SEAT_KEPT  = 1u << 0,   // nobody else sits down in it
+	MISSION_SEAT_LEAVE = 1u << 1,   // and the players in `leave` get out
+};
+
+struct MissionSeatCar {
+	uint16_t netId;   // the session's car
+	uint8_t  flags;   // MissionSeatFlags
+	// Bit n for player n, who is to get out under MISSION_SEAT_LEAVE. 0 with
+	// the flag set is everybody riding in it, which is what an owner of
+	// protocol 54 or older sends.
+	uint8_t  leave;
+};
+
+// **Everybody into the car the mission puts its player in.** Last Requests
+// puts its player into the Reefer with WARP_PLAYER_INTO_CAR, Chaperone into
+// Maria's Stretch, Cipriani's Chauffeur into Toni's car, and the mission then
+// drives off with nothing left for anybody else to follow in, a boat least
+// of all. So once a warp of the owner's mission has put the owner's player in
+// a car the session names, the owner's machine hands the participants on
+// foot the passenger seats its engine has free there, one each, nearest
+// first, keeping back one for each of the mission's pedestrians heading for
+// that car. Each participant given a seat is put straight into it; nobody
+// else is moved. `seats[n]` is player n's wire seat (1 + passenger slot), 0
+// for none. Under MISSION_BOARD_WATER the car is a boat: whoever has no seat
+// in it can't follow it anywhere, so while the owner is in it the owner's
+// checkpoints stop waiting for them (docs/missions.md 11.4). Taken from the
+// running mission's owner alone and relayed to everybody else.
+constexpr uint32_t MISSION_BOARD_WAIT_MS = 5000;
+
+enum MissionBoardFlags : uint8_t {
+	MISSION_BOARD_WATER = 1u << 0,
+};
+
+struct C_MissionBoard {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_BOARD;
+	PacketHeader hdr;
+	uint16_t     missionNumber;
+	uint16_t     netId;               // the session's car
+	uint8_t      seats[MAX_PLAYERS];  // wire seat per player, 0 for none
+	uint8_t      flags;               // MissionBoardFlags
+	uint8_t      pad;
+};
+
+struct S_MissionBoard {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_BOARD;
+	PacketHeader hdr;
+	uint8_t      ownerId;
+	uint8_t      flags;
+	uint16_t     missionNumber;
+	uint16_t     netId;
+	uint8_t      seats[MAX_PLAYERS];
+};
+
+struct C_MissionSeats {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_SEATS;
+	PacketHeader   hdr;
+	uint16_t       missionNumber;
+	uint8_t        count;   // cars in use, at most MISSION_SEAT_CARS
+	uint8_t        pad;
+	MissionSeatCar cars[MISSION_SEAT_CARS];
+};
+
+struct S_MissionSeats {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_SEATS;
+	PacketHeader   hdr;
+	uint8_t        ownerId;
+	uint8_t        count;
+	uint16_t       missionNumber;
+	MissionSeatCar cars[MISSION_SEAT_CARS];
+};
+
+// **One of the mission's objects broke** (mission-audit.md R3). The objects
+// the mission makes are every machine's own, each in the same global, and the
+// map's own identity (ObjectIdent, where the map put it) cannot name them. So
+// a break that a machine's own player or car did to its copy, or that nobody
+// did, on the owner's, goes out named by that global, with the state and the
+// amount ObjectDamage was run with, and every other machine runs the engine's
+// own damage on the object its global holds until it is as broken
+// (OnObjectBrokenElsewhere's rule). That is how the owner's
+// HAS_OBJECT_BEEN_DAMAGED sees a stall a participant drove through in
+// Espresso-2-Go. A blast breaks every copy by itself and is not sent. Taken
+// from anybody in the running mission and relayed to everybody else.
+struct C_MissionObjectBreak {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_OBJECT_BREAK;
+	PacketHeader hdr;
+	uint16_t     missionNumber;
+	uint16_t     global;   // the offset of the global that holds it, everywhere
+	float        amount;   // what ObjectDamage was run with
+	uint8_t      state;    // OBJ_BREAK_*, as ObjectBreakBody::state
+	uint8_t      pad[3];
+};
+
+struct S_MissionObjectBreak {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_OBJECT_BREAK;
+	PacketHeader hdr;
+	uint8_t      playerId;   // whose machine it broke on
+	uint8_t      state;
+	uint16_t     missionNumber;
+	uint16_t     global;
+	uint16_t     pad;
+	float        amount;
+};
+
+// **One of the mission's floating packages taken** (mission-audit.md R2). A
+// Drop In The Ocean's packages fall from a plane and float where they land,
+// so the pickup sync, which names a pickup by where it is, leaves them to each
+// machine. Every machine makes its own (CREATE_FLOATING_PACKAGE is replayed),
+// and a machine whose copy is taken says so, named by the owner's handle for
+// it: the owner's machine then takes its own the way the engine does and
+// pushes it into the ring HAS_PICKUP_BEEN_COLLECTED reads, so the mission
+// counts it, and everybody else's copy goes. Taken from anybody in the
+// running mission and relayed to everybody else.
+struct C_MissionPickup {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_PICKUP;
+	PacketHeader hdr;
+	uint16_t     missionNumber;
+	uint16_t     pad;
+	int32_t      handle;   // the owner's, as the mission holds it
+};
+
+struct S_MissionPickup {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_PICKUP;
+	PacketHeader hdr;
+	uint8_t      playerId;   // whose machine it was taken on
+	uint8_t      pad;
+	uint16_t     missionNumber;
+	int32_t      handle;
+};
+
+// **A game of its own** (docs/missions.md 11.6). A new game starts with the
+// intro, a mission of that machine's own, and the player stands on the first
+// mission's marker all through its opening scene, invisible. So a player
+// whose game runs a mission that is not the session's says so, and the server
+// counts them as nowhere: missing at a start, and out of the running mission
+// until theirs is over, when they come into it like a joiner and are handed
+// what it has up. Their machine runs nothing of the session's mission
+// meanwhile. The owner going into one, a new game in the middle of theirs,
+// ends the session's mission as their leaving would.
+//
+// `fresh` says this machine's game has started over, a load or a new game,
+// so whatever of the running mission it had is gone. The server has the owner
+// hand it over again (S_MissionHandOver), to that player alone.
+struct C_MissionBusy {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_BUSY;
+	PacketHeader hdr;
+	uint8_t      busy;    // 1 while a mission of this machine's own runs
+	uint8_t      fresh;   // 1 once, when this machine's game has started over
+};
+
+struct S_MissionHandOver {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_HAND_OVER;
+	PacketHeader hdr;
+	uint8_t      playerId;   // whose game started over
+	uint8_t      pad;
+	uint16_t     missionNumber;
+};
+
+// **Every pedestrian and car of the running mission, again** (docs/missions.md
+// 11.5). What the mission shows comes to somebody who comes in late through
+// S_MissionHandOver; what it made is the owner's hosted traffic, which reaches
+// a joiner in the backfill and everybody else as it is made. A participant
+// whose game was in a mission of its own when the owner's started, came back
+// from a dropped connection, or started over asks for it all again: the
+// server answers with an S_PedSpawn and an S_CarSpawn, tempId 0, for every
+// AMBIENT_MISSION pedestrian and car it has from somebody else, an S_PedDeath
+// for each of those lying dead, and then S_MissionCatchUp saying how many.
+// The receiver skips what it has already.
+struct C_MissionCatchUp {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_CATCH_UP;
+	PacketHeader hdr;
+	uint16_t     missionNumber;   // as the asker last heard it
+};
+
+struct S_MissionCatchUp {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_CATCH_UP;
+	PacketHeader hdr;
+	uint8_t      ownerId;         // the running mission's owner, INVALID_PLAYER for none
+	uint8_t      pad;
+	uint16_t     missionNumber;
+	uint16_t     cars;            // AMBIENT_MISSION cars sent just before this
+	uint16_t     peds;            // AMBIENT_MISSION pedestrians sent just before this
+	uint16_t     sessionCars;     // of the mission's cars, the ones somebody has claimed since
+};
+
+// **A kill somebody else made** (docs/mission-audit.md R11). Uzi Rider and
+// Bait count their kills with GET_NUM_OF_MODELS_KILLED_BY_PLAYER, which reads
+// CDarkel::RegisteredKills on the owner's machine alone. A kill a
+// participant's machine registers while the session's mission runs goes to
+// the owner, whose counter moves by one for the victim's model: a
+// pedestrian it hosts that its player killed, or that somebody else's hit
+// killed there. The owner's own kills, and the ones the owner's machine
+// registers for somebody else's hit on a pedestrian it hosts, count there as
+// they always did.
+struct C_MissionKill {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_KILL;
+	PacketHeader hdr;
+	uint16_t     missionNumber;
+	uint16_t     model;   // the victim's model index
+};
+
+struct S_MissionKill {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_KILL;
+	PacketHeader hdr;
+	uint8_t      playerId;   // whose machine registered it
+	uint8_t      pad;
+	uint16_t     missionNumber;
+	uint16_t     model;
+	uint16_t     pad2;
+};
+
+// **What a participant's engine answers** (docs/mission-audit.md R5, R7).
+// Some of what the owner's mission asks is decided on every machine, for that
+// machine's player: a garage's state machine shuts on the car its own player
+// brought and resprays its own player's car, and every machine flies its own
+// copy of a mission Cessna for its own player's rocket to bring down. So each
+// participant's machine asks its own engine the owner's questions and says
+// when the answers change, to the owner alone, whose mission then hears "yes"
+// from anybody's engine:
+//
+// - `hasCar` and `resprayed`, per garage: IS_CAR_IN_MISSION_GARAGE now, and a
+//   HAS_RESPRAY_HAPPENED that said yes since the last. A garage is its index in
+//   CGarages::aGarages, main.scm making the same ones in the same order
+//   everywhere.
+// - `shotDown`: a mission plane of the running mission that went down here
+//   since the last, MISSION_SHOT_DOWN_*.
+constexpr uint8_t MISSION_GARAGES = 32;   // bit i is garage i
+
+enum MissionShotDown : uint16_t {
+	MISSION_SHOT_DOWN_DRUG_PLANE    = 1 << 0,   // HAS_DRUG_PLANE_BEEN_SHOT_DOWN, S.A.M.
+	MISSION_SHOT_DOWN_DROP_OFF      = 1 << 1,   // HAS_DROP_OFF_PLANE_BEEN_SHOT_DOWN
+};
+
+struct C_MissionAnswers {
+	static constexpr uint8_t OPCODE = OP_C_MISSION_ANSWERS;
+	PacketHeader hdr;
+	uint16_t     missionNumber;
+	uint16_t     shotDown;    // MissionShotDown, since the last
+	uint32_t     hasCar;      // IS_CAR_IN_MISSION_GARAGE, true here now
+	uint32_t     resprayed;   // HAS_RESPRAY_HAPPENED said true here since the last
+};
+
+struct S_MissionAnswers {
+	static constexpr uint8_t OPCODE = OP_S_MISSION_ANSWERS;
+	PacketHeader hdr;
+	uint8_t      playerId;   // whose engine
+	uint8_t      pad;
+	uint16_t     missionNumber;
+	uint16_t     shotDown;
+	uint16_t     pad2;
+	uint32_t     hasCar;
+	uint32_t     resprayed;
+};
+
+// ---- skipping a cutscene together -------------------------------------------
+//
+// CCutsceneMgr::Update skips a cutscene on the machine whose pad asked for it
+// and nowhere else, so one player's skip left everybody else's scene running
+// and the players came out of it at different moments (docs/missions.md
+// 11.3). Each machine now says which cutscene its game is in whenever the
+// engine's own skip test would let it be skipped (C_CutsceneState, on
+// change), and the server counts everybody in the same one
+// (server/core/cutscenevote.h): the skip input casts a yes instead of
+// skipping, and 75% of them, rounded up, skips it for all of them at once.
+// Alone in a cutscene, a player skips it the way the game always has.
+//
+// Two players are in the same cutscene when the scope and the name are both
+// the same. The session's mission's scene is one cutscene for its owner and
+// every participant replaying it. A scene a game plays for its own script, a
+// new game's intro say, is shared with anybody playing the same one for
+// theirs, so the lobby's new games leave the intro together.
+enum CutsceneScope : uint8_t {
+	CUTSCENE_SCOPE_NONE   = 0,   // no cutscene the engine would skip
+	CUTSCENE_SCOPE_OWN    = 1,   // this game's own script's
+	CUTSCENE_SCOPE_SHARED = 2,   // the session's mission's, owner or participant
+};
+
+// CCutsceneMgr::ms_cutsceneName as LOAD_CUTSCENE's handler copies it: eight
+// bytes, lower case on the wire, not necessarily terminated.
+constexpr size_t CUTSCENE_NAME_LEN = 8;
+
+struct CutsceneKey {
+	uint8_t scope;                    // CutsceneScope
+	char    name[CUTSCENE_NAME_LEN];
+};
+
+// Same scope and the same name, without regard to case.
+inline bool SameCutscene(const CutsceneKey &a, const CutsceneKey &b) {
+	if (a.scope != b.scope)
+		return false;
+	for (size_t i = 0; i < CUTSCENE_NAME_LEN; ++i) {
+		char x = a.name[i], y = b.name[i];
+		if (x >= 'A' && x <= 'Z')
+			x = static_cast<char>(x - 'A' + 'a');
+		if (y >= 'A' && y <= 'Z')
+			y = static_cast<char>(y - 'A' + 'a');
+		if (x != y)
+			return false;
+		if (x == '\0')
+			return true;
+	}
+	return true;
+}
+
+// On every change of the cutscene the sender's game is in (into a skippable
+// one, into another, or out of it: CUTSCENE_SCOPE_NONE with the name zeroed),
+// and on a press of skip: `skip` 1 and the `voteId` of the count it is a yes
+// in. There is no no: not pressing it is.
+struct C_CutsceneState {
+	static constexpr uint8_t OPCODE = OP_C_CUTSCENE_STATE;
+	PacketHeader hdr;
+	CutsceneKey  key;
+	uint8_t      skip;     // 1: the skip input, as a yes
+	uint8_t      voteId;   // with skip, the count it is cast in
+};
+
+// Where the count stands. `voters` below 2 tells the receiver it is alone in
+// the cutscene and skips as the game does.
+struct CutsceneVoteBody {
+	uint8_t     voteId;
+	uint8_t     yes;
+	uint8_t     voters;
+	uint8_t     needed;    // the yes it takes: 75% of voters, rounded up
+	uint8_t     yesMask;   // bit n: player n said skip
+	CutsceneKey key;
+};
+
+enum CutsceneVoteKind : uint8_t {
+	CUTSCENE_VOTE_COUNT = 0,   // to everybody in it, whenever somebody comes, goes or says skip
+	CUTSCENE_VOTE_SKIP  = 1,   // skip it now, to everybody in it at once
+};
+
+// CUTSCENE_VOTE_SKIP: the session's mission moves on with its owner's skip; on
+// a participant it only takes the scene to its end, and the owner's
+// CLEAR_CUTSCENE ends it there as it always did. It also goes alone to a
+// participant who comes into the session's scene a few seconds after it was
+// skipped, with `voters` 0.
+struct S_CutsceneVote {
+	static constexpr uint8_t OPCODE = OP_S_CUTSCENE_VOTE;
+	PacketHeader     hdr;
+	uint8_t          kind;   // CutsceneVoteKind
+	CutsceneVoteBody body;
+};
+
+// ---------------------------------------------------------------------------
+// What a mission leaves behind (docs/missions.md 5.5)
+// ---------------------------------------------------------------------------
+//
+// Every machine runs the same main.scm, so a mission passed on the owner's
+// machine is a set of main-script globals and threads there, and nowhere
+// else: everybody else's triggers would offer it again. When the owner's
+// mission ends its machine sends every main.scm global the mission wrote with
+// a plain assignment (0004/0005 and the arithmetic on them, which is how all
+// 99 completion and unlock flags are set) and that it left different from
+// what it was before its first write, the main-script threads it started
+// (the next mission's trigger, as a passed mission's START_NEW_SCRIPT), and
+// each instruction it ran whose effect a save keeps: a parked-car generator
+// switched, a building swapped, roads closed, a garage's type (game/replay.h,
+// Kind::World). Those also went to everybody as they ran; a part carries one
+// of them, and they come first. A global the mission filled with something
+// an opcode handed back, a car or a blip, is a handle into that machine's
+// pools and is not sent.
+//
+// The server numbers and keeps every delta, and every client keeps its own
+// copy of the log. What a machine's campaign still lacks is worked out
+// against its own globals: the newest delta whose every value is already
+// there, and everything before it, is in (the owner's own, or a save made
+// after it); everything after it is written and its threads are started. A
+// load or a new game asks again, and a save from before the session gets the
+// whole session's missions. A thread is not started a second time: one that
+// names itself (NAME_THREAD, its first instruction) is looked for under that
+// name, and one that does not, every mission trigger, carries a name of the
+// form "@01A2B3" (its label) on every machine that started it for a mission.
+//
+// A client asks for the deltas after the last one it has with
+// C_CampaignSince when it first hears the session's mission state, so a
+// mission passed while it was away or before it came is not missed.
+// S_MissionState::campaignLog says which log that is.
+//
+// Nothing is applied from a machine whose main.scm is not this one:
+// `scriptHash` covers the script past its globals, which no save changes.
+
+constexpr size_t CAMPAIGN_VALUES  = 32;
+constexpr size_t CAMPAIGN_THREADS = 8;
+// What one mission may leave, in parts, and what the server keeps in all. A
+// mission of the campaign sends a few; the bounds are for one that doesn't
+// stop.
+constexpr uint32_t CAMPAIGN_PARTS_PER_MISSION = 128;
+constexpr uint32_t CAMPAIGN_LOG_MAX           = 65536;
+
+struct CampaignValue {
+	uint16_t offset;   // into the script space, where the global lives
+	uint16_t pad;
+	int32_t  value;    // its four bytes, an int or a float alike
+};
+
+struct CampaignThread {
+	int32_t label;     // START_NEW_SCRIPT's operand: where it starts in main.scm
+	char    name[8];   // what it names itself (NAME_THREAD at `label`), or nothing
+};
+
+struct CampaignDeltaBody {
+	uint32_t       seq;             // the server's number for it; 0 from a client
+	uint16_t       missionNumber;
+	uint8_t        valueCount;
+	uint8_t        threadCount;
+	uint8_t        last;            // the mission's last part; threads only ride it
+	uint8_t        pad[3];
+	uint32_t       scriptHash;      // FNV-1a of the owner's main.scm past its globals
+	CampaignValue  values[CAMPAIGN_VALUES];
+	CampaignThread threads[CAMPAIGN_THREADS];
+	uint8_t        opLength;        // an instruction to run, as MissionEffectBody::code
+	uint8_t        pad2[3];
+	uint8_t        op[MISSION_EFFECT_CODE];
+};
+
+// From the running mission's owner, as its mission ends.
+struct C_CampaignDelta {
+	static constexpr uint8_t OPCODE = OP_C_CAMPAIGN_DELTA;
+	PacketHeader      hdr;
+	CampaignDeltaBody body;
+};
+
+// To everybody, the owner too, who only notes the number.
+struct S_CampaignDelta {
+	static constexpr uint8_t OPCODE = OP_S_CAMPAIGN_DELTA;
+	PacketHeader      hdr;
+	uint8_t           ownerId;
+	uint8_t           pad[3];
+	CampaignDeltaBody body;
+};
+
+// Every delta after `seq`, the last one this machine has, to this machine.
+struct C_CampaignSince {
+	static constexpr uint8_t OPCODE = OP_C_CAMPAIGN_SINCE;
+	PacketHeader hdr;
+	uint32_t     seq;
+};
+
+// The cars the Import/Export garages and the emergency crane have taken, as
+// the session's campaign (docs/missions.md 6.1). Each list is the engine's
+// own bits: CGarages::CarTypesCollected, one word for each of the three
+// collecting garages, bit n for the n-th car on its board, and
+// CCranes::CarsCollectedMilitaryCrane, seven bits. Nothing is ever taken off
+// a list, so the session's is every machine's put together.
+constexpr uint8_t CAR_LIST_GARAGES = 3;
+constexpr uint8_t CAR_LIST_CRANE   = 3;   // the crane's, after the garages'
+constexpr uint8_t CAR_LISTS        = 4;
+
+// A machine's own lists, when they have a car the session's lacks, and once
+// on every connection so it is told the session's.
+struct C_CarLists {
+	static constexpr uint8_t OPCODE = OP_C_CAR_LISTS;
+	PacketHeader hdr;
+	uint32_t     collected[CAR_LISTS];
+};
+
+// The session's lists: to the sender, and to everybody when they grew. Each
+// machine puts the bits it lacks into its own engine, and its own main.scm
+// ticks the board, pays nothing twice and opens the crane when its player
+// comes by, as it does for a car of its own.
+struct S_CarLists {
+	static constexpr uint8_t OPCODE = OP_S_CAR_LISTS;
+	PacketHeader hdr;
+	uint32_t     collected[CAR_LISTS];
+};
+
+// Every bit of `add` that `into` lacks, put in; true when there were any.
+inline bool MergeCarLists(uint32_t (&into)[CAR_LISTS], const uint32_t (&add)[CAR_LISTS]) {
+	bool grew = false;
+	for (uint8_t i = 0; i < CAR_LISTS; ++i) {
+		if ((add[i] & ~into[i]) != 0)
+			grew = true;
+		into[i] |= add[i];
+	}
+	return grew;
+}
 
 // ---------------------------------------------------------------------------
 // Desync probes
@@ -5351,6 +7540,28 @@ struct S_ObjectSettled {
 	ObjectRestBody body;
 };
 
+// "My engine just built this object again, and I was told it was broken."
+//
+// The two packets above say there is no table and no backfill, and since this
+// packet that is no longer true, for one reason: the 80 m horizon is *each
+// machine's* horizon. A player who drives off and comes back has his own copy
+// rebuilt pristine while a player who stayed still has it broken, so the
+// session keeps the break and the resting place while any player is within
+// OBJECT_RECORD_RANGE (server/core/objectrecords.h), and hands a joiner the
+// breaks it holds.
+//
+// Sent only for an object this machine has heard about - a break or a
+// resting place off the wire, one of its own reports, or a joiner's backfill -
+// so driving through a city of intact lamp posts sends nothing. The answer is
+// the S_ObjectBroken, then the S_ObjectSettled if there is one, to the asker
+// alone; nothing when the session has forgotten it, which is right, because
+// then nobody is near enough to hold it broken.
+struct C_ObjectRebuilt {
+	static constexpr uint8_t OPCODE = OP_C_OBJECT_REBUILT;
+	PacketHeader hdr;
+	ObjectIdent  ident;   // m_objectMatrix's position, as always
+};
+
 // ---- the police helicopter -------------------------------------------------
 //
 // See the version history's entry 32. A helicopter is named by
@@ -5548,6 +7759,103 @@ struct S_Cheat {
 	CheatBody    body;
 };
 
+// ---- emergency services (docs/protocol.md 1.37) ------------------------------
+
+// A dead ambient pedestrian a medic has just stood up. Sent by the machine
+// whose medic did it, which is the only engine that ran the CPR: the medic is
+// that machine's pedestrian, and its MedicAI decided the treatment was over.
+// The pedestrian may be one it hosts or its replica of somebody else's; either
+// way it is already on his feet there. Reliable, on CH_EVENT, after any
+// C_PedDeath the same machine had for him.
+struct PedReviveBody {
+	uint16_t netId;
+};
+
+struct C_PedRevive {
+	static constexpr uint8_t OPCODE = OP_C_PED_REVIVE;
+	PacketHeader  hdr;
+	PedReviveBody body;
+};
+
+// To everybody but the medic's machine, the pedestrian's host included: the
+// host stands its real ped up, everybody else their replica. Only for a
+// pedestrian the session holds dead and did not make for a mission; the
+// session marks him alive, so his next death is announced like his first and
+// a joiner is handed him on his feet. `playerId` is whose medic it was.
+struct S_PedRevive {
+	static constexpr uint8_t OPCODE = OP_S_PED_REVIVE;
+	PacketHeader  hdr;
+	uint8_t       playerId;
+	PedReviveBody body;
+};
+
+// A fire truck's water cannon, one frame's jet: where it leaves the truck and
+// which way, both in the truck's own frame (x right, y forward, z up, metres
+// and metres per timestep), so an observer's copy sprays from where its own
+// copy of the truck is. What CAutomobile::FireTruckControl handed
+// CWaterCannons::UpdateOne, taken back through the truck's matrix.
+struct WaterCannonBody {
+	uint16_t netId;   // the truck: a session car or a traffic car
+	Vec3     pos;
+	Vec3     dir;
+};
+
+// From the machine that aims the truck - its driver's, or the host of a truck
+// nobody drives - at the snapshot rate while it sprays, unreliable. A jet
+// nobody has heard of for WATER_CANNON_HOLD_MS has stopped.
+struct C_WaterCannon {
+	static constexpr uint8_t OPCODE = OP_C_WATER_CANNON;
+	PacketHeader    hdr;
+	WaterCannonBody body;
+};
+
+// To everybody else, on the snapshot channel. Dropped for a sender who
+// neither drives nor settles a session car nor hosts the traffic car.
+struct S_WaterCannon {
+	static constexpr uint8_t OPCODE = OP_S_WATER_CANNON;
+	PacketHeader    hdr;
+	uint8_t         playerId;
+	WaterCannonBody body;
+};
+
+// How long an observer keeps spraying a jet after its last packet: three and
+// a half packets at SNAPSHOT_HZ, and the same 150 ms CWaterCannon keeps each
+// point of its own jet alive before it moves on (0x00521B86, `add eax,96h`).
+constexpr uint32_t WATER_CANNON_HOLD_MS = 150;
+
+// ---- a unique jump's shot (docs/protocol.md §1.35) ----------------------------
+
+// What the driver's USJ thread did to his camera: SET_FIXED_CAMERA_POSITION
+// then POINT_CAMERA_AT_CAR on the car he drives, or RESTORE_CAMERA_JUMPCUT.
+// `mode` and `swap` are the CCam mode and switch it asked for, 15 (fixed) and
+// 2 (a jump cut) in the stock script. `from` and `up` mean nothing when `on`
+// is 0.
+struct StuntCameraBody {
+	uint16_t netId;   // the session car the shot looks at
+	uint8_t  on;      // 1: the shot starts; 0: it is over
+	uint8_t  mode;
+	uint8_t  swap;
+	uint8_t  reserved;
+	Vec3     from;    // where the camera stands
+	Vec3     up;      // SET_FIXED_CAMERA_POSITION's second vector
+};
+
+// From the car's driver, sent as his camera takes the shot and as it lets go.
+struct C_StuntCamera {
+	static constexpr uint8_t OPCODE = OP_C_STUNT_CAMERA;
+	PacketHeader    hdr;
+	StuntCameraBody body;
+};
+
+// To each player the session has in a passenger seat of that car. `playerId`
+// is the driver.
+struct S_StuntCamera {
+	static constexpr uint8_t OPCODE = OP_S_STUNT_CAMERA;
+	PacketHeader    hdr;
+	uint8_t         playerId;
+	StuntCameraBody body;
+};
+
 // ---- money (MoneyRule) --------------------------------------------------------
 
 // A change to the sender's cash, under MONEY_RULE_SHARED only. `seq` counts
@@ -5696,6 +8004,9 @@ static_assert(offsetof(PlayerStateBody, ammoClip)  == 56, "ammo follows the weap
 static_assert(offsetof(PlayerStateBody, ammoTotal) == 58, "ammo follows the weapon");
 static_assert(offsetof(PlayerStateBody, aimYaw)   == 62, "aim block");
 static_assert(offsetof(PlayerStateBody, flags)    == 70, "flags is last");
+static_assert(sizeof(PlayerRideBody)    == 20, "ride layout");
+static_assert(sizeof(C_PlayerStateRide) == 96, "riding snapshot layout");
+static_assert(sizeof(S_PlayerStateRide) == 97, "riding snapshot layout");
 
 // 1 weapon + 1 flags + 2 clip + 4 total.
 static_assert(sizeof(AmmoSlotBody)    == 8,  "ammo slot layout");
@@ -5703,6 +8014,68 @@ static_assert(sizeof(C_PlayerAmmo)    == 13, "player ammo layout");
 static_assert(sizeof(S_PlayerAmmo)    == 14, "player ammo layout");
 static_assert(sizeof(S_PlayerPings)   == 5 + 2 * MAX_PLAYERS, "ping table layout");
 static_assert(sizeof(C_Password)      == 5 + PASSWORD_LEN, "password layout");
+static_assert(sizeof(C_Kick)          == 6, "kick layout");
+static_assert(sizeof(C_LobbyJoin)     == 5 + 2 + NICK_LEN + PASSWORD_LEN, "lobby join layout");
+static_assert(sizeof(S_LobbyAnswer)   == 5 + 4, "lobby answer layout");
+static_assert(sizeof(LobbyEntry)      == 2 + NICK_LEN, "lobby entry layout");
+static_assert(sizeof(S_Lobby)         == 5 + 4 + (LOBBY_MAX + MAX_PLAYERS) * (2 + NICK_LEN),
+              "lobby roster layout");
+static_assert(sizeof(C_LobbyStart)    == 5 + 4, "lobby start layout");
+static_assert(sizeof(S_LobbyStart)    == 5 + 4, "lobby start layout");
+static_assert(sizeof(MissionArea)         == 28, "mission area layout");
+static_assert(sizeof(C_MissionClaim)      == 5 + 8 + 28, "mission claim layout");
+static_assert(sizeof(S_MissionClaim)      == 5 + 8, "mission claim answer layout");
+static_assert(sizeof(S_MissionWaiting)    == 5 + 8 + 12, "mission waiting layout");
+static_assert(sizeof(C_MissionStarted)    == 5 + 8, "mission start layout");
+static_assert(sizeof(S_MissionState)      == 5 + 16, "mission state layout");
+static_assert(sizeof(C_MissionEnded)      == 5 + 4, "mission end layout");
+static_assert(sizeof(S_MissionFail)       == 5 + 4, "mission fail layout");
+static_assert(sizeof(C_MissionCheckpoint) == 5 + 4 + 12, "mission checkpoint layout");
+static_assert(sizeof(MissionEffectBody)   == 12 + MISSION_EFFECT_CODE, "mission effect layout");
+static_assert(sizeof(C_MissionEffect)     == 5 + sizeof(MissionEffectBody), "mission effect layout");
+static_assert(sizeof(S_MissionEffect)     == 9 + sizeof(MissionEffectBody), "mission effect layout");
+static_assert(sizeof(C_MissionWidget)     == 5 + 8, "mission widget layout");
+static_assert(sizeof(S_MissionWidget)     == 5 + 12, "mission widget layout");
+static_assert(sizeof(C_MissionBusy)        == 5 + 2, "mission busy layout");
+static_assert(sizeof(S_MissionHandOver)    == 5 + 4, "mission hand-over layout");
+static_assert(sizeof(C_MissionCatchUp)     == 5 + 2, "mission catch-up ask layout");
+static_assert(sizeof(S_MissionCatchUp)     == 5 + 10, "mission catch-up answer layout");
+static_assert(sizeof(C_MissionKill)        == 5 + 4, "mission kill layout");
+static_assert(sizeof(S_MissionKill)        == 5 + 8, "mission kill layout");
+static_assert(sizeof(C_MissionAnswers)     == 5 + 12, "mission answers layout");
+static_assert(sizeof(S_MissionAnswers)     == 5 + 16, "mission answers layout");
+static_assert(sizeof(CutsceneKey)          == 9, "cutscene key layout");
+static_assert(sizeof(C_CutsceneState)      == 5 + 11, "cutscene state layout");
+static_assert(sizeof(CutsceneVoteBody)     == 14, "cutscene vote layout");
+static_assert(sizeof(S_CutsceneVote)       == 5 + 15, "cutscene vote layout");
+static_assert(OP_C_CUTSCENE_STATE == 0x9E && OP_S_CUTSCENE_VOTE == 0x9F,
+              "the cutscene vote stays inside 0x9E..0x9F");
+static_assert(sizeof(C_MissionPickup)      == 5 + 8, "mission pickup layout");
+static_assert(sizeof(S_MissionPickup)      == 5 + 8, "mission pickup layout");
+static_assert(sizeof(C_MissionObjectBreak) == 5 + 12, "mission object break layout");
+static_assert(sizeof(S_MissionObjectBreak) == 5 + 12, "mission object break layout");
+static_assert(sizeof(MissionSeatCar)      == 4, "mission seat layout");
+static_assert(sizeof(C_MissionSeats)      == 5 + 4 + 4 * MISSION_SEAT_CARS, "mission seats layout");
+static_assert(sizeof(S_MissionSeats)      == 5 + 4 + 4 * MISSION_SEAT_CARS, "mission seats layout");
+static_assert(offsetof(MissionSeatCar, leave) == 3, "leave is where the pad was");
+static_assert(MAX_PLAYERS <= 8, "MissionSeatCar::leave has a bit per player");
+static_assert(sizeof(C_MissionBoard)      == 5 + 4 + MAX_PLAYERS + 2, "mission board layout");
+static_assert(sizeof(S_MissionBoard)      == 5 + 6 + MAX_PLAYERS, "mission board layout");
+static_assert(OP_C_MISSION_BOARD == 0xE4 && OP_S_MISSION_BOARD == 0xE5,
+              "the board takes the rest of the money block");
+static_assert(sizeof(C_MissionReady)      == 5 + 4, "mission ready layout");
+static_assert(sizeof(S_MissionReady)      == 5 + 8, "mission ready layout");
+static_assert(offsetof(MissionEffectBody, readySeq) == 6, "readySeq is where the pad was");
+static_assert(sizeof(CampaignValue)       == 8, "campaign value layout");
+static_assert(sizeof(CampaignThread)      == 12, "campaign thread layout");
+static_assert(sizeof(CampaignDeltaBody)   == 16 + 8 * CAMPAIGN_VALUES + 12 * CAMPAIGN_THREADS +
+                                                 4 + MISSION_EFFECT_CODE,
+              "campaign delta layout");
+static_assert(sizeof(C_CampaignDelta)     == 5 + sizeof(CampaignDeltaBody), "campaign delta layout");
+static_assert(sizeof(S_CampaignDelta)     == 9 + sizeof(CampaignDeltaBody), "campaign delta layout");
+static_assert(sizeof(C_CampaignSince)     == 9, "campaign since layout");
+static_assert(sizeof(C_CarLists) == 21 && sizeof(S_CarLists) == 21, "car lists layout");
+static_assert(OP_C_CAR_LISTS == 0xF6 && OP_S_CAR_LISTS == 0xF7, "the car lists end the block");
 static_assert(sizeof(DesyncProbeRow)  == 18, "desync probe row layout");
 static_assert(sizeof(C_DesyncProbe)   == 6 + 18 * DESYNC_PROBE_ROWS, "desync probe layout");
 static_assert(sizeof(DesyncReportRow) == 4, "desync report row layout");
@@ -5804,7 +8177,11 @@ static_assert(sizeof(S_CarDespawn)    == 7,  "ambient car despawn layout");
 static_assert(sizeof(AmbientAdoptRow) == 4, "adopt row layout");
 static_assert(sizeof(S_AmbientAdopt)  == 9 + 4 * MAX_ADOPT_ROWS, "adopt batch layout");
 static_assert(offsetof(S_AmbientAdopt, rows) == 9, "rows follow the four bytes");
-static_assert(OP_S_AMBIENT_ADOPT >= 0xD0 && OP_S_AMBIENT_ADOPT <= 0xD5,
+static_assert(offsetof(S_AmbientAdopt, why) == 7, "why took the first pad byte");
+// 5 hdr + 2 netId + 1 count + 1 pad, then 2 a ped.
+static_assert(sizeof(C_CarLetGo) == 9 + 2 * MAX_LET_GO_PEDS, "let-go layout");
+static_assert(offsetof(C_CarLetGo, peds) == 9, "peds follow the four bytes");
+static_assert(OP_S_AMBIENT_ADOPT == 0xCC,
               "adoption stays inside its block");
 
 // 2 netId + 2 health + 12 pos + 16 rot + 12 velocity = 44. The health took
@@ -5833,9 +8210,11 @@ static_assert(sizeof(S_WorldState)    == 10, "world state layout");
 // 2 netId + 1 seat + 1 jack + 2 modelId + 2 colours + 2 extras + 12 pos
 // + 16 rot. The two extras took the place of one `pad` byte, so this grew by
 // one rather than by two.
-static_assert(sizeof(EnterVehicleBody) == 38, "enter-vehicle layout");
-static_assert(sizeof(C_EnterVehicle)  == 43, "enter-vehicle layout");
-static_assert(sizeof(S_EnterVehicle)  == 44, "enter-vehicle layout");
+// + 2 parkedSlot, at the end so nothing before it moves.
+static_assert(sizeof(EnterVehicleBody) == 40, "enter-vehicle layout");
+static_assert(offsetof(EnterVehicleBody, parkedSlot) == 38, "enter-vehicle layout");
+static_assert(sizeof(C_EnterVehicle)  == 45, "enter-vehicle layout");
+static_assert(sizeof(S_EnterVehicle)  == 46, "enter-vehicle layout");
 
 // 2 netId + 1 seat + 1 door, and nothing else. An intent that carried a car's
 // identity would be a claim, which is the one thing it must not be.
@@ -5847,7 +8226,15 @@ static_assert(sizeof(S_JackingVehicle)    == 10, "jacking-vehicle layout");
 
 // 5 hdr + 2 net + 2 model + 12 pos + 16 rot + 2 colour + 2 extras = 41
 // identity, then 4 health + 1 flags = 5 condition.
-static_assert(sizeof(S_VehicleSpawn)  == 46, "vehicle spawn layout");
+// + 2 parkedSlot after the condition.
+static_assert(sizeof(S_VehicleSpawn)  == 48, "vehicle spawn layout");
+static_assert(offsetof(S_VehicleSpawn, parkedSlot) == 46, "vehicle spawn layout");
+// 2 netId + 1 reason + 1 pad.
+static_assert(sizeof(VehicleRemovedBody) == 4, "vehicle removed layout");
+static_assert(sizeof(C_VehicleRemoved)   == 9, "vehicle removed layout");
+static_assert(sizeof(S_VehicleRemoved)   == 10, "vehicle removed layout");
+static_assert(OP_C_VEHICLE_REMOVED == 0xAC && OP_S_VEHICLE_REMOVED == 0xAD,
+              "the removal takes the first free pair of the garage block");
 static_assert(offsetof(S_VehicleSpawn, health) == 41, "condition follows identity");
 
 // 2 netId + 12 pos + 16 rot
@@ -5865,11 +8252,38 @@ static_assert(sizeof(VehicleDamageBody) == 8,  "vehicle damage layout");
 static_assert(offsetof(VehicleDamageBody, doors) == 6, "doors follow panels");
 static_assert(sizeof(C_VehicleDamage)   == 13, "vehicle damage layout");
 static_assert(sizeof(S_VehicleDamage)   == 17, "vehicle damage layout");
+static_assert(sizeof(C_VehicleBomb)     == 5 + 8, "vehicle bomb layout");
+static_assert(sizeof(S_VehicleBomb)     == 5 + 8, "vehicle bomb layout");
+static_assert(offsetof(C_VehicleBomb, fuseMs) == 9 && offsetof(S_VehicleBomb, fuseMs) == 11,
+              "the fuse follows the blame");
+static_assert(sizeof(C_MineBlast)       == 5 + 12, "mine blast layout");
+static_assert(sizeof(S_MineBlast)       == 5 + 16, "mine blast relay layout");
+static_assert(OP_C_MINE_BLAST >= 0xEC && OP_S_MINE_BLAST <= 0xEF, "mines stay inside their block");
+static_assert(sizeof(C_MissionBomb)     == 5 + 4, "mission bomb layout");
+static_assert(sizeof(S_MissionBomb)     == 5 + 4, "mission bomb relay layout");
+static_assert(offsetof(S_MissionBomb, netId) == 7, "the owner and the type come first");
+static_assert(OP_C_MISSION_BOMB == 0xEE && OP_S_MISSION_BOMB == 0xEF,
+              "the mission's bomb takes the rest of the mines' block");
+static_assert(sizeof(C_VehicleRadio)    == 5 + 4, "vehicle radio layout");
+static_assert(sizeof(S_VehicleRadio)    == 5 + 4, "vehicle radio layout");
+static_assert(offsetof(S_VehicleRadio, netId) == 7, "the radio relay's netId follows its two bytes");
+static_assert(sizeof(C_VehicleAlarm)    == 5 + 4, "vehicle alarm layout");
+static_assert(sizeof(S_VehicleAlarm)    == 5 + 6, "vehicle alarm layout");
+static_assert(offsetof(S_VehicleAlarm, netId) == 7, "the alarm relay's netId follows its two bytes");
+static_assert(sizeof(C_VehicleAim)      == 5 + 10, "vehicle aim layout");
+static_assert(sizeof(S_VehicleAim)      == 5 + 12, "vehicle aim layout");
+static_assert(offsetof(S_VehicleAim, gunLR) == 9, "the aim relay's angles follow its netId");
+static_assert(OP_C_VEHICLE_ALARM >= 0xE8 && OP_S_VEHICLE_AIM <= 0xEB,
+              "a car's own state stays inside its block");
+static_assert(VEH_TAXI_LIGHT == 0x20 && VEH_HANDBRAKE == 0x40,
+              "two bits the snapshot's flags byte had free");
 static_assert(sizeof(C_PlayerModel)   == 7,  "player model layout");
 static_assert(sizeof(S_PlayerModel)   == 8,  "player model layout");
 static_assert(sizeof(C_PlayerLook)    == 29, "player look layout");
 static_assert(sizeof(S_PlayerLook)    == 30, "player look layout");
 static_assert(OP_S_PLAYER_LOOK <= 0xCF, "the look stays inside the C0 block");
+static_assert(sizeof(C_PlayerAway)    == 6,  "player away layout");
+static_assert(sizeof(S_PlayerAway)    == 7,  "player away layout");
 
 // 1 weapon + 12 origin + 12 dir + 4 speed
 static_assert(sizeof(ShotBody)        == 29, "shot layout");
@@ -5972,6 +8386,8 @@ static_assert(OP_C_HELI_SHOT == 0xAA && OP_S_HELI_SHOT == 0xAB,
 static_assert(sizeof(GarageMaskBody)    == 4,  "the whole city is one dword");
 static_assert(sizeof(C_GarageState)     == 9,  "garage mask layout");
 static_assert(sizeof(S_GarageState)     == 13, "garage mask relay layout");
+static_assert(sizeof(C_GateState)       == 9,  "gate mask layout");
+static_assert(sizeof(S_GateState)       == 13, "gate mask relay layout");
 static_assert(offsetof(S_GarageState, body) == 9,
               "the mask stays 4-aligned behind the pad");
 // 2 net + 1 garage + 2 colours + 3 pad = 8, so 13 and 17.
@@ -6001,12 +8417,27 @@ static_assert(offsetof(ObjectRestBody, pos) == 52,
               "the position is the last row, as CMatrix has it");
 static_assert(sizeof(C_ObjectSettled)  == 69, "object settled layout");
 static_assert(sizeof(S_ObjectSettled)  == 70, "object settled relay layout");
+static_assert(sizeof(C_ObjectRebuilt)  == 21, "object rebuilt layout");
 
 // 5 hdr + 1 cheat + 1 state, and one more for who typed it.
 static_assert(sizeof(CheatBody) == 2, "cheat body layout");
 static_assert(sizeof(C_Cheat)   == 7, "cheat layout");
 static_assert(sizeof(S_Cheat)   == 8, "cheat relay layout");
+static_assert(sizeof(StuntCameraBody) == 30, "stunt camera body layout");
+static_assert(sizeof(C_StuntCamera)   == 35, "stunt camera layout");
+static_assert(sizeof(S_StuntCamera)   == 36, "stunt camera relay layout");
+static_assert(OP_C_STUNT_CAMERA == 0xF8 && OP_S_STUNT_CAMERA == 0xF9,
+              "the stunt shot takes the two past the cheat block");
 static_assert(offsetof(S_Cheat, body) == 6, "the typist comes first");
+static_assert(sizeof(C_PedRevive)     == 7,  "ped revive layout");
+static_assert(sizeof(S_PedRevive)     == 8,  "ped revive relay layout");
+static_assert(offsetof(S_PedRevive, body) == 6, "the medic's machine comes first");
+static_assert(sizeof(WaterCannonBody) == 26, "water cannon layout");
+static_assert(sizeof(C_WaterCannon)   == 31, "water cannon layout");
+static_assert(sizeof(S_WaterCannon)   == 32, "water cannon relay layout");
+static_assert(offsetof(S_WaterCannon, body) == 6, "the aimer comes first");
+static_assert(OP_C_CHEAT == 0xF0 && OP_S_WATER_CANNON <= 0xF7,
+              "cheats and emergency services stay inside their block");
 static_assert((SESSION_CHEATS_MASK & (SESSION_FRIENDLY_FIRE | SESSION_AMMO_SYNC |
                                       SESSION_WANTED_MASK | SESSION_RAMPAGE_MASK)) == 0,
               "the cheat rule has bits 6-7 to itself");

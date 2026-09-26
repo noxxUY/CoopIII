@@ -153,6 +153,9 @@ void StartServer() {
 	}
 	g_state.running = true;
 	g_state.server.SetPassword(g_state.config.password);
+	g_state.server.SetMissionRules(g_state.config.missionFailOnDeath,
+	                               g_state.config.missionMarginCm, g_state.config.missionEnemies,
+	                               g_state.config.missionScale);
 	g_state.address = LanAddress();
 	for (const std::string &line : ReachLines(LocalIPv4Addresses(), g_state.config.port))
 		Say(LogKind::Info, line.c_str());

@@ -1,6 +1,8 @@
 #include "chat.h"
 
 #include "addresses.h"
+#include "cheats.h"
+#include "fontcull.h"
 #include "pause.h"
 #include "scoreboard.h"
 #include "../chatfeed.h"
@@ -48,6 +50,7 @@ bool     g_outboxFull = false;
 bool g_saidHooked = false;
 bool g_saidOpened = false;
 bool g_saidPasted = false;
+bool g_saidCheatKey = false;
 
 constexpr Rgba CHAT_INK   {233, 230, 222, 255};
 constexpr Rgba NOTICE_INK {170, 123, 87, 255};
@@ -160,8 +163,15 @@ void TypeKey(WPARAM vk, LPARAM lp) {
 	WCHAR out[4] = {};
 	const int n = ToUnicode(static_cast<UINT>(vk), static_cast<UINT>((lp >> 16) & 0xFF),
 	                        keys, out, 4, 0);
+	bool typed = false;
 	for (int i = 0; i < n; ++i)
-		g_line.Type(out[i]);
+		typed |= g_line.Type(out[i]);
+
+	// The chat key was a cheat's letter and this line is the rest of it
+	// (cheats.h, CheatFinishedInChatLine): the game gets the keys, and the
+	// line was never chat.
+	if (typed && FinishCheatFromChatLine(EngineCheatCharFor(g_chatKey), g_line.Text()))
+		CloseLine();
 }
 
 LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -179,7 +189,16 @@ LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			break;
 		}
 	} else if (msg == WM_KEYDOWN && !repeat) {
-		if (static_cast<int>(wp) == g_chatKey && MayOpen()) {
+		// Unless it is the last letter of a cheat: then it is the game's key,
+		// as it would have been with no chat at all.
+		if (static_cast<int>(wp) == g_chatKey && MayOpen() &&
+		    ChatKeyWouldFinishCheat(EngineCheatCharFor(g_chatKey))) {
+			if (!g_saidCheatKey) {
+				g_saidCheatKey = true;
+				Log("chat: the chat key finished a cheat, so it went to the game and the "
+				    "chat line stayed shut (said once)");
+			}
+		} else if (static_cast<int>(wp) == g_chatKey && MayOpen()) {
 			g_line.Begin();
 			ClearKeyStates();
 			if (!g_saidOpened) {
@@ -298,20 +317,46 @@ bool ShouldDraw() {
 	return Global<void *>(CFont__Sprite + FONT_BANK * SIZEOF_SPRITE2D) != nullptr;
 }
 
-void DrawFeedLine(const FeedLine &line, float y, uint8_t alpha, const FeedLayout &l) {
-	if (line.kind == FeedKind::Notice) {
-		PrintLine(l.left, y, line.text, NOTICE_INK, alpha, l);
+// `count` characters of `text`, after `indent` of FEED_CONTINUED, into `out`.
+size_t RowText(const char *text, size_t count, size_t indent, char (&out)[FEED_TEXT + 4]) {
+	size_t n = 0;
+	for (; n < indent && n + 1 < sizeof out; ++n)
+		out[n] = FEED_CONTINUED[n];
+	for (size_t i = 0; i < count && text[i] != '\0' && n + 1 < sizeof out; ++i)
+		out[n++] = text[i];
+	out[n] = '\0';
+	return n;
+}
+
+bool RowFits(const char *text, size_t count, size_t indent, float maxWidth) {
+	char     row[FEED_TEXT + 4];
+	uint16_t wide[FEED_TEXT + 4];
+	const size_t n = RowText(text, count, indent, row);
+	Widen(row, n, wide, FEED_TEXT + 4);
+	return FontWidth(wide) <= maxWidth;
+}
+
+// One row of a line: the first carries the name, in its player's colour.
+void DrawFeedRow(const FeedLine &line, const FeedRow &row, bool continued, float y, uint8_t alpha,
+                 const FeedLayout &l) {
+	char text[FEED_TEXT + 4];
+	RowText(line.text + row.from, row.count, continued ? std::strlen(FEED_CONTINUED) : 0, text);
+	const bool named = !continued && line.nickLen != 0 && line.playerId != INVALID_PLAYER;
+	if (line.kind == FeedKind::Notice && !named) {
+		PrintLine(l.left, y, text, NOTICE_INK, alpha, l);
 		return;
 	}
-	float x = l.left;
-	if (line.nickLen != 0 && line.playerId != INVALID_PLAYER) {
+	float  x    = l.left;
+	size_t nick = 0;
+	if (named) {
+		nick               = line.nickLen < row.count ? line.nickLen : row.count;
 		const NickColour c = ChatNickColour(line.playerId);
-		x += PrintRun(x, y, line.text, line.nickLen, Rgba{c.r, c.g, c.b, 255}, alpha,
-		              l.maxWidth, l.shadow);
+		x += PrintRun(x, y, text, nick, Rgba{c.r, c.g, c.b, 255}, alpha, l.maxWidth, l.shadow);
 	}
-	const char *rest = line.text + line.nickLen;
+	const char *rest = text + nick;
 	if (*rest)
-		PrintRun(x, y, rest, FEED_MESSAGE, CHAT_INK, alpha, l.maxWidth - (x - l.left), l.shadow);
+		PrintRun(x, y, rest, FEED_MESSAGE, line.kind == FeedKind::Notice ? NOTICE_INK : CHAT_INK,
+		         alpha, l.maxWidth - (x - l.left), l.shadow);
 }
 
 // The line being typed, from as far along as it takes for the caret to stay
@@ -352,14 +397,25 @@ void DrawFeed(const Client &client, const FeedLayout &l) {
 	const bool      typing = g_line.Open();
 	const uint32_t  nowMs  = WallClock::NowMs();
 
-	// Newest at the bottom, just above the line being typed.
+	// Newest at the bottom, just above the line being typed, each line on as
+	// many rows as the font says it takes (chatfeed.h, FeedRows).
 	float y = l.bottom - l.lineH;
-	for (size_t i = feed.Count(); i-- > 0;) {
+	for (size_t i = feed.Count(); i-- > 0 && y > 0.0f;) {
 		const FeedLine &line  = feed.Line(i);
 		const uint8_t   alpha = FeedAlpha(nowMs - line.atMs, typing);
+		FeedRow         rows[FEED_ROWS_MAX];
+		size_t          count = 1;
 		if (alpha != 0)
-			DrawFeedLine(line, y, alpha, l);
-		y -= l.lineH;
+			count = FeedRows(line.text,
+			                 [&](size_t from, size_t n, size_t indent) {
+				                 return RowFits(line.text + from, n, indent, l.maxWidth);
+			                 },
+			                 rows);
+		for (size_t r = count; r-- > 0;) {
+			if (alpha != 0)
+				DrawFeedRow(line, rows[r], r != 0, y, alpha, l);
+			y -= l.lineH;
+		}
 	}
 
 	if (typing)
@@ -367,22 +423,23 @@ void DrawFeed(const Client &client, const FeedLayout &l) {
 }
 
 void DrawVersionMark(float screenW, float screenH) {
-	const MarkLayout m = MeasureVersionMark(screenW, screenH);
+	const float      cullY = CurrentTextCullLine(screenW, screenH);
+	const MarkLayout m     = MeasureVersionMark(screenH, cullY);
 	Func<FontScaleFn>(CFont__SetScale)(m.scaleX, m.scaleY);
 	const float w = PrintRun(m.x, m.y, VERSION_MARK, FEED_MESSAGE, MARK_INK, MARK_ALPHA, screenW,
 	                         1.0f);
 
-	// Once per screen size, so a log from any window says where it went. CFont
-	// prints no glyph whose top is at y >= screen width (chatfeed.h).
+	// Once per screen size, so a log from any window says where it went, and
+	// where CFont stops printing on it (game/fontcull.h).
 	static float saidW = 0.0f, saidH = 0.0f;
 	if (screenW != saidW || screenH != saidH) {
 		saidW = screenW;
 		saidH = screenH;
 		Log("chat: version mark at (%.1f, %.1f) scale %.3f x %.3f on a %.0fx%.0f screen, "
-		    "%.1f px wide, %s, %s",
+		    "%.1f px wide, %s, %s y = %.0f",
 		    m.x, m.y, m.scaleX, m.scaleY, screenW, screenH, w,
 		    w > 0.0f ? "text not empty" : "text came out EMPTY",
-		    m.y < screenW ? "above the cull line" : "PAST the cull line");
+		    m.y < cullY ? "above the cull line at" : "PAST the cull line at", cullY);
 	}
 }
 
@@ -442,8 +499,11 @@ void DrawChatOverlay(const Client &client) {
 	if (!(screenW > 0.0f) || !(screenH > 0.0f))
 		return;
 
-	const float      wrapWas = Global<float>(CFont__Details + FONTDETAILS_WRAPX);
-	const FeedLayout l       = MeasureFeed(screenW, screenH);
+	const float wrapWas = Global<float>(CFont__Details + FONTDETAILS_WRAPX);
+	FeedLayout  l       = MeasureFeed(screenW, screenH);
+	// Only moves when PrintChar's y test could not be fixed and the window is
+	// tall enough for the line to be past it.
+	l.bottom -= LiftAboveCull(l.bottom + l.shadow, CurrentTextCullLine(screenW, screenH), screenH);
 	FontStateFor(screenW, l.scaleX, l.scaleY);
 
 	DrawFeed(client, l);
@@ -451,6 +511,41 @@ void DrawChatOverlay(const Client &client) {
 		DrawVersionMark(screenW, screenH);
 
 	Func<FontFloatFn>(CFont__SetWrapx)(wrapWas);
+}
+
+void DrawCornerMark(const char *text, int row) {
+	if (!text || text[0] == '\0' || MenuIsUp())
+		return;
+	if (Global<void *>(CFont__Sprite + FONT_BANK * SIZEOF_SPRITE2D) == nullptr)
+		return;
+	const float screenW = static_cast<float>(Global<int32_t>(RsGlobal__maximumWidth));
+	const float screenH = static_cast<float>(Global<int32_t>(RsGlobal__maximumHeight));
+	if (!(screenW > 0.0f) || !(screenH > 0.0f))
+		return;
+
+	const float      wrapWas = Global<float>(CFont__Details + FONTDETAILS_WRAPX);
+	const float      cullY   = CurrentTextCullLine(screenW, screenH);
+	const MarkLayout scale   = MeasureVersionMark(screenH, cullY);
+	FontStateFor(screenW, scale.scaleX, scale.scaleY);
+	uint16_t wide[FEED_MESSAGE + 2];
+	Widen(text, FEED_MESSAGE, wide, FEED_MESSAGE + 2);
+	MarkLayout m = MeasureCornerMark(screenW, screenH, cullY, FontWidth(wide));
+	if (row > 0) {
+		m.y -= static_cast<float>(row) * FEED_CELL_HEIGHT * m.scaleY * FEED_LINE_GAP;
+		if (m.y < 1.0f)
+			m.y = 1.0f;
+	}
+	const float w = PrintRun(m.x, m.y, text, FEED_MESSAGE, MARK_INK, MARK_ALPHA, screenW, 1.0f);
+	Func<FontFloatFn>(CFont__SetWrapx)(wrapWas);
+
+	static float saidW = 0.0f, saidH = 0.0f;
+	if (screenW != saidW || screenH != saidH) {
+		saidW = screenW;
+		saidH = screenH;
+		Log("chat: corner mark at (%.1f, %.1f) on a %.0fx%.0f screen, %.1f px wide, %s y = %.0f",
+		    m.x, m.y, screenW, screenH, w,
+		    m.y < cullY ? "above the cull line at" : "PAST the cull line at", cullY);
+	}
 }
 
 void AddChatToBridge(WorldBridge &bridge) {

@@ -11,12 +11,14 @@
 
 #include "client.h"
 #include "game/boat.h"
+#include "game/carauthority.h"
 #include "game/cardamage.h"
 #include "game/carlife.h"
 #include "game/combat.h"
 #include "game/darkel.h"
 #include "game/driveby.h"
 #include "game/garage.h"
+#include "game/gates.h"
 #include "game/heli.h"
 #include "game/heligun.h"
 #include "game/horn.h"
@@ -29,13 +31,17 @@
 #include "game/pickup.h"
 #include "game/population.h"
 #include "game/radar.h"
+#include "game/seatplan.h"
 #include "game/sessionclock.h"
 #include "game/vehicle.h"
 #include "game/wanted.h"
+#include "game/wreck.h"
 #include "liftbridgetime.h"
 #include "lighttime.h"
 #include "planetime.h"
 #include "traintime.h"
+
+#include <coopiii/sky.h>
 
 #include <chrono>
 #include <cmath>
@@ -187,12 +193,42 @@ struct Recorder {
 	bool             carAtRest        = false;
 	// Whether the car we are settling is on fire. Not, by default.
 	bool             carBurning       = false;
+	// Whether the car we are settling reads as a wreck, and the answer
+	// ApplyRemoteVehicle was last handed about the fire timer.
+	bool             observedIsWreck  = false;
+	bool             lastFireTimerHere = true;
+	// A burning car blown up by its custodian (BlowUpSettlingVehicle), and
+	// whether the engine lets it; and the wrecks built without a blast.
+	int              settleBlowUps     = 0;
+	bool             settleBlowUpWorks = true;
+	int              quietWrecks       = 0;
 	// What the engine would say about the dents on a car: the one we are
 	// settling, and the one we are driving. Undamaged by default, so no test
 	// written before these existed ever sees a report go out.
 	int               observedDamageSamples = 0;
 	VehicleDamageBody observedDamage{};
 	VehicleDamageBody localDamage{};
+	// The bomb the engine would say those two carry, and the bombs written
+	// into our copies of other people's cars.
+	uint8_t           localBomb    = 0;
+	uint8_t           observedBomb = 0;
+	int               bombApplies  = 0;
+	uint8_t           lastBomb     = 0;
+	// The rest of what the engine would say about those bombs - a fuse and
+	// who is named - and everything written into our copies: every write,
+	// the last one, and the detonator's.
+	VehicleBombSample bombSample{};
+	int               bombWrites   = 0;
+	VehicleBombWrite  lastBombWrite{};
+	bool              bombCarHere  = true;
+	int               detonations  = 0;
+	uint16_t          lastDetonatedNetId = 0;
+	RemotePlayer     *lastDetonator = nullptr;
+	bool              lastDetonatorUs = false;
+	// Mines: ours that went off, waiting to be drained, and other people's.
+	std::vector<Vec3> ourMines;
+	int               mineBlastsApplied = 0;
+	Vec3              lastMineBlast{};
 	// A traffic car that has stopped being traffic (S_CarPromoted).
 	int              promotedAdoptions    = 0;
 	bool             lastPromotionWasOurs = false;
@@ -217,6 +253,17 @@ struct Recorder {
 	bool              lastDamageFlying = false;
 	int              vehicleCorrections = 0;
 	VehicleTransform lastCorrection  = {};
+	uint16_t         lastCorrectionNetId = INVALID_NETID;
+	// Riding in somebody else's car (game/ridecam.h): the occupants put back
+	// on the car before the camera, and the driver's jump shot on our camera.
+	int      occupantSeatings = 0;
+	uint16_t occupantsOf      = INVALID_NETID;
+	bool     stuntShotFree    = true;
+	int      stuntShotsShown  = 0;
+	int      stuntShotsEnded  = 0;
+	uint16_t stuntShotCar     = INVALID_NETID;
+	Vec3     stuntShotFrom{};
+	uint8_t  stuntShotMode    = 0;
 	// What the row said about the horn when it was handed to the correction,
 	// which is the call the engine seam sounds it from.
 	bool             lastCorrectionHorn = false;
@@ -418,6 +465,16 @@ struct Recorder {
 	bool        lastResprayHadCar  = false;
 	ResprayBody lastRespray{};
 
+	// The car radio: m_nRadioStation on each car by handle, what the client
+	// wrote there, the change our own music manager made, and the user tracks.
+	uint8_t  carRadio[64]        = {};
+	int      radioWrites         = 0;
+	int32_t  lastRadioWriteCar   = -1;
+	bool     radioChangePending  = false;
+	int32_t  radioChangeCar      = -1;
+	uint8_t  radioChangeStation  = 0;
+	bool     userTracks          = false;
+
 	// World. `world` is what this machine's engine would report; the rest is
 	// what the client asked to have done to it.
 	WorldState world{12, 0, 0, 0};
@@ -430,6 +487,7 @@ struct Recorder {
 	uint8_t    appliedMinute     = 0xFF;
 	uint8_t    appliedWeather    = 0xFF;
 	uint8_t    appliedWeatherOld = 0xFF;
+	uint8_t    appliedForced     = 0xFF;
 
 	// The session clock, as PreFrame last handed it over.
 	int      sessionClockCalls  = 0;
@@ -555,6 +613,31 @@ struct Recorder {
 	VehicleTransform lastAmbientCarAt{};
 	uint8_t  lastAmbientSeatIdx  = 0xFF;
 	bool     refuseAmbientSeating = false;
+	// The car handle the seating was asked for, and what the engine half
+	// answers: the seat asked for unless told otherwise, or
+	// AMBIENT_SEAT_NONE_FREE for every seat he could have being held.
+	int32_t  lastAmbientSeatHandle = -1;
+	int32_t  ambientSeatAnswer     = 0x7FFF;   // 0x7FFF: the seat asked for
+	// A pedestrian's copy at a door: what each half was asked, and what the
+	// engine half answers.
+	int      ambientEntryBegins   = 0;
+	bool     refuseAmbientEntry   = false;
+	int32_t  lastAmbientEntryCar  = -1;
+	uint8_t  lastAmbientEntrySeat = 0xFF;
+	uint8_t  lastAmbientEntryDoor = 0xFF;
+	uint8_t  ambientEntryProgress = SEAT_RUNNING;
+	int32_t  ambientEntryGot      = -1;
+	int      ambientEntryPolls    = 0;
+	int      ambientEntryAbandons = 0;
+	int      ambientExitBegins    = 0;
+	uint8_t  ambientDoorState     = AMBIENT_DOOR_IN;
+	int      ambientSeatMoves     = 0;
+	uint8_t  lastAmbientSeatMove  = 0xFF;
+	int      settleCalls          = 0;
+	uint8_t  lastSettleSeat       = 0xFF;
+	// What SampleHostedPeds was handed as the session's cars.
+	std::vector<SessionCarRef> hostedPedCars;
+	int      hostedPedSamples = 0;
 	// The engine has taken the ped replica away underneath us. What the real
 	// AmbientReplicaIsAlive discovers by resolving the pool handle and
 	// checking the vtable, the stub is simply told.
@@ -588,6 +671,9 @@ struct Recorder {
 	int      localPollCalls   = 0;
 	int      localUnseats     = 0;
 	int32_t  lastSeatHandle   = -1;
+	// Where LocalPassengerSeat says we ride, while localIsPassenger.
+	int32_t  localPassengerHandle = -1;
+	uint8_t  localPassengerSeat   = 0;
 
 	// ---- rampages (game/darkel.h) --------------------------------------
 	//
@@ -951,6 +1037,7 @@ uint8_t RecDrainLocalCombat(CombatEvent *out, uint8_t max) {
 void RecCorrectVehicle(RemoteVehicle &v, const VehicleTransform &at) {
 	++g_rec.vehicleCorrections;
 	g_rec.lastCorrection     = at;
+	g_rec.lastCorrectionNetId = v.netId;
 	g_rec.lastCorrectionHorn = v.hornSounding;
 }
 
@@ -974,10 +1061,11 @@ void RecSetSessionClock(bool valid, uint32_t offsetMs) {
 	g_rec.sessionClockOffset = offsetMs;
 }
 
-void RecApplyWorldWeather(uint8_t weather, uint8_t weatherOld) {
+void RecApplyWorldWeather(uint8_t weather, uint8_t weatherOld, uint8_t forced) {
 	++g_rec.weatherApplies;
 	g_rec.appliedWeather    = weather;
 	g_rec.appliedWeatherOld = weatherOld;
+	g_rec.appliedForced     = forced;
 }
 
 void RecReleaseWorldWeather() { ++g_rec.weatherReleases; }
@@ -990,7 +1078,7 @@ void RecRestVehicle(RemoteVehicle &) {
 // CVehicle off its roster row, and the rest test for asking the engine
 // whether it has stopped - which is the only thing that ends a settle short
 // of the timeout.
-bool RecSampleObservedVehicle(RemoteVehicle &, VehicleStateBody &out) {
+bool RecSampleObservedVehicle(RemoteVehicle &v, VehicleStateBody &out) {
 	++g_rec.observedSamples;
 	if (!g_rec.observedSampleOk)
 		return false;
@@ -999,6 +1087,26 @@ bool RecSampleObservedVehicle(RemoteVehicle &, VehicleStateBody &out) {
 	out.rot       = {0.0f, 0.0f, 0.0f, 1.0f};
 	out.moveSpeed = g_rec.sampledMoveSpeed;
 	out.health    = 1000.0f;
+	// The real sampler marks the row the moment it reads a wreck, and says so
+	// on the snapshot.
+	if (g_rec.observedIsWreck) {
+		v.destroyed = true;
+		out.health  = 0.0f;
+		out.flags   = VEH_WRECKED;
+	}
+	return true;
+}
+
+bool RecBlowUpSettlingVehicle(RemoteVehicle &) {
+	++g_rec.settleBlowUps;
+	if (g_rec.settleBlowUpWorks)
+		g_rec.observedIsWreck = true;
+	return g_rec.settleBlowUpWorks;
+}
+
+bool RecWreckQuietly(RemoteVehicle &v) {
+	++g_rec.quietWrecks;
+	v.destroyed = true;
 	return true;
 }
 
@@ -1020,6 +1128,57 @@ bool RecSampleLocalVehicleDamage(VehicleDamageBody &out) {
 		return false;
 	out = g_rec.localDamage;
 	return true;
+}
+
+bool RecSampleLocalVehicleBomb(VehicleBombSample *out) {
+	if (!g_rec.drivingLocally)
+		return false;
+	*out      = g_rec.bombSample;
+	out->type = g_rec.localBomb;
+	return true;
+}
+
+bool RecSampleObservedVehicleBomb(RemoteVehicle &, VehicleBombSample *out) {
+	*out      = g_rec.bombSample;
+	out->type = g_rec.observedBomb;
+	return true;
+}
+
+bool RecApplyRemoteVehicleBomb(RemoteVehicle &, const VehicleBombWrite &w) {
+	if (!g_rec.bombCarHere)
+		return false;
+	++g_rec.bombWrites;
+	g_rec.lastBombWrite = w;
+	if (w.writeType) {
+		++g_rec.bombApplies;
+		g_rec.lastBomb = w.type;
+	}
+	return true;
+}
+
+bool RecDetonateRemoteVehicleBomb(RemoteVehicle &v, bool blameUs, RemotePlayer *by) {
+	if (!g_rec.bombCarHere)
+		return false;
+	++g_rec.detonations;
+	g_rec.lastDetonatedNetId = v.netId;
+	g_rec.lastDetonator      = by;
+	g_rec.lastDetonatorUs    = blameUs;
+	return true;
+}
+
+uint8_t RecDrainLocalMineBlasts(Vec3 *out, uint8_t max) {
+	uint8_t n = 0;
+	while (n < max && n < g_rec.ourMines.size()) {
+		out[n] = g_rec.ourMines[n];
+		++n;
+	}
+	g_rec.ourMines.erase(g_rec.ourMines.begin(), g_rec.ourMines.begin() + n);
+	return n;
+}
+
+void RecApplyRemoteMineBlast(const Vec3 &pos) {
+	++g_rec.mineBlastsApplied;
+	g_rec.lastMineBlast = pos;
 }
 
 void RecAdoptPromotedCar(RemoteVehicle &v, bool weHostedIt) {
@@ -1067,9 +1226,10 @@ bool RecSurrenderVehicleSeat(RemoteVehicle &vehicle) {
 	return true;
 }
 
-void RecApplyVehicle(RemoteVehicle &, const VehicleStateBody &body) {
+void RecApplyVehicle(RemoteVehicle &v, const VehicleStateBody &body) {
 	++g_rec.vehicleApplies;
-	g_rec.lastVehicleBody = body;
+	g_rec.lastVehicleBody   = body;
+	g_rec.lastFireTimerHere = v.fireTimerHere;
 }
 
 void RecApplyVehicleDamage(RemoteVehicle &, const VehicleDamageBody &body,
@@ -1214,17 +1374,63 @@ void RecCorrectAmbientCar(RemoteAmbientCar &c, const VehicleTransform &at) {
 	++g_rec.ambientCorrections;
 }
 
-bool RecSeatAmbientPed(RemoteAmbientPed &, RemoteAmbientCar &car, uint8_t seat) {
+int32_t RecSeatAmbientPed(RemoteAmbientPed &, int32_t carHandle, uint16_t carNetId,
+                          uint8_t seat) {
 	++g_rec.ambientSeatAttempts;
+	g_rec.lastAmbientSeatHandle = carHandle;
 	if (g_rec.refuseAmbientSeating)
-		return false;
+		return AMBIENT_SEAT_REFUSED;
+	if (g_rec.ambientSeatAnswer == AMBIENT_SEAT_NONE_FREE)
+		return AMBIENT_SEAT_NONE_FREE;
 	++g_rec.ambientSeats;
-	g_rec.lastAmbientSeatCar = car.netId;
+	g_rec.lastAmbientSeatCar = carNetId;
 	g_rec.lastAmbientSeatIdx = seat;
-	return true;
+	return g_rec.ambientSeatAnswer == 0x7FFF ? seat : g_rec.ambientSeatAnswer;
+}
+
+uint32_t RecSampleHostedPeds(AmbientPedState *, uint32_t, const Vec3 *, uint32_t,
+                             const SessionCarRef *cars, uint32_t carCount) {
+	++g_rec.hostedPedSamples;
+	g_rec.hostedPedCars.assign(cars, cars + carCount);
+	return 0;
 }
 
 void RecUnseatAmbientPed(RemoteAmbientPed &) { ++g_rec.ambientUnseats; }
+
+bool RecBeginAmbientPedEntry(RemoteAmbientPed &, int32_t carHandle, uint8_t seat, uint8_t door) {
+	++g_rec.ambientEntryBegins;
+	g_rec.lastAmbientEntryCar  = carHandle;
+	g_rec.lastAmbientEntrySeat = seat;
+	g_rec.lastAmbientEntryDoor = door;
+	return !g_rec.refuseAmbientEntry;
+}
+
+uint8_t RecPollAmbientPedEntry(RemoteAmbientPed &, int32_t, uint8_t, int32_t &got) {
+	++g_rec.ambientEntryPolls;
+	got = g_rec.ambientEntryGot;
+	return g_rec.ambientEntryProgress;
+}
+
+void RecAbandonAmbientPedEntry(RemoteAmbientPed &) { ++g_rec.ambientEntryAbandons; }
+
+bool RecBeginAmbientPedExit(RemoteAmbientPed &) {
+	++g_rec.ambientExitBegins;
+	return true;
+}
+
+uint8_t RecAmbientPedDoorState(const RemoteAmbientPed &) { return g_rec.ambientDoorState; }
+
+int32_t RecMoveAmbientPedSeat(RemoteAmbientPed &, int32_t, uint8_t seat) {
+	++g_rec.ambientSeatMoves;
+	g_rec.lastAmbientSeatMove = seat;
+	return seat;
+}
+
+bool RecSettleRemoteSeat(RemotePlayer &, RemoteVehicle &, uint8_t seat) {
+	++g_rec.settleCalls;
+	g_rec.lastSettleSeat = seat;
+	return false;
+}
 
 // The same write the real seam makes on success: the handle is cleared, so the
 // roster can drop the row without the object being destroyed.
@@ -1328,6 +1534,32 @@ void RecApplyRemoteRespray(RemoteVehicle *vehicle, const ResprayBody &body) {
 	g_rec.lastRespray       = body;
 }
 
+bool RecReadCarRadio(int32_t handle, uint8_t &station) {
+	if (handle < 0 || handle >= 64)
+		return false;
+	station = g_rec.carRadio[handle];
+	return true;
+}
+
+void RecWriteCarRadio(int32_t handle, uint8_t station) {
+	if (handle < 0 || handle >= 64)
+		return;
+	g_rec.carRadio[handle] = station;
+	++g_rec.radioWrites;
+	g_rec.lastRadioWriteCar = handle;
+}
+
+bool RecDrainLocalRadioChange(int32_t &handle, uint8_t &station) {
+	if (!g_rec.radioChangePending)
+		return false;
+	g_rec.radioChangePending = false;
+	handle  = g_rec.radioChangeCar;
+	station = g_rec.radioChangeStation;
+	return true;
+}
+
+bool RecRadioUserTracksHere() { return g_rec.userTracks; }
+
 // The local player, as the seat key's range test reads them. At the origin,
 // so any car the vehicle helpers put down is within SEAT_RANGE_M.
 bool RecSampleLocalPlayer(PlayerStateBody &out) {
@@ -1357,6 +1589,31 @@ int32_t RecPollLocalSeatEntry() {
 	++g_rec.localPollCalls;
 	return g_rec.localPollAnswer;
 }
+
+bool RecLocalPassengerSeat(int32_t &handle, uint8_t &seat) {
+	if (!g_rec.localIsPassenger || g_rec.localPassengerHandle < 0)
+		return false;
+	handle = g_rec.localPassengerHandle;
+	seat   = g_rec.localPassengerSeat;
+	return true;
+}
+
+void RecSeatOccupants(RemoteVehicle &v) {
+	++g_rec.occupantSeatings;
+	g_rec.occupantsOf = v.netId;
+}
+
+bool RecShowStuntShot(RemoteVehicle &v, const Vec3 &from, const Vec3 &, uint8_t mode, uint8_t) {
+	if (!g_rec.stuntShotFree)
+		return false;
+	++g_rec.stuntShotsShown;
+	g_rec.stuntShotCar  = v.netId;
+	g_rec.stuntShotFrom = from;
+	g_rec.stuntShotMode = mode;
+	return true;
+}
+
+void RecEndStuntShot() { ++g_rec.stuntShotsEnded; }
 
 bool RecUnseatLocalPlayer() {
 	++g_rec.localUnseats;
@@ -1420,9 +1677,13 @@ WorldBridge RecordingBridge() {
 	b.SampleLocalPlayer     = &RecSampleLocalPlayer;
 	b.LocalWantsSeatToggle  = &RecLocalWantsSeatToggle;
 	b.LocalIsPassenger      = &RecLocalIsPassenger;
+	b.LocalPassengerSeat    = &RecLocalPassengerSeat;
 	b.SeatLocalPlayerIn     = &RecSeatLocalPlayerIn;
 	b.PollLocalSeatEntry    = &RecPollLocalSeatEntry;
 	b.UnseatLocalPlayer     = &RecUnseatLocalPlayer;
+	b.SeatOccupants         = &RecSeatOccupants;
+	b.ShowStuntShot         = &RecShowStuntShot;
+	b.EndStuntShot          = &RecEndStuntShot;
 	b.RequestModel    = &RecRequestModel;
 	b.IsModelReady    = &RecIsModelReady;
 	b.SpawnRemote     = &RecSpawn;
@@ -1443,8 +1704,16 @@ WorldBridge RecordingBridge() {
 	b.SampleObservedVehicle      = &RecSampleObservedVehicle;
 	b.VehicleAtRest              = &RecVehicleAtRest;
 	b.VehicleBurning             = &RecVehicleBurning;
+	b.BlowUpSettlingVehicle      = &RecBlowUpSettlingVehicle;
+	b.WreckRemoteVehicleQuietly  = &RecWreckQuietly;
 	b.SampleObservedVehicleDamage = &RecSampleObservedVehicleDamage;
 	b.SampleLocalVehicleDamage    = &RecSampleLocalVehicleDamage;
+	b.SampleLocalVehicleBomb      = &RecSampleLocalVehicleBomb;
+	b.SampleObservedVehicleBomb   = &RecSampleObservedVehicleBomb;
+	b.ApplyRemoteVehicleBomb      = &RecApplyRemoteVehicleBomb;
+	b.DetonateRemoteVehicleBomb   = &RecDetonateRemoteVehicleBomb;
+	b.DrainLocalMineBlasts        = &RecDrainLocalMineBlasts;
+	b.ApplyRemoteMineBlast        = &RecApplyRemoteMineBlast;
 	b.SeatRemotePed              = &RecSeat;
 	b.UnseatRemotePed            = &RecUnseat;
 	b.BeginSeatRemotePed         = &RecBeginSeat;
@@ -1497,7 +1766,15 @@ WorldBridge RecordingBridge() {
 	b.ApplyAmbientPedState    = &RecApplyAmbientPed;
 	b.ApplyAmbientPedFire     = &RecApplyAmbientPedFire;
 	b.SeatAmbientPed          = &RecSeatAmbientPed;
+	b.SampleHostedPeds        = &RecSampleHostedPeds;
 	b.UnseatAmbientPed        = &RecUnseatAmbientPed;
+	b.BeginAmbientPedEntry    = &RecBeginAmbientPedEntry;
+	b.PollAmbientPedEntry     = &RecPollAmbientPedEntry;
+	b.AbandonAmbientPedEntry  = &RecAbandonAmbientPedEntry;
+	b.BeginAmbientPedExit     = &RecBeginAmbientPedExit;
+	b.AmbientPedDoorState     = &RecAmbientPedDoorState;
+	b.MoveAmbientPedSeat      = &RecMoveAmbientPedSeat;
+	b.SettleRemoteSeat        = &RecSettleRemoteSeat;
 	b.RemoveAmbientBodyPart   = &RecRemoveAmbientBodyPart;
 	b.RemovePlayerBodyPart    = &RecRemovePlayerBodyPart;
 	b.KillAmbientReplica      = &RecKillAmbientReplica;
@@ -1527,6 +1804,10 @@ WorldBridge RecordingBridge() {
 	b.ApplyRemoteGarages = &RecApplyRemoteGarages;
 	b.DrainLocalResprays = &RecDrainLocalResprays;
 	b.ApplyRemoteRespray = &RecApplyRemoteRespray;
+	b.ReadCarRadio          = &RecReadCarRadio;
+	b.WriteCarRadio         = &RecWriteCarRadio;
+	b.DrainLocalRadioChange = &RecDrainLocalRadioChange;
+	b.RadioUserTracksHere   = &RecRadioUserTracksHere;
 	return b;
 }
 
@@ -1655,6 +1936,123 @@ void TestARefusedClaimIsNotAName() {
 	yes.body.modelId = 90;
 	c.HandleMessage(Wrap(yes, CH_EVENT));
 	Check(c.LocalVehicleNetId() == 42, "a later yes is still taken");
+}
+
+// ---- the scripted gates (game/gates.h) --------------------------------------
+
+uint8_t g_gateApplied  = 0xFF;
+uint8_t g_gateLocal    = 0;
+bool    g_gateHaveWorld = true;
+
+bool GateSample(uint8_t &mask) {
+	if (!g_gateHaveWorld)
+		return false;
+	mask = g_gateLocal;
+	return true;
+}
+void GateApply(uint8_t mask) { g_gateApplied = mask; }
+
+S_GateState MakeGateState(uint8_t playerId, uint8_t mask) {
+	S_GateState g{};
+	InitHeader(g, 1000);
+	g.playerId  = playerId;
+	g.body.open = mask;
+	return g;
+}
+
+// The garages' union, one byte wide: a gate is held open while anybody else's
+// thread wants it open, a player leaving lets go, and our own id is not
+// somebody else's.
+void TestGateMaskIsAUnion() {
+	std::printf("\ngates: held open while anybody else wants them open\n");
+	WorldBridge b      = RecordingBridge();
+	b.SampleLocalGates = &GateSample;
+	b.ApplyRemoteGates = &GateApply;
+	g_gateLocal        = 0;
+	g_gateHaveWorld    = true;
+	Client c;
+	c.SetBridge(b);
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+
+	c.Tick();
+	Check(g_gateApplied == 0, "nothing held while nobody says anything");
+	c.HandleMessage(Wrap(MakeGateState(1, 1u << 2), CH_EVENT));
+	c.HandleMessage(Wrap(MakeGateState(2, 1u << 2), CH_EVENT));
+	c.Tick();
+	Check(g_gateApplied == (1u << 2), "two police cars at the HQ hold gate 2");
+	c.HandleMessage(Wrap(MakeGateState(1, 0), CH_EVENT));
+	c.Tick();
+	Check(g_gateApplied == (1u << 2), "the first driving off does not shut it on the second");
+	c.HandleMessage(Wrap(MakeGateState(2, 0xFF), CH_EVENT));
+	c.Tick();
+	Check(g_gateApplied == ((1u << GATE_COUNT) - 1), "bits past the seventh gate are dropped");
+	S_PlayerLeave leave{};
+	InitHeader(leave, 1000);
+	leave.playerId = 2;
+	c.HandleMessage(Wrap(leave, CH_EVENT));
+	c.Tick();
+	Check(g_gateApplied == 0, "and a player who leaves takes his gates with him");
+	c.HandleMessage(Wrap(MakeGateState(0, 1u << 4), CH_EVENT));
+	c.Tick();
+	Check(g_gateApplied == 0 && c.RemoteGateMask() == 0, "our own id is never held against us");
+}
+
+// What gates.h decides, without a game.
+void TestGateDecisions() {
+	std::printf("\ngates: what the seam decides\n");
+	using namespace game;
+	bool open = false;
+	Check(GateForTarget(358.125f, -1128.5f, 21.9375f, &open) == 2 && open,
+	      "police HQ 1's open end is gate 2, opening");
+	Check(GateForTarget(1016.0f, -1107.9375f, 12.25f, &open) == 0 && !open,
+	      "the fish factory's shut end, as gates.sc's -1107.938 reads, is gate 0, shutting");
+	Check(GateForTarget(147.1875f, 214.8125f, 10.5625f, &open) == -1,
+	      "Arms Shortage's own slide of Phil's gate is not ours");
+
+	Check(!GateWantedOpen(0, 0, 5000), "never asked is not open");
+	Check(GateWantedOpen(4000, 1000, 5000), "asked for open a second ago is open");
+	Check(!GateWantedOpen(4000, 4500, 5000), "asked for shut since is not");
+	Check(!GateWantedOpen(1000, 0, 5000), "and a request 4 s old has lapsed: he left the zone");
+
+	Check(SwallowGateSlide(true, false), "a shut request on a held gate is answered without moving");
+	Check(!SwallowGateSlide(true, true), "an open one runs");
+	Check(!SwallowGateSlide(false, false), "and nothing is swallowed when nobody holds it");
+
+	Check(DecideGateDrive(true, false, false, false) == GateDrive::Open,
+	      "held by somebody else and not by us: open it");
+	Check(DecideGateDrive(true, true, false, true) == GateDrive::None,
+	      "our own thread is opening it already");
+	Check(DecideGateDrive(false, false, true, false) == GateDrive::Shut,
+	      "let go, and we opened it: shut it");
+	Check(DecideGateDrive(false, false, true, true) == GateDrive::None,
+	      "unless our own thread is in the zone and shutting it itself");
+	Check(DecideGateDrive(false, false, false, false) == GateDrive::None,
+	      "a gate we never touched is left alone");
+
+	// `029B: $G = create_object #ELECTRICGATE at 366.125 -1128.5 21.9375`,
+	// the way init.sc has it: the model as a 16-bit literal, three floats
+	// over 16, then the global.
+	uint8_t space[64] = {};
+	const uint8_t insn[] = {0x9B, 0x02, 0x05, 0x2A, 0x01,
+	                        0x06, 0xE2, 0x16,    // 366.125 * 16 = 5858
+	                        0x06, 0x78, 0xB9,    // -1128.5 * 16 = -18056
+	                        0x06, 0x5F, 0x01,    // 21.9375 * 16 = 351
+	                        0x02, 0x34, 0x12};
+	std::memcpy(space + 10, insn, sizeof insn);
+	Check(FindGateGlobal(space, sizeof space, Gate(2)) == 0x1234,
+	      "police HQ 1 is found by where init.sc puts it");
+	Check(FindGateGlobal(space, sizeof space, Gate(3)) == 0, "and police HQ 2 is not there");
+}
+
+// Claiming only the nearest pickup (pickup.h).
+void TestTheNearestPickupIsClaimed() {
+	std::printf("\npickups: only the nearest one in reach is claimed\n");
+	using namespace game;
+	Check(ShouldSwitchClaim(2.0f, 1.0f), "a gun a metre nearer takes the claim");
+	Check(!ShouldSwitchClaim(1.2f, 1.0f), "one a hair nearer does not, so it does not flap");
+	Check(kDenyRetryFrames >= 60, "a refused claim waits at least a second");
 }
 
 // ---- garages, doors and the Pay'n'Spray -----------------------------------
@@ -3074,6 +3472,315 @@ void PutACarNextToUs(Client &c) {
 	c.Tick();
 }
 
+// ---- the car radio (radiosync.h) --------------------------------------------
+
+S_VehicleRadio MakeRadio(uint16_t netId, uint8_t station, uint8_t playerId = 1) {
+	S_VehicleRadio r{};
+	InitHeader(r, 1000);
+	r.playerId = playerId;
+	r.station  = station;
+	r.netId    = netId;
+	return r;
+}
+
+// Somebody else's car, which the session says is on station 5. Our copy was
+// built rolling its own, and a remote driver sitting down in it here picks
+// another by his model; both are put back.
+void TestACopyCarriesTheSessionsStation() {
+	std::printf("\nthe radio: a copy of a car is on the session's station\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.Tick();
+	const int32_t car = c.SessionCarHandleOf(80);
+	Check(car >= 0 && car < 64, "the copy is built");
+	g_rec.carRadio[car] = 3;
+
+	c.TickRadioForTest();
+	Check(g_rec.radioWrites == 0 && c.CarRadioForTest(80) == RADIO_STATION_UNKNOWN,
+	      "with no station from the session, the copy keeps its own");
+
+	c.HandleMessage(Wrap(MakeRadio(80, 5), CH_EVENT));
+	Check(g_rec.carRadio[car] == 5 && g_rec.lastRadioWriteCar == car,
+	      "the session's station goes onto our copy as it arrives");
+	Check(c.CarRadioForTest(80) == 5, "and the row remembers it");
+
+	g_rec.carRadio[car] = 1;   // CPed::SetRadioStation, for a driver's ped here
+	c.TickRadioForTest();
+	Check(g_rec.carRadio[car] == 5, "a copy that wandered off is put back");
+	const int writes = g_rec.radioWrites;
+	c.TickRadioForTest();
+	Check(g_rec.radioWrites == writes, "and one that has not is left alone");
+	Check(c.RadioReportsSentForTest() == 0, "none of it is ours to report");
+
+	c.HandleMessage(Wrap(MakeRadio(80, 40), CH_EVENT));
+	Check(c.CarRadioForTest(80) == 5 && g_rec.carRadio[car] == 5,
+	      "a station that is not one changes nothing");
+	c.HandleMessage(Wrap(MakeRadio(81, 2), CH_EVENT));
+	Check(c.CarRadioForTest(81) == RADIO_STATION_UNKNOWN,
+	      "and one for a car we have no row for makes none");
+}
+
+// The user tracks are each player's own files. A machine that has none
+// leaves the engine to pick for it, as single player does, rather than
+// writing 9 back for GetCarTuning to roll away again every frame.
+void TestTheUserTracksOnAMachineWithout() {
+	std::printf("\nthe radio: the user tracks on a machine that has none\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.Tick();
+	const int32_t car = c.SessionCarHandleOf(80);
+	g_rec.carRadio[car] = 4;
+	g_rec.userTracks    = false;
+	c.HandleMessage(Wrap(MakeRadio(80, RADIO_STATION_USERTRACK), CH_EVENT));
+	c.TickRadioForTest();
+	Check(g_rec.carRadio[car] == 4 && g_rec.radioWrites == 0,
+	      "no user tracks here: the copy keeps the station the engine gave it");
+	Check(c.CarRadioForTest(80) == RADIO_STATION_USERTRACK,
+	      "while the session still says user tracks");
+
+	g_rec.userTracks = true;
+	c.TickRadioForTest();
+	Check(g_rec.carRadio[car] == RADIO_STATION_USERTRACK,
+	      "and a machine that has some plays its own");
+}
+
+// The car we drive. Its station is ours to give the session when the session
+// has none, once; after that only a change our own radio made goes out.
+void TestTheDriverGivesTheCarItsStation() {
+	std::printf("\nthe radio: the driver's copy gives the session its station\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.drivingLocally     = true;
+	g_rec.localVehicleHandle = 7;
+	g_rec.carRadio[7]        = 4;
+
+	S_EnterVehicle enter;
+	InitHeader(enter, 1000);
+	enter.playerId     = 0;
+	enter.body         = EnterVehicleBody{};
+	enter.body.netId   = 77;
+	enter.body.seat    = 0;
+	enter.body.modelId = 90;
+	c.HandleMessage(Wrap(enter, CH_EVENT));
+	Check(c.LocalVehicleNetId() == 77, "we drive vehicle 77");
+
+	c.TickRadioForTest();
+	Check(c.RadioReportsSentForTest() == 1 && c.LastRadioSentForTest() == 4,
+	      "the session hears the station our copy already had");
+	Check(c.CarRadioForTest(77) == 4, "and it is the car's station from here");
+	c.TickRadioForTest();
+	Check(c.RadioReportsSentForTest() == 1, "said once");
+
+	// The radio key.
+	g_rec.radioChangePending = true;
+	g_rec.radioChangeCar     = 7;
+	g_rec.radioChangeStation = 6;
+	g_rec.carRadio[7]        = 6;
+	c.TickRadioForTest();
+	Check(c.RadioReportsSentForTest() == 2 && c.LastRadioSentForTest() == 6,
+	      "a station our listener chose goes out");
+	Check(c.CarRadioForTest(77) == 6 && g_rec.radioWrites == 0,
+	      "and is the session's at once, so nothing puts the old one back");
+
+	// The echo, and then somebody else in the car turning it in the same
+	// instant: whichever the server took last is where every copy ends.
+	c.HandleMessage(Wrap(MakeRadio(77, 6, 0), CH_EVENT));
+	Check(g_rec.radioWrites == 0, "our own echo writes nothing");
+	c.HandleMessage(Wrap(MakeRadio(77, 2, 1), CH_EVENT));
+	Check(g_rec.carRadio[7] == 2 && c.CarRadioForTest(77) == 2,
+	      "a passenger's later turn is what our copy plays");
+
+	// A change the drain reports for some other car is not ours to say.
+	g_rec.radioChangePending = true;
+	g_rec.radioChangeCar     = 9;
+	g_rec.radioChangeStation = 1;
+	c.TickRadioForTest();
+	Check(c.RadioReportsSentForTest() == 2, "a change to another car goes nowhere");
+}
+
+// A passenger never seeds the station: his copy's roll would outvote the
+// driver's. He turns the dial like anybody else, though.
+void TestAPassengerTurnsTheDialButNeverSeedsIt() {
+	std::printf("\nthe radio: a passenger\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	PutACarNextToUs(c);
+	g_rec.wantSeatToggle  = true;
+	g_rec.localSeatAnswer = SEAT_LOCAL_WALKING;
+	g_rec.localSeatAsked  = 2;
+	c.TickSeat();
+	g_rec.localPollAnswer  = 2;
+	g_rec.localIsPassenger = true;
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == 80, "we ride in vehicle 80");
+
+	const int32_t car = c.SessionCarHandleOf(80);
+	g_rec.carRadio[car] = 8;
+	c.TickRadioForTest();
+	Check(c.RadioReportsSentForTest() == 0, "the passenger's copy says nothing on its own");
+
+	g_rec.radioChangePending = true;
+	g_rec.radioChangeCar     = car;
+	g_rec.radioChangeStation = RADIO_STATION_OFF;
+	c.TickRadioForTest();
+	Check(c.RadioReportsSentForTest() == 1 && c.LastRadioSentForTest() == RADIO_STATION_OFF,
+	      "switching it off is his to say");
+}
+
+// ---- riding in somebody else's car (game/ridecam.h) --------------------------
+
+// Into a passenger seat of vehicle 80, the way the seat key gets there.
+void RideInVehicle80(Client &c) {
+	g_rec.wantSeatToggle  = true;
+	g_rec.localSeatAnswer = SEAT_LOCAL_WALKING;
+	g_rec.localSeatAsked  = 2;
+	c.TickSeat();
+	g_rec.wantSeatToggle   = false;
+	g_rec.localPollAnswer  = 2;
+	g_rec.localIsPassenger = true;
+	c.TickSeat();
+	g_rec.localPassengerHandle = c.SessionCarHandleOf(80);
+	g_rec.localPassengerSeat   = 2;
+}
+
+// The frame's camera runs inside CGame::Process and the cars are corrected
+// after it. The one we ride in has to be corrected before the camera looks at
+// it, and then not again after it, or the camera follows the car a frame late.
+void TestTheRideIsCorrectedBeforeTheCamera() {
+	std::printf("\nthe car we ride in is where its driver says before the camera looks\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	PutACarNextToUs(c);
+	c.HandleMessage(Wrap(MakeVehicleSpawn(81, 90, 40.0f), CH_EVENT));
+	c.Tick();
+
+	int before = g_rec.vehicleCorrections;
+	c.CorrectRideBeforeCamera();
+	Check(g_rec.vehicleCorrections == before && g_rec.occupantSeatings == 0,
+	      "on foot, nothing is corrected ahead of the camera");
+
+	RideInVehicle80(c);
+	Check(c.LocalSeatNetId() == 80, "we ride in vehicle 80");
+
+	before = g_rec.vehicleCorrections;
+	c.CorrectRideBeforeCamera();
+	Check(g_rec.vehicleCorrections == before + 1 && g_rec.lastCorrectionNetId == 80,
+	      "before the camera, only the car we ride in is put where its driver says");
+	Check(g_rec.occupantSeatings == 1 && g_rec.occupantsOf == 80,
+	      "and the people in it are sat back on it");
+
+	c.Tick();
+	Check(g_rec.vehicleCorrections == before + 2 && g_rec.lastCorrectionNetId == 81,
+	      "the pass after the frame corrects the rest and leaves ours where the camera saw it");
+
+	c.Tick();
+	Check(g_rec.vehicleCorrections == before + 4,
+	      "a frame nobody corrected it early, the pass does it as it always did");
+}
+
+S_StuntCamera MakeStuntShot(uint16_t netId, bool on, uint8_t driver = 1) {
+	S_StuntCamera s{};
+	InitHeader(s, 1000);
+	s.playerId   = driver;
+	s.body.netId = netId;
+	s.body.on    = on ? 1 : 0;
+	s.body.mode  = 15;
+	s.body.swap  = 2;
+	s.body.from  = {998.0f, -938.5f, 19.25f};
+	return s;
+}
+
+void TestARiderTakesTheDriversJumpShot() {
+	std::printf("\na unique jump's shot, on the screen of somebody riding in the car\n");
+	using coopiii::STUNT_SHOT_MAX_MS;
+	Client c;
+	c.SetBridge(RecordingBridge());
+	PutACarNextToUs(c);
+
+	c.HandleMessage(Wrap(MakeStuntShot(80, true), CH_EVENT));
+	Check(g_rec.stuntShotsShown == 0 && !c.StuntShotHereForTest().Up(),
+	      "a shot of a car we are not in is not ours to see");
+
+	RideInVehicle80(c);
+	c.HandleMessage(Wrap(MakeStuntShot(80, true), CH_EVENT));
+	Check(g_rec.stuntShotsShown == 1 && g_rec.stuntShotCar == 80 && g_rec.stuntShotMode == 15 &&
+	          g_rec.stuntShotFrom.x == 998.0f,
+	      "riding in it, our camera takes the shot where the driver's stands");
+	c.TickStuntShot(WallClock::NowMs());
+	Check(g_rec.stuntShotsEnded == 0, "and keeps it while we ride and he says nothing");
+
+	c.HandleMessage(Wrap(MakeStuntShot(81, false), CH_EVENT));
+	Check(g_rec.stuntShotsEnded == 0, "another car's end is not ours");
+	c.HandleMessage(Wrap(MakeStuntShot(80, false), CH_EVENT));
+	Check(g_rec.stuntShotsEnded == 1 && !c.StuntShotHereForTest().Up(),
+	      "his end gives the camera back");
+	c.HandleMessage(Wrap(MakeStuntShot(80, false), CH_EVENT));
+	Check(g_rec.stuntShotsEnded == 1, "once");
+
+	c.HandleMessage(Wrap(MakeStuntShot(80, true), CH_EVENT));
+	g_rec.localIsPassenger = false;
+	c.TickStuntShot(WallClock::NowMs());
+	Check(g_rec.stuntShotsEnded == 2, "getting out mid-jump gives it back");
+
+	g_rec.localIsPassenger = true;
+	c.HandleMessage(Wrap(MakeStuntShot(80, true), CH_EVENT));
+	c.TickStuntShot(WallClock::NowMs() + STUNT_SHOT_MAX_MS + 1);
+	Check(g_rec.stuntShotsEnded == 3, "and a driver who goes quiet mid-air does not keep it");
+
+	g_rec.stuntShotFree = false;
+	const int shown     = g_rec.stuntShotsShown;
+	c.HandleMessage(Wrap(MakeStuntShot(80, true), CH_EVENT));
+	Check(g_rec.stuntShotsShown == shown && !c.StuntShotHereForTest().Up(),
+	      "a camera a script of ours holds is left to it");
+}
+
+void TestOnlyTheDriverSendsAJumpShot() {
+	std::printf("\na unique jump's shot goes out from the car's driver\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.Tick();
+
+	c.OwnStuntShotOver();
+	Check(c.StuntShotsSentForTest() == 0, "no shot, nothing to end");
+	const Vec3 from{998.0f, -938.5f, 19.25f};
+	c.OwnStuntShot(c.SessionCarHandleOf(80), from, Vec3{}, 15, 2);
+	Check(c.StuntShotsSentForTest() == 0, "a car somebody else drives is his to send");
+
+	g_rec.drivingLocally     = true;
+	g_rec.localVehicleHandle = 7;
+	S_EnterVehicle enter;
+	InitHeader(enter, 1000);
+	enter.playerId     = 0;
+	enter.body         = EnterVehicleBody{};
+	enter.body.netId   = 77;
+	enter.body.seat    = 0;
+	enter.body.modelId = 90;
+	c.HandleMessage(Wrap(enter, CH_EVENT));
+	Check(c.LocalVehicleNetId() == 77, "we drive vehicle 77");
+
+	c.OwnStuntShot(c.SessionCarHandleOf(77), from, Vec3{}, 15, 2);
+	Check(c.StuntShotsSentForTest() == 1 && c.LastStuntShotForTest().netId == 77 &&
+	          c.LastStuntShotForTest().on == 1 && c.LastStuntShotForTest().from.y == -938.5f &&
+	          c.LastStuntShotForTest().mode == 15 && c.LastStuntShotForTest().swap == 2,
+	      "our own car's shot goes out with where the camera stands");
+	c.OwnStuntShotOver();
+	Check(c.StuntShotsSentForTest() == 2 && c.LastStuntShotForTest().on == 0 &&
+	          c.LastStuntShotForTest().netId == 77,
+	      "and its end, for the same car");
+	c.OwnStuntShotOver();
+	Check(c.StuntShotsSentForTest() == 2, "a camera restored again says nothing more");
+}
+
 void TestTheSeatIsAnnouncedWhenTheWalkStarts() {
 	std::printf("\nthe seat goes on the wire when the entry starts\n");
 	Client c;
@@ -3174,6 +3881,67 @@ void TestTheWarpFallbackStillAnnouncesExactlyOnce() {
 	g_rec.localIsPassenger = true;
 	c.TickSeat();
 	Check(c.LocalSeatNetId() == 80, "still one seat, still the same car");
+}
+
+// "En esta misión, después de una cinemática, un jugador sacó al otro del
+// asiento del conductor." Our script walked our player to a wheel another
+// player held; game/mission.cpp sends him to a passenger door instead
+// (seatplan.h, PlanScriptedWheel), and no key press says which seat he ends up
+// in. The session hears it from the seat he is found in.
+void TestAScriptedRideIsAnnouncedFromTheSeat() {
+	std::printf("\na ride our script started is told to the session once we sit\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	PutACarNextToUs(c);
+	const int32_t handle = c.SessionCarHandleOf(80);
+	Check(handle >= 0, "the car is built here");
+
+	// On the way: nothing is said, the door goes out as an entry intent.
+	c.NoteScriptedRide(80, WallClock::NowMs());
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == INVALID_NETID, "nobody is told a seat we are not in yet");
+	Check(c.ScriptedRideNetIdForTest() == 80, "and the ride is still expected");
+
+	// In, in the back.
+	g_rec.localIsPassenger     = true;
+	g_rec.localPassengerHandle = handle;
+	g_rec.localPassengerSeat   = 3;
+	c.NoteScriptedRide(80, WallClock::NowMs());
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == 80, "the seat went to the session");
+	Check(c.ScriptedRideNetIdForTest() == INVALID_NETID, "once");
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == 80, "and it stands, with nothing more to say");
+
+	// Getting out is the seat key's own exit, unchanged.
+	g_rec.localIsPassenger = false;
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == INVALID_NETID, "the exit went out as it always does");
+}
+
+void TestAScriptedRideLapsesWhenNotSaidAgain() {
+	std::printf("\na ride our script gave up on is not announced later\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	PutACarNextToUs(c);
+	const int32_t handle = c.SessionCarHandleOf(80);
+
+	// Last said well over the hold ago: the walk was broken off.
+	c.NoteScriptedRide(80, WallClock::NowMs() - SCRIPTED_RIDE_HOLD_MS - 500);
+	c.TickSeat();
+	Check(c.ScriptedRideNetIdForTest() == INVALID_NETID, "forgotten");
+	g_rec.localIsPassenger     = true;
+	g_rec.localPassengerHandle = handle;
+	g_rec.localPassengerSeat   = 1;
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == INVALID_NETID,
+	      "sitting in that car some other way later is not taken for the script's ride");
+
+	// Nor a car other than the one it was said for.
+	c.NoteScriptedRide(81, WallClock::NowMs());
+	c.TickSeat();
+	Check(c.LocalSeatNetId() == INVALID_NETID, "the wrong car says nothing");
+	Check(c.ScriptedRideNetIdForTest() == INVALID_NETID, "and is dropped");
 }
 
 // The other half of the reported bug, and the one that made it look like the
@@ -4004,6 +4772,119 @@ void TestPoseApplied() {
 	Check(c.PlayerSlot(1).last.health == 100.0f, "non-interpolated fields survive");
 }
 
+// docs/protocol.md 1.7.2: the body is played at the instant the pose is drawn
+// at, so the legs are not 100 ms ahead of where the ped stands.
+void TestTheBodyIsPlayedWithThePose() {
+	std::printf("\nthe body is played at the pose's instant\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	for (uint32_t i = 0; i <= 8; ++i) {
+		S_PlayerState s = MakeState(1, 1000 + i * 40, float(i));
+		s.body.animId   = static_cast<uint16_t>(i);
+		c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+	}
+	g_rec.modelReady = true;
+	c.Tick();
+	c.Tick();
+	const RemotePlayer &p = c.PlayerSlot(1);
+	Check(p.last.animId == 8, "the newest snapshot is still kept as it came");
+	Check(p.shown.animId < 8, "but the body played is an older one");
+	Check(g_rec.lastPose.pos.x >= float(p.shown.animId) &&
+	          g_rec.lastPose.pos.x <= float(p.shown.animId) + 1.0f,
+	      "the one whose instant the pose is drawn at");
+}
+
+RideFrame g_trainFrame;
+bool      g_haveTrain = false;
+bool RecTrainRideFrame(uint8_t track, uint16_t wagon, RideFrame &out) {
+	if (!g_haveTrain || track != 1 || wagon != 3)
+		return false;
+	out = g_trainFrame;
+	return true;
+}
+
+// docs/protocol.md 1.7.1: a rider is put on our copy of what they ride, not
+// on a world position that trails it.
+void TestARiderIsPutOnOurCopy() {
+	std::printf("\na player riding a train\n");
+	Client      c;
+	WorldBridge b      = RecordingBridge();
+	b.TrainRideFrame   = &RecTrainRideFrame;
+	c.SetBridge(b);
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	for (uint32_t i = 0; i <= 8; ++i) {
+		S_PlayerStateRide s;
+		InitHeader(s, 1000 + i * 40);
+		s.playerId       = 1;
+		s.body           = MakeState(1, 0, float(i)).body;
+		s.ride           = PlayerRideBody{};
+		s.ride.kind      = RIDE_TRAIN;
+		s.ride.track     = 1;
+		s.ride.id        = 3;
+		s.ride.offset    = {0.5f, 2.0f, 1.0f};
+		s.ride.heading   = 0.25f;
+		c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+	}
+	Check(c.PlayerSlot(1).haveState && c.PlayerSlot(1).last.pos.x == 8.0f,
+	      "a riding snapshot is a snapshot");
+
+	g_rec.modelReady = true;
+	g_haveTrain      = false;
+	c.Tick();
+	c.Tick();
+	Check(g_rec.lastPose.pos.x < 9.0f, "with no such wagon here, the world position");
+
+	g_haveTrain       = true;
+	g_trainFrame      = RideFrame{};
+	g_trainFrame.pos  = {5000.0f, 100.0f, 20.0f};
+	c.Tick();
+	Check(std::fabs(g_rec.lastPose.pos.x - 5000.5f) < 1e-3f &&
+	          std::fabs(g_rec.lastPose.pos.y - 102.0f) < 1e-3f &&
+	          std::fabs(g_rec.lastPose.pos.z - 21.0f) < 1e-3f,
+	      "with it, where they stand on our copy of the wagon");
+	Check(std::fabs(g_rec.lastPose.heading - 0.25f) < 1e-3f,
+	      "facing the way they face on it");
+
+	c.HandleMessage(Wrap(MakeState(1, 1400, 9.0f), CH_SNAPSHOT));
+	for (int i = 0; i < 3; ++i)
+		c.Tick();
+	Check(g_rec.lastPose.pos.x > 4000.0f,
+	      "a plain snapshot after it does not pull them off before its instant");
+	g_haveTrain = false;
+}
+
+// A player whose stream has stopped stands still instead of running on the
+// spot (remotebody.h, FrozenBody).
+void TestAFrozenPlayerStopsRunning() {
+	std::printf("\na player whose stream stops\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	for (uint32_t i = 0; i <= 8; ++i) {
+		S_PlayerState s = MakeState(1, 1000 + i * 40, float(i));
+		s.body.animId   = 1;   // ANIM_STD_RUN
+		s.body.moveState = 3;
+		c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+	}
+	g_rec.modelReady = true;
+	c.Tick();
+	c.Tick();
+	Check(c.PlayerSlot(1).shown.animId == 1 && c.PlayerSlot(1).shown.moveSpeed.x != 0.0f,
+	      "running while the snapshots come");
+	std::this_thread::sleep_for(std::chrono::milliseconds(REMOTE_STALL_MS + 50));
+	c.Tick();
+	Check(c.PlayerSlot(1).shown.animId == 3 && c.PlayerSlot(1).shown.moveSpeed.x == 0.0f &&
+	          c.PlayerSlot(1).shown.moveState == 1,
+	      "standing idle once they have stopped arriving");
+	c.HandleMessage(Wrap(MakeState(1, 1400, 9.0f), CH_SNAPSHOT));
+	c.Tick();
+	Check(c.PlayerSlot(1).shown.moveSpeed.x != 0.0f, "and moving again with the next one");
+}
+
 void TestPedLostToTheEngineIsRespawned() {
 	std::printf("\na ped the engine destroys\n");
 	// GTA III owns the ped pool. Even a MISSION_CHAR ped can go away (a
@@ -4783,7 +5664,8 @@ void TestReplayableWeapons() {
 	Check(IsReplayableWeapon(WEAPONTYPE_FLAMETHROWER),
 	      "the flamethrower is replayed, so the flame comes out");
 	Check(!IsReplayableWeapon(WEAPONTYPE_DETONATOR),
-	      "the detonator is refused: it sets off bombs nobody synced");
+	      "the detonator is refused: it fires nothing, and its shot sets off the bombs "
+	      "instead (Client::SetOffBombsFor)");
 	Check(!IsReplayableWeapon(WEAPONTYPE_UNARMED) &&
 	          !IsReplayableWeapon(WEAPONTYPE_BASEBALLBAT),
 	      "melee is refused: it's damage, and its animation already rides "
@@ -6529,6 +7411,162 @@ void TestDisconnectDropsTheHost() {
 	Check(c.HostPlayerId() == INVALID_PLAYER, "with nobody else holding it either");
 }
 
+// ---- whose sky it is (coopiii/sky.h) --------------------------------------------
+
+S_MissionState MakeMissionState(uint8_t state, uint8_t owner, uint16_t number,
+                                uint8_t participants, uint8_t outcome = MISSION_OUTCOME_NONE) {
+	S_MissionState s;
+	InitHeader(s, 1000);
+	s.campaignLog   = 77;
+	s.state         = state;
+	s.ownerId       = owner;
+	s.missionNumber = number;
+	s.participants  = participants;
+	s.outcome       = outcome;
+	s.marginCm      = 500;
+	return s;
+}
+
+void TestTheSkyHolderRule() {
+	std::printf("\nwhose clock and sky the session follows\n");
+	Check(SkyHolder(0, INVALID_PLAYER) == 0, "the host's, with no mission running");
+	Check(SkyHolder(1, 0) == 0, "the running mission's owner's, whoever the host is");
+	Check(SkyHolder(0, 0) == 0, "the same player when the host runs it");
+	Check(SkyHolder(INVALID_PLAYER, INVALID_PLAYER) == INVALID_PLAYER, "nobody's in an empty session");
+	Check(SkyHolderHere(1, INVALID_PLAYER, 0, true) == 0,
+	      "a mission we just launched makes it ours before the server has said");
+	Check(SkyHolderHere(1, INVALID_PLAYER, 0, false) == 1, "and without one it is the host's");
+	Check(SkyHolderHere(1, 2, 0, true) == 2,
+	      "but not over somebody else's mission, which ours never became");
+	Check(SkyHolderHere(1, INVALID_PLAYER, INVALID_PLAYER, true) == 1,
+	      "and not before a welcome has named us");
+}
+
+void TestFollowingTheSkyOverTheHour() {
+	std::printf("\nfollowing the sky over the top of the hour\n");
+	// SUNNY 0, CLOUDY 1, RAINY 2, FOGGY 3.
+	SkyWrite w = FollowSky(12, /*old=*/0, /*new=*/2, /*localHour=*/12, /*localOld=*/3);
+	Check(w.weatherOld == 0 && w.weather == 2 && w.forced == 2,
+	      "in the same hour the pair is copied and the new type pinned");
+
+	// The holder turned 07:00 and went from sunny-into-cloudy to
+	// cloudy-into-rainy; we are at 06:58, still blending into cloudy.
+	w = FollowSky(7, 1, 2, 6, 0);
+	Check(w.weatherOld == 0 && w.weather == 1 && w.forced == 2,
+	      "a clock behind the holder's turn keeps blending into its old type, and turns into its new "
+	      "one off the pin");
+	w = FollowSky(0, 1, 2, 23, 0);
+	Check(w.weatherOld == 0 && w.weather == 1 && w.forced == 2, "the same across midnight");
+
+	// We turned 07:00 at 07:01, the holder is still at 06:59 in sunny-into-cloudy.
+	w = FollowSky(6, 0, 1, 7, 0);
+	Check(w.weatherOld == 1 && w.weather == 1 && w.forced == 1,
+	      "a clock past the holder's turn starts its hour where the holder is going");
+	w = FollowSky(23, 0, 1, 0, 0);
+	Check(w.weatherOld == 1 && w.weather == 1 && w.forced == 1, "and across midnight");
+
+	w = FollowSky(25, 0, 2, 25, 1);
+	Check(w.weatherOld == 0 && w.weather == 2 && w.forced == 2,
+	      "an hour that is no hour writes the pair as it came");
+}
+
+void TestTheMissionOwnerHoldsTheSky() {
+	std::printf("\nthe owner of the session's mission holds the sky\n");
+	// noxx2 is the host, player 0; we are noxx3, player 1, and run Give Me
+	// Liberty.
+	Client c;
+	c.SetBridge(RecordingBridge());
+	g_rec.world = WorldState{12, 3, 0, 0};
+	c.HandleMessage(Wrap(MakeWelcome(1, 0, /*host=*/0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_IDLE, INVALID_PLAYER, MISSION_NONE, 0), CH_EVENT));
+	Check(!c.SkyIsOurs() && c.SkyHolderId() == 0, "the host's sky to begin with");
+	Check(g_rec.weatherApplies == 1, "and ours follows it, pinned");
+
+	c.Missions().Launched(0x4242, 19, 1000);
+	Check(c.SkyIsOurs(), "our START_MISSION makes it ours at once");
+	c.TickWorldForTest();
+	Check(g_rec.weatherReleases == 1, "the pin comes off before the mission's first line runs");
+	Check(c.WorldReportsSentForTest() == 1, "and our sky goes out without waiting for the beat");
+
+	// The mission's opening: FORCE_WEATHER_NOW cloudy, SET_TIME_OF_DAY 4 0.
+	// The host's packet, sent before the server heard of the mission, still
+	// says 12:03.
+	g_rec.world       = WorldState{4, 0, 1, 1};
+	g_rec.timeApplies = 0;
+	const int applied = g_rec.weatherApplies;
+	c.HandleMessage(Wrap(MakeWorldState(0, 12, 3, 0, 0), CH_EVENT));
+	Check(g_rec.timeApplies == 0 && g_rec.weatherApplies == applied,
+	      "and the host's clock no longer drags the mission's back to midday");
+	c.TickWorldForTest();
+	Check(c.WorldReportsSentForTest() == 2, "04:00 and cloudy go out the frame the script sets them");
+	for (int i = 0; i < 10; ++i)
+		c.TickWorldForTest();
+	Check(c.WorldReportsSentForTest() <= 3, "and after that on the 1 Hz beat, not every frame");
+
+	c.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_RUNNING, 1, 19, 0x03), CH_EVENT));
+	Check(c.SkyIsOurs(), "the server's word that it runs changes nothing");
+
+	// It ends, and the host has the sky again.
+	c.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_IDLE, 1, 19, 0), CH_EVENT));
+	Check(!c.SkyIsOurs() && c.SkyHolderId() == 0, "the end gives the sky back to the host");
+	const uint32_t sent = c.WorldReportsSentForTest();
+	c.TickWorldForTest();
+	Check(c.WorldReportsSentForTest() == sent, "and we stop reporting it");
+	c.HandleMessage(Wrap(MakeWorldState(0, 4, 40, 1, 1), CH_EVENT));
+	Check(g_rec.weatherApplies == applied + 1 && g_rec.appliedWeather == 1,
+	      "whose packets we follow again");
+}
+
+void TestTheHostFollowsSomebodyElsesMission() {
+	std::printf("\nthe host, while somebody else's mission runs\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	g_rec.world = WorldState{12, 3, 0, 0};
+	c.HandleMessage(Wrap(MakeWelcome(0, 0, /*host=*/0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_IDLE, INVALID_PLAYER, MISSION_NONE, 0), CH_EVENT));
+	Check(c.SkyIsOurs(), "the host's sky is the session's");
+
+	c.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_RUNNING, 1, 19, 0x03), CH_EVENT));
+	Check(!c.SkyIsOurs() && c.SkyHolderId() == 1, "player 1's mission runs, so it is theirs");
+	Check(c.IsHost(), "though we are still the host");
+	const uint32_t sent = c.WorldReportsSentForTest();
+	c.TickWorldForTest();
+	Check(c.WorldReportsSentForTest() == sent, "we stop reporting ours");
+
+	c.HandleMessage(Wrap(MakeWorldState(0, 4, 0, 1, 1), CH_EVENT));
+	Check(g_rec.timeApplies == 1 && g_rec.appliedHour == 4 && g_rec.appliedMinute == 0,
+	      "the mission's 04:00 moves our clock");
+	Check(g_rec.weatherApplies == 1 && g_rec.appliedWeather == 1 && g_rec.appliedWeatherOld == 1 &&
+	          g_rec.appliedForced == 1,
+	      "and its cloudy sky is ours, pinned");
+	Check(g_rec.weatherReleases == 0, "nothing of ours was released: we never pinned it");
+
+	g_rec.world = WorldState{4, 30, 1, 1};
+	c.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_IDLE, 1, 19, 0, MISSION_OUTCOME_PASSED), CH_EVENT));
+	Check(c.SkyIsOurs(), "the mission over, the sky is the host's again");
+	Check(g_rec.weatherReleases == 1, "our pin comes off and the weather turns on its own again");
+	c.TickWorldForTest();
+	Check(c.WorldReportsSentForTest() == sent + 1, "and our clock goes out at once, from 04:30");
+
+	const int timeBefore = g_rec.timeApplies;
+	c.HandleMessage(Wrap(MakeWorldState(0, 12, 3, 0, 0), CH_EVENT));
+	Check(g_rec.timeApplies == timeBefore, "a stale packet from before is a copy of ours, and ignored");
+}
+
+void TestAClockJumpDoesNotTurnTheWeather() {
+	std::printf("\na follower's clock put back within the hour\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	g_rec.world = WorldState{12, 40, 2, 1};
+	c.HandleMessage(Wrap(MakeWelcome(1, 0, /*host=*/0), CH_EVENT));
+	g_rec.timeApplies    = 0;
+	g_rec.weatherApplies = 0;
+	c.HandleMessage(Wrap(MakeWorldState(0, 12, 10, 2, 1), CH_EVENT));
+	Check(g_rec.timeApplies == 1 && g_rec.appliedMinute == 10, "thirty minutes back is a jump");
+	Check(g_rec.weatherApplies == 1 && g_rec.appliedWeatherOld == 1 && g_rec.appliedWeather == 2,
+	      "and the blend is still the holder's pair, not the one a turn-over would make");
+}
+
 void TestAngleWrap() {
 	std::printf("\naim yaw wrapping\n");
 	constexpr float kPi = 3.14159265358979323846f;
@@ -7073,22 +8111,24 @@ void TestAWreckedSpawnSaysSo() {
 	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
 	g_rec.modelReady = true;
 
-	// The server does not currently put a wreck in a backfill at all, so this
-	// only arrives if something upstream decides a wreck is worth showing.
-	// What is pinned here is that the bit survives the trip and reaches the
-	// seam that would have to act on it, rather than being dropped on the
-	// floor the way the health was.
+	// The backfill hands a joiner the session's wrecks (game/wreck.h). The
+	// bit has to survive the trip and end in a shell, not in a car built
+	// healthy the way the health once was.
 	S_VehicleSpawn wreck = MakeVehicleSpawn(9);
 	wreck.health         = 0.0f;
 	wreck.flags          = VEH_WRECKED;
 	c.HandleMessage(Wrap(wreck, CH_EVENT));
+	Check(c.VehicleByNetId(9) != nullptr && c.VehicleByNetId(9)->destroyed,
+	      "the row is a wreck from the packet on");
 	c.Tick();
 
 	Check(c.VehicleByNetId(9) != nullptr &&
 	          (c.VehicleByNetId(9)->last.flags & VEH_WRECKED) != 0,
 	      "VEH_WRECKED is kept");
-	Check((g_rec.lastVehicleBody.flags & VEH_WRECKED) != 0,
-	      "and handed to the vehicle seam, which is whose decision it is");
+	Check(g_rec.vehicleSpawns == 1 && g_rec.quietWrecks == 1,
+	      "and the car it builds is made a wreck straight away, without a blast");
+	Check(!c.VehicleByNetId(9)->damagePending,
+	      "with no damage pass after it: FuckCarCompletely's is the whole of it");
 }
 
 // ---- getting into a car the session already knows about ---------------------
@@ -8728,7 +9768,7 @@ S_PedSpawn MakeAmbientPedSpawn(uint16_t netId, uint8_t owner = 1,
 	s.netId         = netId;
 	s.body.modelId  = 7;
 	s.body.pedType  = 0;
-	s.body.pad      = 0;
+	s.body.flags    = 0;
 	s.body.pos      = {x, 20.0f, 30.0f};
 	s.body.heading  = 0.0f;
 	return s;
@@ -8745,7 +9785,8 @@ S_CarSpawn MakeAmbientCarSpawn(uint16_t netId, uint8_t owner = 1) {
 	s.body.colour2  = 2;
 	s.body.extra1   = -1;
 	s.body.extra2   = -1;
-	s.body.pad[0] = s.body.pad[1] = 0;
+	s.body.flags    = 0;
+	s.body.pad      = 0;
 	s.body.pos      = {40.0f, 50.0f, 60.0f};
 	s.body.rot      = {0.0f, 0.0f, 0.0f, 1.0f};
 	return s;
@@ -11371,6 +12412,265 @@ void TestTheSessionsWantedRuleArrives() {
 	      "a welcome with no rule bits means per player, not off");
 }
 
+// ---- coming down: the Pay'n'Spray, the bribe (docs/wanted.md §4.9) --------
+//
+// The bug these are for came from a live session: a player resprayed their
+// car and kept their stars. The spray shop cleared them, and the next tick put
+// them back off another player's snapshot that had been sent before anybody
+// had heard of the respray.
+
+void TestWantedHoldArithmetic() {
+	std::printf("\ncoming down: a hold, its cap and its two ways out\n");
+
+	WantedHold h;
+	game::HoldWantedPeer(h, 2, 3, 1000);
+	Check(h.above == 0, "nobody is held who already has no more than we do");
+
+	game::HoldWantedPeer(h, 4, 0, 1000);
+	Check(game::CountedWantedLevel(h, 4, 1100) == 0,
+	      "after a respray, a player still reporting four counts for nothing");
+	Check(game::CountedWantedLevel(h, 5, 2000) == 0,
+	      "nor when the report goes up - that is no sign they came down");
+	Check(game::CountedWantedLevel(h, 0, 2100) == 0 && h.above == 0,
+	      "and once they report less than they did, the hold is gone");
+	Check(game::CountedWantedLevel(h, 4, 2200) == 4,
+	      "so stars they earn after that count in full");
+
+	game::HoldWantedPeer(h, 4, 3, 5000);
+	Check(game::CountedWantedLevel(h, 4, 5100) == 3,
+	      "after a bribe, the old four counts as the three we now hold");
+
+	game::HoldWantedPeer(h, 4, 0, 10000);
+	Check(game::CountedWantedLevel(h, 4, 10000 + game::WANTED_HOLD_MS - 1) == 0,
+	      "held until the time is up");
+	Check(game::CountedWantedLevel(h, 4, 10000 + game::WANTED_HOLD_MS) == 4 &&
+	          h.above == 0,
+	      "and then a player who never came down is simply still wanted - a "
+	      "hold is never a way out of the vehicle rule");
+
+	game::HoldWantedPeer(h, 4, 0, 0xFFFFFF00u);
+	Check(game::CountedWantedLevel(h, 4, 0x00000010u) == 0,
+	      "the clock wrapping inside a hold does not end it early");
+
+	// Who a respray or a bribe reaches.
+	Check(game::WantedEventReaches(WANTED_RULE_SHARED, INVALID_NETID, INVALID_NETID),
+	      "shared: everybody, on foot or not");
+	Check(game::WantedEventReaches(WANTED_RULE_PERPLAYER, 80, 80),
+	      "perplayer: the car it happened in");
+	Check(!game::WantedEventReaches(WANTED_RULE_PERPLAYER, 80, 81) &&
+	          !game::WantedEventReaches(WANTED_RULE_PERPLAYER, INVALID_NETID,
+	                                    INVALID_NETID),
+	      "and nobody else, and two people on foot are not a car");
+	Check(!game::WantedEventReaches(WANTED_RULE_OFF, 80, 80), "off: nobody");
+
+	Check(game::WantedAfterEvents(5, true, 0) == 0, "a respray is a clear");
+	Check(game::WantedAfterEvents(5, false, 2) == 3, "a bribe is a star each");
+	Check(game::WantedAfterEvents(1, false, 3) == 0, "and never below zero");
+	Check(game::WantedAfterEvents(4, true, 1) == 0, "a clear wins over a bribe");
+}
+
+void TestABribeDoesNotMakeABorrowerAnEarner() {
+	std::printf("\nshared: a bribe off a borrowed four leaves a borrowed three\n");
+	WantedSim b;
+	b.rule = WANTED_RULE_SHARED;
+	b.Tick(4);
+	Check(b.engine == 4 && b.borrowed && b.own == 0, "B holds A's four");
+
+	// B's own engine takes the bribe. A has heard and is down to three too.
+	b.engine = 3;
+	b.Tick(3);
+	Check(b.own == 0 && b.borrowed && b.engine == 3,
+	      "B's three is still A's - reading it as earned would let it outlive "
+	      "the player who earned it");
+
+	// A dies.
+	b.Tick(0);
+	Check(b.engine == 0, "so it goes when A's goes");
+}
+
+void TestAResprayIsNotUndoneByACarMate() {
+	std::printf("\nperplayer: a respray is not undone by the passenger's stale "
+	            "report\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeWantedState(1, 1000, 5.0f, 4), CH_SNAPSHOT));
+	c.HandleMessage(Wrap(MakeEnter(1, 80, 1), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(0, 80), CH_EVENT));
+	c.Tick();
+	Check(g_rec.engineWanted == 4, "we drive alice around, and have her four");
+
+	// Our engine's spray shop. Alice has not heard yet.
+	g_rec.engineWanted = 0;
+	c.Tick();
+	c.Tick();
+	Check(g_rec.engineWanted == 0 && g_rec.wantedWrites == 1,
+	      "the respray's clear holds against her four from before it - this "
+	      "is the reported bug");
+
+	// Her machine got our S_Respray and cleared her too.
+	c.HandleMessage(Wrap(MakeWantedState(1, 1040, 5.0f, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.engineWanted == 0, "and she comes down to nothing");
+
+	// And the hold is over: new stars of hers are ours again.
+	c.HandleMessage(Wrap(MakeWantedState(1, 1080, 5.0f, 2), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.engineWanted == 2, "a crime of hers afterwards is still shared by the car");
+}
+
+// Which machine's garage ran the respray does not matter, only which car it
+// names: the driver's and a passenger's engine can both see the car parked in
+// the shop (FindPlayerVehicle is the car the player is in, either seat).
+void TestAResprayClearsTheWholeCar() {
+	std::printf("\nperplayer: a respray clears everybody in the car it names, "
+	            "and nobody else\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeWantedState(1, 1000, 5.0f, 4), CH_SNAPSHOT));
+	c.HandleMessage(Wrap(MakeEnter(1, 80, 1), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(0, 80), CH_EVENT));
+	c.Tick();
+	Check(g_rec.engineWanted == 4, "alice in our car gives us her four");
+
+	S_Respray r{};
+	InitHeader(r, 1100);
+	r.playerId          = 1;
+	r.body.vehicleNetId = 80;
+	r.body.garage       = 9;
+	c.HandleMessage(Wrap(r, CH_EVENT));
+	c.Tick();
+	Check(g_rec.engineWanted == 0 && g_rec.lastWantedWrite == 0,
+	      "her machine's respray of the car clears us, though her last "
+	      "snapshot still says four");
+	c.Tick();
+	Check(g_rec.engineWanted == 0, "and it stays cleared");
+
+	// A respray somewhere else in the city is nothing to us.
+	Client d;
+	d.SetBridge(RecordingBridge());
+	g_rec.engineWanted = 3;
+	d.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	d.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	d.HandleMessage(Wrap(MakeEnter(0, 81), CH_EVENT));
+	d.Tick();
+	S_Respray other{};
+	InitHeader(other, 1200);
+	other.playerId          = 1;
+	other.body.vehicleNetId = 80;
+	d.HandleMessage(Wrap(other, CH_EVENT));
+	d.Tick();
+	Check(g_rec.engineWanted == 3 && g_rec.wantedWrites == 0,
+	      "in perplayer, another car's respray leaves our own stars alone");
+}
+
+void TestAResprayClearsASharedSession() {
+	std::printf("\nshared: one player's respray clears the session\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	S_Welcome w = MakeWelcome(0);
+	w.flags     = FlagsWithWantedRule(0, WANTED_RULE_SHARED);
+	c.HandleMessage(Wrap(w, CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+
+	// We earned three; alice earned four across town; bob borrows it.
+	g_rec.engineWanted = 3;
+	c.HandleMessage(Wrap(MakeWantedState(1, 1000, 500.0f, 4), CH_SNAPSHOT));
+	c.HandleMessage(Wrap(MakeWantedState(2, 1000, 900.0f, 4, true), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.engineWanted == 4, "the session is at alice's four");
+
+	// Bob sprays his car. Nobody's snapshot has caught up.
+	S_Respray r{};
+	InitHeader(r, 1100);
+	r.playerId          = 2;
+	r.body.vehicleNetId = INVALID_NETID;
+	r.body.garage       = 3;
+	c.HandleMessage(Wrap(r, CH_EVENT));
+	c.Tick();
+	c.Tick();
+	Check(g_rec.engineWanted == 0,
+	      "cleared - including the three we earned ourselves, because the "
+	      "session holds one level and not one each");
+
+	// Alice cleared too, on her own machine.
+	c.HandleMessage(Wrap(MakeWantedState(1, 1040, 500.0f, 0), CH_SNAPSHOT));
+	c.HandleMessage(Wrap(MakeWantedState(2, 1040, 900.0f, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.engineWanted == 0, "and nobody puts it back");
+}
+
+void TestABribeTakesAStarOffASharedSession() {
+	std::printf("\nshared: a bribe takes a star off everybody\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	S_Welcome w = MakeWelcome(0);
+	w.flags     = FlagsWithWantedRule(0, WANTED_RULE_SHARED);
+	c.HandleMessage(Wrap(w, CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+
+	// We earned four; alice borrows it.
+	g_rec.engineWanted = 4;
+	c.HandleMessage(Wrap(MakeWantedState(1, 1000, 500.0f, 4, true), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.wantedWrites == 0, "four, our own");
+
+	S_PickupTaken t = MakeTaken(1, 500.0f, 15);
+	t.ident.flags   = PICKUP_F_BRIBE;
+	c.HandleMessage(Wrap(t, CH_EVENT));
+	c.Tick();
+	Check(g_rec.engineWanted == 3 && g_rec.wantedWrites == 1,
+	      "her bribe takes one of our stars");
+	c.Tick();
+	Check(g_rec.engineWanted == 3, "and only one");
+
+	// A pickup that is not a bribe does nothing to anybody's stars.
+	c.HandleMessage(Wrap(MakeTaken(1, 600.0f), CH_EVENT));
+	c.Tick();
+	Check(g_rec.engineWanted == 3 && g_rec.wantedWrites == 1,
+	      "a health pickup is not a bribe");
+
+	// We die: ours was our own, so the session's goes, and alice's with it.
+	g_rec.engineWanted = 0;
+	c.HandleMessage(Wrap(MakeWantedState(1, 1040, 500.0f, 3, true), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.engineWanted == 0, "her echo of our three does not bring it back");
+}
+
+void TestOurOwnBribeWhileBorrowing() {
+	std::printf("\nshared: our own bribe, while borrowing, is not held against "
+	            "us\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	S_Welcome w = MakeWelcome(0);
+	w.flags     = FlagsWithWantedRule(0, WANTED_RULE_SHARED);
+	c.HandleMessage(Wrap(w, CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeWantedState(1, 1000, 500.0f, 4), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.engineWanted == 4 && g_rec.wantedWrites == 1, "we borrow alice's four");
+
+	// Our engine takes the bribe; alice's last snapshot still says four.
+	g_rec.engineWanted = 3;
+	c.Tick();
+	Check(g_rec.engineWanted == 3 && g_rec.wantedWrites == 1,
+	      "our three is not raised back to her stale four");
+
+	c.HandleMessage(Wrap(MakeWantedState(1, 1040, 500.0f, 3), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.engineWanted == 3 && g_rec.wantedWrites == 1,
+	      "she comes down to three and nothing is written");
+
+	c.HandleMessage(Wrap(MakeWantedState(1, 1080, 500.0f, 0), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.engineWanted == 0,
+	      "and when she dies we follow: the bribe did not make her three ours");
+}
+
 void TestDisconnectClearsAmbientPeds() {
 	std::printf("\na disconnect empties the seats before it drops the peds\n");
 	Client c;
@@ -12410,7 +13710,13 @@ void TestABurningCarIsKeptUntilItGoesUp() {
 	Check(v->settleReported && v->burnSinceMs == 0,
 	      "once it stops burning the settle ends as it always did");
 
-	// A burn that stopped running here - a paused game - is let go of.
+	// A burn that has not gone up here in the whole cap is ours to decide:
+	// ours is the only timer that has been counting (BurnOutlastedCustody).
+	Check(!BurnOutlastedCustody(false, 10000 + CUSTODY_BURN_CAP_MS, 10000) &&
+	          !BurnOutlastedCustody(true, 10000 + CUSTODY_BURN_CAP_MS - 1, 10000) &&
+	          BurnOutlastedCustody(true, 10000 + CUSTODY_BURN_CAP_MS, 10000) &&
+	          !BurnOutlastedCustody(true, 99999, 0),
+	      "the cap is the burn's own length, counted from when it caught");
 	Client c2;
 	c2.SetBridge(RecordingBridge());
 	ParkOneCar(c2);
@@ -12421,7 +13727,33 @@ void TestABurningCarIsKeptUntilItGoesUp() {
 	Check(!v2->settleReported, "burning");
 	v2->burnSinceMs -= CUSTODY_BURN_CAP_MS;
 	c2.TickCustody();
-	Check(v2->settleReported, "and given back once it has burned past the cap");
+	Check(g_rec.settleBlowUps == 1 && !v2->settleReported && v2->destroyed,
+	      "past the cap we blow it up here instead of giving it back to every machine");
+	Check(v2->settleEndsAtMs > WallClock::NowMs() && v2->burnSinceMs == 0,
+	      "and the wreck gets a whole settle window of its own");
+	g_rec.carBurning = false;   // a wreck is not burning
+	c2.TickCustody();
+	Check(!v2->settleReported && (v2->last.flags & VEH_WRECKED) != 0,
+	      "the wreck goes on being streamed, saying it is one");
+	g_rec.carAtRest = true;
+	for (int i = 0; i < VEHICLE_REST_FRAMES + 1; ++i)
+		c2.TickCustody();
+	Check(v2->settleReported, "until it lies still");
+
+	// Unless the engine will not blow it up (bCanBeDamaged clear): then it
+	// goes back, and the host's timer has it.
+	Client c3;
+	c3.SetBridge(RecordingBridge());
+	ParkOneCar(c3);
+	c3.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	RemoteVehicle *v3       = const_cast<RemoteVehicle *>(c3.VehicleByNetId(80));
+	g_rec.carBurning        = true;
+	g_rec.settleBlowUpWorks = false;
+	c3.TickCustody();
+	v3->burnSinceMs -= CUSTODY_BURN_CAP_MS;
+	c3.TickCustody();
+	Check(g_rec.settleBlowUps == 1 && v3->settleReported && !v3->destroyed,
+	      "a car the engine refuses to blow up is given back past the cap, as before");
 
 	g_rec.carBurning = false;
 	g_rec.carAtRest  = false;
@@ -12507,6 +13839,444 @@ void TestADentWhileWeSettleACarIsSent() {
 	o.HandleMessage(Wrap(MakeVehicleDamage(80, panels, 0, /*alice=*/1), CH_EVENT));
 	Check(g_rec.vehicleDamageApplies == 1 && g_rec.lastDamageFlying,
 	      "an observer puts the custodian's dent on its copy");
+}
+
+// ---- a car's bomb (mission-audit.md R6) ------------------------------------------
+
+S_VehicleBomb MakeBomb(uint8_t from, uint16_t netId, uint8_t type,
+                       uint8_t blame = INVALID_PLAYER, uint16_t fuseMs = 0) {
+	S_VehicleBomb b{};
+	InitHeader(b, 1000);
+	b.playerId = from;
+	b.netId    = netId;
+	b.bombType = type;
+	b.blame    = blame;
+	b.fuseMs   = fuseMs;
+	return b;
+}
+
+void TestACarsBombGoesWhereTheCarIs() {
+	std::printf("\na car's bomb, from the machine the car is on\n");
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		ParkOneCar(c);
+		c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+		c.TickCustody();
+		Check(c.BombReportsSentForTest() == 0, "a car we settle with no bomb in it says nothing");
+		g_rec.observedBomb = 4;   // CARBOMB_TIMEDACTIVE
+		c.TickCustody();
+		c.TickCustody();
+		Check(c.BombReportsSentForTest() == 1 && c.VehicleByNetId(80)->bomb == 4,
+		      "a bomb set ticking while we settle it is said, once");
+	}
+	{
+		Client c;
+		c.SetBridge(RecordingBridge());
+		GiveUsTheSessionsCar(c);
+		c.TickLocalVehicle();
+		S_EnterVehicle enter;
+		InitHeader(enter, 1000);
+		enter.playerId   = 0;
+		enter.body       = EnterVehicleBody{};
+		enter.body.netId = 80;
+		enter.body.seat  = 0;
+		c.HandleMessage(Wrap(enter, CH_EVENT));
+		g_rec.localBomb = 1;   // CARBOMB_TIMED, the mission's, on every copy
+		c.TickLocalBombForTest();
+		Check(c.LocalVehicleNetId() == 80 && c.BombReportsSentForTest() == 0,
+		      "the bomb a car carries when we take the wheel is the session's already");
+		g_rec.localBomb = 4;
+		c.TickLocalBombForTest();
+		c.TickLocalBombForTest();
+		Check(c.BombReportsSentForTest() == 1 && c.VehicleByNetId(80)->bomb == 4,
+		      "setting it ticking at the wheel is said, once");
+		c.HandleMessage(Wrap(MakeBomb(1, 80, 0), CH_EVENT));
+		Check(g_rec.bombApplies == 0,
+		      "and nobody else's word on its bomb goes into a car we drive");
+	}
+	{
+		Client o;
+		o.SetBridge(RecordingBridge());
+		WatchAliceSettleCar80(o);
+		o.HandleMessage(Wrap(MakeBomb(1, 80, 2), CH_EVENT));
+		Check(g_rec.bombApplies == 1 && g_rec.lastBomb == 2 && o.VehicleByNetId(80)->bomb == 2,
+		      "the bomb 8-Ball fitted on alice's machine goes on our copy of her car");
+		o.HandleMessage(Wrap(MakeBomb(0, 80, 5), CH_EVENT));
+		o.HandleMessage(Wrap(MakeBomb(1, 80, CARBOMB_MAX + 1), CH_EVENT));
+		o.HandleMessage(Wrap(MakeBomb(1, 99, 2), CH_EVENT));
+		Check(g_rec.bombApplies == 1,
+		      "our own word back, a bomb there is none of and a car we do not have change "
+		      "nothing");
+	}
+}
+
+void TestTheBombRulesHoldWithoutAGame() {
+	std::printf("\na car bomb's rules, with no game\n");
+	Check(BombBlame(3, INVALID_PLAYER) == 3 && BombBlame(3, 1) == 3,
+	      "the player the engine names is whose bomb it is");
+	Check(BombBlame(INVALID_PLAYER, 1) == 1 && BombBlame(INVALID_PLAYER, INVALID_PLAYER) ==
+	                                               INVALID_PLAYER,
+	      "and when it names nobody, the session keeps the one it had");
+	Check(BombBlame(INVALID_PLAYER, 1, true) == INVALID_PLAYER,
+	      "but a pedestrian's blast lighting the fuse is nobody's, not the last bomber's");
+	Check(FuseLeft(0, 5000) == 0 && FuseLeft(6000, 5000) == 1000 && FuseLeft(5000, 5000) == 0 &&
+	          FuseLeft(4000, 5000) == 0,
+	      "a fuse has what is left of it, and nothing once it has run out");
+	Check(FuseLeft(5000 + 60000, 5000) == CARBOMB_FUSE_MAX_MS,
+	      "and never more than the timed bomb's seven seconds");
+	Check(FuseLeft(0x00000010u, 0xFFFFFFF0u) == 0x20,
+	      "across the clock's wrap too");
+	RemoteVehicle v;
+	Check(!CarriesBombWord(v), "a car nobody has said a bomb for carries nothing");
+	v.bombBlame = 2;
+	Check(CarriesBombWord(v), "one whose bomb is somebody's does, whatever its type");
+}
+
+// Alice settles car 80 on her machine, and says what its bomb is.
+void TestACarBombIsOnEveryCopy() {
+	std::printf("\na car bomb, whose it is and its fuse, on our copy\n");
+	{
+		Client o;
+		o.SetBridge(RecordingBridge());
+		WatchAliceSettleCar80(o);
+		o.HandleMessage(Wrap(MakeBomb(1, 80, CARBOMB_ONIGNITIONACTIVE, 1), CH_EVENT));
+		Check(g_rec.bombApplies == 1 && g_rec.lastBombWrite.writeType &&
+		          g_rec.lastBombWrite.type == CARBOMB_ONIGNITIONACTIVE &&
+		          g_rec.lastBombWrite.blame == &o.PlayerSlot(1) && !g_rec.lastBombWrite.blameUs &&
+		          g_rec.lastBombWrite.lightMs == 0,
+		      "alice's ignition bomb goes on our copy, with her ped as its rigger and no fuse");
+		const int writes = g_rec.bombWrites;
+		o.TickBombsForTest();
+		Check(g_rec.bombWrites == writes + 1 && !g_rec.lastBombWrite.writeType &&
+		          g_rec.lastBombWrite.blame == &o.PlayerSlot(1),
+		      "and on every pass after it, the rigger again and never the type, since her "
+		      "ped can be built again under it");
+		o.HandleMessage(Wrap(MakeBomb(1, 80, CARBOMB_ONIGNITIONACTIVE, 1, 1000), CH_EVENT));
+		Check(g_rec.lastBombWrite.lightMs > 900 && g_rec.lastBombWrite.lightMs <= 1000 &&
+		          o.VehicleByNetId(80)->bombLit,
+		      "somebody sat down in it on her machine: our copy's fuse is lit with what is "
+		      "left of hers");
+		o.TickBombsForTest();
+		Check(g_rec.lastBombWrite.lightMs == 0, "and lit once, not every pass");
+		o.HandleMessage(Wrap(MakeBomb(1, 80, CARBOMB_REMOTE, 0), CH_EVENT));
+		Check(g_rec.lastBombWrite.blameUs && g_rec.lastBombWrite.blame == nullptr,
+		      "a bomb that is ours names our own player");
+		o.HandleMessage(Wrap(MakeBomb(1, 80, CARBOMB_REMOTE, 1, CARBOMB_FUSE_MAX_MS + 1),
+		                     CH_EVENT));
+		Check(o.VehicleByNetId(80)->bombBlame == 0,
+		      "and a fuse longer than any the engine lights changes nothing");
+	}
+	{
+		// The car is not here when the word arrives: it waits for it.
+		Client o;
+		o.SetBridge(RecordingBridge());
+		WatchAliceSettleCar80(o);
+		g_rec.bombCarHere = false;
+		o.HandleMessage(Wrap(MakeBomb(1, 80, CARBOMB_TIMEDACTIVE, 1, 7000), CH_EVENT));
+		Check(g_rec.bombWrites == 0, "a copy that is not here is given nothing");
+		g_rec.bombCarHere = true;
+		o.TickBombsForTest();
+		Check(g_rec.bombWrites == 1 && g_rec.lastBombWrite.writeType &&
+		          g_rec.lastBombWrite.type == CARBOMB_TIMEDACTIVE &&
+		          g_rec.lastBombWrite.lightMs > 6000,
+		      "and the moment it is, it gets the type and what is left of the fuse");
+	}
+	{
+		// Somebody leaves: the bomb stays, and stops being theirs.
+		Client o;
+		o.SetBridge(RecordingBridge());
+		WatchAliceSettleCar80(o);
+		o.HandleMessage(Wrap(MakeBomb(2, 80, CARBOMB_REMOTE, 1), CH_EVENT));
+		S_PlayerLeave leave;
+		InitHeader(leave, 2000);
+		leave.playerId = 1;
+		leave.reason   = LEAVE_QUIT;
+		o.HandleMessage(Wrap(leave, CH_EVENT));
+		Check(o.VehicleByNetId(80)->bomb == CARBOMB_REMOTE &&
+		          o.VehicleByNetId(80)->bombBlame == INVALID_PLAYER,
+		      "a bomb alice fitted is nobody's once she has gone");
+	}
+}
+
+// The bomb somebody else's detonator sets off, on the car we simulate.
+void TestADetonatorSetsOffTheBombWhereTheCarIs() {
+	std::printf("\na detonator, and the car it is for on another machine\n");
+	Client o;
+	o.SetBridge(RecordingBridge());
+	WatchAliceSettleCar80(o);
+	o.HandleMessage(Wrap(MakeBomb(1, 80, CARBOMB_REMOTE, 1), CH_EVENT));
+	o.HandleMessage(Wrap(MakeShot(2, WEAPONTYPE_DETONATOR), CH_EVENT));
+	Check(g_rec.detonations == 0, "bob's detonator does nothing to alice's bomb");
+	o.HandleMessage(Wrap(MakeShot(1, WEAPONTYPE_DETONATOR), CH_EVENT));
+	Check(g_rec.detonations == 1 && g_rec.lastDetonatedNetId == 80 &&
+	          g_rec.lastDetonator == &o.PlayerSlot(1),
+	      "alice's sets it off on our copy, blamed on her");
+	Check(o.VehicleByNetId(80)->bomb == CARBOMB_NONE && o.VehicleByNetId(80)->bombLit,
+	      "and the car carries no bomb and a burning fuse, as UseDetonator leaves it");
+	Check(g_rec.shotsReplayed == 0, "a detonator is never replayed as a shot");
+	o.HandleMessage(Wrap(MakeShot(1, WEAPONTYPE_DETONATOR), CH_EVENT));
+	Check(g_rec.detonations == 1, "and pressing it again sets off nothing more");
+
+	// Not here yet: the fuse waits for the car.
+	Client w;
+	w.SetBridge(RecordingBridge());
+	WatchAliceSettleCar80(w);
+	w.HandleMessage(Wrap(MakeBomb(1, 80, CARBOMB_REMOTE, 1), CH_EVENT));
+	g_rec.bombCarHere = false;
+	w.HandleMessage(Wrap(MakeShot(1, WEAPONTYPE_DETONATOR), CH_EVENT));
+	g_rec.bombCarHere = true;
+	w.TickBombsForTest();
+	Check(g_rec.detonations == 0 && g_rec.lastBombWrite.writeType &&
+	          g_rec.lastBombWrite.type == CARBOMB_NONE && g_rec.lastBombWrite.lightMs > 0 &&
+	          g_rec.lastBombWrite.lightMs <= 500,
+	      "a car that was not here when she pressed it gets the bomb off and the rest of "
+	      "the half second when it is");
+}
+
+// ---- a bomb the mission fitted (protocol.h, C_MissionBomb) ----------------------
+
+S_MissionBomb MakeMissionBomb(uint8_t owner, uint16_t netId, uint8_t type) {
+	S_MissionBomb b{};
+	InitHeader(b, 1000);
+	b.playerId = owner;
+	b.netId    = netId;
+	b.bombType = type;
+	return b;
+}
+
+// Alice (1) runs I Scream, You Scream and her script arms the van; we are
+// player 0, in her mission.
+void TestAMissionsBombIsTheOwnersOnEveryCopy() {
+	std::printf("\na bomb the mission fitted is its owner's, on every copy\n");
+	{
+		// Our engine ran the replayed ARM_CAR_WITH_BOMB on our copy of car 80.
+		Client o;
+		o.SetBridge(RecordingBridge());
+		WatchAliceSettleCar80(o);
+		o.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_RUNNING, 1, 41, 0x07), CH_EVENT));
+		o.MissionArmedCar(80, CARBOMB_REMOTE, false);
+		const RemoteVehicle *v = o.VehicleByNetId(80);
+		Check(v && v->bomb == CARBOMB_REMOTE && v->bombBlame == 1 && v->bombMission,
+		      "the replay's bomb is alice's on our row, and the mission's");
+		Check(g_rec.bombWrites == 1 && !g_rec.lastBombWrite.writeType &&
+		          g_rec.lastBombWrite.notOurs && g_rec.lastBombWrite.blame == &o.PlayerSlot(1) &&
+		          !g_rec.lastBombWrite.blameUs,
+		      "and our copy, which the handler made ours, names her ped, or nobody while "
+		      "it is not here - never us");
+		Check(o.MissionBombsSentForTest() == 0, "a participant's replay tells the session nothing");
+		o.TickBombsForTest();
+		Check(g_rec.lastBombWrite.notOurs && g_rec.lastBombWrite.blame == &o.PlayerSlot(1),
+		      "and every pass after it keeps our player off it");
+	}
+	{
+		// We are driving the van when her script arms it.
+		Client c;
+		c.SetBridge(RecordingBridge());
+		GiveUsTheSessionsCar(c);
+		c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+		c.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_RUNNING, 1, 41, 0x03), CH_EVENT));
+		c.TickLocalVehicle();
+		c.HandleMessage(Wrap(MakeEnter(0, 80), CH_EVENT));
+		c.TickLocalBombForTest();
+		Check(c.BombReportsSentForTest() == 0, "an unarmed van says nothing");
+		c.MissionArmedCar(80, CARBOMB_REMOTE, false);
+		g_rec.localBomb             = CARBOMB_REMOTE;
+		g_rec.bombSample.blameNetId = INVALID_NETID;   // our copy names nobody now
+		c.TickLocalBombForTest();
+		Check(c.BombReportsSentForTest() == 1 && c.VehicleByNetId(80)->bombBlame == 1 &&
+		          c.VehicleByNetId(80)->bombMission,
+		      "the van we drive is said to carry alice's bomb, not ours, and stays her "
+		      "mission's");
+		g_rec.bombSample.blameNetId = 201;   // her ped streams in and our copy names it
+		c.TickLocalBombForTest();
+		Check(c.BombReportsSentForTest() == 1, "and nothing more when her ped is its rigger");
+	}
+	{
+		// Alice's mission's word, arriving while we drive the van.
+		Client c;
+		c.SetBridge(RecordingBridge());
+		GiveUsTheSessionsCar(c);
+		c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+		c.TickLocalVehicle();
+		c.HandleMessage(Wrap(MakeEnter(0, 80), CH_EVENT));
+		c.TickLocalBombForTest();
+		c.HandleMessage(Wrap(MakeMissionBomb(1, 80, CARBOMB_REMOTE), CH_EVENT));
+		Check(g_rec.bombApplies == 1 && g_rec.lastBombWrite.writeType &&
+		          g_rec.lastBombWrite.type == CARBOMB_REMOTE &&
+		          g_rec.lastBombWrite.blame == &c.PlayerSlot(1) && g_rec.lastBombWrite.notOurs,
+		      "the mission's bomb goes into the van we drive, hers");
+		Check(c.VehicleByNetId(80)->bombBlame == 1 && c.VehicleByNetId(80)->bombMission,
+		      "and our row says so");
+		g_rec.localBomb             = CARBOMB_REMOTE;
+		g_rec.bombSample.blameNetId = 201;
+		c.TickLocalBombForTest();
+		Check(c.BombReportsSentForTest() == 0, "which our engine then has nothing new to say about");
+		c.HandleMessage(Wrap(MakeMissionBomb(0, 80, CARBOMB_TIMED), CH_EVENT));
+		c.HandleMessage(Wrap(MakeMissionBomb(1, 80, CARBOMB_MAX + 1), CH_EVENT));
+		c.HandleMessage(Wrap(MakeMissionBomb(1, 99, CARBOMB_REMOTE), CH_EVENT));
+		Check(g_rec.bombApplies == 1 && c.VehicleByNetId(80)->bomb == CARBOMB_REMOTE,
+		      "our own word back, a bomb there is none of and a car we do not have change "
+		      "nothing");
+	}
+	{
+		// Our own mission arms it.
+		Client c;
+		c.SetBridge(RecordingBridge());
+		WatchAliceSettleCar80(c);
+		c.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_RUNNING, 0, 41, 0x07), CH_EVENT));
+		c.MissionArmedCar(80, CARBOMB_REMOTE, true);
+		Check(c.MissionBombsSentForTest() == 1 && c.VehicleByNetId(80)->bombBlame == 0 &&
+		          c.VehicleByNetId(80)->bombMission && g_rec.bombWrites == 0,
+		      "the owner tells the session the bomb is its own, and leaves its copy as the "
+		      "handler wrote it");
+		c.MissionArmedCar(9999, CARBOMB_REMOTE, true);
+		c.MissionArmedCar(80, CARBOMB_MAX + 1, true);
+		Check(c.MissionBombsSentForTest() == 1, "a car the session has no name for says nothing");
+	}
+	{
+		// A word on it that changes it, and the owner leaving.
+		Client o;
+		o.SetBridge(RecordingBridge());
+		WatchAliceSettleCar80(o);
+		o.HandleMessage(Wrap(MakeMissionBomb(1, 80, CARBOMB_TIMED), CH_EVENT));
+		o.HandleMessage(Wrap(MakeBomb(1, 80, CARBOMB_TIMED, 1), CH_EVENT));
+		Check(o.VehicleByNetId(80)->bombMission, "the holder saying the same keeps it the mission's");
+		o.HandleMessage(Wrap(MakeBomb(1, 80, CARBOMB_TIMEDACTIVE, 2, 7000), CH_EVENT));
+		Check(!o.VehicleByNetId(80)->bombMission && o.VehicleByNetId(80)->bombBlame == 2,
+		      "bob setting its timer going makes it his fuse, as the engine blames the one who "
+		      "pressed it");
+		o.HandleMessage(Wrap(MakeMissionBomb(1, 80, CARBOMB_REMOTE), CH_EVENT));
+		S_PlayerLeave leave;
+		InitHeader(leave, 2000);
+		leave.playerId = 1;
+		leave.reason   = LEAVE_QUIT;
+		o.HandleMessage(Wrap(leave, CH_EVENT));
+		Check(!o.VehicleByNetId(80)->bombMission &&
+		          o.VehicleByNetId(80)->bombBlame == INVALID_PLAYER,
+		      "alice leaving leaves the bomb nobody's, and nobody's mission's");
+	}
+}
+
+// Anybody in the mission may press the mission's detonator; the bomb is still
+// blamed on the owner, its rigger.
+void TestTheMissionsDetonatorIsEverybodysInIt() {
+	std::printf("\nthe mission's detonator, in a participant's hand\n");
+	{
+		Client o;
+		o.SetBridge(RecordingBridge());
+		WatchAliceSettleCar80(o);
+		o.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_RUNNING, 1, 41, 0x07), CH_EVENT));
+		o.HandleMessage(Wrap(MakeMissionBomb(1, 80, CARBOMB_REMOTE), CH_EVENT));
+		o.HandleMessage(Wrap(MakeShot(2, WEAPONTYPE_DETONATOR), CH_EVENT));
+		Check(g_rec.detonations == 1 && g_rec.lastDetonatedNetId == 80 &&
+		          g_rec.lastDetonator == &o.PlayerSlot(1) && !g_rec.lastDetonatorUs,
+		      "bob, in alice's mission, sets the van off here, blamed on alice");
+		Check(o.VehicleByNetId(80)->bomb == CARBOMB_NONE && o.VehicleByNetId(80)->bombLit &&
+		          !o.VehicleByNetId(80)->bombMission,
+		      "and it carries a burning fuse and no bomb, as UseDetonator leaves it");
+	}
+	{
+		Client o;
+		o.SetBridge(RecordingBridge());
+		WatchAliceSettleCar80(o);
+		o.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_RUNNING, 1, 41, 0x03), CH_EVENT));
+		o.HandleMessage(Wrap(MakeMissionBomb(1, 80, CARBOMB_REMOTE), CH_EVENT));
+		o.HandleMessage(Wrap(MakeShot(2, WEAPONTYPE_DETONATOR), CH_EVENT));
+		Check(g_rec.detonations == 0, "bob, not in it, sets off nothing of the mission's");
+		o.PressOurDetonatorForTest();
+		Check(g_rec.detonations == 1 && g_rec.lastDetonator == &o.PlayerSlot(1),
+		      "we are in it: our own press sets it off on our copy, which our engine's "
+		      "UseDetonator would not match, blamed on alice");
+		o.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_IDLE, 1, 41, 0), CH_EVENT));
+	}
+	{
+		Client o;
+		o.SetBridge(RecordingBridge());
+		WatchAliceSettleCar80(o);
+		o.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_IDLE, 1, 41, 0), CH_EVENT));
+		o.HandleMessage(Wrap(MakeMissionBomb(1, 80, CARBOMB_REMOTE), CH_EVENT));
+		o.HandleMessage(Wrap(MakeShot(2, WEAPONTYPE_DETONATOR), CH_EVENT));
+		o.PressOurDetonatorForTest();
+		Check(g_rec.detonations == 0, "with no mission running only alice's own press would");
+	}
+	{
+		// Our mission, alice settling the van.
+		Client c;
+		c.SetBridge(RecordingBridge());
+		WatchAliceSettleCar80(c);
+		c.HandleMessage(Wrap(MakeMissionState(MISSION_STATE_RUNNING, 0, 41, 0x07), CH_EVENT));
+		c.MissionArmedCar(80, CARBOMB_REMOTE, true);
+		c.PressOurDetonatorForTest();
+		Check(g_rec.detonations == 0,
+		      "our own press on our own bomb is left to our engine, which matched it");
+		c.HandleMessage(Wrap(MakeShot(2, WEAPONTYPE_DETONATOR), CH_EVENT));
+		Check(g_rec.detonations == 1 && g_rec.lastDetonatorUs && g_rec.lastDetonator == nullptr,
+		      "bob's press sets it off on our copy, blamed on our own player");
+	}
+}
+
+// We take the wheel of the car alice rigged.
+void TestTheIgnitionIsSaidByWhoeverSitsDown() {
+	std::printf("\nthe ignition, on the machine of whoever sits down\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsTheSessionsCar(c);
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeBomb(1, 80, CARBOMB_ONIGNITIONACTIVE, 1), CH_EVENT));
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 80), CH_EVENT));
+	g_rec.localBomb             = CARBOMB_ONIGNITIONACTIVE;
+	g_rec.bombSample.fuseMs     = 1000;
+	g_rec.bombSample.blameNetId = 201;   // alice's ped, as our copy's rigger
+	c.TickLocalBombForTest();
+	Check(c.BombReportsSentForTest() == 1 && c.VehicleByNetId(80)->bombLit &&
+	          c.VehicleByNetId(80)->bombBlame == 1,
+	      "our engine lit it the frame we sat down, and says so at once, as alice's");
+	c.TickLocalBombForTest();
+	Check(c.BombReportsSentForTest() == 1, "once");
+	g_rec.bombSample.fuseMs     = 0;
+	g_rec.bombSample.blameNetId = INVALID_NETID;
+	g_rec.localBomb             = CARBOMB_REMOTE;
+	c.TickLocalBombForTest();
+	Check(c.BombReportsSentForTest() == 2 && c.VehicleByNetId(80)->bombBlame == 1,
+	      "a copy that names nobody leaves the bomb the session's bomber's");
+	const int writes = g_rec.bombWrites;
+	c.TickBombsForTest();
+	Check(g_rec.bombWrites == writes + 1 && !g_rec.lastBombWrite.writeType &&
+	          g_rec.lastBombWrite.blame == &c.PlayerSlot(1),
+	      "and our own copy is given her ped as its rigger, never a type");
+}
+
+// A mine that went off on one machine goes off on the others.
+void TestAMineGoesOffOnEveryScreen() {
+	std::printf("\na mine the mission dropped\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	g_rec.ourMines.push_back(Vec3{1200.0f, -600.0f, 1.2f});
+	g_rec.ourMines.push_back(Vec3{std::nanf(""), 0.0f, 0.0f});
+	c.TickMinesForTest();
+	Check(c.MineBlastsSentForTest() == 1 && g_rec.ourMines.empty(),
+	      "ours that went off is said, and a place that is not one is not");
+	c.TickMinesForTest();
+	Check(c.MineBlastsSentForTest() == 1, "once");
+
+	S_MineBlast blast{};
+	InitHeader(blast, 1000);
+	blast.playerId = 1;
+	blast.pos      = Vec3{1300.0f, -610.0f, 0.8f};
+	c.HandleMessage(Wrap(blast, CH_EVENT));
+	Check(g_rec.mineBlastsApplied == 1 && g_rec.lastMineBlast.x == 1300.0f,
+	      "alice's goes off here, where she said");
+	blast.playerId = 0;
+	c.HandleMessage(Wrap(blast, CH_EVENT));
+	blast.playerId = 1;
+	blast.pos.z    = 5000.0f;
+	c.HandleMessage(Wrap(blast, CH_EVENT));
+	Check(g_rec.mineBlastsApplied == 1,
+	      "our own back, or one in the sky, changes nothing");
 }
 
 void TestTheLastDentGoesOutBeforeTheSettle() {
@@ -13554,16 +15324,97 @@ bool FeedLineIs(const Client &c, size_t i, FeedKind kind, const char *text) {
 	       std::strcmp(c.Feed().Line(i).text, text) == 0;
 }
 
+// A player's end, once, in the feed, with the victim's name in his colour;
+// and the menu, which says itself on the player's slot.
+void TestTheFeedSaysWhoDied() {
+	std::printf("\nthe feed says who died, who was busted and who is in the menu\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+	const size_t before = c.Feed().Count();
+
+	S_Death d;
+	InitHeader(d, 2000);
+	d.playerId    = 1;
+	d.killerNetId = 202;   // bob
+	d.animId      = ANIM_NONE;
+	c.HandleMessage(Wrap(d, CH_EVENT));
+	Check(c.Feed().Count() == before + 1 &&
+	          FeedLineIs(c, before, FeedKind::Notice, "alice was killed by bob"),
+	      "a kill says who did it");
+	Check(c.Feed().Line(before).playerId == 1 && c.Feed().Line(before).nickLen == 5,
+	      "in the victim's colour, his name alone");
+	c.HandleMessage(Wrap(d, CH_EVENT));
+	Check(c.Feed().Count() == before + 1, "the same death again says nothing");
+
+	d.playerId    = 2;
+	d.killerNetId = INVALID_NETID;
+	c.HandleMessage(Wrap(d, CH_EVENT));
+	Check(FeedLineIs(c, before + 1, FeedKind::Notice, "bob was wasted"), "nobody's kill is wasted");
+
+	S_PlayerState s = MakeState(1, 3000, 1.0f);
+	s.body.pedState = 1;
+	c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+	const size_t lines = c.Feed().Count();
+	s.body.pedState = WIRE_PEDSTATE_ARRESTED;
+	s.hdr.sendTimeMs = 3040;
+	c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+	s.hdr.sendTimeMs = 3080;
+	c.HandleMessage(Wrap(s, CH_SNAPSHOT));
+	Check(c.Feed().Count() == lines + 1 &&
+	          FeedLineIs(c, lines, FeedKind::Notice, "alice was busted"),
+	      "an arrest is said once, however many snapshots carry it");
+	S_PlayerState first = MakeState(2, 3000, 1.0f);
+	first.body.pedState = WIRE_PEDSTATE_ARRESTED;
+	Client late;
+	late.SetBridge(RecordingBridge());
+	late.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	late.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+	const size_t lateBefore = late.Feed().Count();
+	late.HandleMessage(Wrap(first, CH_SNAPSHOT));
+	Check(late.Feed().Count() == lateBefore, "somebody already in cuffs when we heard of him is not news");
+
+	S_PlayerAway a;
+	InitHeader(a, 4000);
+	a.playerId = 2;
+	a.away     = 1;
+	c.HandleMessage(Wrap(a, CH_EVENT));
+	Check(c.PlayerSlot(2).away, "a player's menu going up is on his slot");
+	a.away = 0;
+	c.HandleMessage(Wrap(a, CH_EVENT));
+	Check(!c.PlayerSlot(2).away, "and coming down");
+	a.playerId = 0;
+	a.away     = 1;
+	c.HandleMessage(Wrap(a, CH_EVENT));
+	Check(!c.PlayerSlot(0).away, "our own is never read back");
+}
+
 void TestTheFeedHearsTheSession() {
 	std::printf("\nthe chat feed hears the session\n");
 	Client c;
 	c.SetBridge(RecordingBridge());
 	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
-	Check(c.Feed().Count() == 1 && FeedLineIs(c, 0, FeedKind::Notice, "connected to the session"),
-	      "getting in says so");
+	Check(c.Feed().Count() == 0, "getting in is the log's, not the chat's");
 	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
-	Check(c.Feed().Count() == 2 && FeedLineIs(c, 1, FeedKind::Notice, "back in the session"),
-	      "and getting back in after a loss says that");
+	Check(c.Feed().Count() == 0, "and so is a second session with nothing wrong before it");
+	{
+		Client late;
+		late.SetBridge(RecordingBridge());
+		S_Welcome full = MakeWelcome(0);
+		full.reject    = REJECT_FULL;
+		late.HandleMessage(Wrap(full, CH_EVENT));
+		late.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+		Check(late.Feed().Count() == 2 &&
+		          FeedLineIs(late, 1, FeedKind::Notice, "connected to the session"),
+		      "getting in after the feed said the server was full says so");
+		late.HandleMessage(Wrap(full, CH_EVENT));
+		late.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+		Check(late.Feed().Count() == 4 &&
+		          FeedLineIs(late, 3, FeedKind::Notice, "back in the session"),
+		      "and getting back in after trouble says that");
+	}
 	c.ClearFeedForTest();
 	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
 	Check(c.Feed().Count() == 0, "somebody who was here before us is not announced");
@@ -14226,6 +16077,182 @@ void TestABlastOnAParkedCarStays() {
 	Check(!rowHere()->blasted, "a car we settle ends it at once");
 }
 
+// ---- a car's end (game/wreck.h) ---------------------------------------------
+
+void TestABurningCarNobodyHoldsHasOneTimer() {
+	std::printf("\na burning car nobody holds counts down at the host alone\n");
+	Check(game::FireTimerRunsHere(INVALID_PLAYER, 0, 0), "nobody holds it and we host: ours runs");
+	Check(!game::FireTimerRunsHere(INVALID_PLAYER, 1, 0),
+	      "nobody holds it and somebody else hosts: ours is held");
+	Check(game::FireTimerRunsHere(INVALID_PLAYER, 1, INVALID_PLAYER),
+	      "no host known: every machine counts, as it always did");
+	Check(game::FireTimerRunsHere(1, 1, 0) && !game::FireTimerRunsHere(2, 1, 1),
+	      "a car somebody holds: theirs alone, whoever hosts");
+
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(0, 0, /*host=*/1), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.Tick();
+	c.Tick();
+	Check(g_rec.vehicleApplies > 0 && !g_rec.lastFireTimerHere,
+	      "a parked car while alice hosts: our timer on it is held");
+
+	c.HandleMessage(Wrap(MakeCustody(80, 1), CH_EVENT));
+	c.Tick();
+	Check(!g_rec.lastFireTimerHere, "and while alice settles it, held all the same");
+
+	c.HandleMessage(Wrap(MakeCustody(80, INVALID_PLAYER), CH_EVENT));
+	c.HandleMessage(Wrap(MakeWorldState(0, 12, 0), CH_EVENT));
+	c.Tick();
+	Check(g_rec.lastFireTimerHere,
+	      "handed back while we host: ours is the one timer that runs, and its wreck "
+	      "goes out as UNOWNED_SESSION");
+}
+
+void TestOurBlastAsksForTheCar() {
+	std::printf("\nour blast on a car nobody holds asks for it\n");
+	Check(game::BlastAsksForCar(true, WEAPONTYPE_EXPLOSION, false),
+	      "our explosion that left it standing: we ask");
+	Check(!game::BlastAsksForCar(false, WEAPONTYPE_EXPLOSION, false),
+	      "somebody else's, or nobody's: the thrower asks, or the floor holds it");
+	Check(!game::BlastAsksForCar(true, WEAPONTYPE_EXPLOSION, true),
+	      "one that killed it asks for nothing: the wreck goes out on its own");
+	Check(!game::BlastAsksForCar(true, WEAPONTYPE_COLT45, false),
+	      "and a round is a shot, which asks through the ordinary hit");
+	Check(!IsForwardableDamage(WEAPONTYPE_EXPLOSION),
+	      "the hit that comes back is one no machine applies, so the blast is not "
+	      "taken twice");
+
+	// The ask is an ordinary C_VehicleHit: the shot's path, with the blast's cause.
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	const RemoteVehicle *v = c.VehicleByNetId(80);
+	Check(VehicleHitIsWorthSending(*v, INVALID_NETID),
+	      "a car nobody holds is worth the packet, as a shot on it is");
+}
+
+void TestAWreckIsFollowedWhereItLands() {
+	std::printf("\na wreck is followed to where it comes to rest\n");
+	using game::ClassifyWreckState;
+	using game::WreckStateUse;
+	Check(ClassifyWreckState(false, 1, INVALID_PLAYER, 0) == WreckStateUse::Car,
+	      "a live car's snapshot is a live car's snapshot");
+	Check(ClassifyWreckState(false, 1, 1, VEH_WRECKED) == WreckStateUse::Drop,
+	      "a wreck's settle ahead of the event that makes it one waits for the event");
+	Check(ClassifyWreckState(true, 1, 1, VEH_WRECKED) == WreckStateUse::Wreck,
+	      "from the one settling the wreck, saying so: followed");
+	Check(ClassifyWreckState(true, 1, 1, 0) == WreckStateUse::Drop,
+	      "the same player's snapshot from before the blast: dropped");
+	Check(ClassifyWreckState(true, 2, 1, VEH_WRECKED) == WreckStateUse::Drop &&
+	          ClassifyWreckState(true, 1, INVALID_PLAYER, VEH_WRECKED) == WreckStateUse::Drop,
+	      "anybody else's, or with nobody settling it: dropped");
+
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+
+	// A settle snapshot that overtook alice's blast.
+	S_VehicleState early = MakeVehicleState(1, 80, 50.0f);
+	early.body.flags     = VEH_WRECKED;
+	c.HandleMessage(Wrap(early, CH_SNAPSHOT));
+	Check(c.VehicleByNetId(80)->last.pos.x != 50.0f, "is not taken for a live car's");
+
+	c.HandleMessage(Wrap(MakeVehicleBlowUp(80, 1, 77.0f), CH_EVENT));
+	c.HandleMessage(Wrap(MakeCustody(80, 1), CH_EVENT));
+	Check(c.VehicleByNetId(80)->destroyed && c.VehicleByNetId(80)->last.pos.x == 77.0f,
+	      "the blast puts the wreck where it went up");
+
+	S_VehicleState stale = MakeVehicleState(1, 80, 60.0f);
+	c.HandleMessage(Wrap(stale, CH_SNAPSHOT));
+	Check(c.VehicleByNetId(80)->last.pos.x == 77.0f,
+	      "a snapshot from before the blast does not drag it back");
+
+	S_VehicleState bobs = MakeVehicleState(2, 80, 65.0f);
+	bobs.body.flags     = VEH_WRECKED;
+	c.HandleMessage(Wrap(bobs, CH_SNAPSHOT));
+	Check(c.VehicleByNetId(80)->last.pos.x == 77.0f, "nor does anybody but the settler");
+
+	S_VehicleState landed = MakeVehicleState(1, 80, 80.0f);
+	landed.body.flags     = VEH_WRECKED;
+	landed.body.health    = 0.0f;
+	c.HandleMessage(Wrap(landed, CH_SNAPSHOT));
+	Check(c.VehicleByNetId(80)->last.pos.x == 80.0f && c.VehicleByNetId(80)->last.health == 0.0f,
+	      "alice's settle moves it to where it came down");
+	Check(c.VehicleByNetId(80)->reporterPlayerId == 1, "on alice's clock");
+	const int corrections = g_rec.vehicleCorrections;
+	c.Tick();
+	Check(g_rec.vehicleCorrections == corrections + 1,
+	      "and every frame puts our copy where her stream says, not where it went up");
+}
+
+void TestAWreckWeDecideIsOursToSettle() {
+	std::printf("\na wreck we decide is ours to settle\n");
+	// A car we are settling goes up here, and the settle window it had left
+	// was nothing at all.
+	Client c;
+	c.SetBridge(RecordingBridge());
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	RemoteVehicle *v  = const_cast<RemoteVehicle *>(c.VehicleByNetId(80));
+	v->settleEndsAtMs = 0;
+	UnownedBlast blast{};
+	blast.key.kind = UNOWNED_SESSION;
+	blast.key.id   = 80;
+	g_rec.unownedBlasts.push_back(blast);
+	c.TickUnownedBlastsForTest();
+	Check(v->destroyed && v->settleEndsAtMs > WallClock::NowMs(),
+	      "our own report marks it a wreck and gives the wreck a fresh window");
+	g_rec.observedIsWreck = true;
+	c.TickCustody();
+	Check(!v->settleReported && (v->last.flags & VEH_WRECKED) != 0,
+	      "and it is streamed as a wreck, not handed back on the spot");
+	g_rec.carAtRest = true;
+	for (int i = 0; i < VEHICLE_REST_FRAMES + 1; ++i)
+		c.TickCustody();
+	Check(v->settleReported, "until it lies still");
+
+	// The machine whose own car blew up is told to settle the wreck after the
+	// blast, and has not marked its row yet: the first read does.
+	Client d;
+	d.SetBridge(RecordingBridge());
+	ParkOneCar(d);
+	d.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	RemoteVehicle *w      = const_cast<RemoteVehicle *>(d.VehicleByNetId(80));
+	w->settleEndsAtMs     = 0;
+	g_rec.observedIsWreck = true;
+	d.TickCustody();
+	Check(w->destroyed && !w->settleReported && w->settleEndsAtMs > WallClock::NowMs(),
+	      "the first read of the wreck starts its window");
+
+	// Sinking, the same way as a car that was not blown up.
+	Client e;
+	WorldBridge eb    = RecordingBridge();
+	eb.VehicleSinking = &RecVehicleSinking;
+	e.SetBridge(eb);
+	ParkOneCar(e);
+	e.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	RemoteVehicle *x      = const_cast<RemoteVehicle *>(e.VehicleByNetId(80));
+	g_rec.observedIsWreck = true;
+	g_rec.carAtRest       = true;
+	g_sinking             = true;
+	for (int i = 0; i < VEHICLE_REST_FRAMES + 2; ++i)
+		e.TickCustody();
+	Check(x->destroyed && !x->settleReported,
+	      "a wreck going down in the harbour is kept until it lies on the bottom");
+	g_sinking      = false;
+	x->holdUntilMs = 0;
+	for (int i = 0; i < VEHICLE_REST_FRAMES + 1; ++i)
+		e.TickCustody();
+	Check(x->settleReported, "and let go once it does");
+	g_rec.carAtRest = false;
+}
+
 void TestQuietCountsFromTheJoin() {
 	std::printf("\nquiet counts from the join\n");
 	Client c;
@@ -14300,7 +16327,70 @@ void TestATypedLineIsTakenOnce() {
 	c.TickChatForTest();
 	c.TickChatForTest();
 	Check(g_typedTakes == 2 && !g_typedReady, "asked each frame, and the line was taken");
-	Check(c.Feed().Count() == 1, "our own line waits for the server to relay it");
+	Check(c.Feed().Count() == 0, "our own line waits for the server to relay it");
+}
+
+// /kick, from the chat line (Client::RunChatCommand). m_net has no socket, so
+// what is checked is the decision: whether a kick went out, whom it named,
+// and what our own feed says. Nothing typed after a slash is ever chat.
+const char *g_kickTyped = nullptr;
+
+bool TypeKickLine(char (&out)[CHAT_LEN]) {
+	if (!g_kickTyped)
+		return false;
+	std::memset(out, 0, CHAT_LEN);
+	std::snprintf(out, CHAT_LEN, "%s", g_kickTyped);
+	g_kickTyped = nullptr;
+	return true;
+}
+
+std::string TypeAndRead(Client &c, const char *line) {
+	g_kickTyped = line;
+	c.TickChatForTest();
+	const ChatFeed &f = c.Feed();
+	return f.Count() == 0 ? std::string() : std::string(f.Line(f.Count() - 1).text);
+}
+
+void TestTheHostKicksFromTheChat() {
+	std::printf("\nthe host kicks from the chat\n");
+	{
+		Client      c;
+		WorldBridge bridge   = RecordingBridge();
+		bridge.TakeTypedChat = &TypeKickLine;
+		c.SetBridge(bridge);
+		c.HandleMessage(Wrap(MakeWelcome(0, 0, 0), CH_EVENT));   // we are the host
+		c.HandleMessage(Wrap(MakeJoin(1, "bob"), CH_EVENT));
+		c.HandleMessage(Wrap(MakeJoin(2, "carol"), CH_EVENT));
+		c.ClearFeedForTest();
+
+		Check(TypeAndRead(c, "/kick 2") == "throwing bob out" && c.KicksAskedForTest() == 1 &&
+		          c.LastKickForTest() == 1,
+		      "the host's /kick 2 asks for slot 1, the second row, and says so");
+		Check(TypeAndRead(c, "/kick Carol") == "throwing carol out" && c.KicksAskedForTest() == 2 &&
+		          c.LastKickForTest() == 2,
+		      "a name works too");
+		Check(TypeAndRead(c, "/kick 1") == "that is you" && c.KicksAskedForTest() == 2,
+		      "number 1 is us, and nothing goes out");
+		Check(TypeAndRead(c, "/kick 7") == "nobody here is 7" && c.KicksAskedForTest() == 2,
+		      "nor for an empty slot");
+		Check(TypeAndRead(c, "/kick") == "/kick and the number from the player list, or a name" &&
+		          c.KicksAskedForTest() == 2,
+		      "/kick alone says how it is used");
+		Check(TypeAndRead(c, "/dance") == "/dance is not a command - /kick is the one there is",
+		      "and another command is not one");
+	}
+	{
+		Client      c;
+		WorldBridge bridge   = RecordingBridge();
+		bridge.TakeTypedChat = &TypeKickLine;
+		c.SetBridge(bridge);
+		c.HandleMessage(Wrap(MakeWelcome(0, 0, 1), CH_EVENT));   // bob is the host
+		c.HandleMessage(Wrap(MakeJoin(1, "bob"), CH_EVENT));
+		c.ClearFeedForTest();
+		Check(TypeAndRead(c, "/kick 2") == "only the host can kick, and that is bob" &&
+		          c.KicksAskedForTest() == 0,
+		      "anybody else's /kick goes nowhere, and says who can");
+	}
 }
 
 // ---- a traffic car's dents, from its host (Session::NoteCarDamage) ---------
@@ -14618,20 +16708,73 @@ int RunAimPitchTests();
 // tools/clienttest/siren.cpp
 int RunSirenTests();
 
+// tools/clienttest/carextras.cpp
+int RunCarExtrasTests();
+int RunCarRemovalTests();
+
 // tools/clienttest/cheats.cpp
 int RunCheatTests();
 
 // tools/clienttest/driveby.cpp
 int RunDriveByTests();
 
+// tools/clienttest/passengeraim.cpp
+int RunPassengerAimTests();
+
+// tools/clienttest/runover.cpp
+int RunRunOverTests();
+
+// tools/clienttest/stunt.cpp
+int RunStuntTests();
+int RunMissionCombatTests();
+
+// tools/clienttest/passengers.cpp
+int RunPassengerTests();
+
+// tools/clienttest/radio.cpp
+int RunRadioTests();
+
+// tools/clienttest/outfit.cpp
+int RunOutfitTests();
+
 // tools/clienttest/money.cpp
 int RunMoneyTests();
+int RunMissionTests();
+// tools/clienttest/missionworld.cpp
+int RunMissionWorldTests();
 
 // tools/clienttest/streampick.cpp
 int RunStreamPickTests();
 
 // tools/clienttest/chatfeed.cpp
 int RunChatFeedTests();
+
+// tools/clienttest/fontcull.cpp
+int RunFontCullTests();
+
+// tools/clienttest/cutscene.cpp
+int RunCutsceneTests();
+int RunCutsceneSkipTests();
+
+// tools/clienttest/social.cpp
+int RunSocialTests();
+
+// tools/clienttest/copcrime.cpp
+int RunCopCrimeTests();
+int RunWreckTests();
+// tools/clienttest/remotebody.cpp
+int RunRemoteBodyTests();
+
+// tools/clienttest/carbomb.cpp
+int RunCarBombTests();
+// tools/clienttest/emergency.cpp
+int RunEmergencyTests();
+
+// tools/clienttest/animrevive.cpp
+int RunAnimReviveTests();
+int RunCrowdRangeTests();
+// tools/clienttest/carletgo.cpp
+int RunCarLetGoTests();
 
 // ---- who the ambient batches are ranked for (game/streampick.h) ------------
 
@@ -16347,6 +18490,489 @@ void TestADraggedDriverIsNotUnseatedByThePromotion() {
 	Check(p != nullptr && !p->Seated(), "on foot, in a car that is a session car now");
 }
 
+// ---- the mission's pedestrians in the players' cars (game/seatplan.h) -------
+
+void TestTheSeatPlan() {
+	std::printf("\nwho gets which seat\n");
+	using namespace game;
+	const bool none[4]  = {false, false, false, false};
+	const bool first[4] = {true, false, false, false};
+	const bool all[4]   = {true, true, true, true};
+	Check(FreeSeatMask(false, none, 3) == 0x0F, "a four-door car with nobody in it: the wheel and three");
+	Check(FreeSeatMask(true, first, 3) == 0x0C, "its driver and front passenger in: the two at the back");
+	Check(FreeSeatMask(true, all, 8) == 0, "and a bus is read four passengers deep, as the warp is");
+	Check(FirstFreePassengerSeat(0x0C) == 2 && FirstFreePassengerSeat(0x01) == 0,
+	      "the first free passenger seat, and none when only the wheel is free");
+
+	const uint16_t backFree = 0x0C;   // wire seats 2 and 3
+	SeatPlan p = PlanSeat(2, SeatHolder::Empty, backFree, SeatComer::Replica);
+	Check(p.move == SeatMove::Sit && p.seat == 2, "an empty seat is taken");
+	p = PlanSeat(1, SeatHolder::EnginePed, backFree, SeatComer::RemotePlayer);
+	Check(p.move == SeatMove::Shift && p.seat == 1 && p.shiftTo == 2,
+	      "Misty in the seat a player has on his own screen moves along to the back, "
+	      "and the player sits where he does there");
+	p = PlanSeat(1, SeatHolder::EnginePed, backFree, SeatComer::Replica);
+	Check(p.move == SeatMove::Elsewhere && p.seat == 2,
+	      "but not for a copy of somebody else's pedestrian, who sits in another");
+	p = PlanSeat(1, SeatHolder::EnginePed, 0, SeatComer::RemotePlayer);
+	Check(p.move == SeatMove::Refuse, "and with none left, nobody is moved, and nobody taken out");
+	p = PlanSeat(2, SeatHolder::RemotePlayer, 0x08, SeatComer::Replica);
+	Check(p.move == SeatMove::Elsewhere && p.seat == 3,
+	      "a pedestrian's copy never takes a player's seat, he sits in another");
+	p = PlanSeat(2, SeatHolder::RemotePlayer, 0, SeatComer::Replica);
+	Check(p.move == SeatMove::Refuse, "or in none");
+	p = PlanSeat(2, SeatHolder::Replica, 0, SeatComer::RemotePlayer);
+	Check(p.move == SeatMove::Evict, "a player the session seats moves a copy when there is no other seat");
+	p = PlanSeat(2, SeatHolder::Replica, 0, SeatComer::Replica);
+	Check(p.move == SeatMove::Refuse, "two copies never take a seat off each other");
+	p = PlanSeat(2, SeatHolder::LocalPlayer, backFree, SeatComer::Replica);
+	Check(p.move == SeatMove::Elsewhere && p.seat == 2,
+	      "the local player is never moved");
+	p = PlanSeat(0, SeatHolder::LocalPlayer, backFree, SeatComer::RemotePlayer);
+	Check(p.move == SeatMove::Refuse, "least of all from the wheel");
+	p = PlanSeat(0, SeatHolder::EnginePed, backFree, SeatComer::RemotePlayer);
+	Check(p.move == SeatMove::Evict, "a jack's driver is taken out of the wheel");
+	p = PlanSeat(0, SeatHolder::RemotePlayer, backFree, SeatComer::Replica);
+	Check(p.move == SeatMove::Refuse, "but not for a pedestrian's copy");
+
+	Check(SeatCarFor(true, false, false, false, true) == SeatCar::Session,
+	      "a pedestrian's host can name a session car");
+	Check(SeatCarFor(true, true, true, true, false) == SeatCar::Traffic &&
+	          SeatCarFor(true, true, true, false, false) == SeatCar::None,
+	      "and his own traffic, which nobody else's host speaks for");
+	Check(SeatCarFor(true, false, false, false, false) == SeatCar::None &&
+	          SeatCarFor(false, false, false, false, true) == SeatCar::None,
+	      "a car not here yet is not a seat, and on foot is on foot");
+
+	Check(DoorEntryMayTake(1, SeatHolder::Empty) && DoorEntryMayTake(0, SeatHolder::EnginePed) &&
+	          DoorEntryMayTake(2, SeatHolder::RemotePlayer),
+	      "a door is walked to for a free seat, a jack, or a stale copy of a player");
+	Check(!DoorEntryMayTake(2, SeatHolder::EnginePed) && !DoorEntryMayTake(2, SeatHolder::Replica) &&
+	          !DoorEntryMayTake(1, SeatHolder::LocalPlayer),
+	      "never for a seat a pedestrian or the local player holds");
+	Check(DoorEntryMayTake(2, SeatHolder::Empty, SeatComer::Replica) &&
+	          !DoorEntryMayTake(0, SeatHolder::EnginePed, SeatComer::Replica) &&
+	          !DoorEntryMayTake(2, SeatHolder::RemotePlayer, SeatComer::Replica),
+	      "a copy of a pedestrian opens a door only to an empty seat");
+
+	// A player's copy in another seat than his own screen's (PlanSettle).
+	Check(PlanSettle(2, 1, SeatHolder::Empty, true) == SettleMove::Move,
+	      "his own seat free now: into it");
+	Check(PlanSettle(2, 1, SeatHolder::EnginePed, true) == SettleMove::Swap &&
+	          PlanSettle(3, 1, SeatHolder::Replica, true) == SettleMove::Swap,
+	      "held by a pedestrian: they change places, and nobody leaves the car");
+	Check(PlanSettle(2, 1, SeatHolder::EnginePed, false) == SettleMove::Stay,
+	      "not while somebody is still climbing in by that door");
+	Check(PlanSettle(2, 1, SeatHolder::LocalPlayer, true) == SettleMove::Stay &&
+	          PlanSettle(2, 1, SeatHolder::RemotePlayer, true) == SettleMove::Stay,
+	      "never the local player's seat, nor another player's");
+	Check(PlanSettle(1, 1, SeatHolder::Empty, true) == SettleMove::Stay &&
+	          PlanSettle(0, 1, SeatHolder::Empty, true) == SettleMove::Stay &&
+	          PlanSettle(2, 0, SeatHolder::Empty, true) == SettleMove::Stay,
+	      "in his seat already, or a wheel on either side: nothing");
+
+	// Our own script putting our player at a wheel (PlanScriptedWheel).
+	//                 other  free   inCar  enter  warp
+	Check(PlanScriptedWheel(true, true, false, false, false) == WheelMove::Ride,
+	      "Give Me Liberty's walk to the Kuruma a participant drives: a passenger door");
+	Check(PlanScriptedWheel(true, true, false, false, true) == WheelMove::Ride,
+	      "and the warp to it: a passenger seat");
+	Check(PlanScriptedWheel(false, true, false, false, false) == WheelMove::Drive &&
+	          PlanScriptedWheel(false, false, false, false, true) == WheelMove::Drive,
+	      "nobody else at the wheel: the script's own instruction");
+	Check(PlanScriptedWheel(true, false, false, false, false) == WheelMove::Drive,
+	      "no passenger seat left: the script has its player, jack and all");
+	Check(PlanScriptedWheel(true, true, false, true, false) == WheelMove::Drive,
+	      "a door already opening is left to finish");
+	Check(PlanScriptedWheel(true, true, true, false, true) == WheelMove::Drive &&
+	          PlanScriptedWheel(true, true, true, false, false) == WheelMove::Ride,
+	      "in a car already: the passenger warp needs the pavement, the walk does not");
+}
+
+// ---- a pedestrian's copy at a car door (AMBIENT_PED_ENTERING / _EXITING) ----
+
+// A copy of the host's pedestrian and a session car, both built here.
+int32_t GiveUsAPedestrianAndACar(Client &c, uint16_t pedNetId, uint16_t carNetId) {
+	GiveUsAnAmbientPed(c, pedNetId);
+	c.HandleMessage(Wrap(MakeVehicleSpawn(carNetId), CH_EVENT));
+	c.Tick();
+	const RemoteVehicle *car = c.VehicleByNetId(carNetId);
+	return car ? car->poolHandle : -1;
+}
+
+S_PedStates MakeAtTheDoor(uint16_t pedNetId, uint32_t timeMs, uint16_t carNetId, uint8_t seat,
+                          uint8_t door) {
+	return MakePedStates(1, pedNetId, timeMs, 11.0f, 0, carNetId,
+	                     AmbientPedEntrySeatByte(seat, door), AMBIENT_PED_ENTERING);
+}
+
+void TestAPedestriansCopyOpensTheDoor() {
+	std::printf("\nMisty opens the car door on every screen, not only her host's\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	const int32_t car = GiveUsAPedestrianAndACar(c, 540, 83);
+	Check(car >= 0, "the session car exists here");
+
+	c.HandleMessage(Wrap(MakeAtTheDoor(540, 2000, 83, 1, 1), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientEntryBegins == 1 && g_rec.lastAmbientEntryCar == car &&
+	          g_rec.lastAmbientEntrySeat == 1 && g_rec.lastAmbientEntryDoor == 1,
+	      "her host has her at the front passenger's door: our copy opens it too");
+	const RemoteAmbientPed *p = c.AmbientPed(540);
+	Check(p != nullptr && p->Entering() && !p->Seated() && g_rec.ambientSeatAttempts == 0,
+	      "she is at the door, not warped into the seat");
+
+	const int applies = g_rec.ambientApplies;
+	c.HandleMessage(Wrap(MakeAtTheDoor(540, 2100, 83, 1, 1), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientApplies == applies, "the door's own animation moves her, not the stream");
+	Check(g_rec.ambientEntryBegins == 1, "and the door is opened once");
+
+	g_rec.ambientEntryProgress = SEAT_DONE;
+	g_rec.ambientEntryGot      = 1;
+	c.Tick();
+	Check(p->Seated() && p->seatedIndex == 1 && !p->Entering(),
+	      "the engine seats her where the door leads");
+
+	c.HandleMessage(Wrap(MakeAtTheDoor(540, 2200, 83, 1, 1), CH_SNAPSHOT));
+	c.Tick();
+	Check(p->Seated() && g_rec.ambientUnseats == 0,
+	      "a row from before her host sat down does not take her back out");
+
+	c.HandleMessage(Wrap(MakePedStates(1, 540, 2300, 11.0f, 0, 83, 1), CH_SNAPSHOT));
+	c.Tick();
+	c.Tick();
+	Check(p->Seated() && g_rec.ambientSeatAttempts == 0 && g_rec.ambientUnseats == 0,
+	      "and her host's word that she sits there changes nothing: no warp on top");
+}
+
+void TestADoorThatWillNotOpenHereFallsBackToTheSeat() {
+	std::printf("\na door that will not open here\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAPedestrianAndACar(c, 541, 84);
+	g_rec.refuseAmbientEntry = true;
+	c.HandleMessage(Wrap(MakeAtTheDoor(541, 2000, 84, 2, 2), CH_SNAPSHOT));
+	c.Tick();
+	c.HandleMessage(Wrap(MakeAtTheDoor(541, 2100, 84, 2, 2), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientEntryBegins == 1, "asked once for the entry, not every frame");
+	c.HandleMessage(Wrap(MakePedStates(1, 541, 2200, 11.0f, 0, 84, 2), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientSeats == 1 && c.AmbientPed(541)->Seated(),
+	      "and seated the plain way once her host has her in");
+
+	Client d;
+	d.SetBridge(RecordingBridge());
+	GiveUsAPedestrianAndACar(d, 542, 85);
+	d.HandleMessage(Wrap(MakeAtTheDoor(542, 2000, 85, 1, 1), CH_SNAPSHOT));
+	d.Tick();
+	g_rec.ambientEntryProgress = SEAT_LOST;
+	d.Tick();
+	Check(g_rec.ambientEntryAbandons == 1 && !d.AmbientPed(542)->Entering(),
+	      "an entry the engine drops is taken off her, door and all");
+	d.HandleMessage(Wrap(MakePedStates(1, 542, 2100, 11.0f, 0, 85, 1), CH_SNAPSHOT));
+	d.Tick();
+	Check(g_rec.ambientSeats == 1, "and the seat is given the plain way");
+}
+
+void TestAPedestriansCopyClimbsOut() {
+	std::printf("\nand climbs out with her host\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAPedestrianAndACar(c, 543, 86);
+	c.HandleMessage(Wrap(MakePedStates(1, 543, 2000, 11.0f, 0, 86, 1), CH_SNAPSHOT));
+	c.Tick();
+	const RemoteAmbientPed *p = c.AmbientPed(543);
+	Check(p->Seated(), "seated");
+
+	c.HandleMessage(Wrap(MakePedStates(1, 543, 2100, 11.0f, 0, 86, 1, AMBIENT_PED_EXITING),
+	                     CH_SNAPSHOT));
+	c.Tick();
+	c.Tick();
+	Check(g_rec.ambientExitBegins == 1, "her host is climbing out: ours does, once");
+
+	g_rec.ambientDoorState = AMBIENT_DOOR_LEAVING;
+	c.HandleMessage(Wrap(MakePedStates(1, 543, 2200, 11.0f), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientUnseats == 0 && p->Seated(),
+	      "her host is out first; ours finishes the climb rather than being pulled out");
+
+	g_rec.ambientDoorState = AMBIENT_DOOR_OUT;
+	c.Tick();
+	Check(g_rec.ambientUnseats == 1 && !p->Seated(), "and is on foot once it is over");
+}
+
+void TestHisHostMovesHimAlong() {
+	std::printf("\na pedestrian his host moves along to another seat\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAPedestrianAndACar(c, 544, 87);
+	c.HandleMessage(Wrap(MakePedStates(1, 544, 2000, 11.0f, 0, 87, 1), CH_SNAPSHOT));
+	c.Tick();
+	c.HandleMessage(Wrap(MakePedStates(1, 544, 2100, 11.0f, 0, 87, 2), CH_SNAPSHOT));
+	c.Tick();
+	c.Tick();
+	const RemoteAmbientPed *p = c.AmbientPed(544);
+	Check(g_rec.ambientSeatMoves == 1 && g_rec.lastAmbientSeatMove == 2 && p->seatedIndex == 2,
+	      "his copy moves along with him, once");
+	Check(g_rec.ambientSeatAttempts == 1 && g_rec.ambientUnseats == 0,
+	      "without leaving the car");
+}
+
+void TestAPlayerIsSettledIntoHisOwnSeat() {
+	std::printf("\na player's copy goes to the seat his own screen has him in\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeVehicleSpawn(88), CH_EVENT));
+	c.Tick();
+	c.HandleMessage(Wrap(MakeEnter(1, 88, 1), CH_EVENT));
+	for (int i = 0; i < 4; ++i)
+		c.Tick();
+	Check(c.PlayerSlot(1).Seated(), "alice sits in the car");
+	Check(g_rec.settleCalls > 0 && g_rec.lastSettleSeat == 1,
+	      "and her copy is asked into seat 1, the one the session gave her");
+}
+
+void TestWhoSimulatesAMissionCar() {
+	std::printf("\nwhich machine simulates a mission car\n");
+	using namespace game;
+	constexpr uint8_t us = 1, owner = 0, bob = 2;
+	CarSimulator s = WhoSimulates(false, INVALID_PLAYER, INVALID_PLAYER, owner, us);
+	Check(s.where == CarSim::Player && s.player == owner,
+	      "the mission's car nobody has claimed is its owner's to simulate");
+	s = WhoSimulates(false, INVALID_PLAYER, INVALID_PLAYER, INVALID_PLAYER, owner);
+	Check(s.where == CarSim::Here && WhereTheWordGoes(s) == CarWordTo::Nobody,
+	      "on the owner's machine, its engine simulates it and the word goes nowhere");
+	s = WhoSimulates(true, us, INVALID_PLAYER, INVALID_PLAYER, owner);
+	Check(s.where == CarSim::Player && s.player == us && WhereTheWordGoes(s) == CarWordTo::OnePlayer,
+	      "once a participant takes the wheel, his machine does, and the owner's word goes there");
+	s = WhoSimulates(true, us, INVALID_PLAYER, INVALID_PLAYER, us);
+	Check(s.where == CarSim::Here, "and on his own machine nothing corrects it");
+	s = WhoSimulates(true, INVALID_PLAYER, bob, INVALID_PLAYER, owner);
+	Check(s.where == CarSim::Player && s.player == bob, "nobody at the wheel: whoever settles it");
+	s = WhoSimulates(true, INVALID_PLAYER, INVALID_PLAYER, INVALID_PLAYER, owner);
+	Check(s.where == CarSim::Everybody && WhereTheWordGoes(s) == CarWordTo::Everybody,
+	      "and nobody holding it: every copy is its own, and the word goes to all");
+	s = WhoSimulates(true, us, bob, INVALID_PLAYER, owner);
+	Check(s.player == us, "a driver outranks a custodian");
+}
+
+void TestAHostsPedestrianSitsInASessionCar() {
+	std::printf("\nthe mission's pedestrian in a car a player drives\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(c, 530);
+	c.HandleMessage(Wrap(MakeVehicleSpawn(81), CH_EVENT));
+	c.Tick();
+	const RemoteVehicle *car = c.VehicleByNetId(81);
+	Check(car != nullptr && car->poolHandle >= 0, "the session car exists here");
+
+	// His host has him in the back of it: 8-Ball in the Kuruma a participant
+	// has taken the wheel of, Misty in the owner's car.
+	c.HandleMessage(Wrap(MakePedStates(1, 530, 2000, 11.0f, 0, 81, 2), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientSeats == 1 && g_rec.lastAmbientSeatCar == 81 &&
+	          g_rec.lastAmbientSeatHandle == car->poolHandle && g_rec.lastAmbientSeatIdx == 2,
+	      "he sits in it, in the seat his host has him in");
+	const RemoteAmbientPed *p = c.AmbientPed(530);
+	Check(p != nullptr && p->Seated() && p->seatedIndex == 2,
+	      "not stood up where the seat is, in the car's way");
+
+	// Another seat, because a player sits in his here: the seat the bridge
+	// gave is the one that counts.
+	Client d;
+	d.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(d, 531);
+	d.HandleMessage(Wrap(MakeVehicleSpawn(82), CH_EVENT));
+	d.Tick();
+	g_rec.ambientSeatAnswer = 3;
+	d.HandleMessage(Wrap(MakePedStates(1, 531, 2000, 11.0f, 0, 82, 1), CH_SNAPSHOT));
+	d.Tick();
+	Check(d.AmbientPed(531)->Seated() && d.AmbientPed(531)->seatedIndex == 3,
+	      "the seat he got here is the one remembered");
+	d.Tick();
+	Check(g_rec.ambientSeatAttempts == 1, "and he is not moved every frame to try for his own");
+}
+
+void TestAPromotionKeepsItsPassengers() {
+	std::printf("\na player takes the wheel of the mission's car with its passenger in it\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(c, 532);
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(612), CH_EVENT));
+	c.Tick();
+	c.HandleMessage(Wrap(MakePedStates(1, 532, 2000, 11.0f, 0, 612, 2), CH_SNAPSHOT));
+	c.Tick();
+	Check(g_rec.ambientSeats == 1 && c.AmbientPed(532)->Seated(), "8-Ball sits in the back");
+
+	c.HandleMessage(Wrap(MakeCarPromoted(612, 2, 1), CH_EVENT));
+	c.Tick();
+	Check(g_rec.ambientUnseats == 0, "the promotion leaves him where he is");
+	Check(c.AmbientPed(532)->Seated() && c.AmbientPed(532)->seatVehicleNetId == 612,
+	      "the same CVehicle under the same number, so nothing about his seat changed");
+
+	// And his host goes on saying so, now of a session car.
+	c.HandleMessage(Wrap(MakePedStates(1, 532, 2100, 12.0f, 0, 612, 2), CH_SNAPSHOT));
+	c.Tick();
+	c.Tick();
+	Check(g_rec.ambientSeatAttempts == 1 && g_rec.ambientUnseats == 0,
+	      "which changes nothing: he is not taken out and put back");
+}
+
+void TestAPedestriansSeatIsTakenForAnEntry() {
+	std::printf("\na seat the mission's pedestrian holds is taken on every screen\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveAliceAPed(c);
+	c.HandleMessage(Wrap(MakeJoin(2, "bob"), CH_EVENT));
+	FeedPosition(c, 2);
+	c.Tick();
+	c.HandleMessage(Wrap(MakeAmbientPedSpawn(533, 1), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleSpawn(83), CH_EVENT));
+	c.Tick();
+	c.HandleMessage(Wrap(MakePedStates(1, 533, 2000, 11.0f, 0, 83, 2), CH_SNAPSHOT));
+	c.Tick();
+	Check(c.AmbientPed(533) != nullptr && c.AmbientPed(533)->Seated(),
+	      "alice's pedestrian sits in seat 2 of car 83");
+
+	// Bob starts getting into that seat. Nothing in the session gives a seat
+	// to a pedestrian, so only the roster's copy of him says it is his.
+	g_rec.animEntry  = true;
+	const int begins = g_rec.seatAnimBegins;
+	c.HandleMessage(Wrap(MakeEntering(2, 83, 2, 2), CH_EVENT));
+	c.Tick();
+	c.Tick();
+	Check(g_rec.seatAnimBegins == begins, "bob's entry is not played into his seat");
+
+	c.HandleMessage(Wrap(MakeEntering(2, 83, 1, 1), CH_EVENT));
+	c.Tick();
+	Check(g_rec.seatAnimBegins == begins + 1, "and one into a free seat is");
+}
+
+void TestNoSeatHereKeepsHimOutOfTheWay() {
+	std::printf("\nevery seat he could have is held here\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(c, 534);
+	c.HandleMessage(Wrap(MakeVehicleSpawn(84), CH_EVENT));
+	c.Tick();
+	g_rec.ambientSeatAnswer = AMBIENT_SEAT_NONE_FREE;
+	c.HandleMessage(Wrap(MakePedStates(1, 534, 2000, 11.0f, 0, 84, 1), CH_SNAPSHOT));
+	c.Tick();
+	c.Tick();
+	const RemoteAmbientPed *p = c.AmbientPed(534);
+	Check(p != nullptr && !p->Seated() && p->seatless,
+	      "he is kept out of the car's way rather than stood up inside it");
+	Check(g_rec.ambientSeatAttempts == 2 && p->seatVehicleNetId == 84,
+	      "and the seat is asked for again every frame, nothing dropped");
+
+	g_rec.ambientSeatAnswer = 0x7FFF;
+	c.Tick();
+	Check(c.AmbientPed(534)->Seated() && !c.AmbientPed(534)->seatless,
+	      "the moment one is free he sits in it");
+
+	S_VehicleDespawn gone;
+	InitHeader(gone, 3000);
+	gone.netId = 84;
+	c.HandleMessage(Wrap(gone, CH_EVENT));
+	Check(!c.AmbientPed(534)->Seated() && c.AmbientPed(534)->seatVehicleNetId == INVALID_NETID &&
+	          g_rec.ambientUnseats == 1,
+	      "and when the session lets the car go, he comes out of it first");
+}
+
+void TestAPedestrianWaitsUnseenForHisCar() {
+	std::printf("\nhis host has him in a car not built here yet\n");
+	// On foot he would stand in mid-air where its seat will be.
+	Client d;
+	d.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(d, 535);
+	g_rec.modelReady = false;
+	d.HandleMessage(Wrap(MakeAmbientCarSpawn(613), CH_EVENT));
+	d.HandleMessage(Wrap(MakePedStates(1, 535, 2000, 11.0f, 0, 613, 1), CH_SNAPSHOT));
+	d.Tick();
+	Check(!d.AmbientPed(535)->Seated() && d.AmbientPed(535)->seatless,
+	      "a pedestrian in a car not built here yet is kept out of sight");
+	g_rec.modelReady = true;
+	d.Tick();
+	Check(d.AmbientPed(535)->Seated() && !d.AmbientPed(535)->seatless,
+	      "and sits in it once it is");
+	d.HandleMessage(Wrap(MakePedStates(1, 535, 2100, 11.0f), CH_SNAPSHOT));
+	d.Tick();
+	Check(!d.AmbientPed(535)->Seated() && !d.AmbientPed(535)->seatless,
+	      "on foot is on foot, and in sight");
+}
+
+void TestAPedestrianInACarHisHostCannotNameIsHidden() {
+	std::printf("\nhis host has him in a car it has no session name for\n");
+	// The driver of a car only his host's screen has: on foot he would drive
+	// nothing along the road in mid-air.
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(c, 536);
+	c.HandleMessage(Wrap(MakePedStates(1, 536, 2000, 11.0f, 0, INVALID_NETID, 0,
+	                                   AMBIENT_PED_IN_UNSEEN_CAR),
+	                     CH_SNAPSHOT));
+	c.Tick();
+	const RemoteAmbientPed *p = c.AmbientPed(536);
+	Check(p != nullptr && !p->Seated() && p->seatless && p->inUnseenCar,
+	      "a driver whose car nobody here can build is kept out of sight");
+	Check(g_rec.ambientSeatAttempts == 0, "and nothing tries to seat him in anything");
+
+	c.HandleMessage(Wrap(MakePedStates(1, 536, 2100, 11.0f), CH_SNAPSHOT));
+	c.Tick();
+	Check(!c.AmbientPed(536)->seatless && !c.AmbientPed(536)->inUnseenCar,
+	      "out of it and on foot, he is in sight again");
+
+	c.HandleMessage(Wrap(MakeAmbientCarSpawn(614), CH_EVENT));
+	c.Tick();
+	c.HandleMessage(Wrap(MakePedStates(1, 536, 2200, 11.0f, 0, 614, 0,
+	                                   AMBIENT_PED_IN_UNSEEN_CAR),
+	                     CH_SNAPSHOT));
+	c.Tick();
+	Check(c.AmbientPed(536)->Seated() && !c.AmbientPed(536)->seatless,
+	      "a named car wins over the bit: he sits in it");
+}
+
+void TestACarsModelIndexIsTheWordNotTheDword() {
+	std::printf("\na car's model index is sixteen bits, whatever is behind it\n");
+	// CEntity::m_level sits in the word after m_modelIndex and nothing
+	// initialises it for a vehicle; the pool's slots are never cleared.
+	alignas(4) uint8_t car[0x5A8]{};
+	Field<int16_t>(car, offs::MODEL_INDEX)     = 111;
+	Field<uint16_t>(car, offs::MODEL_INDEX + 2) = 0xCDCD;
+	uint16_t model = 0;
+	Check(game::VehicleModelIndex(car, model) && model == 111,
+	      "a Kuruma in a slot with leftovers behind its model index is still a Kuruma");
+	Field<int16_t>(car, offs::MODEL_INDEX) = 0;
+	Check(!game::VehicleModelIndex(car, model), "and a car with no model yet has none");
+	Field<int16_t>(car, offs::MODEL_INDEX) = -1;
+	Check(!game::VehicleModelIndex(car, model), "nor one with a negative index");
+}
+
+void TestOurPedestriansAreSaidToSitInSessionCars() {
+	std::printf("\nour own pedestrian in a session car is said to sit in it\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	const int32_t ours = GiveUsTheSessionsCar(c);
+	c.TickLocalVehicle();
+	c.HandleMessage(Wrap(MakeEnter(0, 80, 0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleSpawn(85), CH_EVENT));
+	c.Tick();
+	const RemoteVehicle *theirs = c.VehicleByNetId(85);
+	c.TickHostedPedsForTest();
+	Check(c.LocalVehicleNetId() == 80 && theirs != nullptr && theirs->poolHandle >= 0,
+	      "we drive car 80 and car 85 is somebody else's");
+	bool saw80 = false, saw85 = false;
+	for (const SessionCarRef &r : g_rec.hostedPedCars) {
+		saw80 = saw80 || (r.netId == 80 && r.poolHandle == ours);
+		saw85 = saw85 || (r.netId == 85 && r.poolHandle == theirs->poolHandle);
+	}
+	Check(g_rec.hostedPedSamples > 0 && saw80 && saw85,
+	      "the sampler is handed both, so Misty in ours and 8-Ball in theirs go out seated");
+}
+
 void TestOurOwnJackGoesOutAsAJack() {
 	std::printf("\ntelling the session we are jacking\n");
 	Client c;
@@ -16461,6 +19087,9 @@ int main() {
 	TestVehicleClaimIsSentOnce();
 	TestARefusedClaimIsNotAName();
 	TestRemoteDriverIsRecorded();
+	TestGateMaskIsAUnion();
+	TestGateDecisions();
+	TestTheNearestPickupIsClaimed();
 	TestGarageMaskIsAUnion();
 	TestLeavingReleasesGarages();
 	TestOurOwnGarageMaskIsNotHeldAgainstUs();
@@ -16506,8 +19135,17 @@ int main() {
 	TestExitAnimationStartsFromTheSnapshot();
 	TestTheSeatIsAnnouncedWhenTheWalkStarts();
 	TestAnEntryThatNeverFinishesTakesItsSeatBack();
+	TestACopyCarriesTheSessionsStation();
+	TestTheUserTracksOnAMachineWithout();
+	TestTheDriverGivesTheCarItsStation();
+	TestAPassengerTurnsTheDialButNeverSeedsIt();
+	TestTheRideIsCorrectedBeforeTheCamera();
+	TestARiderTakesTheDriversJumpShot();
+	TestOnlyTheDriverSendsAJumpShot();
 	TestASeatThatCameOutDifferentIsCorrected();
 	TestTheWarpFallbackStillAnnouncesExactlyOnce();
+	TestAScriptedRideIsAnnouncedFromTheSeat();
+	TestAScriptedRideLapsesWhenNotSaidAgain();
 	TestOurOwnPassengerSeatIsNotReadAsACarWeDrive();
 	TestExitAnimationIsNotStartedOnFoot();
 	TestSeatedPedStopsBeingPositioned();
@@ -16516,6 +19154,9 @@ int main() {
 	TestRefusedSeatingIsNotRetriedForever();
 	TestLeavingWhileSeated();
 	TestPoseApplied();
+	TestTheBodyIsPlayedWithThePose();
+	TestARiderIsPutOnOurCopy();
+	TestAFrozenPlayerStopsRunning();
 	TestPedLostToTheEngineIsRespawned();
 	TestNoBridgeIsSafe();
 	TestTheSwitchReachesTheEngine();
@@ -16604,6 +19245,11 @@ int main() {
 	TestRubbishWorldStateIsIgnored();
 	TestNoWorldToReadMeansNoCorrection();
 	TestDisconnectDropsTheHost();
+	TestTheSkyHolderRule();
+	TestFollowingTheSkyOverTheHour();
+	TestTheMissionOwnerHoldsTheSky();
+	TestTheHostFollowsSomebodyElsesMission();
+	TestAClockJumpDoesNotTurnTheWeather();
 
 	TestABackfilledPlayerExistsWithoutASnapshot();
 	TestAJoinWithoutAPositionStillCreatesNothing();
@@ -16720,6 +19366,13 @@ int main() {
 	TestABorrowedLevelDoesNotEchoInSharedMode();
 	TestNoPlayerPedMeansNoWantedDecision();
 	TestTheSessionsWantedRuleArrives();
+	TestWantedHoldArithmetic();
+	TestABribeDoesNotMakeABorrowerAnEarner();
+	TestAResprayIsNotUndoneByACarMate();
+	TestAResprayClearsTheWholeCar();
+	TestAResprayClearsASharedSession();
+	TestABribeTakesAStarOffASharedSession();
+	TestOurOwnBribeWhileBorrowing();
 	TestACarWeAreDrivingIsNotWrittenToBeforeTheClaimComesBack();
 	TestADeathCauseIsNamed();
 
@@ -16748,6 +19401,14 @@ int main() {
 	TestABurningCarIsKeptUntilItGoesUp();
 	TestOurSettleAfterTakingOverSomebodyElsesIsOurs();
 	TestADentWhileWeSettleACarIsSent();
+	TestACarsBombGoesWhereTheCarIs();
+	TestTheBombRulesHoldWithoutAGame();
+	TestACarBombIsOnEveryCopy();
+	TestADetonatorSetsOffTheBombWhereTheCarIs();
+	TestAMissionsBombIsTheOwnersOnEveryCopy();
+	TestTheMissionsDetonatorIsEverybodysInIt();
+	TestTheIgnitionIsSaidByWhoeverSitsDown();
+	TestAMineGoesOffOnEveryScreen();
 	TestTheLastDentGoesOutBeforeTheSettle();
 	TestADentAfterOurSettleIsNotOursToSend();
 	TestALighterDentIsStillNewsAfterASettle();
@@ -16780,11 +19441,34 @@ int main() {
 	g_failures += RunRampageVoteTests();
 	g_failures += RunAimPitchTests();
 	g_failures += RunSirenTests();
+	g_failures += RunCarExtrasTests();
+	g_failures += RunCarRemovalTests();
 	g_failures += RunCheatTests();
 	g_failures += RunDriveByTests();
+	g_failures += RunPassengerAimTests();
+	g_failures += RunRunOverTests();
+	g_failures += RunStuntTests();
+	g_failures += RunMissionCombatTests();
+	g_failures += RunPassengerTests();
+	g_failures += RunRadioTests();
+	g_failures += RunOutfitTests();
 	g_failures += RunMoneyTests();
+	g_failures += RunMissionTests();
+	g_failures += RunMissionWorldTests();
+	g_failures += RunSocialTests();
 	g_failures += RunStreamPickTests();
 	g_failures += RunChatFeedTests();
+	g_failures += RunFontCullTests();
+	g_failures += RunCutsceneTests();
+	g_failures += RunCutsceneSkipTests();
+	g_failures += RunCopCrimeTests();
+	g_failures += RunCarBombTests();
+	g_failures += RunEmergencyTests();
+	g_failures += RunWreckTests();
+	g_failures += RunRemoteBodyTests();
+	g_failures += RunAnimReviveTests();
+	g_failures += RunCrowdRangeTests();
+	g_failures += RunCarLetGoTests();
 	g_failures += RunAdoptTests();
 	TestALeaversPedIsAdoptedByUs();
 	TestSomebodyElseAdoptsAndWeFollow();
@@ -16794,7 +19478,9 @@ int main() {
 	TestTheCarWeAreDrivingWaitsForItsClaim();
 	TestAnAdoptPacketIsBounded();
 	TestTheFeedHearsTheSession();
+	TestTheFeedSaysWhoDied();
 	TestATypedLineIsTakenOnce();
+	TestTheHostKicksFromTheChat();
 	TestThePingsAreTheServers();
 	TestBackInTheCarWeWereIn();
 	TestBeingTurnedAwaySaysWhy();
@@ -16808,6 +19494,10 @@ int main() {
 	TestTheProbeTakesInTheCrowdAndTheTraffic();
 	TestAShoveAsksToSettleAParkedCar();
 	TestABlastOnAParkedCarStays();
+	TestABurningCarNobodyHoldsHasOneTimer();
+	TestOurBlastAsksForTheCar();
+	TestAWreckIsFollowedWhereItLands();
+	TestAWreckWeDecideIsOursToSettle();
 	TestANudgeIsAPush();
 	TestWireMotionIsHeld();
 	TestACarsOwnBlastIsNotRelayed();
@@ -16860,6 +19550,21 @@ int main() {
 	TestAJackOfTheJackersOwnTrafficIsNotPlayedTwice();
 	TestTheTrafficDriverIsLeftToTheDrag();
 	TestADraggedDriverIsNotUnseatedByThePromotion();
+	TestTheSeatPlan();
+	TestAPedestriansCopyOpensTheDoor();
+	TestADoorThatWillNotOpenHereFallsBackToTheSeat();
+	TestAPedestriansCopyClimbsOut();
+	TestHisHostMovesHimAlong();
+	TestAPlayerIsSettledIntoHisOwnSeat();
+	TestWhoSimulatesAMissionCar();
+	TestAHostsPedestrianSitsInASessionCar();
+	TestAPromotionKeepsItsPassengers();
+	TestAPedestriansSeatIsTakenForAnEntry();
+	TestNoSeatHereKeepsHimOutOfTheWay();
+	TestAPedestrianWaitsUnseenForHisCar();
+	TestAPedestrianInACarHisHostCannotNameIsHidden();
+	TestACarsModelIndexIsTheWordNotTheDword();
+	TestOurPedestriansAreSaidToSitInSessionCars();
 	TestOurOwnJackGoesOutAsAJack();
 	TestOurSeatIsLeftToTheDrag();
 

@@ -77,6 +77,14 @@ silently and cannot resync is worse than one only the host drives.
 So the script exists in exactly one place, and everyone else receives its
 effects.
 
+> **Refined 2026-09-24.** [missions.md](missions.md) measured the script and
+> recommends two changes to this section. Nothing is suppressed on clients:
+> every machine keeps running its own main script, as it already does in free
+> roam. And a mission runs on the machine of the player who started it, not on
+> the session host, because that machine has the mission's area streamed and
+> its collision loaded (`missions.md` §5.1). The part that stays is that each
+> *mission* runs in one place only.
+
 ### 2.1 What "the player" means to the host's script
 
 The host's own ped. The script reads its position, health, wanted level and
@@ -163,6 +171,12 @@ already supports it.
 Everything in Tier 1 is a prerequisite for Tier 2, so none of it gets thrown
 away later.
 
+> **Corrected 2026-09-24.** Nothing was ever suppressed. Free roam is built on
+> every machine running its own `main.scm`: pickups, rampages, garages and
+> hidden packages all depend on it. So a session today is N single-player
+> campaigns in one city, each player's missions private to them.
+> `missions.md` §2.1.
+
 ### Tier 2: host-driven campaign
 
 The host's script runs; the events in §2.2 replicate. Any player can *take
@@ -201,6 +215,18 @@ questions, and we only want to change the answers to those.
 
 Intercept point: `CRunningScript::ProcessOneCommand` (`Script.cpp:2050`), or
 the individual handlers (see §6).
+
+> **Corrected 2026-09-24.** The table above counts the 78 `.sc` files by
+> command name, and those files spell most commands as raw opcodes. Over the
+> whole script the mission markers are `LOCATE_PLAYER_ON_FOOT_3D` (115 sites in
+> the main section), gated by `CAN_PLAYER_START_MISSION`. In all, 97 opcodes
+> take the player, at 3,760 sites. The trigger also turns out not to need
+> intercepting at all, because every machine already runs its own triggers.
+> It only needs arbitrating, at `CAN_PLAYER_START_MISSION`.
+> On the target install, III.CLEO has already replaced the entry of
+> `ProcessOneCommand` (`0x00439500`) with a jump to its own dispatcher, so
+> that entry is not the place to hook. `missions.md` §3.2, §3.3, §5.2 and
+> §8.
 
 ---
 

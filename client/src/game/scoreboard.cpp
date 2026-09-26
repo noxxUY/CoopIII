@@ -1,6 +1,7 @@
 #include "scoreboard.h"
 
 #include "addresses.h"
+#include "fontcull.h"
 #include "population.h"
 #include "../boardlayout.h"
 #include "../chatfeed.h"
@@ -201,7 +202,8 @@ Rgba StateInk(BoardState s) {
 	case BoardState::Driving:
 	case BoardState::Passenger: return HUD_CAR;
 	case BoardState::Wasted:    return INK_DEAD;
-	case BoardState::Away:      return INK_AWAY;
+	case BoardState::Away:
+	case BoardState::Paused:    return INK_AWAY;
 	case BoardState::OnFoot:    break;
 	}
 	return INK_DIM;
@@ -272,7 +274,11 @@ void DrawRowText(const BoardLayout &b, int i, const Row &r) {
 
 	Font(FONT_BANK, BOARD_TEXT_SX, BOARD_TEXT_SY, b);
 	const float textY = b.TextTop(top, BOARD_ROW_H, BOARD_TEXT_SY);
-	Print(b.X(BOARD_NICK_X), textY, r.nick[0] ? r.nick : "?", INK,
+	// The number /kick takes (chatfeed.h, ListNumber) goes before the name.
+	char named[NICK_LEN + 8];
+	std::snprintf(named, sizeof named, "%u  %s",
+	              r.id < MAX_PLAYERS ? ListNumber(r.id) : 0u, r.nick[0] ? r.nick : "?");
+	Print(b.X(BOARD_NICK_X), textY, named, INK,
 	      b.U(r.host ? BOARD_HOST_X - BOARD_NICK_X - 3.0f : BOARD_HEALTH_X - BOARD_NICK_X - 4.0f),
 	      alpha);
 
@@ -343,7 +349,7 @@ Row RemoteRow(const Client &client, uint8_t id, uint32_t nowMs) {
 	r.quietMs = p.haveState ? nowMs - p.heardAtMs : 0;
 	r.pingMs  = client.PingOf(id);
 	r.state   = StateOf(p.dead, r.health, p.seatVehicleNetId != INVALID_NETID, p.seatIndex,
-	                    r.quietMs);
+	                    r.quietMs, p.away);
 	return r;
 }
 
@@ -395,15 +401,16 @@ void Draw(const Client &client, float screenW, float screenH) {
 	char copy[96];
 	FooterLines(client, copy);
 
-	const BoardLayout b = MeasureBoard(screenW, screenH, count, copy[0] ? 2 : 1);
+	const float       cullY = CurrentTextCullLine(screenW, screenH);
+	const BoardLayout b     = MeasureBoard(screenW, screenH, count, copy[0] ? 2 : 1, cullY);
 	if (!(b.unit > 0.0f))
 		return;
 
 	if (!g_saidShown) {
 		g_saidShown = true;
 		Log("scoreboard: up for the first time, %d row(s), %.0fx%.0f at (%.0f, %.0f) on a "
-		    "%.0fx%.0f screen, %.2f px per unit",
-		    count, b.width, b.height, b.left, b.top, screenW, screenH, b.unit);
+		    "%.0fx%.0f screen, %.2f px per unit, text prints down to y = %.0f",
+		    count, b.width, b.height, b.left, b.top, screenW, screenH, b.unit, cullY);
 	}
 
 	// Whatever text the HUD has queued is drawn now, so the panel goes over

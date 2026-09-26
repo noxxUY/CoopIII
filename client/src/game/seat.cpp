@@ -4,6 +4,7 @@
 #include "carstatus.h"
 #include "ped.h"
 #include "pedanim.h"
+#include "seatplan.h"
 #include "vehicle.h"
 #include "../client.h"
 #include "../log.h"
@@ -492,7 +493,64 @@ bool UnseatLocalPlayer() {
 	return true;
 }
 
+// Free, and nobody climbing in by its door: 8-Ball, told into the Kuruma a
+// moment before Give Me Liberty's player is, is at a door when the player is
+// put in, and the slot behind that door is his (seatplan.h).
+bool PassengerSeatFree(void *vehicle) {
+	return vehicle && FirstFreePassengerSeat(FreeSeatsForWarp(vehicle)) != 0;
+}
+
+int32_t WarpLocalPlayerIntoPassengerSeat(int32_t vehicleHandle) {
+	void *const ped     = PlayerPed();
+	void *const vehicle = VehicleFromHandle(vehicleHandle);
+	if (!ped || !vehicle || Field<bool>(ped, offs::PED_IN_VEHICLE) || !PassengerSeatFree(vehicle))
+		return -1;
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+		return -1;
+	// The warp takes the first empty slot, door or no door; he is moved to
+	// the first one nobody is climbing into before anything reads it.
+	const uint8_t wanted = FirstFreePassengerSeat(FreeSeatsForWarp(vehicle));
+	int32_t       seat   = WarpIntoSeat(ped, vehicle);
+	if (seat > 0 && wanted != 0 && seat != wanted)
+		seat = MovePassengerToSeat(vehicle, ped, wanted);
+	return seat > 0 ? seat : -1;
+}
+
+int32_t WarpLocalPlayerIntoGivenSeat(int32_t vehicleHandle, uint8_t given, uint16_t givenToOthers) {
+	void *const ped     = PlayerPed();
+	void *const vehicle = VehicleFromHandle(vehicleHandle);
+	if (!ped || !vehicle || Field<bool>(ped, offs::PED_IN_VEHICLE))
+		return -1;
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
+		return -1;
+	const uint8_t wanted = PickBoardSeat(FreeSeatsForWarp(vehicle), given, givenToOthers);
+	if (wanted == 0)
+		return -1;
+	int32_t seat = WarpIntoSeat(ped, vehicle);
+	if (seat > 0 && seat != wanted)
+		seat = MovePassengerToSeat(vehicle, ped, wanted);
+	return seat > 0 ? seat : -1;
+}
+
+bool LocalPassengerSeat(int32_t &vehicleHandle, uint8_t &seat) {
+	void *const ped = PlayerPed();
+	if (!ped || !Field<bool>(ped, offs::PED_IN_VEHICLE))
+		return false;
+	void *const car = Field<void *>(ped, offs::PED_MY_VEHICLE);
+	if (!car)
+		return false;
+	const int32_t at = PassengerSeatOf(car, ped);
+	if (at <= 0)
+		return false;
+	vehicleHandle = Func<int32_t(__cdecl *)(void *)>(CPools__GetVehicleRef)(car);
+	seat          = static_cast<uint8_t>(at);
+	return vehicleHandle >= 0;
+}
+
 void AddSeatToBridge(WorldBridge &bridge) {
+	bridge.LocalPassengerSeat   = &LocalPassengerSeat;
 	bridge.LocalWantsSeatToggle = &LocalWantsSeatToggle;
 	bridge.SeatLocalPlayerIn    = &SeatLocalPlayerIn;
 	bridge.PollLocalSeatEntry   = &PollLocalSeatEntry;

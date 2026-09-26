@@ -167,10 +167,97 @@ inline uint8_t MatchTypedCheats(const char *buffer, uint8_t *out, uint8_t max) {
 	return n;
 }
 
+// ---- the chat key inside a cheat ------------------------------------------------
+
+// The chat key is T, and eleven of the 23 cheats have a T in them. Opening
+// the line swallows that T and every key after it, so TURTOISE could never be
+// typed in a session. Two rules give it back, and neither lets chat text
+// start a cheat of its own.
+//
+// 1. **A chat key that finishes a cheat is the game's.** GESUNDHEIT's last
+//    letter goes to the engine the way it always has, and the line does not
+//    open. `key` is the character the engine would push for the chat key
+//    (0 when it pushes none, and then there is nothing to rescue).
+inline bool ChatKeyFinishesCheat(const char *buffer, char key) {
+	if (key == '\0')
+		return false;
+	char copy[KEYBOARD_CHEAT_STRING_LEN];
+	for (size_t i = 0; i < KEYBOARD_CHEAT_STRING_LEN; ++i)
+		copy[i] = buffer[i];
+	PushCheatChar(copy, key);
+	uint8_t ids[CHEAT_COUNT];
+	return MatchTypedCheats(copy, ids, CHEAT_COUNT) != 0;
+}
+
+// 2. **A line that is exactly the rest of a cheat is the rest of that cheat.**
+//    `buffer` is what the engine has seen, which is everything typed before
+//    the chat key opened the line; `line` is the whole of what has been
+//    typed into it since. If the chat key and that line, pushed in that
+//    order, finish a cheat the engine has not seen finish yet, and that
+//    cheat began at or before the chat key, then the line was never chat.
+//
+// "Began at or before the chat key" is what keeps words out: every letter of
+// the line has to be part of the cheat, so a cheat word anywhere in a
+// sentence, or a line that is nothing but a whole cheat word, never matches -
+// the line would have to be preceded, outside chat, by the cheat's first
+// letters. Nothing typed along the way may fire anything either, so handing
+// `keys` to the engine one by one fires that cheat on the last of them and
+// nothing before it.
+//
+// The cheat's CheatId, or CHEAT_COUNT. `keys` gets what to push, the chat
+// key first, and `*count` how many.
+inline uint8_t CheatFinishedInChatLine(const char *buffer, char key, const char *line,
+                                       char (&keys)[KEYBOARD_CHEAT_STRING_LEN],
+                                       uint8_t *count) {
+	*count = 0;
+	if (key == '\0' || line == nullptr || line[0] == '\0')
+		return CHEAT_COUNT;
+
+	// The engine sees letters as MapVirtualKey gives them, which is capitals.
+	size_t n = 0;
+	keys[n++] = key;
+	for (const char *p = line; *p != '\0'; ++p) {
+		if (n == KEYBOARD_CHEAT_STRING_LEN)
+			return CHEAT_COUNT;   // longer than any cheat
+		char c = *p;
+		if (c >= 'a' && c <= 'z')
+			c = static_cast<char>(c - 'a' + 'A');
+		if (c < 'A' || c > 'Z')
+			return CHEAT_COUNT;   // no cheat has anything but letters
+		keys[n++] = c;
+	}
+
+	char copy[KEYBOARD_CHEAT_STRING_LEN];
+	for (size_t i = 0; i < KEYBOARD_CHEAT_STRING_LEN; ++i)
+		copy[i] = buffer[i];
+	uint8_t ids[CHEAT_COUNT];
+	for (size_t i = 0; i + 1 < n; ++i) {
+		PushCheatChar(copy, keys[i]);
+		if (MatchTypedCheats(copy, ids, CHEAT_COUNT) != 0)
+			return CHEAT_COUNT;
+	}
+	PushCheatChar(copy, keys[n - 1]);
+	const uint8_t fired = MatchTypedCheats(copy, ids, CHEAT_COUNT);
+	if (fired == 0)
+		return CHEAT_COUNT;
+	// The line is n - 1 letters; the chat key sits at copy[n - 1].
+	for (uint8_t i = 0; i < fired; ++i) {
+		size_t len = 0;
+		while (CHEAT_SITES[ids[i]].reversed[len] != '\0')
+			++len;
+		if (len < n)
+			return CHEAT_COUNT;
+	}
+	*count = static_cast<uint8_t>(n);
+	return ids[0];
+}
+
 // ---- the decision -------------------------------------------------------------
 
 struct CheatContext {
 	bool    inSession = false;   // welcomed, and still connected
+	// Holds the session's sky: the host, or the running mission's owner
+	// (coopiii/sky.h). The only thing it decides is where a sky cheat runs.
 	bool    isHost    = false;
 	uint8_t rule      = CHEAT_RULE_SHARED;
 };
@@ -353,6 +440,18 @@ inline bool MayScanForThreats(bool isRemotePlayer, bool isAmbientReplica) {
 // can move replicas on this machine until their owner's stream puts them back.
 bool InstallCheatHooks();
 void RemoveCheatHooks();
+
+// The chat line's half of the two rules above (game/chat.cpp). `vk` is the
+// chat key: the character the engine's key handler would push for it, from
+// the same MapVirtualKeyA(vk, 2) call it makes (0x00583D90), or 0.
+char EngineCheatCharFor(int vk);
+// Is the chat key about to finish a cheat in the engine's own buffer?
+bool ChatKeyWouldFinishCheat(char key);
+// If `line`, typed after the chat key, finishes a cheat, hands the chat key
+// and the line to CPad::AddToPCCheatString one key at a time - the door every
+// typed cheat comes through, so a session's rule and routing apply to it
+// exactly as to one typed with the line shut - and returns true.
+bool FinishCheatFromChatLine(char key, const char *line);
 
 // SetCheatSession, DrainLocalCheats and ApplyRoutedCheat.
 void AddCheatsToBridge(WorldBridge &bridge);

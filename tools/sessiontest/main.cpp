@@ -10,14 +10,18 @@
 // a rollover.
 
 #include "reach.h"
+#include "lobby.h"
+#include "objectrecords.h"
 #include "session.h"
 
 #include "coopiii/net.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <vector>
 
 using namespace coopiii;
 
@@ -238,6 +242,27 @@ void TestAJoinerIsToldWhatEverybodyIsWearing() {
 	Check(carl->look[0] == '\0', "a reused slot starts with no look");
 }
 
+// The menu is a level sent on change, so a joiner is told who has it up.
+void TestAJoinerIsToldWhoIsInTheMenu() {
+	std::printf("\nwho is in the menu, for whoever joins later\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Check(s.NotePlayerAway(*alice, true), "a menu going up is worth relaying");
+	Check(!s.NotePlayerAway(*alice, true), "the same again is not");
+
+	Player *bob = Join(s, 2, "bob");
+	Backfill back = s.BuildBackfill(bob->id, 88);
+	Check(back.aways.size() == 1 && back.aways[0].hdr.opcode == OP_S_PLAYER_AWAY &&
+	          back.aways[0].playerId == alice->id && back.aways[0].away == 1,
+	      "bob is told alice has the menu up");
+	Check(s.NotePlayerAway(*alice, false) && s.BuildBackfill(bob->id, 89).aways.empty(),
+	      "and nothing once she has closed it");
+
+	s.RemovePeer(1);
+	Player *carl = Join(s, 3, "carl");
+	Check(!carl->away, "a reused slot starts out of the menu");
+}
+
 // A joiner has to be told which doors are currently open for somebody.
 //
 // The garage mask is a *level* and it is only sent when it changes, so
@@ -395,7 +420,7 @@ void TestABackfilledCarCarriesItsCondition() {
 	Check(v.flags == (VEH_ENGINE_ON | VEH_SIREN), "engine and siren as the driver has them");
 }
 
-void TestAWreckIsNotBackfilled() {
+void TestAWreckIsNotBackfilledAsACar() {
 	std::printf("\na car that has been blown up\n");
 	Session s;
 	Player *alice = Join(s, 1, "alice");
@@ -414,7 +439,9 @@ void TestAWreckIsNotBackfilled() {
 
 	Player *bob = Join(s, 2, "bob");
 	const Backfill back = s.BuildBackfill(bob->id, 1);
-	Check(back.vehicles.empty(), "and a joiner is not handed a car that is gone");
+	Check(back.vehicles.size() == 1 && (back.vehicles[0].flags & VEH_WRECKED) != 0 &&
+	          back.vehicles[0].health == 0.0f,
+	      "and a joiner is handed it as a wreck, never as a car that works");
 	Check(back.seats.empty(), "nor a seat in one");
 	Check(alice->vehicleNetId == INVALID_NETID, "the driver is out of it");
 
@@ -466,6 +493,182 @@ void TestAPassengerIsBackfilledInTheirOwnSeat() {
 	      "in the same car");
 	Check(car->driverPlayerId == alice->id,
 	      "a passenger getting in does not take the wheel");
+}
+
+// The car radio (protocol.h, S_VehicleRadio): anybody in the car turns it,
+// nobody else, and a joiner is told where it is.
+void TestTheRadioIsTurnedFromInsideTheCar() {
+	std::printf("\nthe car radio\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Player *carol = Join(s, 3, "carol");
+	Vehicle *car  = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+	s.NoteEnterVehicle(*bob, *car, /*seat=*/1);
+
+	uint8_t held = 0;
+	Check(car->radio == RADIO_STATION_UNKNOWN, "a new car has no station");
+	Check(s.NoteVehicleRadio(alice->id, netId, 4, held) && held == 4,
+	      "the driver's copy gives it one");
+	Check(s.FindVehicle(netId)->radio == 4, "and the session holds it");
+	Check(s.NoteVehicleRadio(bob->id, netId, 7, held) && held == 7,
+	      "a passenger turns the dial too");
+	Check(!s.NoteVehicleRadio(bob->id, netId, 7, held) && held == 7,
+	      "the same station again is nothing to tell anybody");
+	Check(!s.NoteVehicleRadio(carol->id, netId, 2, held) && held == 7,
+	      "somebody not in the car is refused, and told what it is on");
+	Check(!s.NoteVehicleRadio(alice->id, netId, 12, held) && held == 7,
+	      "and so is a number that is no station");
+	Check(!s.NoteVehicleRadio(alice->id, 999, 2, held) && held == RADIO_STATION_UNKNOWN,
+	      "and a car the session has never heard of");
+	Check(s.NoteVehicleRadio(alice->id, netId, RADIO_STATION_OFF, held),
+	      "off is a station like any other");
+
+	const Backfill back = s.BuildBackfill(carol->id, 1);
+	Check(back.radios.size() == 1 && back.radios[0].netId == netId &&
+	          back.radios[0].station == RADIO_STATION_OFF &&
+	          back.radios[0].playerId == INVALID_PLAYER,
+	      "a joiner is told the station, as the session's own record");
+
+	s.NoteExitVehicle(*bob, netId);
+	Check(!s.NoteVehicleRadio(bob->id, netId, 3, held),
+	      "a passenger who has got out has no dial in it any more");
+
+	Vehicle *other = Claim(s, *carol, 92);
+	const Backfill again = s.BuildBackfill(bob->id, 1);
+	Check(other && again.radios.size() == 1,
+	      "a car nobody has said a station for is not in it");
+
+	s.NotePlayerDied(*alice, 17);
+	Check(!s.NoteVehicleRadio(alice->id, netId, 3, held), "nor does a dead driver");
+}
+
+// A car's bomb (protocol.h, C_VehicleBomb): from whoever simulates the car,
+// whose it is and what is left of a burning fuse, kept for a joiner.
+C_VehicleBomb BombReport(uint16_t netId, uint8_t type, uint8_t blame, uint16_t fuseMs) {
+	C_VehicleBomb b{};
+	b.netId    = netId;
+	b.bombType = type;
+	b.blame    = blame;
+	b.fuseMs   = fuseMs;
+	return b;
+}
+
+void TestACarsBombIsTheSessions() {
+	std::printf("\na car's bomb, kept by the session\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Player *carol = Join(s, 3, "carol");
+	Vehicle *car  = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+
+	Check(s.NoteVehicleBomb(alice->id, BombReport(netId, CARBOMB_ONIGNITION, alice->id, 0), 1000),
+	      "the driver's word on it is kept");
+	Check(s.FindVehicle(netId)->bomb == CARBOMB_ONIGNITION &&
+	          s.FindVehicle(netId)->bombBlame == alice->id &&
+	          s.FindVehicle(netId)->bombFuseEndMs == 0,
+	      "the bomb, whose it is, and no fuse");
+	Check(!s.NoteVehicleBomb(bob->id, BombReport(netId, CARBOMB_NONE, bob->id, 0), 1000),
+	      "somebody who does not simulate the car says nothing of it");
+	Check(!s.NoteVehicleBomb(alice->id, BombReport(netId, CARBOMB_MAX + 1, alice->id, 0), 1000) &&
+	          !s.NoteVehicleBomb(alice->id,
+	                             BombReport(netId, CARBOMB_TIMED, alice->id,
+	                                        CARBOMB_FUSE_MAX_MS + 1),
+	                             1000) &&
+	          !s.NoteVehicleBomb(alice->id, BombReport(netId, CARBOMB_TIMED, 7, 0), 1000),
+	      "nor does a bomb there is none of, a fuse no bomb lights, or a player nobody is");
+	Check(s.FindVehicle(netId)->bomb == CARBOMB_ONIGNITION, "and none of that changed it");
+
+	Check(s.NoteVehicleBomb(alice->id,
+	                        BombReport(netId, CARBOMB_ONIGNITIONACTIVE, bob->id, 1000), 5000),
+	      "a fuse bob's bomb lit is kept too");
+	Backfill back = s.BuildBackfill(carol->id, 5400);
+	Check(back.bombs.size() == 1 && back.bombs[0].netId == netId &&
+	          back.bombs[0].bombType == CARBOMB_ONIGNITIONACTIVE &&
+	          back.bombs[0].blame == bob->id && back.bombs[0].fuseMs == 600 &&
+	          back.bombs[0].playerId == INVALID_PLAYER,
+	      "a joiner is told the bomb, whose, and the 600 ms left of the fuse");
+	back = s.BuildBackfill(carol->id, 7000);
+	Check(back.bombs.size() == 1 && back.bombs[0].fuseMs == 0,
+	      "and once it has run out, the bomb alone");
+	Check(s.NoteVehicleBomb(alice->id, BombReport(netId, CARBOMB_ONIGNITIONACTIVE, bob->id, 0),
+	                        5100) &&
+	          s.FindVehicle(netId)->bombFuseEndMs != 0,
+	      "a fuse said unlit leaves one already burning alone");
+	Check(FuseLeftMs(0, 100) == 0 && FuseLeftMs(1100, 100) == 1000 && FuseLeftMs(100, 1100) == 0 &&
+	          FuseLeftMs(100000, 100) == CARBOMB_FUSE_MAX_MS,
+	      "what is left of a fuse, never more than seven seconds");
+
+	s.RemovePeer(2);
+	Check(s.FindVehicle(netId)->bomb == CARBOMB_ONIGNITIONACTIVE &&
+	          s.FindVehicle(netId)->bombBlame == INVALID_PLAYER,
+	      "bob leaves: the bomb stays, and is nobody's");
+
+	Vehicle *other = Claim(s, *carol, 92);
+	back = s.BuildBackfill(carol->id, 8000);
+	Check(other && back.bombs.size() == 1, "a car with no bomb is not in the backfill");
+}
+
+// A bomb the mission's script fitted (protocol.h, C_MissionBomb): the
+// owner's, whoever simulates the car, until a word on it changes it.
+void TestAMissionsBombIsTheOwners() {
+	std::printf("\na bomb the mission fitted, kept by the session\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Player *carol = Join(s, 3, "carol");
+	Vehicle *car  = Claim(s, *bob, 91);
+	const uint16_t netId = car->netId;
+
+	C_MissionBomb arm{};
+	arm.netId    = netId;
+	arm.bombType = CARBOMB_REMOTE;
+	Check(!s.NoteMissionBomb(alice->id, arm), "no mission running: nobody's script fits one");
+	Check(s.Mission().Start(alice->id, 41, s.ConnectedMask()), "alice starts a mission");
+	Check(!s.NoteMissionBomb(bob->id, arm),
+	      "bob, in it and at the wheel, is not the one whose script runs");
+	arm.bombType = CARBOMB_MAX + 1;
+	Check(!s.NoteMissionBomb(alice->id, arm), "nor is a bomb there is none of");
+	arm.bombType = CARBOMB_REMOTE;
+	arm.netId    = 9999;
+	Check(!s.NoteMissionBomb(alice->id, arm), "nor a car the session does not have");
+	arm.netId = netId;
+	Check(s.NoteMissionBomb(alice->id, arm), "alice's mission fits a remote bomb to bob's car");
+	Check(car->bomb == CARBOMB_REMOTE && car->bombBlame == alice->id && car->bombMission,
+	      "it is alice's, and the mission's");
+
+	Check(s.NoteVehicleBomb(bob->id, BombReport(netId, CARBOMB_REMOTE, alice->id, 0), 1000) &&
+	          car->bombMission,
+	      "bob's engine saying the same thing leaves it the mission's");
+	Backfill back = s.BuildBackfill(carol->id, 1000);
+	Check(back.bombs.size() == 1 && back.bombs[0].blame == alice->id &&
+	          back.missionBombs.size() == 1 && back.missionBombs[0].netId == netId &&
+	          back.missionBombs[0].playerId == alice->id &&
+	          back.missionBombs[0].bombType == CARBOMB_REMOTE,
+	      "a joiner is told the bomb, and then that it is alice's mission's");
+
+	Check(s.NoteVehicleBomb(bob->id, BombReport(netId, CARBOMB_NONE, alice->id, 500), 2000) &&
+	          !car->bombMission,
+	      "set off, it is a burning fuse like any other");
+	back = s.BuildBackfill(carol->id, 2100);
+	Check(back.bombs.size() == 1 && back.missionBombs.empty(),
+	      "and a joiner is told the fuse alone");
+
+	Check(s.NoteMissionBomb(alice->id, arm) && car->bombMission, "fitted again");
+	Check(s.NoteVehicleBomb(bob->id, BombReport(netId, CARBOMB_REMOTE, bob->id, 0), 3000) &&
+	          !car->bombMission,
+	      "a bomb shop fitting bob's own over it makes it his");
+	Check(s.NoteMissionBomb(alice->id, arm) && car->bombMission, "and fitted once more");
+	s.RemovePeer(1);
+	Check(car->bomb == CARBOMB_REMOTE && car->bombBlame == INVALID_PLAYER && !car->bombMission,
+	      "alice leaves: the bomb stays, nobody's and nobody's mission's");
+
+	Check(KeepsMissionBomb(true, 3, 1, 3, 1) && !KeepsMissionBomb(false, 3, 1, 3, 1) &&
+	          !KeepsMissionBomb(true, 3, 1, 0, 1) && !KeepsMissionBomb(true, 1, 1, 4, 2) &&
+	          !KeepsMissionBomb(true, 3, 1, 3, 2),
+	      "the same bomb and the same player keep it the mission's, and nothing else does");
 }
 
 void TestOnlyTheDriverMayReportTheCar() {
@@ -695,6 +898,35 @@ void TestEveryPedGetsItsOwnName() {
 	Check(a != INVALID_NETID && b != INVALID_NETID && a != b, "two claims, two netIds");
 	Check(s.FindPed(a)->ownerPlayerId == alice->id && s.FindPed(b)->ownerPlayerId == bob->id,
 	      "each stays with the machine that made it");
+}
+
+AmbientCarBody CarBody(uint16_t modelId, float x);
+
+void TestAMissionsPedsAndCarsSayWhoseTheyAre() {
+	std::printf("\nthe session's mission's pedestrians and cars\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	AmbientPedBody enemy = PedBody(7, 4, 1.0f);
+	enemy.flags          = AMBIENT_MISSION;
+	AmbientCarBody car   = CarBody(91, 2.0f);
+	car.flags            = AMBIENT_MISSION;
+	const uint16_t ped = s.AddPed(alice->id, enemy)->netId;
+	const uint16_t veh = s.AddCar(alice->id, car)->netId;
+	s.AddPed(alice->id, PedBody(9, 5, 3.0f));
+	Player *bob = Join(s, 2, "bob");
+	const Backfill back = s.BuildBackfill(bob->id, 1);
+	bool pedSays = false, carSays = false, ambientSays = false;
+	for (const S_PedSpawn &p : back.peds) {
+		if (p.netId == ped)
+			pedSays = p.body.flags == AMBIENT_MISSION && p.ownerPlayerId == alice->id;
+		else
+			ambientSays = ambientSays || p.body.flags != 0;
+	}
+	for (const S_CarSpawn &c : back.cars)
+		if (c.netId == veh)
+			carSays = c.body.flags == AMBIENT_MISSION;
+	Check(pedSays && carSays, "a joiner is told they are the mission's, and whose");
+	Check(!ambientSays, "and the ordinary crowd is not");
 }
 
 void TestAPlayerTakesTheirPedsWithThem() {
@@ -1070,6 +1302,26 @@ void TestAPackageIsEverybodysByDefault() {
 	Check(s.BuildBackfill(c->id, 40).pickups.size() == 1, "and a joiner is told it is gone");
 }
 
+void TestTheMissionsStashIsEverybodysOwn() {
+	std::printf("the mission's stash, one each\n");
+	Session s;   // packages shared: the stash does not ask the package rule
+	Player *a = Join(s, 1, "alice");
+	Player *b = Join(s, 2, "bob");
+	const PickupIdent uzi   = Ident(3.0f, 3, 172, PICKUP_F_STASH);   // PICKUP_ONCE
+	const PickupIdent brief = Ident(5.0f, 3, 1319);                   // the briefcase
+	Check(s.PickupIsPerPlayer(uzi) && !s.PickupIsPerPlayer(brief),
+	      "the mission's weapons are everybody's own, its briefcase is one");
+	Check(s.ClaimPickup(a->id, uzi, 10) == Session::PickupVerdict::GRANTED &&
+	          s.ClaimPickup(b->id, uzi, 11) == Session::PickupVerdict::GRANTED &&
+	          s.NotePickupCollected(a->id, uzi, 20) && s.NotePickupCollected(b->id, uzi, 21),
+	      "alice and bob each take an uzi of their own");
+	Check(s.ClaimPickup(a->id, uzi, 30) == Session::PickupVerdict::DENIED,
+	      "and nobody takes theirs twice");
+	s.ClaimPickup(a->id, brief, 40);
+	Check(s.ClaimPickup(b->id, brief, 41) == Session::PickupVerdict::DENIED,
+	      "while the briefcase is whoever gets there first");
+}
+
 void TestAPackageIsYourOwnUnderPerPlayer() {
 	std::printf("a hidden package, per player\n");
 	Session s;
@@ -1193,6 +1445,99 @@ void TestTheSamePickupIsMatchedWithinTolerance() {
 	Check(s.ClaimPickup(b->id, Ident(10.0f, 3, /*model=*/101), 0) ==
 	          Session::PickupVerdict::GRANTED,
 	      "the same place with another model is a different one");
+}
+
+// A reservation that stood 15 s goes to the next claimant, and the one it was
+// taken from is named so the server can tell him. His own collection inside
+// the grace still counts; after it, it does not.
+void TestAMovedReservationNamesItsOldHolder() {
+	std::printf("a reservation moved after 15 s says whose it was\n");
+	Session s;
+	Player *a = Join(s, 1, "A");
+	Player *b = Join(s, 2, "B");
+	const PickupIdent gun = Ident(60.0f, 2);
+
+	uint8_t from = 0;
+	Check(s.ClaimPickup(a->id, gun, 0, &from) == Session::PickupVerdict::GRANTED &&
+	          from == INVALID_PLAYER,
+	      "A reserves it, and nobody is displaced");
+	Check(s.ClaimPickup(b->id, gun, 1000, &from) == Session::PickupVerdict::DENIED,
+	      "B is refused while A's reservation is fresh");
+	Check(s.ClaimPickup(b->id, gun, PICKUP_RESERVATION_MS, &from) ==
+	              Session::PickupVerdict::GRANTED &&
+	          from == a->id,
+	      "15 s later it is B's, and A is named as the one it was taken from");
+	Check(s.ClaimPickup(b->id, gun, PICKUP_RESERVATION_MS + 10, &from) ==
+	              Session::PickupVerdict::GRANTED &&
+	          from == INVALID_PLAYER,
+	      "B asking again displaces nobody");
+	Check(s.NotePickupCollected(a->id, gun, PICKUP_RESERVATION_MS + 500),
+	      "A's engine took it before the denial arrived: his collection counts");
+	Check(!s.NotePickupCollected(b->id, gun, PICKUP_RESERVATION_MS + 600),
+	      "and B's afterwards does not, so only one of them has it");
+
+	const PickupIdent armour = Ident(70.0f, 2);
+	s.ClaimPickup(a->id, armour, 0);
+	s.ClaimPickup(b->id, armour, PICKUP_RESERVATION_MS, &from);
+	Check(!s.NotePickupCollected(a->id, armour,
+	                             PICKUP_RESERVATION_MS + PICKUP_DISPLACED_GRACE_MS),
+	      "past the grace A's late report is not taken");
+	Check(s.NotePickupCollected(b->id, armour,
+	                            PICKUP_RESERVATION_MS + PICKUP_DISPLACED_GRACE_MS),
+	      "and B, who holds it, collects it");
+}
+
+// Broken street objects, kept while anybody is near them.
+void TestObjectRecordsLiveWhileSomebodyIsNear() {
+	std::printf("broken street objects are kept while a player is near them\n");
+	ObjectRecords r;
+	ObjectBreakBody lamp{};
+	lamp.ident.pos        = {100.0f, 200.0f, 10.0f};
+	lamp.ident.modelIndex = 1300;
+	lamp.amount           = 400.0f;
+	lamp.state            = OBJ_BREAK_RENDER_DAMAGED;
+	r.NoteBroken(1, lamp, 10);
+	lamp.amount = 300.0f;
+	lamp.state  = OBJ_BREAK_SMASHED;
+	r.NoteBroken(2, lamp, 20);
+	const ObjectRecord *got = r.Find(lamp.ident);
+	Check(got && got->breakBody.state == (OBJ_BREAK_RENDER_DAMAGED | OBJ_BREAK_SMASHED) &&
+	          got->breakBody.amount == 400.0f && r.Count() == 1,
+	      "two reports are one record, as broken as either said and hit as hard");
+
+	ObjectRestBody rest{};
+	rest.ident = lamp.ident;
+	rest.pos   = {101.0f, 200.0f, 9.5f};
+	r.NoteSettled(1, rest, 30);
+	got = r.Find(lamp.ident);
+	Check(got && got->hasRest && (got->breakBody.state & OBJ_BREAK_UPROOTED) != 0,
+	      "the resting place rides with it and says it came loose");
+
+	ObjectIdent other = lamp.ident;
+	other.pos.x += 0.1f;
+	Check(r.Find(other) != nullptr, "10 cm out is the same lamp post");
+	other.modelIndex = 1301;
+	Check(r.Find(other) == nullptr, "another model is not");
+
+	const Vec3 nearby[] = {{150.0f, 250.0f, 10.0f}};
+	Check(r.ExpireFar(nearby, 1) == 0 && r.Count() == 1, "kept while a player is 71 m away");
+	const Vec3 away[] = {{300.0f, 200.0f, 10.0f}};
+	Check(r.ExpireFar(away, 1) == 1 && r.Count() == 0,
+	      "and forgotten once nobody is within 120 m, where every copy is a dummy again");
+
+	for (uint32_t i = 0; i < OBJECT_RECORD_CAPACITY + 5; ++i) {
+		ObjectBreakBody b{};
+		b.ident.pos        = {static_cast<float>(i) * 2.0f, 0.0f, 0.0f};
+		b.ident.modelIndex = 1300;
+		r.NoteBroken(1, b, i);
+	}
+	Check(r.Count() == OBJECT_RECORD_CAPACITY, "the table never grows past its size");
+	ObjectIdent newest{};
+	newest.pos        = {static_cast<float>(OBJECT_RECORD_CAPACITY + 4) * 2.0f, 0.0f, 0.0f};
+	newest.modelIndex = 1300;
+	ObjectIdent oldest{};
+	oldest.modelIndex = 1300;
+	Check(r.Find(newest) && !r.Find(oldest), "and the oldest report makes room");
 }
 
 void TestARespawningPickupComesBackAndAOnceDoesNot() {
@@ -1826,8 +2171,8 @@ void TestOnlyTheCustodianWritesOffACarInCustody() {
 
 	Check(s.NoteUnownedBlowUp(k, alice->id, 10), "alice may");
 	Check(s.FindVehicle(car->netId)->destroyed, "and the session agrees");
-	Check(s.CustodianOf(car->netId) == INVALID_PLAYER,
-	      "which ends her custody: a wreck has nothing left to settle");
+	Check(s.CustodianOf(car->netId) == alice->id,
+	      "and she goes on settling it: the wreck is hers to bring to rest");
 	Check(!s.NoteUnownedBlowUp(k, bob->id, 20) && !s.NoteUnownedBlowUp(k, alice->id, 30),
 	      "and it is written off once");
 }
@@ -2372,7 +2717,8 @@ void TestAWreckIsNotHandedToAnybodyToSettle() {
 
 	s.DestroyVehicle(netId);
 	Check(s.CustodianOf(netId) == INVALID_PLAYER,
-	      "blowing up takes the driver out and hands the shell to nobody");
+	      "blowing up with nobody named to settle it takes the driver out and hands "
+	      "the shell to nobody");
 	Check(!s.MayReportVehicle(alice->id, netId),
 	      "so nothing more is reported about it");
 
@@ -3160,6 +3506,82 @@ void TestEveryCheatIsRelayedWhereItsRouteSays() {
 	      "and so is a cheat that does not exist");
 }
 
+void TestACatchUpIsWhatTheMissionMade() {
+	std::printf("\nwhat the running mission made, for a participant who asks\n");
+	Session s;
+	Player *noxx2 = Join(s, 1, "noxx2");
+	Player *noxx3 = Join(s, 2, "noxx3");
+	s.Mission().Start(noxx3->id, 19, s.ReadyMask());
+
+	AmbientCarBody kuruma = CarBody(111, 812.0f);
+	kuruma.flags          = AMBIENT_MISSION;
+	const uint16_t car    = s.AddCar(noxx3->id, kuruma)->netId;
+	s.AddCar(noxx3->id, CarBody(90, 20.0f));   // traffic
+	AmbientCarBody wreck = CarBody(116, 30.0f);
+	wreck.flags          = AMBIENT_MISSION;
+	UnownedVehicleKey key{};
+	key.kind = UNOWNED_AMBIENT;
+	key.id   = s.AddCar(noxx3->id, wreck)->netId;
+	s.NoteUnownedBlowUp(key, noxx3->id, 10);
+	AmbientCarBody ours = CarBody(111, 40.0f);
+	ours.flags          = AMBIENT_MISSION;
+	s.AddCar(noxx2->id, ours);   // the asker's own
+
+	AmbientPedBody eight = PedBody(26, 21, 811.0f);
+	eight.flags          = AMBIENT_MISSION;
+	const uint16_t ped   = s.AddPed(noxx3->id, eight)->netId;
+	s.AddPed(noxx3->id, PedBody(7, 4, 5.0f));   // a pedestrian of the street
+	AmbientPedBody dead = PedBody(30, 7, 9.0f);
+	dead.flags          = AMBIENT_MISSION;
+	const uint16_t body = s.AddPed(noxx3->id, dead)->netId;
+	PedDeathBody died{};
+	died.netId  = body;
+	died.animId = 5;
+	s.NotePedDeath(died, noxx3->id);
+
+	const MissionCatchUp back = s.BuildMissionCatchUp(noxx2->id, 77);
+	Check(back.cars.size() == 1 && back.cars[0].netId == car && back.cars[0].tempId == 0 &&
+	          back.cars[0].ownerPlayerId == noxx3->id && back.cars[0].hdr.sendTimeMs == 77,
+	      "the mission's car, and not the traffic, the wreck or the asker's own");
+	Check(back.peds.size() == 2 && (back.peds[0].netId == ped || back.peds[1].netId == ped),
+	      "the mission's pedestrians, and not the street's");
+	Check(back.pedDeaths.size() == 1 && back.pedDeaths[0].body.netId == body,
+	      "and the dead one among them is said dead");
+	Check(back.sessionCars == 0, "nobody has claimed one of its cars");
+	Check(s.BuildMissionCatchUp(noxx3->id, 1).cars.size() == 1,
+	      "the owner asking hears of nobody's but noxx2's");
+}
+
+void TestTheSkyFollowsTheSessionsMission() {
+	std::printf("\nthe clock and the sky, while a mission runs\n");
+	Session s;
+	Player *noxx2 = Join(s, 1, "noxx2");   // the host
+	Player *noxx3 = Join(s, 2, "noxx3");
+	Check(s.SkyHolderId() == noxx2->id, "the host's, with no mission");
+	Check(s.NoteCheat(noxx3->id, Cheat(CHEAT_RAINY, 0)) == CHEAT_RELAY_HOST,
+	      "so a guest's sky cheat goes to the host");
+
+	Check(s.Mission().Start(noxx3->id, 19, s.ConnectedMask()), "noxx3 starts Give Me Liberty");
+	Check(s.SkyHolderId() == noxx3->id && s.HostId() == noxx2->id,
+	      "and the sky is noxx3's while it runs, with noxx2 still the host");
+	Check(s.NoteCheat(noxx2->id, Cheat(CHEAT_FOGGY, 0)) == CHEAT_RELAY_HOST,
+	      "the host's sky cheat goes to noxx3 then");
+	Check(s.NoteCheat(noxx3->id, Cheat(CHEAT_FOGGY, 0)) == CHEAT_RELAY_DROP,
+	      "and noxx3's own stays with noxx3, whose world packet carries it");
+
+	Check(s.Mission().End(noxx3->id, 19, MISSION_OUTCOME_PASSED), "it is passed");
+	Check(s.SkyHolderId() == noxx2->id, "and the sky is the host's again");
+
+	s.Mission().Start(noxx3->id, 20, s.ConnectedMask());
+	s.RemovePeer(1);   // noxx2, the host, leaves in the middle of it
+	Check(s.HostId() == noxx3->id && s.SkyHolderId() == noxx3->id,
+	      "the host leaving mid-mission changes nothing about the sky");
+	Player *carol = Join(s, 3, "carol");
+	s.Mission().Leave(noxx3->id);
+	s.RemovePeer(2);
+	Check(carol && s.SkyHolderId() == carol->id, "and the owner leaving hands it to whoever is host");
+}
+
 void TestTheSessionRemembersWhatEverybodyRuns() {
 	std::printf("\nthe cheats a joiner has to be brought to\n");
 	Session s;
@@ -3472,7 +3894,164 @@ void TestNobodyNearMeansNobodySettlesIt() {
 	Vehicle *wreck = Claim(s, *erin, 91);
 	s.NotePlayerState(*bob, StandAt(3.0f));
 	s.DestroyVehicle(wreck->netId);
-	Check(s.HandOverVehiclesOf(erin->id).empty(), "and a wreck has nothing left to settle");
+	Check(s.HandOverVehiclesOf(erin->id).empty(), "and a wreck nobody settles has nothing to hand on");
+}
+
+// ---- a wreck, settled and handed to a joiner (client/src/game/wreck.h) -----
+
+void TestAWreckIsSettledByWhoeverDecidedIt() {
+	std::printf("\na wreck is settled by the machine that decided it\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+
+	s.DestroyVehicle(netId, alice->id, 500);
+	Check(s.FindVehicle(netId)->destroyed && s.CustodianOf(netId) == alice->id,
+	      "alice's car blew up under her, and she settles the wreck");
+	Check(alice->vehicleNetId == INVALID_NETID && car->driverPlayerId == INVALID_PLAYER,
+	      "nobody is in it");
+	Check(s.MayReportVehicle(alice->id, netId) && !s.MayReportVehicle(bob->id, netId),
+	      "so hers is the one word on where it is");
+
+	Check(!s.NoteWreckState(alice->id, VehState(netId, 20.0f, 700.0f)),
+	      "a snapshot of hers from before the blast is not a wreck's");
+	Check(!s.NoteWreckState(bob->id, VehState(netId, 30.0f, 0.0f, VEH_WRECKED)),
+	      "and bob's is nobody's");
+	Check(s.FindVehicle(netId)->pos.x != 20.0f && s.FindVehicle(netId)->pos.x != 30.0f,
+	      "neither moves it");
+	Check(s.NoteWreckState(alice->id, VehState(netId, 40.0f, 0.0f, VEH_WRECKED)),
+	      "her wreck's settle is");
+	Check(s.FindVehicle(netId)->pos.x == 40.0f && s.FindVehicle(netId)->destroyed &&
+	          s.FindVehicle(netId)->health == 0.0f,
+	      "and puts it where it came down, still a wreck on zero");
+
+	Check(s.EndCustody(netId, alice->id) && s.CustodianOf(netId) == INVALID_PLAYER,
+	      "once it lies still she says so");
+	Check(!s.NoteWreckState(alice->id, VehState(netId, 45.0f, 0.0f, VEH_WRECKED)),
+	      "and after that nothing moves it");
+
+	// A settler the session has never heard of settles nothing.
+	Vehicle *c2 = Claim(s, *bob, 91);
+	s.DestroyVehicle(c2->netId, 77, 600);
+	Check(s.CustodianOf(c2->netId) == INVALID_PLAYER, "a settler who is not here is nobody");
+
+	// A car nobody holds, blown up where everybody replays the blast: the
+	// first to say so settles it, the rest are too late.
+	Vehicle *c3 = Claim(s, *alice, 91);
+	s.NoteExitVehicle(*alice, c3->netId);
+	s.EndCustody(c3->netId, alice->id);
+	UnownedVehicleKey k{};
+	k.kind = UNOWNED_SESSION;
+	k.id   = c3->netId;
+	Check(s.NoteUnownedBlowUp(k, bob->id, 700) && s.CustodianOf(c3->netId) == bob->id,
+	      "bob said it first, and bob settles the wreck");
+	Check(!s.NoteUnownedBlowUp(k, alice->id, 710) && s.CustodianOf(c3->netId) == bob->id,
+	      "alice's report of the same wreck changes nothing");
+}
+
+void TestAWreckIsBackfilledWhileTheEnginesHaveIt() {
+	std::printf("\na joiner is handed the session's wrecks\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Vehicle *car  = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+	VehicleDamageBody dmg{};
+	dmg.netId  = netId;
+	dmg.panels = 0x12;
+	VehicleDamageBody merged{};
+	s.NoteVehicleDamage(dmg, merged);
+
+	s.DestroyVehicle(netId, alice->id, 1000);
+	s.NoteWreckState(alice->id, VehState(netId, 55.0f, 0.0f, VEH_WRECKED));
+
+	Player *bob = Join(s, 2, "bob");
+	Backfill b  = s.BuildBackfill(bob->id, 1500);
+	Check(b.vehicles.size() == 1 && b.vehicles[0].netId == netId &&
+	          (b.vehicles[0].flags & VEH_WRECKED) != 0 && b.vehicles[0].health == 0.0f,
+	      "bob is handed the car as the wreck it is");
+	Check(b.vehicles.size() == 1 && b.vehicles[0].pos.x == 55.0f,
+	      "where its settle left it, not where it went up");
+	Check(b.vehicleDamage.empty() && b.seats.empty(),
+	      "with nothing about its body - FuckCarCompletely is the whole of it - and no seat");
+	Check(b.custodies.size() == 1 && b.custodies[0].netId == netId &&
+	          b.custodies[0].playerId == alice->id,
+	      "and told alice is still settling it, so he follows her rather than pinning it");
+
+	s.EndCustody(netId, alice->id);
+	Check(s.BuildBackfill(bob->id, 1000 + WRECK_BACKFILL_MS - 1).vehicles.size() == 1,
+	      "for as long as the engines keep a wreck");
+	Check(s.BuildBackfill(bob->id, 1000 + WRECK_BACKFILL_MS).vehicles.empty(),
+	      "and not once they have cleared it away");
+}
+
+void TestAWreckBeingSettledIsHandedOn() {
+	std::printf("\na wreck whose settler leaves is handed on\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	s.NotePlayerState(*alice, StandAt(0.0f));
+	s.NotePlayerState(*bob, StandAt(5.0f));
+	Vehicle *car = Claim(s, *alice, 91);
+	s.DestroyVehicle(car->netId, alice->id, 100);
+	const std::vector<uint16_t> handed = s.HandOverVehiclesOf(alice->id);
+	Check(handed.size() == 1 && s.CustodianOf(car->netId) == bob->id,
+	      "bob, next to it, settles the wreck alice was settling");
+}
+
+
+void TestACarTakenAwayOnPurpose() {
+	std::printf("\na session car an engine took away on purpose\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	const uint16_t id = car->netId;
+
+	VehicleRemovedBody body{};
+	body.netId             = id;
+	body.reason            = VEHICLE_REMOVED_EXPORTED;
+	VehicleRemovedBody relay{};
+	Check(!s.RemoveVehicleOnPurpose(bob->id, body, relay),
+	      "refused from anybody while somebody else drives it");
+	Check(s.FindVehicle(id) != nullptr, "and the car stays");
+
+	body.reason = VEHICLE_REMOVED_NONE;
+	Check(!s.RemoveVehicleOnPurpose(alice->id, body, relay), "refused with no reason");
+	body.reason = VEHICLE_REMOVED_COUNT;
+	Check(!s.RemoveVehicleOnPurpose(alice->id, body, relay), "or one that is not a reason");
+
+	body.reason = VEHICLE_REMOVED_EXPORTED;
+	Check(s.RemoveVehicleOnPurpose(alice->id, body, relay), "taken from its driver");
+	Check(s.FindVehicle(id) == nullptr, "the row is gone");
+	Check(alice->vehicleNetId == INVALID_NETID, "and nobody is left in a seat of it");
+	Check(relay.netId == id && relay.reason == VEHICLE_REMOVED_EXPORTED, "the relay names it");
+	Check(!s.RemoveVehicleOnPurpose(alice->id, body, relay), "a second word on it is refused");
+
+	Vehicle *other = Claim(s, *bob, 92);
+	s.NoteExitVehicle(*bob, other->netId);
+	VehicleRemovedBody crane{};
+	crane.netId          = other->netId;
+	crane.reason         = VEHICLE_REMOVED_CRANE;
+	Check(s.RemoveVehicleOnPurpose(alice->id, crane, relay),
+	      "a car nobody drives may be taken by whoever holds it");
+	Check(s.FindVehicle(other->netId) == nullptr, "and it is gone");
+}
+
+void TestAParkedCarsGeneratorRidesItsSpawn() {
+	std::printf("\na parked car's generator, in the backfill\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Vehicle *car  = Claim(s, *alice, 91);
+	car->parkedSlot = 14;
+	const Backfill back = s.BuildBackfill(bob->id, 1000);
+	bool found = false;
+	for (const S_VehicleSpawn &spawn : back.vehicles)
+		if (spawn.netId == car->netId)
+			found = spawn.parkedSlot == 14;
+	Check(found, "the joiner lets go of its own car on that generator too");
 }
 
 void TestACarsWholeLife() {
@@ -3857,15 +4436,612 @@ void TestAnAwardIsDeliveredOncePerCar() {
 
 // tools/sessiontest/rampagevote.cpp
 int RunRampageVoteTests();
+int RunCutsceneVoteTests();
+// tools/sessiontest/emergency.cpp
+int RunEmergencyTests();
+
+// tools/sessiontest/carextras.cpp
+int RunCarExtrasTests();
 int RunAdoptTests();
+// tools/sessiontest/stuntcam.cpp
+int RunStuntCameraTests();
+// The host's kick (protocol.h, C_Kick): the host may throw anybody else out,
+// and nobody else may throw anybody.
+void TestOnlyTheHostMayKick() {
+	std::printf("\nonly the host may kick\n");
+	Session       s;
+	const uint8_t alice = Join(s, 1, "alice")->id;   // first in: the host
+	const uint8_t bob   = Join(s, 2, "bob")->id;
+	const uint8_t carol = Join(s, 3, "carol")->id;
+	Check(s.HostId() == alice, "alice is the host");
+	Check(s.MayKick(alice, bob) == Session::KickVerdict::Allowed, "the host may throw bob out");
+	Check(s.MayKick(bob, carol) == Session::KickVerdict::NotHost, "bob may not throw carol out");
+	Check(s.MayKick(bob, alice) == Session::KickVerdict::NotHost, "nor the host");
+	Check(s.MayKick(alice, alice) == Session::KickVerdict::Themselves,
+	      "the host does not throw themselves out");
+	Check(s.MayKick(alice, 7) == Session::KickVerdict::NoSuchPlayer, "an empty slot is nobody");
+	Check(s.MayKick(INVALID_PLAYER, bob) == Session::KickVerdict::NotHost,
+	      "and nobody is not the host");
+	s.RemovePeer(1);
+	Check(s.HostId() == bob, "alice goes and bob is the host");
+	Check(s.MayKick(bob, carol) == Session::KickVerdict::Allowed, "so now bob may");
+	Check(s.MayKick(bob, alice) == Session::KickVerdict::NoSuchPlayer, "but alice is gone already");
+}
+
+// ---- the session's one mission (missionslot.h) -----------------------------
+
+void Place(Session &s, uint8_t id, float x, float y, float z) {
+	PlayerStateBody b = State(x, 100.0f);
+	b.pos             = {x, y, z};
+	s.NotePlayerState(*s.FindById(id), b);
+}
+
+C_MissionClaim ClaimAt(const MissionArea &area, uint32_t key = 0x1234, uint16_t hint = 19) {
+	C_MissionClaim c{};
+	InitHeader(c, 1000);
+	c.launchKey   = key;
+	c.missionHint = hint;
+	c.kind        = MISSION_KIND_STORY;
+	c.area        = area;
+	return c;
+}
+
+MissionSlot::ClaimAnswer ClaimFor(Session &s, uint8_t id, const MissionArea &area, uint32_t nowMs,
+                                  uint32_t key = 0x1234) {
+	MissionPresence present[MAX_PLAYERS];
+	const size_t    n = s.MissionPresences(present);
+	return s.Mission().Claim(id, ClaimAt(area, key), present, n, nowMs);
+}
+
+void TestWhereThereIs() {
+	std::printf("\nwhere a mission's start or checkpoint is\n");
+	const MissionArea box = MissionAreaLocate3D(100.0f, 100.0f, 10.0f, 1.5f, 1.5f, 2.0f);
+	Check(InMissionArea({101.0f, 99.0f, 11.0f}, box, 0.0f), "inside the box is there");
+	Check(!InMissionArea({102.0f, 100.0f, 10.0f}, box, 0.0f), "half a metre out is not, with no margin");
+	Check(InMissionArea({106.5f, 100.0f, 10.0f}, box, 5.0f), "but it is 5 m out with the margin");
+	Check(!InMissionArea({106.6f, 100.0f, 10.0f}, box, 5.0f), "and not a hair past it");
+	Check(!InMissionArea({100.0f, 100.0f, 18.0f}, box, 5.0f),
+	      "a 3D box has a height: the bridge overhead is not the marker");
+	const MissionArea flat = MissionAreaLocate2D(100.0f, 100.0f, 1.5f, 1.5f);
+	Check(InMissionArea({100.0f, 100.0f, 500.0f}, flat, 5.0f), "a 2D one does not");
+	const MissionArea corners = MissionAreaCorners2D(10.0f, 20.0f, -10.0f, 0.0f);
+	Check(InMissionArea({-9.0f, 1.0f, 0.0f}, corners, 0.0f) &&
+	          !InMissionArea({-11.0f, 1.0f, 0.0f}, corners, 0.0f),
+	      "corners in either order make the same box");
+	const MissionArea owner = MissionAreaAround({50.0f, 50.0f, 5.0f});
+	Check(InMissionArea({54.0f, 47.0f, 6.0f}, owner, 5.0f) &&
+	          !InMissionArea({56.0f, 50.0f, 5.0f}, owner, 5.0f),
+	      "an odd job's area is 5 m round the owner");
+	Check(!InMissionArea({NAN, 100.0f, 10.0f}, box, 5.0f), "and a position with a NaN is nowhere");
+	Check(InMissionArea({101.0f, 100.0f, 10.0f}, box, -3.0f) &&
+	          !InMissionArea({102.0f, 100.0f, 10.0f}, box, -3.0f),
+	      "a margin below zero is none");
+}
+
+void TestAMissionStartsWithEverybodyThere() {
+	std::printf("\na mission starts with everybody at its start\n");
+	Session       s;
+	const uint8_t alice = Join(s, 1, "alice")->id;
+	const uint8_t bob   = Join(s, 2, "bob")->id;
+	const uint8_t carol = Join(s, 3, "carol")->id;
+	const MissionArea marker = MissionAreaLocate3D(100.0f, 100.0f, 10.0f, 1.5f, 1.5f, 2.0f);
+	Place(s, alice, 100.0f, 100.0f, 10.0f);
+	Place(s, bob, 103.0f, 100.0f, 10.0f);
+
+	MissionSlot::ClaimAnswer a = ClaimFor(s, alice, marker, 1000);
+	Check(a.verdict == MISSION_CLAIM_WAITING && a.missing == PlayerBit(carol),
+	      "carol has not been placed anywhere yet, so the start waits for her");
+	S_MissionWaiting w{};
+	Check(s.Mission().TakeWaitingChange(&w) && w.ownerId == alice &&
+	          w.missingMask == PlayerBit(carol) && w.what == MISSION_WAIT_START &&
+	          w.missionHint == 19 && w.where.x == 100.0f,
+	      "and everybody is told alice waits for carol there");
+	Check(!s.Mission().TakeWaitingChange(&w), "once");
+
+	Place(s, carol, 120.0f, 100.0f, 10.0f);
+	a = ClaimFor(s, alice, marker, 1500);
+	Check(a.verdict == MISSION_CLAIM_WAITING && !s.Mission().TakeWaitingChange(&w),
+	      "20 m off is still missing, and the same wait says nothing new");
+
+	MissionSlot::ClaimAnswer busy = ClaimFor(s, bob, marker, 1600, 0x9999);
+	Check(busy.verdict == MISSION_CLAIM_BUSY && busy.ownerId == alice,
+	      "bob's own marker is refused while alice is waited for");
+
+	Place(s, carol, 106.0f, 100.0f, 10.0f);
+	a = ClaimFor(s, alice, marker, 2000);
+	Check(a.verdict == MISSION_CLAIM_GRANTED && a.missing == 0,
+	      "6 m from the centre is within 5 m of the marker's edge: granted");
+	Check(s.Mission().TakeWaitingChange(&w) && w.what == MISSION_WAIT_NONE,
+	      "and the wait is over for everybody");
+
+	Place(s, bob, 140.0f, 100.0f, 10.0f);
+	a = ClaimFor(s, alice, marker, 2400);
+	Check(a.verdict == MISSION_CLAIM_WAITING && a.missing == PlayerBit(bob),
+	      "bob wandering off before the start takes the grant back");
+}
+
+void TestTheSessionsMissionRuns() {
+	std::printf("\nthe session's mission, from its start to its end\n");
+	Session       s;
+	const uint8_t alice = Join(s, 1, "alice")->id;
+	const uint8_t bob   = Join(s, 2, "bob")->id;
+	MissionSlot  &m     = s.Mission();
+
+	Check(m.Start(alice, 19, s.ConnectedMask()), "alice's START_MISSION makes it the session's");
+	S_MissionState st = m.State();
+	Check(st.state == MISSION_STATE_RUNNING && st.ownerId == alice && st.missionNumber == 19 &&
+	          st.participants == (PlayerBit(alice) | PlayerBit(bob)) &&
+	          (st.flags & MISSION_FLAG_FAIL_ON_DEATH) != 0 && st.marginCm == 500,
+	      "running, hers, Give Me Liberty, with both of them in it and the death rule on");
+	Check(!m.Start(bob, 20, s.ConnectedMask()), "a second mission is not the session's");
+	const MissionArea anywhere = MissionAreaAround({0.0f, 0.0f, 0.0f});
+	Check(ClaimFor(s, bob, anywhere, 3000).verdict == MISSION_CLAIM_BUSY, "nor may one be claimed");
+
+	S_MissionFail fail{};
+	Check(!m.FailFor(alice, MISSION_FAIL_DIED, &fail), "the owner's own death is the engine's to fail");
+	Check(m.FailFor(bob, MISSION_FAIL_BUSTED, &fail) && fail.playerId == bob &&
+	          fail.reason == MISSION_FAIL_BUSTED && fail.missionNumber == 19,
+	      "bob busted is the order to fail it");
+	Check(!m.FailFor(bob, MISSION_FAIL_DIED, &fail), "given once per mission");
+
+	Check(!m.End(bob, 19, MISSION_OUTCOME_PASSED), "only the owner says how it ended");
+	Check(m.End(alice, 19, MISSION_OUTCOME_FAILED), "and she does");
+	st = m.State();
+	Check(st.state == MISSION_STATE_IDLE && st.outcome == MISSION_OUTCOME_FAILED &&
+	          st.missionNumber == 19 && st.participants == 0,
+	      "idle again, with how the last one went");
+
+	m.SetFailOnDeath(false);
+	Check(m.Start(bob, 20, s.ConnectedMask()), "bob starts one without a claim, and it is the session's");
+	Check(!m.FailFor(alice, MISSION_FAIL_DIED, &fail), "with the rule off nobody's death fails it");
+	Check((m.State().flags & MISSION_FLAG_FAIL_ON_DEATH) == 0, "and everybody is told it is off");
+}
+
+void TestAClaimLapses() {
+	std::printf("\na claim nobody refreshes lapses\n");
+	Session       s;
+	const uint8_t alice = Join(s, 1, "alice")->id;
+	const uint8_t bob   = Join(s, 2, "bob")->id;
+	const MissionArea marker = MissionAreaLocate2D(0.0f, 0.0f, 1.0f, 1.0f);
+	ClaimFor(s, alice, marker, 1000);
+	S_MissionWaiting w{};
+	s.Mission().TakeWaitingChange(&w);
+	Check(!s.Mission().Expire(1000 + MISSION_CLAIM_TTL_MS - 1), "still hers a moment before");
+	Check(s.Mission().Expire(1000 + MISSION_CLAIM_TTL_MS), "gone once she stops asking");
+	Check(s.Mission().TakeWaitingChange(&w) && w.what == MISSION_WAIT_NONE,
+	      "and nobody is waited for any more");
+	Check(ClaimFor(s, bob, marker, 4000).ownerId == bob, "so bob may claim his own");
+}
+
+void TestLeavingAndJoiningAMission() {
+	std::printf("\nleaving and joining the session's mission\n");
+	{
+		Session       s;
+		const uint8_t alice = Join(s, 1, "alice")->id;
+		const uint8_t bob   = Join(s, 2, "bob")->id;
+		s.Mission().Start(alice, 30, s.ConnectedMask());
+		Check(s.Mission().Leave(bob) && s.Mission().Participants() == PlayerBit(alice),
+		      "bob leaving leaves the participants");
+		const uint8_t carol = Join(s, 3, "carol")->id;
+		Check(s.Mission().Join(carol) &&
+		          s.Mission().Participants() == (PlayerBit(alice) | PlayerBit(carol)),
+		      "carol arriving in the middle of it is in it");
+		Check(!s.Mission().Join(carol), "once");
+		Check(s.Mission().Leave(alice), "alice, its owner, leaving ends it");
+		const S_MissionState st = s.Mission().State();
+		Check(st.state == MISSION_STATE_IDLE && st.outcome == MISSION_OUTCOME_OWNER_LEFT,
+		      "for everybody, as failed because its owner left (missions.md 12.3)");
+		Check(!s.Mission().Join(carol), "and nobody joins a mission that is not running");
+	}
+	{
+		Session       s;
+		const uint8_t alice = Join(s, 1, "alice")->id;
+		const uint8_t bob   = Join(s, 2, "bob")->id;
+		const uint8_t carol = Join(s, 3, "carol")->id;
+		Place(s, alice, 0.0f, 0.0f, 0.0f);
+		ClaimFor(s, alice, MissionAreaLocate2D(0.0f, 0.0f, 1.0f, 1.0f), 1000);
+		S_MissionWaiting w{};
+		s.Mission().TakeWaitingChange(&w);
+		Check(w.missingMask == (PlayerBit(bob) | PlayerBit(carol)), "alice waits for bob and carol");
+		s.Mission().Leave(bob);
+		Check(s.Mission().TakeWaitingChange(&w) && w.missingMask == PlayerBit(carol),
+		      "bob quitting is one fewer to wait for");
+		s.Mission().Leave(alice);
+		Check(!s.Mission().HasClaim() && s.Mission().TakeWaitingChange(&w) &&
+		          w.what == MISSION_WAIT_NONE,
+		      "and alice quitting takes her claim and the wait with her");
+	}
+}
+
+void TestTheLobbysOwnBookkeeping() {
+	std::printf("\nthe lobby's own bookkeeping\n");
+	Lobby        lobby;
+	RejectReason reject = REJECT_BAD_VERSION;
+	Check(lobby.HostId() == INVALID_PLAYER && lobby.Count() == 0, "an empty lobby has no host");
+	const Lobby::Member *alice = lobby.Join(10, "alice", reject);
+	const Lobby::Member *bob   = lobby.Join(11, "b\x01ob", reject);
+	Check(alice && bob && reject == REJECT_NONE && lobby.Count() == 2 && lobby.HostId() == alice->id,
+	      "the first launcher in is the host");
+	Check(bob->nick == "b ob", "and a name is cleaned as a player's is");
+	Check(!lobby.Join(10, "alice again", reject) && lobby.Count() == 2, "one connection is in once");
+	const uint8_t bobId = bob->id;
+	for (PeerId peer = 12; peer < 12 + LOBBY_MAX - 2; ++peer)
+		lobby.Join(peer, "somebody", reject);
+	Check(lobby.Count() == LOBBY_MAX && !lobby.Join(99, "late", reject) && reject == REJECT_FULL,
+	      "a full lobby turns the next one away as full");
+
+	Check(!lobby.MayStart(11, 1000), "bob may not start everybody's game");
+	Check(lobby.MayStart(10, 1000), "alice may");
+	Check(!lobby.MayStart(10, 1000 + LOBBY_START_COOLDOWN_MS - 1), "and not again at once");
+	Check(lobby.MayStart(10, 1000 + LOBBY_START_COOLDOWN_MS), "but after a while, yes");
+
+	S_Lobby roster{};
+	lobby.FillRoster(roster);
+	Check(roster.count == LOBBY_MAX && roster.waiting == LOBBY_MAX &&
+	          roster.hostLobbyId == roster.entries[0].id &&
+	          (roster.entries[0].flags & LOBBY_ENTRY_HOST) != 0 &&
+	          std::strcmp(roster.entries[0].nick, "alice") == 0 &&
+	          std::strcmp(roster.entries[1].nick, "b ob") == 0 &&
+	          (roster.entries[1].flags & LOBBY_ENTRY_HOST) == 0,
+	      "the roster has them longest waiting first, the host marked");
+
+	Check(lobby.Leave(10) && !lobby.Leave(10) && lobby.HostId() == bobId,
+	      "alice going makes bob, who waited longest after her, the host");
+	Check(lobby.Join(99, "late", reject) && lobby.HostId() == bobId,
+	      "and somebody coming into the place she left does not take it from him");
+	lobby.FillRoster(roster);
+	Check(roster.entries[roster.count - 1].id == alice->id &&
+	          std::strcmp(roster.entries[roster.count - 1].nick, "late") == 0,
+	      "the newcomer waits last, in the place she left");
+}
+
+void TestAGameInAMissionOfItsOwnIsNowhere() {
+	std::printf("\na game in a mission of its own, a new game's intro, is nowhere\n");
+	Session       s;
+	const uint8_t alice = Join(s, 1, "alice")->id;
+	const uint8_t bob   = Join(s, 2, "bob")->id;
+	// Give Me Liberty's marker, which the intro keeps its player standing on,
+	// invisible, all through the bank.
+	const MissionArea marker = MissionAreaLocate2D(811.875f, -939.9375f, 3.5f, 3.5f);
+	Place(s, alice, 811.875f, -939.9375f, 35.75f);
+	Place(s, bob, 811.875f, -939.9375f, 35.75f);
+	s.FindById(bob)->missionBusy = true;
+	MissionSlot::ClaimAnswer a = ClaimFor(s, alice, marker, 1000);
+	Check(a.verdict == MISSION_CLAIM_WAITING && a.missing == PlayerBit(bob),
+	      "bob, on the marker all through the intro, is not there yet");
+	Check(s.ReadyMask() == PlayerBit(alice) &&
+	          s.ConnectedMask() == (PlayerBit(alice) | PlayerBit(bob)),
+	      "nor free to be in a mission, though connected");
+	s.FindById(bob)->missionBusy = false;
+	a = ClaimFor(s, alice, marker, 1500);
+	Check(a.verdict == MISSION_CLAIM_GRANTED, "out of it, bob is there, and it starts");
+	s.Mission().Start(alice, 19, s.ReadyMask());
+	Check(s.Mission().Participants() == (PlayerBit(alice) | PlayerBit(bob)), "with both in it");
+
+	Check(s.Mission().StandAside(bob) && s.Mission().Participants() == PlayerBit(alice),
+	      "bob's game going into a new game's intro stands aside from it");
+	Check(!s.Mission().StandAside(bob), "once");
+	Check(s.Mission().Join(bob) && s.Mission().Participants() == (PlayerBit(alice) | PlayerBit(bob)),
+	      "and comes back into it once the intro is over");
+	Check(s.Mission().StandAside(alice) && s.Mission().State().state == MISSION_STATE_IDLE &&
+	          s.Mission().State().outcome == MISSION_OUTCOME_OWNER_LEFT,
+	      "alice's game going into a mission of its own ends the session's, as leaving would");
+
+	Place(s, bob, 811.875f, -939.9375f, 35.75f);
+	ClaimFor(s, bob, marker, 3000, 0x7777);
+	Check(s.Mission().HasClaim() && s.Mission().Claimant() == bob, "bob claims the next start");
+	s.Mission().StandAside(bob);
+	Check(!s.Mission().HasClaim(), "and lets go of the claim when their game goes into its own");
+}
+
+// The owner's first run with `missions = on`, 2026-09-24: noxx3 and noxx2 both
+// started a new game, both played the intro, and both claimed Give Me Liberty
+// at the bridge when it was over, 0.8 s apart.
+void TestTwoNewGamesMeetAtTheBridge() {
+	std::printf("\ntwo new games: each plays its intro, one of them starts Give Me Liberty\n");
+	Session       s;
+	const uint8_t noxx3 = Join(s, 1, "noxx3")->id;
+	const uint8_t noxx2 = Join(s, 2, "noxx2")->id;
+	const MissionArea marker = MissionAreaLocate2D(811.875f, -939.9375f, 3.5f, 3.5f);
+	Place(s, noxx3, 811.875f, -939.9375f, 35.75f);
+	Place(s, noxx2, 811.875f, -939.9375f, 35.75f);
+	s.FindById(noxx3)->missionBusy = true;
+	s.FindById(noxx2)->missionBusy = true;
+
+	s.FindById(noxx3)->missionBusy = false;
+	MissionSlot::ClaimAnswer a = ClaimFor(s, noxx3, marker, 17646);
+	S_MissionWaiting         w{};
+	Check(a.verdict == MISSION_CLAIM_WAITING && a.missing == PlayerBit(noxx2) && a.leftOut == 0,
+	      "noxx3, out of its intro first, waits at the bridge for noxx2, still in theirs");
+	Check(s.Mission().TakeWaitingChange(&w) && w.busyMask == PlayerBit(noxx2) &&
+	          w.goesOnInS == MISSION_BUSY_WAIT_MS / 1000,
+	      "and everybody is told noxx2 is in a mission of its own, and how long the start waits");
+
+	s.FindById(noxx2)->missionBusy = false;
+	MissionSlot::ClaimAnswer b = ClaimFor(s, noxx2, marker, 18418);
+	Check(b.verdict == MISSION_CLAIM_BUSY && b.ownerId == noxx3,
+	      "noxx2's own trigger, out of its intro, finds the start noxx3's");
+	a = ClaimFor(s, noxx3, marker, 18500);
+	Check(a.verdict == MISSION_CLAIM_GRANTED && a.missing == 0 && a.leftOut == 0,
+	      "noxx3's next claim finds noxx2 on the marker: granted, nobody left out");
+	Check(s.Mission().Start(noxx3, 19, s.ReadyMask()) &&
+	          s.Mission().Participants() == (PlayerBit(noxx3) | PlayerBit(noxx2)),
+	      "Give Me Liberty is noxx3's, with noxx2 in it");
+	b = ClaimFor(s, noxx2, marker, 18600);
+	Check(b.verdict == MISSION_CLAIM_BUSY && b.ownerId == noxx3 &&
+	          !s.Mission().Start(noxx2, 19, s.ReadyMask()),
+	      "and noxx2's trigger gets no second copy of it");
+}
+
+// What the owner's two games did, their busy flag never clearing: a start
+// that waits only for games in their own intro does not wait for ever.
+void TestAStartDoesNotWaitForAnIntroForEver() {
+	std::printf("\na start does not wait for a game in its own intro for ever\n");
+	Session       s;
+	const uint8_t alice = Join(s, 1, "alice")->id;
+	const uint8_t bob   = Join(s, 2, "bob")->id;
+	const MissionArea marker = MissionAreaLocate2D(811.875f, -939.9375f, 3.5f, 3.5f);
+	Place(s, alice, 811.875f, -939.9375f, 35.75f);
+	Place(s, bob, 811.875f, -939.9375f, 35.75f);
+	s.FindById(bob)->missionBusy = true;
+	// Alice's trigger, held on the marker, claims twice a second.
+	const auto keepClaiming = [&](uint32_t from, uint32_t to, uint32_t key) {
+		MissionSlot::ClaimAnswer last;
+		for (uint32_t t = from; t <= to; t += MISSION_CLAIM_REFRESH_MS)
+			last = ClaimFor(s, alice, marker, t, key);
+		return last;
+	};
+
+	const uint32_t t0 = 5000;
+	MissionSlot::ClaimAnswer a = ClaimFor(s, alice, marker, t0);
+	S_MissionWaiting         w{};
+	s.Mission().TakeWaitingChange(&w);
+	keepClaiming(t0 + 500, t0 + MISSION_BUSY_WAIT_MS - 500, 0x1234);
+	a = ClaimFor(s, alice, marker, t0 + MISSION_BUSY_WAIT_MS - 1);
+	Check(a.verdict == MISSION_CLAIM_WAITING && a.missing == PlayerBit(bob) &&
+	          !s.Mission().TakeWaitingChange(&w),
+	      "a hair short of the wait, bob is still waited for, and nothing new is said");
+	a = ClaimFor(s, alice, marker, t0 + MISSION_BUSY_WAIT_MS);
+	Check(a.verdict == MISSION_CLAIM_GRANTED && a.missing == 0 && a.leftOut == PlayerBit(bob),
+	      "once it is up, the start goes on without bob");
+	Check(s.Mission().TakeWaitingChange(&w) && w.what == MISSION_WAIT_NONE,
+	      "and the wait is over on everybody's screen");
+	s.Mission().Start(alice, 19, s.ReadyMask());
+	Check(s.Mission().Participants() == PlayerBit(alice), "with alice alone in it");
+	s.FindById(bob)->missionBusy = false;
+	Check(s.Mission().Join(bob) && s.Mission().Participants() == (PlayerBit(alice) | PlayerBit(bob)),
+	      "and bob in it as a joiner once his intro is over");
+	s.Mission().End(alice, 19, MISSION_OUTCOME_FAILED);
+
+	// Somebody who is only somewhere else is never left behind.
+	const uint8_t carol = Join(s, 3, "carol")->id;
+	Place(s, carol, 900.0f, -300.0f, 10.0f);
+	s.FindById(bob)->missionBusy = true;
+	const uint32_t t1 = 100000;
+	a = ClaimFor(s, alice, marker, t1, 0x7777);
+	s.Mission().TakeWaitingChange(&w);
+	Check(w.busyMask == PlayerBit(bob) && w.goesOnInS == 0,
+	      "with carol away too, no end to the wait is said");
+	a = keepClaiming(t1 + 500, t1 + 3 * MISSION_BUSY_WAIT_MS, 0x7777);
+	Check(a.verdict == MISSION_CLAIM_WAITING && a.missing == (PlayerBit(bob) | PlayerBit(carol)),
+	      "and none comes: carol is the host's to kick, and bob is waited for with her");
+	Place(s, carol, 811.875f, -939.9375f, 35.75f);
+	a = ClaimFor(s, alice, marker, t1 + 3 * MISSION_BUSY_WAIT_MS + 500, 0x7777);
+	Check(a.verdict == MISSION_CLAIM_GRANTED && a.leftOut == PlayerBit(bob),
+	      "once carol comes, a claim that has waited that long goes on without bob");
+
+	// Walking off the marker lets the claim go, and its wait with it.
+	s.Mission().Start(alice, 19, s.ReadyMask());
+	s.Mission().End(alice, 19, MISSION_OUTCOME_FAILED);
+	const uint32_t t2 = 400000;
+	ClaimFor(s, alice, marker, t2, 0x8888);
+	s.Mission().Expire(t2 + MISSION_CLAIM_TTL_MS);
+	a = ClaimFor(s, alice, marker, t2 + MISSION_BUSY_WAIT_MS, 0x8888);
+	Check(a.verdict == MISSION_CLAIM_WAITING,
+	      "a claim that lapsed and was made again starts its wait again");
+}
+
+void TestACheckpointWaitsForEverybody() {
+	std::printf("\na checkpoint waits for everybody\n");
+	Session       s;
+	const uint8_t alice = Join(s, 1, "alice")->id;
+	const uint8_t bob   = Join(s, 2, "bob")->id;
+	S_MissionWaiting w{};
+	Check(!s.Mission().Checkpoint(alice, PlayerBit(bob), {5.0f, 5.0f, 5.0f}),
+	      "nothing to wait at with no mission running");
+	s.Mission().Start(alice, 21, s.ConnectedMask());
+	s.Mission().TakeWaitingChange(&w);
+	Check(!s.Mission().Checkpoint(bob, PlayerBit(alice), {5.0f, 5.0f, 5.0f}),
+	      "and only the owner is heard");
+	Check(s.Mission().Checkpoint(alice, PlayerBit(bob) | PlayerBit(alice), {5.0f, 5.0f, 5.0f}) &&
+	          s.Mission().TakeWaitingChange(&w) && w.what == MISSION_WAIT_CHECKPOINT &&
+	          w.missingMask == PlayerBit(bob) && w.missionHint == 21,
+	      "alice at a checkpoint waits for bob, never for herself");
+	s.Mission().Checkpoint(alice, 0, {5.0f, 5.0f, 5.0f});
+	Check(s.Mission().TakeWaitingChange(&w) && w.what == MISSION_WAIT_NONE, "until he arrives");
+
+	// Not for ever: everybody is told how long it has left.
+	const uint8_t carol = Join(s, 3, "carol")->id;
+	s.Mission().Join(carol);
+	const uint32_t t = 50000;
+	s.Mission().Checkpoint(alice, PlayerBit(bob), {9.0f, 9.0f, 9.0f}, t);
+	Check(s.Mission().TakeWaitingChange(&w) &&
+	          w.goesOnInS == MISSION_CHECKPOINT_WAIT_MS / 1000 && w.busyMask == 0,
+	      "a checkpoint counts down from the time it began to wait");
+	s.Mission().Checkpoint(alice, PlayerBit(bob) | PlayerBit(carol), {9.0f, 9.0f, 9.0f}, t + 20000);
+	Check(s.Mission().TakeWaitingChange(&w) && w.missingMask == (PlayerBit(bob) | PlayerBit(carol)) &&
+	          w.goesOnInS == MISSION_CHECKPOINT_WAIT_MS / 1000 - 20,
+	      "and somebody else missing too does not start it again");
+	s.Mission().Checkpoint(alice, PlayerBit(bob) | PlayerBit(carol), {9.0f, 9.0f, 9.0f}, t + 30000);
+	Check(!s.Mission().TakeWaitingChange(&w), "the same wait asked again tells nobody anything new");
+	s.Mission().Checkpoint(alice, PlayerBit(bob), {19.0f, 9.0f, 9.0f}, t + 40000);
+	Check(s.Mission().TakeWaitingChange(&w) && w.goesOnInS == MISSION_CHECKPOINT_WAIT_MS / 1000,
+	      "another checkpoint is another wait");
+	s.Mission().Checkpoint(alice, PlayerBit(bob), {19.0f, 9.0f, 9.0f},
+	                       t + 40000 + MISSION_CHECKPOINT_WAIT_MS + 5000);
+	Check(!s.Mission().TakeWaitingChange(&w) || w.goesOnInS >= 1,
+	      "and one past its time never reads as waiting for ever");
+}
+
+void TestTheOddJobsStartBesideTheOwner() {
+	std::printf("\nan odd job starts with everybody beside its owner\n");
+	Session       s;
+	const uint8_t alice = Join(s, 1, "alice")->id;
+	const uint8_t bob   = Join(s, 2, "bob")->id;
+	s.Mission().SetMarginCm(500);
+	Place(s, alice, 50.0f, 50.0f, 5.0f);
+	Place(s, bob, 53.0f, 54.0f, 5.0f);
+	const MissionArea around = MissionAreaAround({50.0f, 50.0f, 5.0f});
+	Check(ClaimFor(s, alice, around, 1000).verdict == MISSION_CLAIM_GRANTED,
+	      "bob in a car of their own beside alice's ambulance is there");
+	s.Mission().SetMarginCm(0);
+	Check(ClaimFor(s, alice, around, 1200).verdict == MISSION_CLAIM_WAITING,
+	      "with no margin, beside the ambulance is not in it");
+}
+
+// A retry of Give Me Liberty, as the owner's run on 2026-09-24 found it: the
+// Kuruma blew up with its driver inside, the mission failed, and both players
+// were back at the bridge while one of them was still lying there dead.
+void TestADeadPlayerIsNotAtTheStart() {
+	std::printf("\nsomebody dead on the marker is not at the start\n");
+	Session       s;
+	const uint8_t alice = Join(s, 1, "alice")->id;
+	const uint8_t bob   = Join(s, 2, "bob")->id;
+	const MissionArea marker = MissionAreaLocate2D(811.875f, -939.9375f, 3.5f, 3.5f);
+	Place(s, alice, 811.875f, -939.9375f, 35.75f);
+	Place(s, bob, 812.5f, -939.0f, 35.75f);
+	s.NotePlayerDied(*s.FindById(bob), 0);
+	MissionSlot::ClaimAnswer a = ClaimFor(s, alice, marker, 1000);
+	Check(a.verdict == MISSION_CLAIM_WAITING && a.missing == PlayerBit(bob),
+	      "bob's body is on the marker, and the start waits for him");
+	s.NotePlayerRespawned(*s.FindById(bob), {811.875f, -939.9375f, 35.75f}, 3.14f);
+	a = ClaimFor(s, alice, marker, 1500);
+	Check(a.verdict == MISSION_CLAIM_GRANTED, "back on his feet at the bridge, he is there");
+}
+
+// The same run: after the failure the last try's Kuruma stayed on everybody's
+// screen, a wreck on the one whose copy the engine never clears, and the retry
+// made a second one beside it.
+void TestAFinishedMissionsCarsGo() {
+	std::printf("\nthe cars a mission made go when it is over\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	AmbientCarBody made = CarBody(111, 5.0f);
+	made.flags          = AMBIENT_MISSION;
+
+	Check(s.ReleaseMissionCars().empty(), "nothing to let go of with no mission");
+	s.Mission().Start(alice->id, 19, s.ConnectedMask());
+	const uint16_t kuruma = s.AddCar(alice->id, made)->netId;
+	const uint16_t other  = s.AddCar(alice->id, made)->netId;
+	const uint16_t street = s.AddCar(alice->id, CarBody(91, 9.0f))->netId;
+	uint8_t        was    = INVALID_PLAYER;
+	AmbientCarBody body{};
+	// Each row looked up again: a promotion may grow the table under the last.
+	bool promoted = s.PromoteCar(kuruma, bob->id, was, body) != nullptr;
+	s.NoteEnterVehicle(*bob, *s.FindVehicle(kuruma), 0);
+	s.NoteExitVehicle(*bob, kuruma);
+	promoted = s.PromoteCar(other, alice->id, was, body) != nullptr && promoted;
+	s.NoteEnterVehicle(*alice, *s.FindVehicle(other), 0);
+	promoted = s.PromoteCar(street, bob->id, was, body) != nullptr && promoted;
+	s.NoteEnterVehicle(*bob, *s.FindVehicle(street), 0);
+	s.NoteExitVehicle(*bob, street);
+	Check(promoted && s.FindVehicle(kuruma)->missionMade && s.FindVehicle(other)->missionMade &&
+	          !s.FindVehicle(street)->missionMade,
+	      "the two the mission made are its, the traffic car bob took is not");
+	Check(s.ReleaseMissionCars().empty(), "and none goes while it runs");
+
+	s.Mission().End(alice->id, 19, MISSION_OUTCOME_FAILED);
+	const std::vector<uint16_t> gone = s.ReleaseMissionCars();
+	Check(gone.size() == 1 && gone[0] == kuruma && s.FindVehicle(kuruma) == nullptr,
+	      "over, the empty Kuruma goes");
+	Check(s.FindVehicle(other) != nullptr && !s.FindVehicle(other)->missionMade &&
+	          s.FindVehicle(street) != nullptr,
+	      "the one alice sits in stays, an ordinary car now, and so does bob's traffic car");
+	s.NoteExitVehicle(*alice, other);
+	Check(s.ReleaseMissionCars().empty(), "and it is not let go of later for having been the mission's");
+
+	AmbientCarBody late = CarBody(111, 12.0f);
+	late.flags          = AMBIENT_MISSION;
+	const uint16_t after = s.AddCar(alice->id, late)->netId;
+	Vehicle *a = s.PromoteCar(after, bob->id, was, body);
+	Check(a && !a->missionMade, "a car still flagged the mission's, taken with none running, is nobody's");
+}
+
+void TestTheCampaignLogKeepsEveryMission() {
+	std::printf("\nthe campaign log keeps what every mission left\n");
+	CampaignLog log;
+	Check(log.Id() != 0 && log.Id() != CampaignLog().Id(),
+	      "each run of the server names its log afresh, and never 0");
+	CampaignDeltaBody body{};
+	body.missionNumber = 19;
+	body.seq           = 77;   // a client's number means nothing
+	Check(log.Append(0, body) == 1 && log.Append(2, body) == 2 && log.Last() == 2,
+	      "the server numbers them from 1, whatever came in");
+	const std::vector<S_CampaignDelta> all = log.Since(0);
+	Check(all.size() == 2 && all[0].body.seq == 1 && all[0].ownerId == 0 && all[1].body.seq == 2 &&
+	          all[1].ownerId == 2 && all[1].hdr.opcode == OP_S_CAMPAIGN_DELTA,
+	      "a machine with none gets both, in order, with whose they were");
+	Check(log.Since(1).size() == 1 && log.Since(1)[0].body.seq == 2 && log.Since(2).empty(),
+	      "and one that has the first gets only the second");
+
+	log.MissionStarted();
+	uint32_t taken = 0;
+	while (taken < 1000 && log.TakePartFor(19))
+		++taken;
+	Check(taken == CAMPAIGN_PARTS_PER_MISSION, "a mission leaves only so many parts");
+	log.MissionStarted();
+	Check(log.TakePartFor(19), "and the next mission, the same one again included, counts afresh");
+}
+
+// A passenger's round never lands on anybody in the same car, and the server
+// drops such a hit whatever the friendly-fire setting (OnDamage, ShareACar).
+void TestNobodyHurtsTheirOwnCar() {
+	std::printf("a hit inside one car\n");
+	Player driver, rider, other, walker;
+	driver.vehicleNetId = 12;
+	driver.seat         = 0;
+	rider.vehicleNetId  = 12;
+	rider.seat          = 2;
+	other.vehicleNetId  = 13;
+	Check(ShareACar(rider, driver) && ShareACar(driver, rider),
+	      "a passenger and his driver share the car, both ways round");
+	Check(!ShareACar(rider, other), "a player in another car does not");
+	Check(!ShareACar(rider, walker) && !ShareACar(walker, rider),
+	      "nor does one on foot");
+	Check(!ShareACar(walker, Player{}), "and two players on foot share nothing");
+}
 
 int main() {
+	TestNobodyHurtsTheirOwnCar();
 	g_failures += RunRampageVoteTests();
+	g_failures += RunCutsceneVoteTests();
+	g_failures += RunEmergencyTests();
+	g_failures += RunCarExtrasTests();
 	g_failures += RunAdoptTests();
+	g_failures += RunStuntCameraTests();
 	TestAJoinerIsToldWhatEverybodyIsWearing();
+	TestAJoinerIsToldWhoIsInTheMenu();
 	TestHostIsTheFirstPlayerIn();
+	TestOnlyTheHostMayKick();
+	TestWhereThereIs();
+	TestAMissionStartsWithEverybodyThere();
+	TestTheSessionsMissionRuns();
+	TestAClaimLapses();
+	TestLeavingAndJoiningAMission();
+	TestAGameInAMissionOfItsOwnIsNowhere();
+	TestTwoNewGamesMeetAtTheBridge();
+	TestAStartDoesNotWaitForAnIntroForEver();
+	TestTheLobbysOwnBookkeeping();
+	TestACheckpointWaitsForEverybody();
+	TestTheOddJobsStartBesideTheOwner();
+	TestADeadPlayerIsNotAtTheStart();
+	TestAFinishedMissionsCarsGo();
+	TestTheCampaignLogKeepsEveryMission();
 	TestAJoinerNeverTakesTheHostFromSomeoneStillHere();
 	TestTheLastPlayerOutTakesItWithThem();
+	TestTheSkyFollowsTheSessionsMission();
+	TestACatchUpIsWhatTheMissionMade();
 	TestTheClockAcceptsOnlyRealTimes();
 	TestTheClockRollsOver();
 	TestWeatherIsAPairAndIsChecked();
@@ -3877,9 +5053,12 @@ int main() {
 	TestADeadPlayerIsInNoSeat();
 	TestAnArrestIsARespawnWithoutADeath();
 	TestABackfilledCarCarriesItsCondition();
-	TestAWreckIsNotBackfilled();
+	TestAWreckIsNotBackfilledAsACar();
 	TestADriverLeavingReleasesTheirCar();
 	TestAPassengerIsBackfilledInTheirOwnSeat();
+	TestTheRadioIsTurnedFromInsideTheCar();
+	TestACarsBombIsTheSessions();
+	TestAMissionsBombIsTheOwners();
 	TestOnlyTheDriverMayReportTheCar();
 	TestAPassengerGetsOutOfAWreck();
 	TestSteppingStraightFromOneCarIntoAnother();
@@ -3890,6 +5069,7 @@ int main() {
 
 	TestOnlyTheOwnerMayTakeAPedAway();
 	TestEveryPedGetsItsOwnName();
+	TestAMissionsPedsAndCarsSayWhoseTheyAre();
 	TestAPlayerTakesTheirPedsWithThem();
 	TestABackfilledPedIsNeverMistakenForYourOwn();
 	TestOnlyTheOwnerMayKillTheirPed();
@@ -3907,6 +5087,8 @@ int main() {
 	TestOnlyTheHolderCanReportACollection();
 	TestTheSamePickupIsMatchedWithinTolerance();
 	TestARespawningPickupComesBackAndAOnceDoesNot();
+	TestAMovedReservationNamesItsOldHolder();
+	TestObjectRecordsLiveWhileSomebodyIsNear();
 	TestABribeGetsItsOwnWindow();
 	TestExpiryDropsOnlyWhatCanComeBack();
 	TestACollectedDropIsForgotten();
@@ -3929,6 +5111,9 @@ int main() {
 	TestAHitOnACarInCustodyGoesToTheCustodian();
 	TestACustodyEndingMovesTheHitsOn();
 	TestOnlyTheCustodianWritesOffACarInCustody();
+	TestAWreckIsSettledByWhoeverDecidedIt();
+	TestAWreckIsBackfilledWhileTheEnginesHaveIt();
+	TestAWreckBeingSettledIsHandedOn();
 	TestAHitOnACarNobodyHoldsMakesTheShooterItsCustodian();
 	TestAWreckedCarTakesNoMoreHits();
 	TestAPassengerMayNotShootTheCarHeIsSittingIn();
@@ -3986,6 +5171,8 @@ int main() {
 	TestTheCheatRuleIsClamped();
 
 	TestACarsWholeLife();
+	TestACarTakenAwayOnPurpose();
+	TestAParkedCarsGeneratorRidesItsSpawn();
 	TestWalkingBackToAParkedCarKeepsIt();
 	TestNobodyInItOrSettlingItIsReleased();
 	TestTheCapIsOnCarsAliveNotCarsEver();
@@ -4000,6 +5187,7 @@ int main() {
 	TestALeaversCarGoesToWhoeverIsNextToIt();
 	TestAPackageIsEverybodysByDefault();
 	TestAPackageIsYourOwnUnderPerPlayer();
+	TestTheMissionsStashIsEverybodysOwn();
 	TestNetIdsSkipZeroAndLiveOnes();
 	TestNobodyNearMeansNobodySettlesIt();
 	TestAJoinerAndANewDriverGetTheDents();

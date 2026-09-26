@@ -1,6 +1,7 @@
 #include "pickup.h"
 
 #include "addresses.h"
+#include "mission.h"
 #include "hook/hook.h"
 #include "log.h"
 
@@ -58,6 +59,7 @@ uint32_t     g_removedCount = 0;   // how many entries are in use
 // fail loudly, once, not sixty times a second.
 bool g_saidCollision   = false;
 bool g_saidUnusable    = false;
+bool g_saidMoved       = false;
 bool g_saidRingFull    = false;
 bool g_saidTimeout     = false;
 bool g_saidDropMade    = false;
@@ -132,6 +134,10 @@ PickupIdent IdentOf(size_t slot) {
 	// And the skull, whose claim opens a vote rather than taking it.
 	if (ModelOf(slot) == ModelIndexGlobal(MI_PICKUP_KILLFRENZY))
 		id.flags |= PICKUP_F_RAMPAGE;
+	// One the session's mission laid out for everybody to take their own of
+	// (game/mission.h, MissionStashAt).
+	if (MissionStashAt(p[0], p[1], id.modelIndex))
+		id.flags |= PICKUP_F_STASH;
 	return id;
 }
 
@@ -299,10 +305,17 @@ size_t FindSlot(const PickupIdent &ident, bool requireLive) {
 	size_t best      = NUM_PICKUPS;
 	float  bestDist  = kIdentToleranceSq;
 	int    matches   = 0;
+	bool   apart     = false;   // two of them at different spots
+	size_t first     = NUM_PICKUPS;
 	const float want[3] = {ident.pos.x, ident.pos.y, ident.pos.z};
 
 	for (size_t i = 0; i < NUM_PICKUPS; ++i) {
 		if (PickupType(i) == PICKUP_NONE || ModelOf(i) != ident.modelIndex)
+			continue;
+		// Of its own type too: Ammu-Nation's out-of-stock Uzi sits exactly
+		// where the Uzi in stock goes, and a claim for one is never for the
+		// other.
+		if (PickupType(i) != ident.type)
 			continue;
 		if (requireLive && !IsLive(i))
 			continue;
@@ -310,13 +323,20 @@ size_t FindSlot(const PickupIdent &ident, bool requireLive) {
 		if (d > kIdentToleranceSq)
 			continue;
 		++matches;
+		if (first == NUM_PICKUPS)
+			first = i;
+		else if (Dist2(PosOf(i), PosOf(first)) != 0.0f)
+			apart = true;
 		if (d <= bestDist) {
 			bestDist = d;
 			best     = i;
 		}
 	}
 
-	if (matches > 1) {
+	// The same pickup made twice on the same spot is one pickup to anybody:
+	// Cipriani's Chauffeur makes the shop's Uzi and the thread it starts
+	// makes it again, in retail too. Only two at different spots are a guess.
+	if (matches > 1 && apart) {
 		++g_stats.identCollisions;
 		if (!g_saidCollision) {
 			g_saidCollision = true;
@@ -578,6 +598,41 @@ void __cdecl HookedPickupsUpdate() {
 
 	uint32_t blocked = 0;
 
+	// The one pickup this machine claims this pass (pickup.h,
+	// kClaimSwitchMargin): the nearest in reach, unless the one already held
+	// is about as near. Skulls are asked for on the touch and stay out of it.
+	size_t chosen = NUM_PICKUPS;
+	if (havePlayer) {
+		size_t held = NUM_PICKUPS, best = NUM_PICKUPS;
+		float  heldD2 = 0.0f, bestD2 = 0.0f;
+		for (size_t i = 0; i < NUM_PICKUPS; ++i) {
+			const uint8_t type = PickupType(i);
+			if (type == PICKUP_NONE || IsMine(type) || !IsLive(i) || IsSkull(i))
+				continue;
+			const float d2 = Dist2(PosOf(i), player);
+			if (d2 > kClaimRadiusSq)
+				continue;
+			const PickupSlot &s = g_slots[i];
+			if (s.gate != PickupGate::BLOCKED) {
+				if (held == NUM_PICKUPS || d2 < heldD2) {
+					held   = i;
+					heldD2 = d2;
+				}
+				continue;
+			}
+			if (static_cast<int32_t>(g_frame - s.retryFrame) < 0)
+				continue;   // refused a moment ago
+			if (best == NUM_PICKUPS || d2 < bestD2) {
+				best   = i;
+				bestD2 = d2;
+			}
+		}
+		chosen = held;
+		if (best != NUM_PICKUPS &&
+		    (held == NUM_PICKUPS || ShouldSwitchClaim(std::sqrt(heldD2), std::sqrt(bestD2))))
+			chosen = best;
+	}
+
 	for (size_t i = 0; i < NUM_PICKUPS; ++i) {
 		g_stashed[i] = 0;
 
@@ -642,6 +697,8 @@ void __cdecl HookedPickupsUpdate() {
 		// have let us have it, since the asking starts a vote. pickup.h,
 		// SkullTouched.
 		bool wanted = havePlayer && IsLive(i) && Dist2(PosOf(i), player) <= kClaimRadiusSq;
+		if (!skull)
+			wanted = i == chosen;
 		if (wanted && skull) {
 			const float *at = PosOf(i);
 			wanted = static_cast<int32_t>(g_frame - slot.retryFrame) >= 0 &&
@@ -763,7 +820,11 @@ void __cdecl HookedPickupsUpdate() {
 		// frenzy already running. Hold the reservation while they are in
 		// range and give it back the moment they are not, because a
 		// reservation nobody gives back is a pickup nobody else can have.
-		if (!havePlayer || Dist2(PosOf(i), player) > kClaimRadiusSq) {
+		//
+		// And give it back the moment another pickup is the one this player
+		// is going for, so the gun beside it is free for somebody else.
+		if (!havePlayer || Dist2(PosOf(i), player) > kClaimRadiusSq ||
+		    (!IsSkull(i) && i != chosen)) {
 			slot.gate = PickupGate::BLOCKED;
 			++g_stats.walkedAway;
 			if (g_cb.Release) {
@@ -917,6 +978,13 @@ void OnPickupTakenByOther(const PickupIdent &ident) {
 		return;
 	}
 
+	// The mission's stash: whoever took one, the mission hears it, and ours
+	// stays for us to take.
+	if ((ident.flags & PICKUP_F_STASH) != 0) {
+		TellTheScript(slot);
+		return;
+	}
+
 	ReplayEngineRemoval(slot);
 	TellTheScript(slot);
 
@@ -996,9 +1064,21 @@ void OnPickupDroppedElsewhere(const PickupDropBody &drop) {
 void OnPickupDenied(const PickupIdent &ident) {
 	++g_stats.denials;
 	for (size_t i = 0; i < NUM_PICKUPS; ++i) {
-		if (g_slots[i].gate == PickupGate::CLAIMED &&
-		    SameIdent(g_slots[i].ident, ident)) {
-			g_slots[i].gate = PickupGate::BLOCKED;
+		// A grant as well as a claim: a reservation that stood too long is
+		// moved to somebody else, and this is how its old holder hears. From
+		// here it is hidden from our engine again, so only one of us gets it.
+		// A voted skull is never taken back this way.
+		const bool held = g_slots[i].gate == PickupGate::CLAIMED ||
+		                  (g_slots[i].gate == PickupGate::GRANTED && !g_slots[i].voted);
+		if (held && SameIdent(g_slots[i].ident, ident)) {
+			if (g_slots[i].gate == PickupGate::GRANTED && !g_saidMoved) {
+				g_saidMoved = true;
+				Log("pickup: our reservation on model %d at (%.0f %.0f %.0f) stood too long "
+				    "and went to somebody else; it is theirs now",
+				    ident.modelIndex, ident.pos.x, ident.pos.y, ident.pos.z);
+			}
+			g_slots[i].gate       = PickupGate::BLOCKED;
+			g_slots[i].retryFrame = g_frame + kDenyRetryFrames;
 			// A skull: the vote failed, or another one is running. It stays
 			// where it is, and can be touched again in a moment.
 			if ((g_slots[i].ident.flags & PICKUP_F_RAMPAGE) != 0) {
@@ -1033,6 +1113,36 @@ void ReleaseAllPickups() {
 	// So the next pass with a live session arms cleanly rather than thinking
 	// it is still mid-session.
 	g_seamActive   = false;
+}
+
+bool PickupStillUp(int32_t handle) {
+	// slot | (m_nIndex << 16), which is negative once the generation passes
+	// 0x7FFF; -1, no pickup, names slot 0xFFFF.
+	const uint32_t bits = static_cast<uint32_t>(handle);
+	const size_t   slot = bits & 0xFFFFu;
+	if (slot >= NUM_PICKUPS || GenerationOf(slot) != static_cast<uint16_t>(bits >> 16))
+		return false;
+	return PickupType(slot) != PICKUP_NONE && Removed(slot) == 0;
+}
+
+bool PickupInUse(int32_t handle) {
+	const uint32_t bits = static_cast<uint32_t>(handle);
+	const size_t   slot = bits & 0xFFFFu;
+	return handle != -1 && slot < NUM_PICKUPS &&
+	       GenerationOf(slot) == static_cast<uint16_t>(bits >> 16) && PickupType(slot) != PICKUP_NONE;
+}
+
+bool TakeMissionPickup(int32_t handle, bool tellTheScript) {
+	if (!PickupStillUp(handle))
+		return false;
+	const size_t slot = static_cast<uint32_t>(handle) & 0xFFFFu;
+	// Into the ring first: it names the pickup by its slot's generation,
+	// which the removal leaves alone, and the engine's own collection pushes
+	// before it removes too.
+	if (tellTheScript)
+		TellTheScript(slot);
+	ReplayEngineRemoval(slot);
+	return true;
 }
 
 void AddPickupsToBridge(WorldBridge &bridge) {

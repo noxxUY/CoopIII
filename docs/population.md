@@ -178,14 +178,27 @@ ended up hosting all the traffic and the other none. That is §1.3 working
 exactly as written - "the engine stops generating when the street in front of
 you is full, whoever filled it" - but it does interact with §2.3: the
 generator works off *the local player's* position, so a machine that has
-stopped generating is relying on somebody else's traffic being near it. Two
-players on opposite islands would each still generate their own, because
-neither one's cars are anywhere near the other's gate. Two players in the same
-street share. Nothing in between has been measured.
+stopped generating is relying on somebody else's traffic being near it.
+
+**Corrected 2026-09-25.** This used to say that two players on opposite
+islands "would each still generate their own, because neither one's cars are
+anywhere near the other's gate". That was wrong. Neither gate has a position
+in it: `NumRandomCars` and `ms_nTotalPeds` are session-wide counts, and every
+replica was built on every machine at any distance. So a player across the
+city had his street counted full of somebody else's traffic and crowd, his
+engine stopped generating, and - because `GenerateOneRandomCar`'s police arm
+sits behind the same two gates - a wanted player could get few or no police
+cars. The fix is §2.3's: a replica is built only near the local player. With
+that, two players in one street share it as measured above, and two players
+far apart each generate their own, because the other's crowd is no longer in
+the count. A wanted player gets his police in the shared-street case too:
+wanted.md §6.1.
 
 This design does not promise a general ownership handoff. A pedestrian stays
 with the machine that created it until that machine drops it, and so does a
-traffic car unless another player takes its wheel (§1.3.0); handing a living
+traffic car unless another player takes its wheel (§1.3.0), or its host's
+engine drops it by distance while another player is near it, which hands it to
+that player instead of despawning it (`protocol.md` §1.45). Handing a living
 one to somebody else for any other reason is its own piece of work.
 
 ---
@@ -287,6 +300,36 @@ local player has no model and no collision there. §5.3 already settles what
 happens to a *player* in that position - a blip and nothing else - and ambient
 entities need the same answer, which is probably "do not create them at all
 beyond the radius, and create them when they come into it".
+
+**Done 2026-09-25, and it turned out to be about the generators more than the
+streamer** (§1.3.2's correction). `client/src/game/crowdrange.h` is the rule
+and `Client::UpdateReplicaRange` carries it out, first thing in the pedestrian
+spawn pass every frame:
+
+- The centre is `FindPlayerCentreOfWorld(PlayerInFocus)` (0x004A1170), the
+  point both generators themselves centre on: the player, his car, or the
+  replay camera. Nothing is built or taken down while there is no player ped.
+- A replica is built within **160 m** of it and taken down past **200 m**,
+  flat distance. The 40 m between the two is so a car driving along the edge
+  is not built and destroyed on alternate frames.
+- Out of range the **row is held**: identity, owner, the stream and its
+  interpolation buffer, death, dents, the instruction to sit in a car. Only
+  the CPed or CVehicle goes, in `OnPedDespawn`'s and `OnCarDespawn`'s order
+  (off the door, out of the seat, then destroyed), and the spawn is re-armed.
+  Built again, it goes where its host last put it rather than where it was
+  born.
+- A pedestrian his host has sitting in a traffic car follows the car's
+  decision. Never taken down: anything the mission made (`AMBIENT_MISSION`),
+  a car a player sits in or is at the door of here, the car we have asked to
+  take over, and a car a mission pedestrian is to sit in.
+- A replica that is not built is not counted, so a far one no longer fills
+  this machine's gates, and the ped pool and the streamer carry only what is
+  near.
+- Known cost: a wreck taken down is not built again, because the `destroyed`
+  guard refuses to build a wreck at all. It is gone when you come back.
+
+The log says, at most every thirty seconds while anything crosses the edge,
+how many of each are built here and how many were taken down and brought back.
 
 ### 2.4 The AI
 

@@ -16,14 +16,19 @@
 // GTA III running - same reason interp.h is shaped the way it is.
 #pragma once
 
+#include "cannonsync.h"
 #include "chatfeed.h"
 #include "clock.h"
 #include "helisync.h"
 #include "interp.h"
+#include "missionsync.h"
 #include "moneysync.h"
 #include "netthread.h"
+#include "cutsceneskipview.h"
 #include "rampagevoteview.h"
+#include "remotebody.h"
 #include "sessiontime.h"
+#include "stuntshotview.h"
 
 #include <coopiii/protocol.h>
 
@@ -79,6 +84,19 @@ struct EntryWatch {
 	}
 };
 
+// Another player's stars, discounted for a moment after ours came down.
+// docs/wanted.md §4.9. game/wanted.h has the arithmetic (HoldWantedPeer,
+// CountedWantedLevel); this is only the three numbers it keeps per player.
+//
+// `above` is what they were reporting when the hold began, 0 for no hold.
+// `cap` is the most they count for while it lasts. Both come from the same
+// moment, so a player with a hold always has above > cap.
+struct WantedHold {
+	uint8_t  above   = 0;
+	uint8_t  cap     = 0;
+	uint32_t sinceMs = 0;
+};
+
 struct RemotePlayer {
 	bool         active  = false;
 	uint8_t      playerId = 0xFF;
@@ -95,6 +113,14 @@ struct RemotePlayer {
 	// (animation, health, weapon).
 	PlayerStateBody last{};
 	bool            haveState = false;
+	// Every snapshot's body and ride beside `interp`'s poses, and the body
+	// UpdateRemotes picked out of it for the instant the pose is drawn at.
+	// ApplyRemotePose plays the animation, aim and the rest off `shown`, and
+	// only health, armour and the weapon in the hand off `last`
+	// (docs/protocol.md 1.7.2).
+	BodyTimeline    timeline;
+	PlayerStateBody shown{};
+	bool            stallSaid = false;
 	// When the newest snapshot arrived, on WallClock. The player list shows a
 	// player who has gone quiet - the menu, a loading screen, a cutscene, or
 	// their game not being the window in front - so a frozen ped on screen
@@ -136,6 +162,11 @@ struct RemotePlayer {
 	bool     dead         = false;
 	uint16_t deathAnimId  = ANIM_NONE;
 	bool     deathApplied = false;
+
+	// Their pause menu is up (S_PlayerAway). Their ped stands where they left
+	// it with its controls taken away; the nametag and the player list say
+	// why.
+	bool     away         = false;
 
 	// Engine-side identity. -1 until Area B spawns a ped for this player.
 	// docs/protocol.md §1.5: local only, never goes on the wire.
@@ -296,6 +327,14 @@ struct RemotePlayer {
 		return netId != INVALID_NETID &&
 		       (seatedVehicleNetId == netId || enteringVehicleNetId == netId);
 	}
+
+	// Hidden by ped.cpp for a mission's cutscene (SetRemotePlayersHidden), so
+	// that it is shown again after, and only then.
+	bool hiddenForScene = false;
+
+	// Their stars count for less until they have come down too, because ours
+	// just did (docs/wanted.md §4.9). Client::TickWanted keeps it.
+	WantedHold wantedHold;
 };
 
 // What PollSeatRemotePed says about an entry that is already in flight.
@@ -310,6 +349,19 @@ enum SeatProgress : uint8_t {
 // longer has an answer on the frame it was pressed.
 constexpr int32_t SEAT_LOCAL_REFUSED = -1;   // no, and the client log says why
 constexpr int32_t SEAT_LOCAL_WALKING = -2;   // on the way, ask again next frame
+
+// What WorldBridge::SeatAmbientPed says when it is not handing back the seat a
+// copy of somebody else's pedestrian got (game/seatplan.h).
+constexpr int32_t AMBIENT_SEAT_NONE_FREE = -1;   // every seat he could have is held; nothing touched
+constexpr int32_t AMBIENT_SEAT_REFUSED   = -2;   // the engine would not seat him
+
+// Where a copy of somebody else's pedestrian is against its car, as
+// WorldBridge::AmbientPedDoorState reads it off our engine.
+enum AmbientDoorState : uint8_t {
+	AMBIENT_DOOR_IN      = 0,   // in his seat
+	AMBIENT_DOOR_LEAVING = 1,   // in it, and climbing out (PED_EXIT_CAR)
+	AMBIENT_DOOR_OUT     = 2,   // not in a car at all
+};
 
 // Which free passenger seat the seat key asks for. `freeSeats` has bit n set
 // for each free seat n (1..8, wire numbering); `onRight` is which side of the
@@ -363,6 +415,11 @@ constexpr uint32_t SEAT_ANIM_TIMEOUT_MS = 6000;
 constexpr uint32_t ENTER_INTENT_TTL_MS = 7500;
 static_assert(ENTER_INTENT_TTL_MS >= SEAT_ANIM_TIMEOUT_MS + 1000,
               "an intent must outlive the entry it started, plus the claim's trip");
+
+// How long Client::NoteScriptedRide holds after it was last said. It is said
+// every frame, so this only has to outlast the gap between two client ticks
+// by a comfortable margin.
+constexpr uint32_t SCRIPTED_RIDE_HOLD_MS = 1000;
 
 // What the local player's engine is doing about getting into a car.
 //
@@ -470,6 +527,7 @@ constexpr uint8_t WIRE_PEDSTATE_EXIT_CAR = 54;
 constexpr uint8_t WIRE_PEDSTATE_DRIVING       = 44;
 constexpr uint8_t WIRE_PEDSTATE_DRAG_FROM_CAR = 51;
 constexpr uint8_t WIRE_PEDSTATE_ARRESTED      = 56;
+static_assert(WIRE_PEDSTATE_ARRESTED == PEDSTATE_ON_WIRE_ARRESTED, "the server reads it too");
 
 // Is a remote player being dragged out of the car the session still seats
 // them in? Returns the netId to keep them out of, or INVALID_NETID.
@@ -639,6 +697,25 @@ struct VehicleIdentity {
 	int8_t   extra2  = -1;
 	Vec3     pos{};
 	Quat     rot{0.0f, 0.0f, 0.0f, 1.0f};
+	// The car generator this car is standing on, plus one; 0 for none
+	// (EnterVehicleBody::parkedSlot).
+	uint16_t parkedSlot = 0;
+};
+
+// ---- cars an engine takes away on purpose (game/carremoval.h) -------------
+
+// One session car with a CVehicle here, and whether this machine is the one
+// whose engine may crush, crane, deliver or store it.
+struct VehicleRemover {
+	int32_t  poolHandle = -1;
+	uint16_t netId      = 0;
+	bool     weMay      = false;
+};
+
+// One our engine did: which car and why (VehicleRemovedReason).
+struct VehicleRemoval {
+	uint16_t netId  = 0;
+	uint8_t  reason = 0;
 };
 
 // ---- our own life ----------------------------------------------------------
@@ -811,6 +888,27 @@ struct RemoteVehicle {
 	// in - being deleted underneath them on a disconnect.
 	bool ours = false;
 
+	// The station the session has for this car's radio (protocol.h,
+	// S_VehicleRadio), RADIO_STATION_UNKNOWN until somebody in it has said.
+	// Every copy is made to carry it (Client::SyncCarRadios).
+	uint8_t radio = RADIO_STATION_UNKNOWN;
+
+	// When the car's alarm stops, on WallClock, or 0 for none (carextrasync.h).
+	// On a car we watch, what is left of it is written onto our copy; on one
+	// we simulate, what the session has been told.
+	uint32_t alarmUntilMs = 0;
+
+	// Where its gun points, as its driver last said (protocol.h,
+	// S_VehicleAim). Written onto our copy while somebody else drives it.
+	bool  aimKnown = false;
+	float gunLR    = 0.0f;
+	float gunUD    = 0.0f;
+	// Whose clock the last one was stamped on, and when: it rides an
+	// unsequenced channel, and one that arrives behind a newer one from the
+	// same driver is dropped.
+	uint8_t  aimFrom    = 0xFF;
+	uint32_t aimStampMs = 0;
+
 	// The session has given this car to somebody else while our own engine
 	// still has the local player at its wheel. A carjack, from the losing end.
 	//
@@ -847,6 +945,18 @@ struct RemoteVehicle {
 	// exists to make impossible.
 	uint8_t custodianPlayerId = INVALID_PLAYER;
 
+	// Whoever drove it last, us included, INVALID_PLAYER before anybody has.
+	// Kept after they get out: once the custody is over, it is the player
+	// whose machine may let its engine crush, crane, deliver or store the car
+	// (game/carremoval.h, MayRemoveCar).
+	uint8_t lastDriverPlayerId = INVALID_PLAYER;
+
+	// An engine took this car away on purpose - ours, or the holder's
+	// (protocol.h, C_VehicleRemoved). Like `destroyed`, it stops the respawn
+	// that a car gone from the pool otherwise gets, and it has the despawn
+	// that follows delete even a car our own engine made.
+	bool removed = false;
+
 	// While this machine holds custody: when to give up, and how many
 	// consecutive frames the car has read as at rest.
 	//
@@ -881,6 +991,26 @@ struct RemoteVehicle {
 	uint32_t settleDamagePanels = 0;
 	uint16_t settleDamageDoors  = 0;
 
+	// The bomb it carries (CARBOMB_*), as last said: by its holder, or by us
+	// while we settle it (protocol.h, C_VehicleBomb).
+	uint8_t  bomb = 0;
+	// Whose bomb it is, INVALID_PLAYER for nobody, and whether its fuse is
+	// burning, as last said. Every copy names that player's ped as the rigger
+	// (Client::ReconcileVehicleBombs), which is what the ignition and the
+	// detonator go by.
+	uint8_t  bombBlame = INVALID_PLAYER;
+	bool     bombLit   = false;
+	// The bomb is the one the mission's script fitted, and bombBlame is the
+	// mission's owner (protocol.h, C_MissionBomb), until a word on it changes
+	// it (KeepsMissionBomb). Anybody in the running mission may set off a
+	// remote one (DetonatorSetsOff).
+	bool     bombMission = false;
+	// What has been said about the bomb that our copy has not been given yet,
+	// because the car was not here or the word arrived first: its type, and a
+	// fuse to light, as when it runs out by WallClock, 0 for none.
+	bool     bombTypePending = false;
+	uint32_t bombFuseEndsMs  = 0;
+
 	// Whether WorldBridge::SurrenderVehicleSeat has been run for the
 	// surrender above. One call, not one per frame: it is a handover, and the
 	// engine only has to be told once.
@@ -905,6 +1035,13 @@ struct RemoteVehicle {
 	// engine seam's CorrectRemoteVehicle in the same call - kept here rather
 	// than decided in the seam so the decision is testable without a game.
 	bool hornSounding = false;
+
+	// Whether this machine's engine may run the car's five-second fire timer.
+	// Worked out by Client::UpdateRemoteVehicles before every
+	// ApplyRemoteVehicle, which holds the timer when it is false: everywhere
+	// but at the holder's machine for a car somebody holds, and everywhere but
+	// at the host for a car nobody does (game/wreck.h, FireTimerRunsHere).
+	bool fireTimerHere = true;
 
 	// What shape the session says this car is in: CDamageManager's panel word
 	// and six two-bit door levels (docs/cardamage.md §3).
@@ -1055,9 +1192,10 @@ constexpr uint32_t CUSTODY_SINK_CAP_MS = 20000;
 //
 // Settled or out of time, as it always was - except that a burning car is kept
 // until it goes up. The custodian's engine is the one running the fire timer
-// (everybody else holds theirs), so handing a burning car back leaves nobody
-// to decide it: every machine's timer then runs and every machine blows it up
-// on its own. And a car that was shot a moment ago is kept too.
+// (everybody else holds theirs), so a burning car handed back is one whose
+// fire timer moves to the host (game/wreck.h, FireTimerRunsHere), counting
+// from nothing. Kept, it goes up on the timer that has been counting all
+// along. And a car that was shot a moment ago is kept too.
 inline bool CustodyMayEnd(bool settled, bool burning, uint32_t nowMs,
                           uint32_t settleEndsAtMs, uint32_t holdUntilMs,
                           uint32_t burnSinceMs) {
@@ -1066,6 +1204,18 @@ inline bool CustodyMayEnd(bool settled, bool burning, uint32_t nowMs,
 	if (nowMs < holdUntilMs)
 		return false;
 	return settled || nowMs >= settleEndsAtMs;
+}
+
+// A burning car the custodian has kept for CUSTODY_BURN_CAP_MS without its
+// fire timer going off. The custodian blows it up itself rather than handing
+// it back: handed back, it was every machine's timer again and every machine
+// blew it up on its own. Its engine is the only one that has been counting,
+// so this is the same decision taken a little late, by the same machine. If
+// the engine refuses (bCanBeDamaged clear, which the campaign sets on a car
+// it needs), the car goes back and the host's timer has it
+// (game/wreck.h, FireTimerRunsHere).
+inline bool BurnOutlastedCustody(bool burning, uint32_t nowMs, uint32_t burnSinceMs) {
+	return burning && burnSinceMs != 0 && nowMs - burnSinceMs >= CUSTODY_BURN_CAP_MS;
 }
 
 // ---- ambient population (docs/population.md §3 step 2) ----------------------
@@ -1100,6 +1250,11 @@ struct RemoteAmbientPed {
 	// The model has been asked for and the ped doesn't exist yet. Same
 	// two-phase spawn as a player (protocol.md §1.6).
 	bool     spawnPending = false;
+	// Near enough the local player to be built here (game/crowdrange.h).
+	bool     inRange      = false;
+	// Taken down for the radius at least once, so building it again is a
+	// return rather than a first build (Client::UpdateReplicaRange's count).
+	bool     stowed       = false;
 
 	// ---- the stream (docs/population.md §3 step 6) -------------------------
 
@@ -1179,6 +1334,25 @@ struct RemoteAmbientPed {
 	uint16_t seatVehicleNetId   = INVALID_NETID;
 	uint16_t seatedVehicleNetId = INVALID_NETID;
 	uint8_t  seatIndex          = 0;
+	// The seat he actually has here, which is his host's unless a player sits
+	// in that one on this machine (game/seatplan.h). What SeatIsTaken reads.
+	uint8_t  seatedIndex        = 0;
+
+	// The car his host says he sits in is here, and every seat he could have
+	// in it is held. He is not left standing where the seat is: that is inside
+	// the car, in the way of its collision, and a car with somebody standing
+	// in it every frame barely moves. So while this is set his copy is kept
+	// out of sight and out of the collision (WorldBridge::ApplyAmbientPedState)
+	// and the seat is asked for again every frame. The same while the car he
+	// sits in is not built here yet, when on foot he would stand in mid-air
+	// where the seat will be. `seatlessHidden` is the engine seam's note that
+	// it has done so, for putting him back.
+	bool     seatless       = false;
+	bool     seatlessHidden = false;
+	// His host's last row said he sits in a car it has no name for
+	// (AMBIENT_PED_IN_UNSEEN_CAR): not one we can build, so he is kept out of
+	// sight exactly as for a car of ours that is not built yet.
+	bool     inUnseenCar    = false;
 
 	// A player's jack played here pulled this driver out: the same pair as
 	// RemotePlayer's, for the same reason. His host keeps naming the seat until
@@ -1186,6 +1360,35 @@ struct RemoteAmbientPed {
 	uint16_t pulledOutOfNetId  = INVALID_NETID;
 	uint32_t pulledOutAtMs     = 0;
 	uint32_t engineHoldSinceMs = 0;
+
+	// ---- at a door ----------------------------------------------------------
+	//
+	// His host's pedestrian opening a door of a car (AMBIENT_PED_ENTERING):
+	// which car, the seat it ends in, the door, and when a row last said so.
+	// Our copy plays the same entry once, `entryTried`, and the warp stands
+	// behind it as it does for a player's copy.
+	uint16_t   entryNetId           = INVALID_NETID;
+	uint8_t    entrySeat            = 0;
+	uint8_t    entryDoor            = 0;
+	uint32_t   entrySaidMs          = 0;
+	bool       entryTried           = false;
+	// Our copy's own entry, while it plays: the car, the seat and when it is
+	// given up on. EntryWatch is client.h's, the one a player's copy uses.
+	uint16_t   enteringVehicleNetId = INVALID_NETID;
+	uint8_t    enteringSeat         = 0;
+	uint32_t   enterDeadlineMs      = 0;
+	EntryWatch enterWatch;
+	// Climbing out (AMBIENT_PED_EXITING), and when a row last said so; our
+	// copy's climb is started once per exit, and the seat loop keeps its
+	// hands off it until it is over.
+	bool       exitSaid             = false;
+	uint32_t   exitSaidMs           = 0;
+	bool       exitPlayed           = false;
+	uint32_t   exitHoldSinceMs      = 0;
+	// His host moved him to another seat of the same car.
+	bool       reseat               = false;
+
+	bool Entering() const { return enteringVehicleNetId != INVALID_NETID; }
 
 	// A seated ped is positioned by CWorld::Process from the car's own
 	// matrix, every frame (docs/protocol.md §1.13.2). So nothing else may
@@ -1200,6 +1403,29 @@ struct RemoteAmbientPed {
 struct LocalAmbientCar {
 	uint32_t       tempId = 0;
 	AmbientCarBody body{};
+};
+
+// A traffic car of ours the local engine dropped by distance with another
+// player near it, and the peds of ours it took with it (protocol.h,
+// C_CarLetGo). Already out of this machine's hosting when it is drained.
+struct LocalCarLetGo {
+	uint16_t netId    = INVALID_NETID;
+	uint8_t  pedCount = 0;
+	uint16_t peds[MAX_LET_GO_PEDS] = {};
+};
+
+// Another player, where his last snapshot put him, for the engine side's
+// questions about who is near what (WorldBridge::NoteRemoteViewers).
+struct ViewerAt {
+	uint8_t playerId = INVALID_PLAYER;
+	Vec3    pos{};
+};
+
+// A session car this machine has a CVehicle for: its pool reference and the
+// session's name for it (WorldBridge::SampleHostedPeds).
+struct SessionCarRef {
+	int32_t  poolHandle = -1;
+	uint16_t netId      = INVALID_NETID;
 };
 
 // Somebody else's traffic car, as this machine holds it.
@@ -1221,6 +1447,12 @@ struct RemoteAmbientCar {
 	// it stops resolving when the engine deletes the car, reused slot or not.
 	int32_t  poolHandle   = -1;
 	bool     spawnPending = false;
+	// Near enough the local player to be built here (game/crowdrange.h).
+	// Out of range the row is held, streamed and interpolated, and nothing
+	// is built.
+	bool     inRange      = false;
+	// Taken down for the radius at least once (RemoteAmbientPed::stowed).
+	bool     stowed       = false;
 
 	// The session says this car is a wreck (roadmap.md 5.8). Kept on the row
 	// rather than read back off the engine because it has to outlive the
@@ -1285,6 +1517,12 @@ struct RemoteAmbientCar {
 	// per frame: it is reliable, so it gets there, and the row goes away
 	// entirely when the promotion lands.
 	bool claimPending = false;
+
+	// When the spawn arrived, on WallClock, and whether a copy of the
+	// mission's car still not built a second later has been said: a car the
+	// owner's camera is looking at and ours is not (Client::UpdateRemoteAmbientCars).
+	uint32_t namedAtMs = 0;
+	bool     saidLate  = false;
 };
 
 // Is a hit the local player landed on this traffic replica worth sending to
@@ -1302,14 +1540,99 @@ inline bool CarHitIsWorthSending(const RemoteAmbientCar &car, uint8_t localPlaye
 	return true;
 }
 
+// A car's bomb as our engine has it (protocol.h, C_VehicleBomb): its type,
+// what is left of a lit fuse, and who the car names for it - the one who set
+// the fuse going while it burns, the one who had it fitted otherwise - as our
+// own player or another player's ped, by that player's netId. `blameOther`
+// when it names something that is no player at all: a pedestrian whose
+// explosion lit the car's delayed one (CVehicle::InflictDamage, 0x00551C37).
+struct VehicleBombSample {
+	uint8_t  type       = 0;
+	uint16_t fuseMs     = 0;
+	bool     blameUs    = false;
+	uint16_t blameNetId = INVALID_NETID;
+	bool     blameOther = false;
+};
+
+// What to put on our copy of a car. The type only when the session's word is
+// new to the copy; the rigger whenever the session has one; a fuse only when
+// the copy's own is not already burning, and it blames the same player.
+struct VehicleBombWrite {
+	bool          writeType = false;
+	uint8_t       type      = 0;
+	bool          blameUs   = false;
+	RemotePlayer *blame     = nullptr;
+	uint16_t      lightMs   = 0;
+	// The session names somebody other than our own player. A copy whose
+	// rigger is our player is then put right even while that somebody's ped
+	// is not here, to nobody: the replayed ARM_CAR_WITH_BOMB writes our
+	// player there, and a copy left naming us would be claimed by us the
+	// moment we held the car.
+	bool          notOurs   = false;
+};
+
+// Who a bomb report names: the player the engine names, or when it names
+// nobody - that player's ped was not here when our copy was told - whoever the
+// session already had. A copy never forgets whose bomb it carries. Something
+// that is no player is nobody's, not the last bomber's.
+inline uint8_t BombBlame(uint8_t named, uint8_t held, bool namedNoPlayer = false) {
+	if (namedNoPlayer)
+		return INVALID_PLAYER;
+	return named != INVALID_PLAYER ? named : held;
+}
+
+// Is there anything about this car's bomb for a copy to carry?
+inline bool CarriesBombWord(const RemoteVehicle &v) {
+	return v.bomb != 0 || v.bombBlame != INVALID_PLAYER || v.bombTypePending ||
+	       v.bombFuseEndsMs != 0;
+}
+
+// When a fuse with `fuseMs` left runs out, on WallClock: never 0, which is
+// "no fuse".
+inline uint32_t FuseEnds(uint32_t nowMs, uint16_t fuseMs) {
+	const uint32_t ends = nowMs + fuseMs;
+	return ends != 0 ? ends : 1;
+}
+
+// What is left of a fuse that runs out at `endsMs` on WallClock, 0 for none or
+// for one that has already run out, capped at the longest the engine lights.
+inline uint16_t FuseLeft(uint32_t endsMs, uint32_t nowMs) {
+	if (endsMs == 0)
+		return 0;
+	const int32_t left = static_cast<int32_t>(endsMs - nowMs);
+	if (left <= 0)
+		return 0;
+	return left > CARBOMB_FUSE_MAX_MS ? CARBOMB_FUSE_MAX_MS : static_cast<uint16_t>(left);
+}
+
 // The engine seam. Every function here is optional - with none of them set,
 // CoopIII runs headless. It connects, keeps an accurate roster, interpolates
 // poses, but draws nothing. That's exactly the state Area B starts from, and
 // it's genuinely useful to be able to test that state on its own.
+// What the local player is riding, as the engine has it (docs/protocol.md
+// 1.7.1). A vehicle comes back as its pool reference, because only Client
+// knows the session's name for it; a train wagon names itself.
+struct LocalRide {
+	uint8_t  kind          = RIDE_NONE;
+	uint8_t  track         = 0;
+	uint16_t wagon         = 0;
+	int32_t  vehicleHandle = -1;
+	Vec3     offset{};
+	float    heading       = 0.0f;
+};
+
 struct WorldBridge {
 	// Fill `out` from the local player. Returns false if there's no player
 	// yet (menus, loading) - CoopIII then sends nothing this frame.
 	bool (*SampleLocalPlayer)(PlayerStateBody &out) = nullptr;
+
+	// What the local player stands on or sits in that moves, and where on it.
+	// False on foot on the ground, seated in an ordinary car, and with no ped.
+	bool (*SampleLocalRide)(LocalRide &out) = nullptr;
+	// Our engine's placement of a vehicle, by pool reference, or of a train
+	// wagon, by track and wagon id. What a rider is put back on.
+	bool (*VehicleRideFrame)(int32_t handle, RideFrame &out) = nullptr;
+	bool (*TrainRideFrame)(uint8_t track, uint16_t wagon, RideFrame &out) = nullptr;
 
 	// The local player's model index right now. False when there's no
 	// player ped, same "menus, loading" case as SampleLocalPlayer.
@@ -1400,6 +1723,17 @@ struct WorldBridge {
 	                           uint8_t custodianPlayerId, bool weSettle,
 	                           bool blastFloorEnds) = nullptr;
 
+	// Which session cars this machine's crusher, crane and garages may take,
+	// every row with a CVehicle, before every frame's physics
+	// (Client::NoteVehicleHolders, game/carremoval.h). Null leaves every
+	// session car out of their reach.
+	void (*NoteVehicleRemovers)(const VehicleRemover *rows, uint8_t count) = nullptr;
+	// The ones our engine took since the last call.
+	uint8_t (*DrainVehicleRemovals)(VehicleRemoval *out, uint8_t max) = nullptr;
+	// Another player took the parked car on generator `parkedSlot - 1`: let go
+	// of ours the way the engine does when its own player takes one.
+	void (*TakeOverParkedCar)(uint16_t parkedSlot) = nullptr;
+
 	// Once per frame, before CGame::Process and after every pass that can
 	// build or destroy a copy: raise the engine's traffic cap by what this
 	// machine's copies of session cars add to the generator's count, so they
@@ -1443,7 +1777,9 @@ struct WorldBridge {
 	// these are what that machine does with it.
 
 	// Read a car this machine is the custodian of, for the C_VehicleState it
-	// sends on the session's behalf.
+	// sends on the session's behalf. A wreck is read too, with VEH_WRECKED set
+	// and nothing but where it is and how it moves (game/wreck.h, "where a
+	// wreck comes to rest"), and the row is marked destroyed on the way.
 	//
 	// Not SampleLocalVehicle with a different name: that one reads the car
 	// the local player is sitting at the wheel of and refuses everything
@@ -1471,6 +1807,16 @@ struct WorldBridge {
 	// never sinks anything.
 	bool (*VehicleSinking)(RemoteVehicle &vehicle) = nullptr;
 
+	// Blow up the burning car we are settling, through the engine's own
+	// BlowUpCar and the detour, so the wreck goes out as UNOWNED_SESSION like
+	// any other (BurnOutlastedCustody). False when the engine would not.
+	bool (*BlowUpSettlingVehicle)(RemoteVehicle &vehicle) = nullptr;
+
+	// Make a copy the backfill says is a wreck into one, without the blast
+	// (game/wreck.h, "the shell a joiner is handed"). Null leaves the car
+	// intact, which is the bug a joiner used to see.
+	bool (*WreckRemoteVehicleQuietly)(RemoteVehicle &vehicle) = nullptr;
+
 	// Has the local player's car just shoved this one, which nobody holds? A
 	// yes asks the session to let this machine settle it (VEHICLE_HIT_PUSH),
 	// since until somebody's engine simulates a parked car it is a wall on
@@ -1494,6 +1840,29 @@ struct WorldBridge {
 	// how it was before this existed.
 	bool (*SampleObservedVehicleDamage)(RemoteVehicle &vehicle,
 	                                    VehicleDamageBody &out) = nullptr;
+
+	// The bomb (CARBOMB_*) the car the local player is *driving* carries, and
+	// one a car this machine is settling carries (protocol.h, C_VehicleBomb,
+	// docs/mission-audit.md R6). False on foot, as a passenger, for a wreck
+	// and for anything but a car, the one kind of vehicle that has a bomb.
+	bool (*SampleLocalVehicleBomb)(VehicleBombSample *out) = nullptr;
+	bool (*SampleObservedVehicleBomb)(RemoteVehicle &vehicle, VehicleBombSample *out) = nullptr;
+	// Put the session's word on a car's bomb on our copy of it. False when
+	// the car is not here, or is not a car with a bomb.
+	bool (*ApplyRemoteVehicleBomb)(RemoteVehicle &vehicle, const VehicleBombWrite &write) = nullptr;
+	// What CWorld::UseDetonator does to a car whose bomb a detonator just set
+	// off: the bomb off it, a 500 ms fuse and the rigger to blame - our own
+	// player when `blameUs`, otherwise `by`'s ped. False when the car is not
+	// here.
+	bool (*DetonateRemoteVehicleBomb)(RemoteVehicle &vehicle, bool blameUs,
+	                                  RemotePlayer *by) = nullptr;
+
+	// A mine the mission dropped (protocol.h, C_MineBlast): where each of ours
+	// that went off since the last drain did, and somebody else's mine going
+	// off here - ours at that place taken out of the world and the engine's
+	// own explosion set off in its place. game/mine.h.
+	uint8_t (*DrainLocalMineBlasts)(Vec3 *out, uint8_t max) = nullptr;
+	void (*ApplyRemoteMineBlast)(const Vec3 &pos) = nullptr;
 
 	// Make an observed car wear it. Never lowers anything; `flying` decides
 	// whether a part that has just gone actually flies off (a live change) or
@@ -1539,6 +1908,11 @@ struct WorldBridge {
 	// writing a transform (game/vehicle.cpp). Only the other half of the pair
 	// never did, and this is that half.
 	bool (*LocalDrivesVehicle)(const RemoteVehicle &vehicle) = nullptr;
+
+	// Is our own pause menu up? Sampled once a frame and sent on change as
+	// C_PlayerAway, so everybody else can tell a player who stepped away
+	// from one who is just standing there.
+	bool (*LocalMenuUp)() = nullptr;
 
 	// Hand the driver's seat of this car over, because the session says it is
 	// somebody else's now. The losing half of a carjack.
@@ -1621,8 +1995,27 @@ struct WorldBridge {
 	// false.
 	bool (*LocalIsPassenger)() = nullptr;
 
+	// Which car, as a pool ref, and which wire seat (1 + passenger slot) the
+	// local player rides in. False on foot or at a wheel. What a ride our own
+	// script started is announced from, since no key press said which seat.
+	bool (*LocalPassengerSeat)(int32_t &vehicleHandle, uint8_t &seat) = nullptr;
+
 	// Get out. The same key that got us in.
 	bool (*UnseatLocalPlayer)() = nullptr;
+
+	// Riding in somebody else's car (game/ridecam.h).
+	//
+	// Put the peds sitting in this car where its matrix says their seats are,
+	// the way CWorld::Process did before the car was corrected, so the car
+	// the camera is about to look at and the people in it agree.
+	void (*SeatOccupants)(RemoteVehicle &vehicle) = nullptr;
+	// The driver's unique jump shot, on our camera: fixed at `from`, looking
+	// at this car. False when a script of ours holds the camera, or there is
+	// no car.
+	bool (*ShowStuntShot)(RemoteVehicle &vehicle, const Vec3 &from, const Vec3 &up,
+	                      uint8_t mode, uint8_t swap) = nullptr;
+	// And back behind the player with a cut, if the shot is still ours.
+	void (*EndStuntShot)() = nullptr;
 
 	// Put a remote ped in a seat, and take them out again.
 	//
@@ -1680,6 +2073,13 @@ struct WorldBridge {
 	// Ask the engine to open the door and climb out. False means it refused,
 	// and the caller should take them out the plain way.
 	bool (*BeginUnseatRemotePed)(RemotePlayer &player) = nullptr;
+
+	// A player seated in another passenger seat of his car than `seat`, the
+	// one the session gives him, because it was taken when he was seated:
+	// into it now if it is free, or in exchange with the pedestrian holding
+	// it (game/seatplan.h, PlanSettle). True when he moved.
+	bool (*SettleRemoteSeat)(RemotePlayer &player, RemoteVehicle &vehicle,
+	                         uint8_t seat) = nullptr;
 
 	// A jack, on this ped: the engine's own, from CPed::SetCarJack_AllClear on,
 	// through the door `doorSeat` names and into the driver's seat. The car is a
@@ -1877,16 +2277,19 @@ struct WorldBridge {
 	bool (*SampleWorld)(WorldState &out) = nullptr;
 
 	// Put the session's time of day on this machine. Only called once the
-	// drift is past kClockToleranceMinutes, so it's allowed to be a jump.
+	// drift is past kClockToleranceMinutes, so it's allowed to be a jump - and
+	// a jump is not an hour going by, so the local weather doesn't turn over
+	// for it.
 	void (*ApplyWorldTime)(uint8_t hour, uint8_t minute) = nullptr;
 
-	// Pin this machine's sky to the pair the host is blending between, and
-	// stop the local weather rotation picking its own next one.
-	void (*ApplyWorldWeather)(uint8_t weather, uint8_t weatherOld) = nullptr;
+	// Pin this machine's sky to the pair the session is blending between, as
+	// coopiii/sky.h's FollowSky puts it for our clock, and stop the local
+	// weather rotation picking its own next one: ForcedWeatherType = `forced`.
+	void (*ApplyWorldWeather)(uint8_t weather, uint8_t weatherOld, uint8_t forced) = nullptr;
 
-	// Give the sky back to the engine. Called when this machine becomes the
-	// host, because a pinned sky never changes again and the session would
-	// otherwise inherit whatever the last host was looking at, forever.
+	// Give the sky back to the engine. Called when this machine's sky becomes
+	// the session's, because a pinned sky never changes again and the session
+	// would otherwise inherit whatever the last holder was looking at, forever.
 	void (*ReleaseWorldWeather)() = nullptr;
 
 	// ---- trains, planes, traffic lights, the lift bridge ---------------------
@@ -1957,8 +2360,15 @@ struct WorldBridge {
 	// Every one takes its turn, more often the nearer it is to one of
 	// `viewers` - the other players, from Client::ViewerPositions - which is
 	// §2.1's rate-by-distance (game/streampick.h).
+	//
+	// `cars` is every session car this machine has a CVehicle for, the one we
+	// drive included. A hosted pedestrian sitting in one of them is said to sit
+	// in it under its session netId, as one in a car we host is: the mission's
+	// 8-Ball in the car a participant drives, Misty in the owner's. Without it
+	// he went out as a man standing on foot where his seat is.
 	uint32_t (*SampleHostedPeds)(AmbientPedState *out, uint32_t max,
-	                             const Vec3 *viewers, uint32_t viewerCount) = nullptr;
+	                             const Vec3 *viewers, uint32_t viewerCount,
+	                             const SessionCarRef *cars, uint32_t carCount) = nullptr;
 
 	// Puts a replica where the session says it is and plays what the session
 	// says it is playing.
@@ -1979,13 +2389,36 @@ struct WorldBridge {
 	// for a ped the engine is seating.
 	bool (*SampleReplicaPosition)(int32_t poolHandle, bool car, Vec3 &out) = nullptr;
 
-	// Seat a ped replica in a traffic replica, and take it back out. The
-	// engine work is the same CPed::SetObjective + CPed::WarpPedIntoCar pair
-	// the player seating uses, reached through game/ped.cpp rather than
-	// written a third time.
-	bool (*SeatAmbientPed)(RemoteAmbientPed &ped, RemoteAmbientCar &car,
-	                       uint8_t seat) = nullptr;
+	// Seat a ped replica in a car, and take it back out: a traffic replica of
+	// his own host's, or any session car (`carHandle` is the car's pool
+	// reference, `carNetId` only for the log). The engine work is the same
+	// CPed::SetObjective + CPed::WarpPedIntoCar pair the player seating uses,
+	// reached through game/ped.cpp rather than written a third time, into the
+	// seat game/seatplan.h gives. The seat he got, AMBIENT_SEAT_NONE_FREE or
+	// AMBIENT_SEAT_REFUSED.
+	int32_t (*SeatAmbientPed)(RemoteAmbientPed &ped, int32_t carHandle, uint16_t carNetId,
+	                          uint8_t seat) = nullptr;
 	void (*UnseatAmbientPed)(RemoteAmbientPed &ped) = nullptr;
+
+	// The same two with the door open, because his host's pedestrian is
+	// doing it (AMBIENT_PED_ENTERING, AMBIENT_PED_EXITING): the engine's own
+	// entry and exit on our copy, polled, with the pair above behind them.
+	// Begin is false when it would not start - a car on the move, a door in
+	// use, a seat somebody holds here - and nothing changed. Poll hands back
+	// SEAT_DONE with the wire seat he got, SEAT_RUNNING, or SEAT_LOST; a lost
+	// one is given up with Abandon, which gives the door back.
+	bool (*BeginAmbientPedEntry)(RemoteAmbientPed &ped, int32_t carHandle, uint8_t seat,
+	                             uint8_t doorSeat) = nullptr;
+	uint8_t (*PollAmbientPedEntry)(RemoteAmbientPed &ped, int32_t carHandle, uint8_t seat,
+	                               int32_t &got) = nullptr;
+	void (*AbandonAmbientPedEntry)(RemoteAmbientPed &ped) = nullptr;
+	bool (*BeginAmbientPedExit)(RemoteAmbientPed &ped) = nullptr;
+	// AmbientDoorState, off our copy.
+	uint8_t (*AmbientPedDoorState)(const RemoteAmbientPed &ped) = nullptr;
+	// Along to another free passenger seat of the car he sits in, because his
+	// host moved him. The wire seat he is in afterwards, -1 when not seated.
+	int32_t (*MoveAmbientPedSeat)(RemoteAmbientPed &ped, int32_t carHandle,
+	                              uint8_t seat) = nullptr;
 
 	// ---- limbs (protocol version 17) ---------------------------------------
 
@@ -2070,9 +2503,28 @@ struct WorldBridge {
 
 	uint32_t (*DrainLocalAmbientCars)(LocalAmbientCar *out, uint32_t max) = nullptr;
 	uint32_t (*DrainLostAmbientCars)(uint16_t *out, uint32_t max) = nullptr;
+	// The cars our engine dropped by distance while another player was near
+	// them, to go out as C_CarLetGo rather than C_CarDespawn. Null: every car
+	// our engine drops is a despawn, as before.
+	uint32_t (*DrainLetGoAmbientCars)(LocalCarLetGo *out, uint32_t max) = nullptr;
+	// The other players, every frame from PreFrame and so before
+	// CGame::Process, which is where the engine drops traffic by distance.
+	void (*NoteRemoteViewers)(const ViewerAt *viewers, uint32_t count) = nullptr;
 	bool (*NameLocalAmbientCar)(uint32_t tempId, uint16_t netId) = nullptr;
 	bool (*SpawnAmbientCarReplica)(RemoteAmbientCar &car) = nullptr;
 	void (*DespawnAmbientCarReplica)(RemoteAmbientCar &car) = nullptr;
+
+	// Where the local engine centres its population - the player, his car,
+	// or the replay camera - for game/crowdrange.h's radius. False with no
+	// player ped. Null means no radius: every replica is built, as before.
+	bool (*SampleCrowdCentre)(Vec3 &out) = nullptr;
+	// The pool handles of every traffic replica built here, after the spawn
+	// pass, so the generator's police arm can leave them out of its count
+	// for a wanted player (game/crowdrange.h, TrafficRoomForPolice).
+	void (*NoteBuiltCarReplicas)(const int32_t *handles, uint32_t count) = nullptr;
+	// Every frame from PreFrame, true while connected: the adrenaline pill
+	// must not slow this whole machine's world to a third in a session.
+	void (*HoldAdrenalineClock)(bool inSession) = nullptr;
 
 	// Fills `out` with up to `max` hosted cars and returns how many, picked
 	// the way SampleHostedPeds picks. `hornMask` gets bit i for each written
@@ -2247,6 +2699,12 @@ struct WorldBridge {
 	// on change has to be got right on reconnect as well.
 	void (*ApplyRemoteGarages)(uint32_t mask) = nullptr;
 
+	// The scripted gates (game/gates.h), the same shape: this machine's own
+	// mask, "my GATES threads want gate i open", false with no world; and
+	// the union of everybody else's, written every frame.
+	bool (*SampleLocalGates)(uint8_t &mask) = nullptr;
+	void (*ApplyRemoteGates)(uint8_t mask)   = nullptr;
+
 	// Hands over the Pay'n'Spray visits this machine's own engine completed
 	// since the last call. A drain, not a sample, for the same reason a shot
 	// is one: it is an event, and only the engine knows when one happened.
@@ -2259,6 +2717,37 @@ struct WorldBridge {
 	// mask has already done.
 	void (*ApplyRemoteRespray)(RemoteVehicle *vehicle,
 	                           const ResprayBody &body) = nullptr;
+
+	// ---- the car radio (radiosync.h, game/radio.h) --------------------------
+	//
+	// The station on this machine's copy of a car, by engine handle: its
+	// CVehicle::m_nRadioStation. False when the handle names nothing.
+	bool (*ReadCarRadio)(int32_t vehicleHandle, uint8_t &station) = nullptr;
+	// Put a station on a copy. When the local player sits in that car and his
+	// radio is playing something else, it changes on the next audio service,
+	// the way it does when he gets in.
+	void (*WriteCarRadio)(int32_t vehicleHandle, uint8_t station) = nullptr;
+	// The station our own music manager last moved the car the local player
+	// sits in to - the radio key, F9, switching it off - once. A drain for the
+	// same reason a respray is one: only the engine knows it happened.
+	bool (*DrainLocalRadioChange)(int32_t &vehicleHandle, uint8_t &station) = nullptr;
+	// Whether this machine has user tracks to play (cSampleManager::
+	// IsMP3RadioChannelAvailable). Null reads as no.
+	bool (*RadioUserTracksHere)() = nullptr;
+
+	// ---- a car's alarm and its gun (carextrasync.h, game/carextras.h) ----------
+	//
+	// The milliseconds a copy's alarm has left, CVehicle::m_nAlarmState: 0
+	// for none and for an armed car that has not gone off. False when the
+	// handle names nothing.
+	bool (*ReadCarAlarm)(int32_t vehicleHandle, uint16_t &remainingMs) = nullptr;
+	// Sound a copy's alarm for that long, or with 0 stop it. A car still armed
+	// is never disarmed by a 0.
+	void (*WriteCarAlarm)(int32_t vehicleHandle, uint16_t remainingMs) = nullptr;
+	// m_fCarGunLR and m_fCarGunUD. False for anything that is not a tank or a
+	// fire truck, which have no gun to aim.
+	bool (*ReadCarAim)(int32_t vehicleHandle, float &gunLR, float &gunUD) = nullptr;
+	void (*WriteCarAim)(int32_t vehicleHandle, float gunLR, float gunUD) = nullptr;
 	// ---- breakable street objects -----------------------------------------
 	//
 	// docs/objects.md. Somebody drove into a lamp post, a meter or a crate
@@ -2273,6 +2762,24 @@ struct WorldBridge {
 
 	// ---- the police helicopter (helisync.h) --------------------------------
 	HeliBridge heli;
+
+	// ---- emergency services (game/emergency.h) -----------------------------
+	//
+	// The dead pedestrians a medic on this machine stood up since the last
+	// call, by netId: ones we host and replicas of somebody else's alike.
+	uint32_t (*DrainMedicRevives)(uint16_t *out, uint32_t max) = nullptr;
+	// Somebody's medic stood this pedestrian up. False when there is no
+	// replica here to stand up, which leaves him to the spawn pass.
+	bool (*ReviveAmbientReplica)(RemoteAmbientPed &ped) = nullptr;
+	// The same for a pedestrian this machine hosts. False for one it does not
+	// host, or who is not dead here.
+	bool (*ReviveHostedPed)(uint16_t netId) = nullptr;
+	// A replica has just been killed because its host's engine killed him.
+	// Makes the body one our own medics will go to, as the host's engine
+	// does for its own corpses.
+	void (*OfferCorpseToMedics)(RemoteAmbientPed &ped) = nullptr;
+	// The fire truck's water cannon (cannonsync.h).
+	CannonBridge cannon;
 
 	// ---- cheats (game/cheats.h, docs/cheats.md) ---------------------------
 	//
@@ -2293,6 +2800,9 @@ struct WorldBridge {
 
 	// ---- money (moneysync.h, game/money.h) --------------------------------
 	MoneyBridge money;
+
+	// ---- the session's one mission (missionsync.h, game/mission.h) -------
+	MissionBridge missions;
 };
 
 class Client {
@@ -2306,6 +2816,27 @@ public:
 	// Game thread, once per frame, around CGame::Process.
 	void PreFrame();
 	void PostFrame();
+	// Game thread, inside CGame::Process, right before TheCamera.Process
+	// (game/ridecam.h). What the camera follows has to be where it is drawn.
+	void BeforeCamera();
+
+	// The car we ride in, corrected onto its driver's stream ahead of the
+	// camera and not again after it this frame. BeforeCamera's work, minus
+	// the connection check, so a test can drive it.
+	void CorrectRideBeforeCamera();
+
+	// Our own USJ thread pointed its fixed camera at the car we drive, and a
+	// script restored the camera: told to the players riding with us
+	// (game/ridecam.h).
+	void OwnStuntShot(int32_t vehicleHandle, const Vec3 &from, const Vec3 &up, uint8_t mode,
+	                  uint8_t swap);
+	void OwnStuntShotOver();
+	// Test seam: the last shot we sent, or would have, and how many.
+	const StuntCameraBody &LastStuntShotForTest() const { return m_lastStuntShot; }
+	uint32_t StuntShotsSentForTest() const { return m_stuntShotsSent; }
+	const StuntShot &StuntShotHereForTest() const { return m_stuntShot; }
+	// And the rider's per-frame check, which PostFrame runs.
+	void TickStuntShot(uint32_t nowMs);
 
 	bool     IsConnected() const { return m_net.IsConnected(); }
 	// Taken from S_Welcome on the game thread, so the roster logic has one
@@ -2313,12 +2844,19 @@ public:
 	uint8_t  LocalPlayerId() const { return m_localPlayerId; }
 	uint32_t RoundTripMs() const { return m_net.RoundTripMs(); }
 
-	// Whether this machine's own game is the one everyone else's clock and
-	// sky follow. INVALID_PLAYER on either side means no, so this is false
-	// before the first welcome and after a disconnect.
+	// Whether this machine is the session's host. INVALID_PLAYER on either
+	// side means no, so this is false before the first welcome and after a
+	// disconnect.
 	uint8_t HostPlayerId() const { return m_hostPlayerId; }
 	bool    IsHost() const {
 		return m_localPlayerId != INVALID_PLAYER && m_localPlayerId == m_hostPlayerId;
+	}
+	// Whose game everyone else's clock and sky follow (coopiii/sky.h): the
+	// host's, or the owner's of the session's mission while it runs, ours
+	// from our own START_MISSION on.
+	uint8_t SkyHolderId() const;
+	bool    SkyIsOurs() const {
+		return m_localPlayerId != INVALID_PLAYER && SkyHolderId() == m_localPlayerId;
 	}
 
 	const RemotePlayer &PlayerSlot(uint8_t id) const { return m_players[id]; }
@@ -2328,6 +2866,10 @@ public:
 	// most `max` of them. What the ambient batches are ranked by: they are
 	// only ever read on those players' screens.
 	uint32_t ViewerPositions(Vec3 *out, uint32_t max) const;
+	// The same players with their ids, for WorldBridge::NoteRemoteViewers,
+	// and the push of them to the engine side once a frame.
+	uint32_t ViewersWithIds(ViewerAt *out, uint32_t max) const;
+	void     PushViewers(bool connected);
 
 	// The chat and the session's notices, for game/chat.cpp to draw.
 	const ChatFeed &Feed() const { return m_feed; }
@@ -2360,6 +2902,20 @@ public:
 	// looks one up. Returns null if we've never been told about it.
 	const RemoteVehicle *VehicleByNetId(uint16_t netId) const;
 
+	// A session car and this machine's engine handle for it, each way: the one
+	// the local player drives, or one we watch. INVALID_NETID and -1 for a
+	// car the session has no such name for (traffic is population.cpp's).
+	uint16_t SessionCarNetIdOf(int32_t handle) const;
+	int32_t  SessionCarHandleOf(uint16_t netId) const;
+
+	// A mission's ARM_CAR_WITH_BOMB has just run here on the session's car
+	// `netId` (protocol.h, C_MissionBomb): our own mission's, `ownScript`, or
+	// the owner's replayed by our engine. The bomb is the mission owner's on
+	// our row either way. The owner tells the session; a participant puts
+	// its copy's rigger back from its own player, which the handler wrote,
+	// to the owner's ped, or to nobody while that ped is not here.
+	void MissionArmedCar(uint16_t netId, uint8_t bombType, bool ownScript);
+
 	// The car the local player is driving, as the session names it, or
 	// INVALID_NETID on foot.
 	uint16_t LocalVehicleNetId() const { return m_localVehicleNetId; }
@@ -2375,6 +2931,8 @@ public:
 	// it is one OR, so tools/clienttest reads it directly rather than
 	// inferring it from what the bridge was handed.
 	uint32_t RemoteGarageMask() const;
+	// The same union for the scripted gates.
+	uint8_t RemoteGateMask() const;
 
 	// What S_Welcome said about cheats, and whether the next PostFrame sends
 	// the world at once. Test seams: neither leaves any other trace without a
@@ -2387,7 +2945,9 @@ public:
 	void SetBridge(const WorldBridge &bridge) {
 		m_bridge = bridge;
 		BindHelis();
+		BindCannons();
 		BindMoney();
+		BindMissions();
 	}
 	void HandleMessage(const Message &msg);
 	// One frame of the roster: what PreFrame does, then what PostFrame does
@@ -2395,6 +2955,7 @@ public:
 	// send - that's the distinction the vehicle sync hinges on.
 	void Tick() {
 		UpdateRemotes();
+		SendVehicleRemovals();
 		UpdateRemoteVehicles();
 		NoteVehicleHolders();
 		UpdateUnownedWrecks();
@@ -2405,6 +2966,7 @@ public:
 		UpdateAmbientPedSeats();
 		ApplyAmbientPedPoses();
 		UpdateGarages();
+		UpdateGates();
 		TickWanted();
 		CorrectRemoteVehicles();
 		CorrectAmbientCars();
@@ -2434,12 +2996,26 @@ public:
 	void TickAmbientClaims() { ClaimDrivenAmbientCars(); }
 	// Test seam: the traffic hits the detour queued, sent or dropped.
 	void TickCarHitsForTest() { SendLocalCarHits(); }
+	void     TickMedicRevivesForTest() { SendMedicRevives(); }
+	uint32_t MedicRevivesSentForTest() const { return m_medicRevivesSent; }
+	// Test seam: the wrecks our own engine decided, going out.
+	void TickUnownedBlastsForTest() { SendUnownedBlasts(); }
 	// Test seam: the typed line leaving.
 	void TickChatForTest() { SendTypedChat(); }
+	// The /kicks that went to the server, and whom the last one named.
+	uint32_t KicksAskedForTest() const { return m_kicksAsked; }
+	uint8_t  LastKickForTest() const { return m_lastKick; }
 	// Test seam: what the next desync probe would say, without the clock.
 	uint8_t BuildDesyncProbe(C_DesyncProbe &out);
 	// And how many times a shove has asked to settle a car.
 	uint32_t PushAsksForTest() const { return m_pushAsks; }
+	// Test seams for the let-go (C_CarLetGo) and the radius line's counts.
+	uint32_t CarLetGosSentForTest() const { return m_carLetGosSent; }
+	void     TickLocalAmbientCarsForTest() { SendLocalAmbientCars(); }
+	void     PushViewersForTest(bool connected) { PushViewers(connected); }
+	uint32_t ReplicasNewForTest() const { return m_replicasNew; }
+	uint32_t ReplicasRestoredForTest() const { return m_replicasRestored; }
+	uint32_t NearCarDespawnsForTest() const { return m_nearCarDespawns; }
 	void ClearFeedForTest() { m_feed.Clear(); }
 	// Test seam: the reconnect's wait for its old car, run out now.
 	void EndRejoinWaitForTest() {
@@ -2448,10 +3024,42 @@ public:
 	}
 	// Test seam: our own traffic's dents leaving, without the 10 Hz clock.
 	void TickHostedCarDamageForTest() { SendHostedCarDamage(WallClock::NowMs()); }
+	void TickHostedPedsForTest() { SendHostedPedStates(); }
 	// Test seam: the driver's damage report, and how many damage reports of
 	// either kind have gone out.
 	void TickLocalDamageForTest() { SendLocalVehicleDamage(); }
+	void TickLocalBombForTest() { SendLocalVehicleBomb(); }
+	// Test seam: our own detonator going, as SendLocalCombat sees it.
+	void PressOurDetonatorForTest() { SetOffBombsFor(m_localPlayerId); }
+	uint32_t MissionBombsSentForTest() const { return m_missionBombsSent; }
+	void TickBombsForTest() { ReconcileVehicleBombs(); }
+	void TickMinesForTest() { SendLocalMineBlasts(); }
+	uint32_t MineBlastsSentForTest() const { return m_mineBlastsSent; }
 	uint32_t DamageReportsSentForTest() const { return m_damageReportsSent; }
+	// Test seam: the car radio's pass, what went out, and the station the
+	// session has for a car (RADIO_STATION_UNKNOWN with no row).
+	void     TickRadioForTest() { SyncCarRadios(); }
+	uint32_t RadioReportsSentForTest() const { return m_radioReportsSent; }
+	uint8_t  LastRadioSentForTest() const { return m_lastRadioSent; }
+	uint8_t  CarRadioForTest(uint16_t netId) const {
+		const RemoteVehicle *v = VehicleByNetId(netId);
+		return v ? v->radio : RADIO_STATION_UNKNOWN;
+	}
+	uint32_t BombReportsSentForTest() const { return m_bombReportsSent; }
+	// Test seam: a car's alarm and gun (carextrasync.h). The reports as the send
+	// tick makes them, the writes as the frame's correction makes them.
+	void     TickCarExtrasForTest() { SyncCarExtras(); }
+	void     CorrectCarExtrasForTest() { CorrectCarExtras(); }
+	uint32_t AlarmReportsSentForTest() const { return m_alarmReportsSent; }
+	uint16_t LastAlarmSentForTest() const { return m_lastAlarmSent; }
+	uint32_t AimReportsSentForTest() const { return m_aimReportsSent; }
+	// Test seam: the world report as PostFrame makes it, and how many have
+	// gone out.
+	void     TickWorldForTest() {
+		SyncSky();
+		SendLocalWorld();
+	}
+	uint32_t WorldReportsSentForTest() const { return m_worldReportsSent; }
 
 	// Test seam: the seat key and the animated entry it starts. Same reason
 	// as above - what matters is *when* the session is told, and that is a
@@ -2492,6 +3100,20 @@ public:
 	// what makes a failed entry retract itself.
 	uint16_t LocalSeatNetId() const { return m_localSeatNetId; }
 	uint16_t PendingSeatNetId() const { return m_pendingSeatNetId; }
+
+	// A script of ours put the local player in a passenger seat of the car
+	// the session calls `netId`, rather than at the wheel another player
+	// holds (game/mission.cpp, seatplan.h PlanScriptedWheel). game/mission.cpp
+	// says so every frame while he is on his way there and once he is in; the
+	// seat he took goes to the session the tick he is in it, the way the seat
+	// key's does. Said for SCRIPTED_RIDE_HOLD_MS after the last time, then
+	// forgotten, so a walk the player breaks off is not announced when he
+	// later gets into that car some other way.
+	void NoteScriptedRide(uint16_t netId, uint32_t nowMs) {
+		m_scriptedRideNetId = netId;
+		m_scriptedRideMs    = nowMs;
+	}
+	uint16_t ScriptedRideNetIdForTest() const { return m_scriptedRideNetId; }
 
 	// Test seam: what a dropped connection does to the roster. PreFrame
 	// reaches it only through a live socket that has just died.
@@ -2547,6 +3169,17 @@ public:
 	// The move the server asked for, once.
 	bool TakeRampageTeleport(RampageTeleportBody &out);
 	void ReportRampageArrival(uint8_t voteId, uint8_t result);
+
+	// Skipping a cutscene together (cutsceneskipview.h). game/cutsceneskip.cpp
+	// says which cutscene the game is in, reads the count, sends a press of
+	// skip and carries out a skip the server orders.
+	const CutsceneSkipView &SkipView() const { return m_cutsceneSkip; }
+	// Sent only when it changes; a new session forgets what was sent.
+	void ReportCutscene(const CutsceneKey &key);
+	// False if nobody else is in our cutscene, or we have said skip already.
+	bool CastCutsceneSkip();
+	// The skip the server ordered, once.
+	bool TakeCutsceneSkip(CutsceneKey &key, uint8_t &voteId);
 	// A player's nick, ours included, or null for nobody.
 	const char *NickFor(uint8_t playerId) const;
 
@@ -2572,10 +3205,20 @@ public:
 	// it actually left.
 	bool ReportObjectSettled(const ObjectRestBody &body);
 
+	// Our engine built again an object we were told was broken: ask the
+	// session for its break and resting place (C_ObjectRebuilt). Same
+	// contract as the two above.
+	bool ReportObjectRebuilt(const ObjectIdent &ident);
+
 	// The police helicopters, both directions. See helisync.h.
 	HeliSync &HelisForTest() { return m_helis; }
+	CannonSync &CannonsForTest() { return m_cannons; }
 	// And the money. See moneysync.h.
 	MoneySync &MoneyForTest() { return m_money; }
+	// The session's one mission. The script engine's half (game/mission.cpp)
+	// asks it at a start gate, a launch, a checkpoint and an end.
+	MissionSync       &Missions() { return m_missions; }
+	const MissionSync &Missions() const { return m_missions; }
 
 private:
 	void OnWelcome(const S_Welcome &pkt);
@@ -2583,17 +3226,35 @@ private:
 	void OnLeave(const S_PlayerLeave &pkt);
 	void OnRampageVote(const S_RampageVote &pkt);
 	void OnRampageTeleport(const S_RampageTeleport &pkt);
+	void OnCutsceneVote(const S_CutsceneVote &pkt);
 	// A line of chat, ours included: the server sends everybody's to everybody.
 	void OnChat(const S_Chat &pkt);
 	// What the player typed since the last frame, on its way out.
 	void SendTypedChat();
+	// A typed line that starts with '/' (chatfeed.h, ParseChatCommand). Only
+	// ever answered in our own feed; nothing goes out as chat.
+	void RunChatCommand(const char *text);
 	void OnPlayerModel(const S_PlayerModel &pkt);
 	void OnPlayerLook(const S_PlayerLook &pkt);
+	void OnPlayerAway(const S_PlayerAway &pkt);
+	// Our own menu, from the bridge, out as C_PlayerAway when it changes.
+	void SendLocalAway();
+	// The feed's name for a player's netId: ours, a remote player's, or
+	// nullptr for anybody else.
+	const char *NickOfNetId(uint16_t netId) const;
 	// Takes a remote player's ped down so the two-phase spawn builds it again
 	// in whatever they're wearing now. Shared by a model and a look change.
 	void RebuildRemoteBody(RemotePlayer &p);
 	void OnPlayerAmmo(const S_PlayerAmmo &pkt);
 	void OnPlayerState(const S_PlayerState &pkt);
+	void OnPlayerStateRide(const S_PlayerStateRide &pkt);
+	void TakePlayerState(uint8_t playerId, uint32_t sendTimeMs, const PlayerStateBody &body,
+	                     const PlayerRideBody &ride);
+	// Where the rider's pose goes on our own copy of what they ride, if we
+	// have one (docs/protocol.md 1.7.1).
+	bool PlaceOnRide(const PlayerRideBody &ride, Pose &pose);
+	// The session's name for what the local player rides, or false.
+	bool NameLocalRide(PlayerRideBody &out);
 	void OnVehicleSpawn(const S_VehicleSpawn &pkt);
 	void OnVehicleDespawn(const S_VehicleDespawn &pkt);
 	void OnVehicleState(const S_VehicleState &pkt);
@@ -2613,6 +3274,8 @@ private:
 	// car may be three streets away and not streamed in yet.
 	void OnUnownedBlowUp(const S_UnownedBlowUp &pkt);
 	void OnEnterVehicle(const S_EnterVehicle &pkt);
+	void OnStuntCamera(const S_StuntCamera &pkt);
+	bool RidingIn(uint16_t netId) const;
 	void OnEnteringVehicle(const S_EnteringVehicle &pkt);
 	void OnJackingVehicle(const S_JackingVehicle &pkt);
 	void OnExitVehicle(const S_ExitVehicle &pkt);
@@ -2634,7 +3297,11 @@ private:
 	// from a player is what that player currently says, and it replaces
 	// whatever they said before.
 	void OnGarageState(const S_GarageState &pkt);
+	void OnGateState(const S_GateState &pkt);
 	void OnRespray(const S_Respray &pkt);
+	void OnVehicleRadio(const S_VehicleRadio &pkt);
+	void OnVehicleAlarm(const S_VehicleAlarm &pkt);
+	void OnVehicleAim(const S_VehicleAim &pkt);
 	void OnObjectBroken(const S_ObjectBroken &pkt);
 	// The session's rampage. Three handlers and no state machine: the frenzy
 	// is open or it is not, and everything that names a frenzy that is not
@@ -2651,9 +3318,13 @@ private:
 	// being the host is a single event with one handler instead of something
 	// two packet paths each have to remember.
 	void SetHost(uint8_t hostPlayerId);
+	// The same for whose the sky is, which moves with the host and with the
+	// session's mission. Called wherever either may have changed; does
+	// nothing when neither did.
+	void SyncSky();
 	// Move the clock if it's drifted far enough to be worth the jump, and
-	// mirror the sky. Does nothing on the host: the host is what this is a
-	// copy of.
+	// mirror the sky. Does nothing where the sky is ours: that is what this
+	// is a copy of.
 	void ApplyWorldState(const WorldStateBody &body);
 	// Feed the header of a packet the server stamped with its own clock into
 	// the session clock. Only S_Welcome and S_WorldState: every other S_ packet
@@ -2700,6 +3371,11 @@ private:
 	RemoteVehicle *ObservedVehicleWeAreDriving();
 	RemoteVehicle *VehicleByPoolHandle(int32_t handle);
 	bool SeatIsTaken(uint16_t netId, uint8_t seat, uint8_t exceptPlayer) const;
+	// Every copy of somebody else's pedestrian sitting in session car `netId`
+	// out of it, and none left waiting to get in: the car is about to go.
+	void UnseatAmbientPedsFrom(uint16_t netId);
+	// A copy of the mission's car still not built a second after it was named.
+	void SayMissionCarLate(RemoteAmbientCar &car, bool modelIn);
 
 	// A traffic car by netId or by pool handle, whichever machine hosts it: a
 	// replica in m_cars, or one of our own engine's through the bridge. Only a
@@ -2746,11 +3422,15 @@ private:
 	// UpdateRemoteVehicles so a car spawned this frame is covered, and in
 	// PreFrame so it is in place before CGame::Process runs the detours.
 	void NoteVehicleHolders();
+	// What our engine took away on purpose, out as C_VehicleRemoved, and what
+	// the holder's engine took (game/carremoval.h).
+	void SendVehicleRemovals();
+	void OnVehicleRemoved(const S_VehicleRemoved &pkt);
 	// Reconciles seatVehicleNetId against seatedVehicleNetId. Runs after
 	// both spawn passes, so a ped and a car that appear on the same frame
 	// get seated that frame instead of the next one.
 	void UpdateRemoteSeats();
-	void CorrectRemoteVehicles();
+	void CorrectRemoteVehicles(uint16_t only = INVALID_NETID);
 	void SendLocalState();
 	void SendLocalEntering();
 	void SendLocalVehicle();
@@ -2759,10 +3439,16 @@ private:
 	// packet on the same channel - the only difference is that nobody is
 	// sitting in these.
 	void SendCustodyVehicles();
+	// A car we settle has just become a wreck: marked destroyed, and its
+	// settle window started again from now, since it has just been thrown up
+	// by its own explosion (game/wreck.h, "where a wreck comes to rest").
+	void StartWreckSettle(RemoteVehicle &vehicle, uint32_t nowMs);
 	// The dents on one car we are settling, change-only against the row's own
 	// high-water mark. Called from SendCustodyVehicles on every pass that still
 	// holds the custody, which includes the one that sends C_VehicleSettled.
 	void SendCustodyVehicleDamage(RemoteVehicle &vehicle, uint32_t nowMs);
+	// And its bomb, when our engine changed it (protocol.h, C_VehicleBomb).
+	void SendCustodyVehicleBomb(RemoteVehicle &vehicle, uint32_t nowMs);
 	// Asks the session to make a traffic car a session car, because the local
 	// player has just taken the wheel of somebody else's. protocol.h,
 	// S_CarPromoted.
@@ -2776,6 +3462,28 @@ private:
 	// snapshot rate because that is when the car is sampled anyway, not
 	// because the field belongs in a snapshot - docs/cardamage.md §3.4.
 	void SendLocalVehicleDamage();
+	// The bomb the car we drive carries, when it changes: a bomb shop fitted
+	// one, or we set it ticking (protocol.h, C_VehicleBomb).
+	void SendLocalVehicleBomb();
+	void OnVehicleBomb(const S_VehicleBomb &pkt);
+	// The player a bomb sample names, as a player id.
+	uint8_t BombBlameNamed(const VehicleBombSample &sample) const;
+	// Puts what the session says about each car's bomb on our copy of it,
+	// once the car is here: the type and a fuse once, the rigger for as long
+	// as the session names one, since that player's ped can come and go.
+	void ReconcileVehicleBombs();
+	bool PutBombOnCopy(RemoteVehicle &vehicle, uint32_t nowMs);
+	// Somebody's detonator went (a C_Shot with WEAPONTYPE_DETONATOR), or ours:
+	// every remote bomb it sets off (DetonatorSetsOff) goes off on our copy
+	// too. Ours skips our own bombs, which our engine's UseDetonator has
+	// already found.
+	void SetOffBombsFor(uint8_t presser);
+	// A bomb the owner's mission fitted (protocol.h, S_MissionBomb).
+	void OnMissionBomb(const S_MissionBomb &pkt);
+	// Mines (protocol.h, C_MineBlast): ours that went off, and somebody
+	// else's.
+	void SendLocalMineBlasts();
+	void OnMineBlast(const S_MineBlast &pkt);
 	// Gives a car the damage its row is holding, once, after it spawns.
 	void UpdateRemoteVehicleDamage();
 	void TickPassengerSeat();
@@ -2796,8 +3504,20 @@ private:
 
 	// The highest level any other player is entitled to lend us under the
 	// session's rule. game/wanted.h, WantedPeerRaisesFloor, is the decision;
-	// this is the fold over the roster.
-	uint8_t WantedFloor() const;
+	// this is the fold over the roster. Not const: a player whose hold has
+	// run its course is let go of here (CountedWantedLevel).
+	uint8_t WantedFloor(uint32_t nowMs);
+
+	// Our stars have just come down to `cap`. Everybody reporting more than
+	// that counts for no more than `cap` until they have come down too, or
+	// until WANTED_HOLD_MS has passed (docs/wanted.md §4.9).
+	void HoldWantedPeers(uint8_t cap, uint32_t nowMs);
+
+	// A Pay'n'Spray or a bribe somebody else paid for, if it reaches us under
+	// the session's rule (game/wanted.h, WantedEventReaches). Only recorded
+	// here; TickWanted carries it out, because it is the one place that knows
+	// whether there is a player ped to carry it out on.
+	void NoteRemoteWantedEvent(uint8_t playerId, uint16_t carNetId, bool clear);
 
 	// Reconcile the engine's stars against the session's.
 	//
@@ -2882,11 +3602,24 @@ private:
 	// CGarage::Update, so the mask read here is the one the frame just
 	// produced.
 	void UpdateGarages();
+	// The same for the scripted gates, right after it.
+	void UpdateGates();
 
 	// Announce the Pay'n'Spray visits our own engine completed. Above the
 	// send-rate limiter with the rest of the reliable events: a respray is a
 	// thing that happened once, not a stream.
 	void SendLocalResprays();
+	// The car radio: what our listener did to the car we sit in, the station
+	// the driver's copy gives a car the session has none for, and every copy
+	// put back on the session's. radiosync.h has the rules.
+	void SyncCarRadios();
+	void SendVehicleRadio(uint16_t netId, uint8_t station);
+	// A car's alarm and gun (carextrasync.h). The first says what the cars we
+	// simulate are doing, on the send tick; the second writes what the
+	// session says onto the copies we watch, every frame after physics.
+	void SyncCarExtras();
+	void ReportCarAlarm(RemoteVehicle &vehicle, uint32_t nowMs);
+	void CorrectCarExtras();
 
 	// ---- ambient population (docs/population.md §3 step 2) -----------------
 
@@ -2902,6 +3635,12 @@ private:
 	void OnPedDespawn(const S_PedDespawn &pkt);
 	void OnPedBodyPart(const S_PedBodyPart &pkt);
 	void OnPedDeath(const S_PedDeath &pkt);
+	// Somebody's medic stood a dead pedestrian up. The death was a standing
+	// fact and this ends it: our replica stands up, or the one we host does.
+	void OnPedRevive(const S_PedRevive &pkt);
+	// The pedestrians our own medics stood up this frame, out on CH_EVENT
+	// after the deaths.
+	void SendMedicRevives();
 	// Somebody else's player shot one of *our* pedestrians. Carried out at
 	// once, not recorded: unlike a death, which is a standing fact about a
 	// pedestrian and outlives any particular copy of him, a hit is only worth
@@ -2941,6 +3680,13 @@ private:
 	void SendHostedCarDamage(uint32_t nowMs);
 	void OnAmbientCarDamage(RemoteAmbientCar &car, const S_VehicleDamage &pkt);
 	void UpdateRemoteAmbientCars();
+	// Which replicas are near enough the local player to be built, and the
+	// ones gone out of reach taken down (game/crowdrange.h). First thing in
+	// UpdateRemoteAmbientPeds, so both spawn passes see the same answer.
+	void UpdateReplicaRange();
+	void StowAmbientPed(RemoteAmbientPed &ped);
+	void StowAmbientCar(RemoteAmbientCar &car);
+	bool AmbientCarMustStay(const RemoteAmbientCar &car) const;
 	// WorldBridge::UpdateTrafficAllowance, once per frame. Only the bridge
 	// knows which CVehicles are copies, so this is just the call and its
 	// place in the frame.
@@ -2948,6 +3694,9 @@ private:
 	// Every frame, after CGame::Process, beside CorrectRemoteVehicles.
 	void CorrectAmbientCars();
 	void OnCarSpawn(const S_CarSpawn &pkt);
+	// The server's answer to our C_MissionCatchUp, behind the spawns it sent
+	// again: said in the log beside what this game holds of the mission.
+	void OnMissionCatchUp(const S_MissionCatchUp &pkt);
 	void OnCarDespawn(const S_CarDespawn &pkt);
 	void OnCarStates(const S_CarStates &pkt);
 	RemoteAmbientCar *AmbientCarByNetId(uint16_t netId);
@@ -3045,6 +3794,7 @@ private:
 	// The vote before one, as the server last described it, and a move it
 	// asked for that the game half hasn't carried out yet.
 	RampageVoteView     m_rampageVote;
+	CutsceneSkipView    m_cutsceneSkip;
 	RampageTeleportBody m_teleport{};
 	bool                m_teleportWaiting = false;
 
@@ -3068,6 +3818,13 @@ private:
 	uint8_t m_sentWanted         = 0;
 	bool    m_sentWantedBorrowed = false;
 
+	// Another player's Pay'n'Spray or bribe that reaches us, waiting for
+	// TickWanted to find a player ped to apply it to (docs/wanted.md §4.9).
+	// A clear wins over any number of stars off.
+	bool    m_wantedClearPending   = false;
+	uint8_t m_wantedStarsOffPending = 0;
+	bool    m_saidWantedEvent       = false;
+
 	// Said once each, the first time this machine raises its own player's
 	// stars because of the session, and the first time it lowers them.
 	//
@@ -3078,11 +3835,25 @@ private:
 	// change its own player's stars, and in which direction.
 	bool m_saidWantedRaised  = false;
 	bool m_saidWantedLowered = false;
+	bool m_saidRideHeard     = false;
+	bool m_saidRideSent      = false;
 
-	// Whose game the session's time of day comes from. INVALID_PLAYER until
-	// a welcome or a world packet says.
+	// The session's host. INVALID_PLAYER until a welcome or a world packet
+	// says.
 	uint8_t     m_hostPlayerId = INVALID_PLAYER;
 	RateLimiter m_worldRate{1};
+
+	// Whose the sky was as SyncSky last saw it, and whether that was us.
+	uint8_t m_skyHolder = INVALID_PLAYER;
+	bool    m_skyOurs   = false;
+
+	// What our last world packet said, while the sky is ours. A clock that
+	// jumped or a weather that turned since goes out at once rather than on
+	// the next 1 Hz beat: a mission's SET_TIME_OF_DAY reaches everybody in a
+	// round trip instead of up to a second later.
+	WorldState m_worldSent{};
+	bool       m_worldSentValid   = false;
+	uint32_t   m_worldReportsSent = 0;
 
 	// Whether it was us that pinned this machine's sky. Only set while we're
 	// following somebody else's, and it's what stops a machine that has been
@@ -3124,6 +3895,8 @@ private:
 	void     SendDesyncProbe(uint32_t nowMs);
 	void     OnDesyncReport(const S_DesyncReport &pkt);
 	uint32_t m_pushAsks          = 0;
+	uint32_t m_kicksAsked        = 0;
+	uint8_t  m_lastKick          = INVALID_PLAYER;
 	bool     m_saidPushAsk       = false;
 	uint32_t m_lastProbeMs       = 0;
 	uint32_t m_probeCarCursor    = 0;
@@ -3134,6 +3907,46 @@ private:
 	// respray's clear is not counted. Only read by clienttest: Send is a no-op
 	// there, so this is the one trace a report leaves.
 	uint32_t m_damageReportsSent   = 0;
+	// The bomb the car we drive carried when we last looked, and which car
+	// that was: a car we have just taken the wheel of starts from what it
+	// carries, which is what the session already has.
+	uint16_t m_bombNetId           = INVALID_NETID;
+	uint8_t  m_sentBomb            = 0;
+	uint8_t  m_sentBombBlame       = INVALID_PLAYER;
+	bool     m_sentBombLit         = false;
+	uint32_t m_bombReportsSent     = 0;
+	bool     m_saidDetonatorHeard  = false;
+	bool     m_saidMissionDetonator = false;
+	// The bombs our own mission fitted that went to the session, and whether
+	// each end of a mission's bomb has said itself once.
+	uint32_t m_missionBombsSent    = 0;
+	bool     m_saidMissionBombSent = false;
+	bool     m_saidMissionBombHeard = false;
+	bool     m_saidMissionBombOwned = false;
+	// Mines that went off here and were said, and whether each end of that
+	// has said itself once.
+	uint32_t m_mineBlastsSent      = 0;
+	bool     m_saidMineSent        = false;
+	bool     m_saidMineHeard       = false;
+	// The revives our own medics made that went to the session.
+	uint32_t m_medicRevivesSent    = 0;
+	// The radio stations we have told the session, and the last one.
+	uint32_t m_radioReportsSent    = 0;
+	uint8_t  m_lastRadioSent       = RADIO_STATION_UNKNOWN;
+	bool     m_saidRadioHeard      = false;
+	bool     m_saidRadioPutBack    = false;
+	// A car's alarm and gun (carextrasync.h): what has gone out, and the aim we
+	// last sent for the car we drive.
+	uint32_t m_alarmReportsSent    = 0;
+	uint16_t m_lastAlarmSent       = 0;
+	uint32_t m_aimReportsSent      = 0;
+	uint16_t m_aimSentNetId        = INVALID_NETID;
+	float    m_aimSentLR           = 0.0f;
+	float    m_aimSentUD           = 0.0f;
+	uint32_t m_aimSentAtMs         = 0;
+	bool     m_saidAlarmHeard      = false;
+	bool     m_saidAimHeard        = false;
+	bool     m_saidBombSent        = false;
 
 	// Wrecks the session has told us about that this machine has not applied
 	// yet. The common case is that the explosion was replayed here too and
@@ -3159,6 +3972,9 @@ private:
 	bool m_saidVehicleHitSent      = false;
 	bool m_saidLateCustodyHit      = false;
 	bool m_saidKeptBurningCar      = false;
+	bool m_saidBurnCapBlowUp       = false;
+	bool m_saidWreckSettleHeard    = false;
+	bool m_saidWreckSettleSent     = false;
 	bool m_saidCarHitSent          = false;
 	bool m_saidUnownedWrecksFull   = false;
 
@@ -3178,11 +3994,27 @@ private:
 	// say, and the first packet goes out on the first bit that sets.
 	uint32_t m_sentGarageMask           = 0;
 	bool     m_saidGarageHeld           = false;
+	// The scripted gates, one bit per gate, the same way.
+	uint8_t  m_gateMasks[MAX_PLAYERS] = {};
+	uint8_t  m_sentGateMask           = 0;
 
 	// The car we are riding in as a passenger, if any. Separate from
 	// m_localVehicleNetId on purpose: that one means "we are driving this and
 	// its physics are ours to report", and a passenger reports nothing.
 	uint16_t m_localSeatNetId      = INVALID_NETID;
+
+	// That car, corrected before this frame's camera, so the pass after the
+	// frame leaves it where the camera saw it (game/ridecam.h).
+	uint16_t m_rideCorrectedEarly  = INVALID_NETID;
+	bool     m_saidRideEarly       = false;
+	// The car whose jump shot we told its riders about, while it is up.
+	uint16_t        m_stuntShotSentNetId = INVALID_NETID;
+	StuntCameraBody m_lastStuntShot{};
+	uint32_t        m_stuntShotsSent     = 0;
+	// The driver's shot on our own screen, while we ride with him.
+	StuntShot m_stuntShot;
+	bool      m_saidStuntShot        = false;
+	bool      m_saidStuntShotRefused = false;
 
 	// The car an animated passenger entry is walking towards, or INVALID_NETID,
 	// and the seat it was started for. Held here and not in game/seat.cpp
@@ -3204,11 +4036,44 @@ private:
 
 	uint16_t m_pendingSeatNetId    = INVALID_NETID;
 	uint8_t  m_pendingSeatIndex    = 0;
+	// NoteScriptedRide's: the car and when it was last said.
+	uint16_t m_scriptedRideNetId   = INVALID_NETID;
+	uint32_t m_scriptedRideMs      = 0;
+	bool     m_saidScriptedRide    = false;
 	bool     m_saidSeatRefused     = false;
+	// We have been asked out of our seat for the session's mission's
+	// passengers and have started getting out (mission-audit.md R4).
+	bool     m_leftSeatForMission  = false;
 	bool     m_saidEnterIntent     = false;
 	bool     m_saidEnterSent       = false;
 	bool     m_saidEnterIntentLapsed = false;
 	bool     m_saidSeatEcho        = false;
+	bool     m_saidAmbientInSessionCar = false;
+	bool     m_saidAmbientDoorEntry    = false;
+	bool     m_saidAmbientInUnseenCar  = false;
+	bool     m_saidTrafficCarLate      = false;
+	uint32_t m_missionCarsSaid = 0;
+	// docs/population.md §2.3: replicas taken down and built again for the
+	// radius, and when that was last said.
+	uint32_t m_replicasStowed   = 0;
+	uint32_t m_replicasRestored = 0;
+	// Built for the first time since the last line: new rows, not returns.
+	// They used to be counted as returns, which made a street filling up
+	// read like a radius flapping at its edge.
+	uint32_t m_replicasNew      = 0;
+	uint32_t m_rangeSaidMs      = 0;
+	// Other machines' traffic built near us that its host despawned
+	// (OnCarDespawn): since the last range line, and how many were described.
+	uint32_t m_nearCarDespawns     = 0;
+	uint32_t m_nearCarDespawnsSaid = 0;
+	// Traffic of ours handed on rather than despawned (C_CarLetGo), and how
+	// many of somebody else's let-goes we have described.
+	uint32_t m_carLetGosSent = 0;
+	uint32_t m_letGoRowsSaid = 0;
+	// Since the last radius line: somebody's let-go handed to us, and to a
+	// third player while we kept our copy.
+	uint32_t m_letGoCarsTaken   = 0;
+	uint32_t m_letGoCarsWatched = 0;
 	bool     m_vehicleClaimPending = false;
 
 	// When it is worth asking again after the session refused to name our
@@ -3236,6 +4101,8 @@ private:
 	uint16_t m_sentModelId = 0xFFFF;
 	// Same for the look. Empty is "nothing announced yet".
 	char     m_sentLook[PLAYER_LOOK_LEN] = {};
+	// Whether this session has been told our menu is up.
+	bool     m_sentAway = false;
 
 	// The last ammunition this client put on the wire for each of its own
 	// thirteen slots, so a slot only costs a packet when it actually
@@ -3307,6 +4174,9 @@ private:
 
 	ChatFeed    m_feed;
 	uint32_t    m_welcomes = 0;   // accepted, this run of the game
+	// The feed has said we lost the session or were turned away, and the next
+	// welcome is to say we are in after all.
+	bool        m_feedSaidTrouble = false;
 	// The car we were in when the last session ended (ClearRoster), for the
 	// backfill of the next one to hand back (OnVehicleSpawn).
 	uint16_t    m_rejoinNetId  = INVALID_NETID;
@@ -3335,8 +4205,14 @@ private:
 	HeliSync m_helis;
 	void BindHelis();
 
+	CannonSync m_cannons;
+	void BindCannons();
+
 	MoneySync m_money;
+
+	MissionSync m_missions;
 	void BindMoney();
+	void BindMissions();
 };
 
 } // namespace coopiii
