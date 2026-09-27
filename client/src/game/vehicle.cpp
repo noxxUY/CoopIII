@@ -10,17 +10,23 @@
 #include "carstatus.h"
 #include "combat.h"
 #include "horn.h"
+#include "leadcheck.h"
 #include "observed.h"
 #include "passengeraim.h"
 #include "ped.h"
 #include "pedanim.h"
 #include "population.h"
 #include "siren.h"
+#include "teardown.h"
 #include "wreck.h"
 #include "wreckqueue.h"
 #include "../hook/hook.h"
 #include "../log.h"
 #include "../quat.h"
+
+#include <windows.h>
+
+#include <cstring>
 
 namespace coopiii::game {
 
@@ -764,8 +770,9 @@ void __fastcall HookedBlowUpBoat(void *self, void * /*edx*/, void *culprit) {
 // place (docs/protocol.md §1.23). Both detours refuse it together, for the
 // reason just given, and CorrectAmbientCarReplica holds the host's health on
 // it every frame as a backstop for the writers that never call this function:
-// the upside-down drain at 0x0052F472, the burning-occupant write of 75.0f at
-// 0x00479959 and the engine-status drain at 0x005347E0.
+// the burning-occupant write of 75.0f at 0x00479959 and the engine-status
+// drain at 0x005347E0. The upside-down drain at 0x0052F472 was a third, and is
+// now kept off a replica at its own gate (RoofDrainPlayerCar).
 using InflictDamageThisFn = void(__thiscall *)(void *, void *, uint32_t, float);
 using InflictDamageHookFn = void(__fastcall *)(void *, void *, void *, uint32_t,
                                                float);
@@ -1097,14 +1104,8 @@ void TakeOverParkedCar(uint16_t parkedSlot) {
 			return;
 
 		// CoopIII deleting a car the engine made, so the same teardown as a
-		// copy's (DespawnRemoteVehicle): moving list, world, references, and
-		// the object's own deleting destructor.
-		Func<void(__thiscall *)(void *)>(CPhysical__RemoveFromMovingList)(car);
-		Func<void(__cdecl *)(void *)>(CWorld__Remove)(car);
-		Func<void(__cdecl *)(void *)>(CWorld__RemoveReferencesToDeletedObject)(car);
-		if (void *const vtable = Field<void *>(car, 0))
-			Func<void *(__thiscall *)(void *, uint8_t)>(
-			    *reinterpret_cast<uintptr_t *>(vtable))(car, 1);
+		// copy's (game/teardown.h).
+		DestroyVehicle(car, "a parked car somebody else took");
 	}
 
 	// CCarGenerator::Process's own arm for a car a player took (addresses.h,
@@ -1433,6 +1434,23 @@ bool VehicleSinking(RemoteVehicle &vehicle) {
 	if (!(at.z < level))
 		return false;
 	return StillSinking(ReadVec3(v, offs::MOVE_SPEED));
+}
+
+// The drain's own test on the car we settle, read the way the drain reads it
+// (addresses.h, "a car left on its roof"). The local player sitting in it is
+// not asked: CPlayerInfo::Process then sets it alight instead, and a car that
+// is going to burn either way is worth keeping.
+bool VehicleOnItsRoof(RemoteVehicle &vehicle) {
+	void *const v = ResolveRemoteVehicle(vehicle);
+	// Asked first: +0x4DA is past the end of a boat.
+	if (!v || VehicleTypeOf(v) != VEHICLE_TYPE_CAR)
+		return false;
+	return CarOnItsRoof(true, ReadVec3(v, offs::MATRIX_UP).z,
+	                    (Field<uint8_t>(v, offs::VEH_FLAGS_C) & VEH_CAN_BE_DAMAGED) != 0,
+	                    (Field<uint8_t>(v, offs::AUTO_ROOF_FLAGS) &
+	                     offs::AUTO_NOT_DAMAGED_UPSIDE_DOWN) != 0,
+	                    VehicleStatus(v),
+	                    (Field<uint8_t>(v, offs::PHYSICAL_FLAGS) & offs::PHYSICAL_IN_WATER) != 0);
 }
 
 void TakeVehicleBack(RemoteVehicle &vehicle) {
@@ -1818,9 +1836,6 @@ bool SpawnRemoteVehicle(RemoteVehicle &vehicle) {
 }
 
 void DespawnRemoteVehicle(RemoteVehicle &vehicle) {
-	using RemoveFn = void(__cdecl *)(void *);
-	using RefsFn   = void(__cdecl *)(void *);
-
 	void *const v = ResolveRemoteVehicle(vehicle);
 	if (!v) {
 		vehicle.poolHandle = -1;
@@ -1846,36 +1861,18 @@ void DespawnRemoteVehicle(RemoteVehicle &vehicle) {
 	}
 	ForgetSessionCopy(vehicle.poolHandle);
 
-	// By hand, before CWorld::Remove, because CWorld::Remove will not do it
-	// for an entity that has gone static (addresses.h,
-	// WorldRemoveUnlinksFromMovingList). Leave the node behind and the next
-	// CWorld::Process reads m_rwObject off a freed pool slot.
+	// game/teardown.h: whoever is still in it, a garage that may be waiting
+	// for it, the moving list, the world, the references and the deleting
+	// destructor through the car's own vtable, in the engine's order. The
+	// garage is the part that crashed a participant: a replayed
+	// SET_TARGET_CAR_FOR_MISSION_GARAGE had pointed his lockup at this copy,
+	// and nothing else would have told the lockup the copy was gone.
 	//
 	// A parked car does not go static, though this used to say it always
 	// did: the engine never sets bIsStatic on a vehicle (see VehicleAtRest).
-	// So this is a guard rather than the fix for a known case, and the log
-	// line says so if something ever sets the bit. RemoveFromMovingList
-	// checks m_movingListNode itself, so this is free when the car was never
-	// in the list.
-	if (NeedsMovingListUnlink(Field<uint8_t>(v, offs::ENTITY_FLAGS_A),
-	                          Field<void *>(v, offs::MOVING_LIST_NODE) != nullptr))
-		Log("bridge: vehicle %u went static while still in the moving list; "
-		    "unlinking it by hand", vehicle.netId);
-	Func<void(__thiscall *)(void *)>(CPhysical__RemoveFromMovingList)(v);
-
-	Func<RemoveFn>(CWorld__Remove)(v);
-	Func<RefsFn>(CWorld__RemoveReferencesToDeletedObject)(v);
-
-	// Through the object's own vtable slot 0, with the "delete" flag, so the
-	// engine runs CVehicle::operator delete and the slot goes back to the
-	// vehicle pool. The ped despawn crash was exactly this call going
-	// through a stale vtable into the global operator delete, handing a
-	// pool pointer to the CRT heap.
-	void *const vtable = Field<void *>(v, 0);
-	if (vtable) {
-		using DtorFn = void *(__thiscall *)(void *, uint8_t);
-		Func<DtorFn>(*reinterpret_cast<uintptr_t *>(vtable))(v, 1);
-	}
+	// So the moving-list unlink in there is a guard rather than the fix for a
+	// known case, and its log line says so if something ever sets the bit.
+	DestroyVehicle(v, "a session car's despawn");
 
 	vehicle.poolHandle   = -1;
 	vehicle.appliedFlags = 0xFF;
@@ -2826,6 +2823,86 @@ void __cdecl HookedSteerAIBoatWithPhysics(void *vehicle) {
 	g_boatAiSteer.Original<void(__cdecl *)(void *)>()(vehicle);
 }
 
+// ---- the upside-down drain (addresses.h, "a car left on its roof") ----------
+//
+// The call to FindPlayerVehicle at 0x0052F426, which VehicleDamage only reaches
+// for a car on its roof and compares with the car itself. Answering with the
+// car is the drain's own "this is the player's car, leave it", so nothing but
+// the drain is skipped. A call-site redirection, not a detour.
+bool g_roofDrainTaken      = false;
+bool g_saidRoofDrainHeld   = false;
+bool g_saidRoofDrainRuns   = false;
+
+void *__fastcall RoofDrainPlayerCar(void *car) {
+	void *const playerCar = Func<void *(__cdecl *)()>(FindPlayerVehicle)();
+	if (!car || car == playerCar)
+		return playerCar;
+	if (RoofDrainMayRun(CarOwnerHere(car))) {
+		if (!g_saidRoofDrainRuns) {
+			g_saidRoofDrainRuns = true;
+			Log("vehicle: a car whose health is ours to decide is on its roof here, and "
+			    "our engine is draining it toward a fire (said once)");
+		}
+		return playerCar;
+	}
+	if (!g_saidRoofDrainHeld) {
+		g_saidRoofDrainHeld = true;
+		const Observed *const o = FindObserved(car);
+		Log("vehicle: %s %u is on its roof here and another machine decides its health, "
+		    "so our engine does not drain it (said once)",
+		    o ? "session car" : "car", o ? static_cast<unsigned>(o->netId) : 0u);
+	}
+	return car;
+}
+
+// ebp is the car at the call site (addresses.h): handed on in ecx, and the
+// return goes straight back to the drain's `cmp ebp,eax`.
+__declspec(naked) void RoofDrainPlayerCarFromEbp() {
+	__asm {
+		mov ecx, ebp
+		jmp RoofDrainPlayerCar
+	}
+}
+
+bool RedirectCallAt(uintptr_t site, uintptr_t from, uintptr_t to) {
+	if (!RelCallAt(Ptr<uint8_t>(site), site, from))
+		return false;
+	DWORD old = 0;
+	if (!VirtualProtect(reinterpret_cast<void *>(site), 5, PAGE_EXECUTE_READWRITE, &old))
+		return false;
+	const int32_t rel = static_cast<int32_t>(to - (site + 5));
+	std::memcpy(reinterpret_cast<void *>(site + 1), &rel, sizeof rel);
+	VirtualProtect(reinterpret_cast<void *>(site), 5, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void *>(site), 5);
+	return true;
+}
+
+void TakeRoofDrain() {
+	g_saidRoofDrainHeld = false;
+	g_saidRoofDrainRuns = false;
+	if (g_roofDrainTaken)
+		return;
+	g_roofDrainTaken =
+	    RedirectCallAt(ROOF_DRAIN_PLAYER_CAR_CALL, FindPlayerVehicle,
+	                   reinterpret_cast<uintptr_t>(&RoofDrainPlayerCarFromEbp));
+	if (g_roofDrainTaken)
+		Log("vehicle: took the upside-down drain's gate at 0x%08X; only the machine "
+		    "that decides a car's health drains it",
+		    static_cast<unsigned>(ROOF_DRAIN_PLAYER_CAR_CALL));
+	else
+		Log("vehicle: FAILED to take the upside-down drain's gate at 0x%08X - every "
+		    "machine drains its own copy of a car on its roof, and the wire puts it "
+		    "back", static_cast<unsigned>(ROOF_DRAIN_PLAYER_CAR_CALL));
+}
+
+void GiveRoofDrainBack() {
+	if (g_roofDrainTaken &&
+	    RedirectCallAt(ROOF_DRAIN_PLAYER_CAR_CALL,
+	                   reinterpret_cast<uintptr_t>(&RoofDrainPlayerCarFromEbp),
+	                   FindPlayerVehicle))
+		g_roofDrainTaken = false;
+}
+
 } // namespace
 
 // ---- destruction -----------------------------------------------------------
@@ -2905,6 +2982,12 @@ bool InstallVehicleHooks() {
 		    "copy of it and nothing will travel, so the two will diverge",
 		    static_cast<unsigned>(CVehicle__InflictDamage));
 
+	// Out of the return value, and said on its own line. Without it every
+	// machine drains its own copy of a car on its roof for a frame at a time,
+	// which is how it was before; the custodian keeping such a car
+	// (RoofKeepsCustody) is what makes it burn at all.
+	TakeRoofDrain();
+
 	// Kept out of the return value. The caller's failure line is about cars
 	// exploding, and all this one costs is a remote siren nobody hears, which
 	// is how it always was. Said on its own line instead.
@@ -2964,6 +3047,7 @@ void RemoveVehicleHooks() {
 	g_blowUpCar.Remove();
 	g_blowUpBoat.Remove();
 	g_inflictDamage.Remove();
+	GiveRoofDrainBack();
 	g_sirenAudio.Remove();
 	// And MaxNumberOfCarsInUse goes back to what the engine set.
 	RemoveSaveGuard();
@@ -3894,9 +3978,6 @@ bool SpawnAmbientCarReplica(RemoteAmbientCar &car) {
 }
 
 void DespawnAmbientCarReplica(RemoteAmbientCar &car) {
-	using RemoveFn = void(__cdecl *)(void *);
-	using RefsFn   = void(__cdecl *)(void *);
-
 	if (car.poolHandle < 0)
 		return;
 	void *const v  = VehicleFromRef(car.poolHandle);
@@ -3920,41 +4001,18 @@ void DespawnAmbientCarReplica(RemoteAmbientCar &car) {
 		return;
 	}
 
-	// Before CWorld::Remove, because CWorld::Remove will not unlink an entity
-	// that has gone static (addresses.h, WorldRemoveUnlinksFromMovingList),
-	// and a node left behind has the next CWorld::Process reading m_rwObject
-	// off a freed pool slot.
+	// game/teardown.h does the rest, in the engine's order. Its moving-list
+	// unlink is a guard here, not the fix for a known case: a replica does
+	// not go static on its own, though this used to say it did.
+	// CPhysical::ProcessControl's quiet-frame counter is behind a type test
+	// at 0x00495F9A - an object, or a ped without bPedPhysics - and a vehicle
+	// jumps past it to 0x00496179 (addresses.h, the note after the boat's
+	// exit gate).
 	//
-	// A replica does not go static on its own, though this used to say it
-	// did. CPhysical::ProcessControl's quiet-frame counter is behind a type
-	// test at 0x00495F9A - an object, or a ped without bPedPhysics - and a
-	// vehicle jumps past it to 0x00496179 (addresses.h, the note after the
-	// boat's exit gate). So this is a guard, not the fix for a known case:
-	// RemoveFromMovingList checks m_movingListNode itself and costs nothing
-	// when there is no node, and the log line says so if something else
-	// ever sets the bit.
-	if (NeedsMovingListUnlink(Field<uint8_t>(v, offs::ENTITY_FLAGS_A),
-	                          Field<void *>(v, offs::MOVING_LIST_NODE) != nullptr))
-		Log("population: ambient car %u went static while still in the moving "
-		    "list; unlinking it by hand", car.netId);
-	Func<void(__thiscall *)(void *)>(CPhysical__RemoveFromMovingList)(v);
-
-	{
-		// ~CVehicle reaches CWorld::Remove, and so our own Remove detour.
-		// Suppressed for the same reason the Add is.
-		ReplicaScope scope;
-		Func<RemoveFn>(CWorld__Remove)(v);
-		Func<RefsFn>(CWorld__RemoveReferencesToDeletedObject)(v);
-
-		// Through the object's own vtable, never the global operator delete -
-		// that is exactly what turned the first ped despawn into a heap
-		// corruption.
-		void *const vtable = Field<void *>(v, 0);
-		if (vtable) {
-			using DtorFn = void *(__thiscall *)(void *, uint8_t);
-			Func<DtorFn>(*reinterpret_cast<uintptr_t *>(vtable))(v, 1);
-		}
-	}
+	// CWorld::Remove reaches our own Remove detour; suppressed for the same
+	// reason the Add is.
+	ReplicaScope scope;
+	DestroyVehicle(v, "a traffic car replica's despawn");
 }
 
 void CorrectAmbientCarReplica(RemoteAmbientCar &car, const VehicleTransform &at) {
@@ -4014,13 +4072,14 @@ void CorrectAmbientCarReplica(RemoteAmbientCar &car, const VehicleTransform &at)
 
 	// The host's health, every frame, and the fire timer held at zero under
 	// it. The two detours refuse InflictDamage and BlowUpCar on a replica, but
-	// three writers never call either: the upside-down drain at 0x0052F472
-	// (above VehicleDamage's bCollisionProof test), CFire::ProcessFire putting
-	// 75.0f on the car of a burning occupant at 0x00479959, and the
-	// engine-status drain at 0x005347E0. Whatever they did this frame is put
-	// back here, after physics. Below 250 the flames still draw off m_fHealth,
-	// so a car burning on the host burns here too, and only the timer is kept
-	// from deciding anything (the same split ApplyRemoteVehicle makes).
+	// two writers never call either: CFire::ProcessFire putting 75.0f on the
+	// car of a burning occupant at 0x00479959, and the engine-status drain at
+	// 0x005347E0. (The upside-down drain at 0x0052F472 was a third; its gate
+	// is taken now, and a replica on its roof burns when its host says so.)
+	// Whatever they did this frame is put back here, after physics. Below 250
+	// the flames still draw off m_fHealth, so a car burning on the host burns
+	// here too, and only the timer is kept from deciding anything (the same
+	// split ApplyRemoteVehicle makes).
 	//
 	// Not on a wreck: the host has finished with it, and writing health back
 	// into a shell relights it.

@@ -200,7 +200,7 @@ rather than a sentence.
 ### What is left
 
 Two arms of `CPhysical` and `CObject::ProcessControl`, all three of which are
-**a collision**. The brief guessed "a car driving into them and gunfire"; the
+**a collision**. The first guess was "a car driving into them and gunfire"; the
 binary says gunfire was never in it. **The whole remaining feature is: somebody
 drove into it.** That is what got built.
 
@@ -214,8 +214,7 @@ dummies and back on every frame, keyed off **the local player's** position,
 and the streamer centres on one player (`roadmap.md` §2.1). Two machines are
 churning different slots from the first second.
 
-There are already three answers in this codebase and the brief was right that
-one of them fits.
+There are already three answers in this codebase and one of them fits.
 
 **The server-allocated netId (`population.md` §3) is overkill and would be
 wrong.** A temp-id handshake exists because *the creator invents the entity*
@@ -419,14 +418,10 @@ pristine one, which is what single player does too.
 
 ## 7. The wire
 
-`PROTOCOL_VERSION` moves for this. The merged build is **18**, one number for
-the ten branches that landed together; see the version history in
-`sdk/include/coopiii/protocol.h`. The check this section used to record still
-holds and is worth keeping: against the `wip-snapshot` capture of the
-uncommitted work in the main tree, this uses nothing in `0xC0`-`0xCF`, declares
-no `ObjectIdent` or `ObjectBreakBody`, and leaves `Vec3` and `PacketHeader`
-byte-identical, so the sizes below hold on top of it. (The opcodes that tree
-adds and this section does not are `0x74`/`0x75`, `C_/S_PED_BODY_PART`.)
+`PROTOCOL_VERSION` moves for this. It went out in version **18**, together with
+nine other changes; see the version history in
+`sdk/include/coopiii/protocol.h`. Nothing else uses `0xC0`-`0xCF`, and `Vec3`
+and `PacketHeader` are unchanged, so the sizes below hold.
 
 Opcodes `0xC0`-`0xCF` are reserved for this; four are used.
 

@@ -3,6 +3,7 @@
 
 #include "carlife.h"
 #include "leadcheck.h"
+#include "teardown.h"
 #include "vehicle.h"
 #include "../log.h"
 
@@ -36,6 +37,8 @@ bool g_saidRefusedDestroy = false;
 bool g_saidCrusher        = false;
 bool g_saidCrane          = false;
 bool g_saidStore          = false;
+bool g_saidStaleTarget    = false;
+bool g_saidStaleCrane     = false;
 
 void *CarAt(int32_t handle) { return handle < 0 ? nullptr : AmbientCarFromRef(handle); }
 
@@ -88,6 +91,22 @@ void PushRemoval(uint16_t netId, uint8_t reason) {
 using DestroyFn = void(__cdecl *)(void *);
 
 void DestroyFor(void *vehicle, uint8_t reason) {
+	// The garage's own pointer, which is raw: SetTargetCarForMissonGarage
+	// (0x00426BD0) registers no reference, so nothing tells a garage its car
+	// has gone. A car CoopIII already deleted is refused here rather than
+	// handed to CWorld::Remove, which would call through the vtable a
+	// finished destructor leaves behind (game/teardown.h). The engine nils
+	// the garage's target itself on the way back, so refusing is all it takes.
+	const EntityState state = VehicleState(vehicle);
+	if (state != EntityState::Live) {
+		if (!g_saidStaleTarget) {
+			g_saidStaleTarget = true;
+			Log("carremoval: a garage here tried to take away a car that is %s; left "
+			    "it alone (said once)",
+			    EntityStateName(state));
+		}
+		return;
+	}
 	uint16_t netId   = INVALID_NETID;
 	bool     session = false;
 	if (!MayTake(vehicle, netId, session)) {
@@ -103,6 +122,9 @@ void DestroyFor(void *vehicle, uint8_t reason) {
 	}
 	if (session)
 		PushRemoval(netId, reason);
+	// Any other garage still pointed at it is told too; the one delivering
+	// nils its own target when this returns.
+	ForgetEngineRawPointersTo(vehicle);
 	Func<DestroyFn>(DestroyVehicleAndDriverAndPassengers)(vehicle);
 }
 
@@ -142,6 +164,8 @@ void __fastcall StoreHideout(void *garage, void * /*edx*/, void *cars, int32_t m
 		if (g_rows[i].weMay) {
 			if (by == VEHICLE_CREATED_BY_MISSION)
 				HandCopyToEngine(v);
+			// The store deletes it, and tells no garage.
+			ForgetEngineRawPointersTo(v);
 			PushRemoval(g_rows[i].netId, VEHICLE_REMOVED_STORED);
 			if (!g_saidStore) {
 				g_saidStore = true;
@@ -190,10 +214,21 @@ void __fastcall FindCarSkippingOthers(void *crane, void * /*edx*/, void *list) {
 using RemoveFn = void(__cdecl *)(void *);
 
 void __cdecl CraneRemoves(void *vehicle) {
+	// The crane picked this car up this frame, so it is live unless something
+	// is badly wrong - and then the deleting destructor the engine runs next
+	// fails however this goes. Said, so a crash there has a line before it.
+	const EntityState state = VehicleState(vehicle);
+	if (state != EntityState::Live && !g_saidStaleCrane) {
+		g_saidStaleCrane = true;
+		Log("carremoval: the military crane is delivering a car that is %s (said once)",
+		    EntityStateName(state));
+	}
 	uint16_t netId   = INVALID_NETID;
 	bool     session = false;
 	if (MayTake(vehicle, netId, session) && session)
 		PushRemoval(netId, VEHICLE_REMOVED_CRANE);
+	if (state == EntityState::Live)
+		ForgetEngineRawPointersTo(vehicle);
 	// Always: the deleting destructor is the next instruction.
 	Func<RemoveFn>(CWorld__Remove)(vehicle);
 }

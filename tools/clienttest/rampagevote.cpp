@@ -64,7 +64,7 @@ void TestTheLine() {
 	FormatRampageVote(out, 256, "alice", 'Y', 'N', 1, 2, 12);
 	Check(Narrow(out) ==
 	          "alice wants to start a rampage. Press Y to vote yes or N to vote no. (1/2 yes, 12s)",
-	      "the line is word for word what the owner asked for");
+	      "the line reads exactly as intended");
 
 	FormatRampageVote(out, 256, "bob", 'J', 0x71, 3, 4, 1);
 	Check(Narrow(out) ==

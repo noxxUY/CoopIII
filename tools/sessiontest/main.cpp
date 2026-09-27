@@ -429,7 +429,7 @@ void TestAWreckIsNotBackfilledAsACar() {
 
 	// Zero health is a number; VEH_WRECKED is a fact. An observer that writes
 	// zero into m_fHealth gets a car that reads dead and behaves brand new,
-	// which is exactly what the owner found: a destroyed car came back to a
+	// which is exactly what a playtest found: a destroyed car came back to a
 	// late joiner intact enough to climb into and too dead to drive.
 	s.NoteVehicleState(VehState(netId, 100.0f, 0.0f));
 	Check(!s.FindVehicle(netId)->destroyed, "zero health on its own is not a wreck");
@@ -4054,6 +4054,27 @@ void TestAParkedCarsGeneratorRidesItsSpawn() {
 	Check(found, "the joiner lets go of its own car on that generator too");
 }
 
+// The same abandoned car under a host who set abandonedCars to 10 s.
+void TestAnAbandonedCarGoesWhenTheHostSays() {
+	std::printf("\nan abandoned car goes when the host says\n");
+	Session s;
+	Check(s.VehicleReleaseMs() == VEHICLE_RELEASE_MS, "a minute unless the host says otherwise");
+	s.SetVehicleReleaseMs(10000);
+	Player *alice = Join(s, 1, "alice");
+	s.NotePlayerState(*alice, StandAt(0.0f));
+	Vehicle *car = Claim(s, *alice, 91);
+	const uint16_t netId = car->netId;
+	s.NoteVehicleState(VehState(netId, 300.0f, 1000.0f));
+	s.NoteExitVehicle(*alice, netId);
+	s.EndCustody(netId, alice->id);
+	s.NotePlayerState(*alice, StandAt(290.0f));
+	Check(s.ReleaseIdleVehicles(3000).empty(), "kept while she is beside it");
+	s.NotePlayerState(*alice, StandAt(1500.0f));
+	Check(s.ReleaseIdleVehicles(3000 + 10000 - 1).empty(), "and for ten seconds once she has gone");
+	const std::vector<uint16_t> gone = s.ReleaseIdleVehicles(3000 + 10000);
+	Check(gone.size() == 1 && gone[0] == netId, "then released, fifty seconds sooner than before");
+}
+
 void TestACarsWholeLife() {
 	std::printf("\na session car from its claim to its row being reused\n");
 	Session s;
@@ -4437,6 +4458,7 @@ void TestAnAwardIsDeliveredOncePerCar() {
 // tools/sessiontest/rampagevote.cpp
 int RunRampageVoteTests();
 int RunCutsceneVoteTests();
+int RunSettingsTests();
 // tools/sessiontest/emergency.cpp
 int RunEmergencyTests();
 
@@ -4445,6 +4467,8 @@ int RunCarExtrasTests();
 int RunAdoptTests();
 // tools/sessiontest/stuntcam.cpp
 int RunStuntCameraTests();
+// tools/sessiontest/publicip.cpp
+int RunPublicAddressTests();
 // The host's kick (protocol.h, C_Kick): the host may throw anybody else out,
 // and nobody else may throw anybody.
 void TestOnlyTheHostMayKick() {
@@ -5016,10 +5040,12 @@ int main() {
 	TestNobodyHurtsTheirOwnCar();
 	g_failures += RunRampageVoteTests();
 	g_failures += RunCutsceneVoteTests();
+	g_failures += RunSettingsTests();
 	g_failures += RunEmergencyTests();
 	g_failures += RunCarExtrasTests();
 	g_failures += RunAdoptTests();
 	g_failures += RunStuntCameraTests();
+	g_failures += RunPublicAddressTests();
 	TestAJoinerIsToldWhatEverybodyIsWearing();
 	TestAJoinerIsToldWhoIsInTheMenu();
 	TestHostIsTheFirstPlayerIn();
@@ -5171,6 +5197,7 @@ int main() {
 	TestTheCheatRuleIsClamped();
 
 	TestACarsWholeLife();
+	TestAnAbandonedCarGoesWhenTheHostSays();
 	TestACarTakenAwayOnPurpose();
 	TestAParkedCarsGeneratorRidesItsSpawn();
 	TestWalkingBackToAParkedCarKeepsIt();

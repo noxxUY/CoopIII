@@ -10,6 +10,7 @@
 // is where the log lines go.
 #pragma once
 
+#include "config.h"
 #include "cutscenevote.h"
 #include "objectrecords.h"
 #include "rampagevote.h"
@@ -69,6 +70,12 @@ inline const char *TagOf(LogKind kind) { return kind == LogKind::Chat ? "[chat]"
 // Connections the server takes: every slot, a launcher waiting in the lobby
 // for each (docs/protocol.md 1.31), and two to say "full" on.
 constexpr uint8_t  SERVER_PEERS  = MAX_PLAYERS + LOBBY_MAX + 2;
+
+// The settings' defaults are the numbers the server had before they were
+// settings, and these are the ones config.h cannot see for itself.
+static_assert(CONFIG_ABANDONED_S_DEFAULT * 1000u == VEHICLE_RELEASE_MS,
+              "abandonedCars defaults to VEHICLE_RELEASE_MS");
+
 // How long a connection has to say hello before it is dropped.
 constexpr uint32_t HELLO_WAIT_MS = 10000;
 
@@ -141,6 +148,10 @@ public:
 		m_lastWorldMs = 0;
 		m_lastPingsMs = 0;
 		m_skyHolder   = INVALID_PLAYER;
+		// The next Start is a new session, and Configure after it tells the log
+		// the rules again rather than what changed.
+		m_configured         = false;
+		m_pendingRampageRule = INVALID_RULE;
 	}
 
 	// What a hello has to be followed by, or empty for nothing. protocol.h,
@@ -170,6 +181,113 @@ public:
 		                                        "can join"
 		                                      : "players need the password to join");
 	}
+
+	// Every setting in CoopIII-Server.ini but the port, applied to the running
+	// session: both front ends call it once after Start, and the window again
+	// each time its options are saved. What the players have to be told goes
+	// to everybody already in:
+	//
+	//   - the session flags and the wanted cap, as S_SessionRules;
+	//   - the money rule, as S_Money to each player, which starts every
+	//     wallet over the way a change of rule always has;
+	//   - the mission rules, as S_MissionState.
+	//
+	// A change of rampage rule while a rampage or its vote is running waits
+	// for both to be over (ApplyPendingRampageRule), so nobody's CDarkel
+	// changes rule halfway through a frenzy. Everything else is at once.
+	void Configure(const ServerConfig &c) {
+		const bool     first         = !m_configured;
+		m_configured                 = true;
+		const uint8_t  flagsBefore   = SessionFlagsNow();
+		const uint8_t  wantedBefore  = m_maxWanted;
+		const S_MissionState missionBefore = m_session.Mission().State();
+
+		if (first || c.password != m_password)
+			SetPassword(c.password);
+
+		m_session.SetFriendlyFire(c.friendlyFire);
+		m_session.SetAmmoSync(c.ammoSync);
+		m_session.SetWantedRule(WireValue(c.wantedLevel));
+		m_session.SetCheatRule(WireValue(c.cheats));
+		m_session.SetPackageRule(WireValue(c.hiddenPackages));
+		m_maxWanted = SaneMaxWanted(c.maxWanted);
+
+		const uint8_t rampage = WireValue(c.rampage);
+		m_pendingRampageRule  = INVALID_RULE;
+		if (rampage != m_session.RampageRuleValue()) {
+			if (RampageBusy()) {
+				m_pendingRampageRule = rampage;
+				Log(LogKind::Info, "rampages: the new rule waits for the rampage that is "
+				                   "running now to end");
+			} else {
+				m_session.SetRampageRule(rampage);
+			}
+		}
+
+		const uint8_t money = WireValue(c.money);
+		if (money != m_session.MoneyRuleValue()) {
+			m_session.SetMoneyRule(money);
+			if (m_listening && !first) {
+				const uint32_t now = NowMs();
+				for (const Player &p : m_session.Players())
+					if (p.active)
+						m_net.SendTo(p.peer, m_session.MoneyFor(p.id, INVALID_PLAYER, 0, now),
+						             CH_EVENT);
+				Log(LogKind::Info, "money: the rule is now %s, and every wallet starts over",
+				    Name(c.money));
+			}
+		}
+
+		m_session.SetPlayerLimit(c.maxPlayers);
+		m_session.SetVehicleReleaseMs(static_cast<uint32_t>(c.abandonedCarS) * 1000u);
+
+		MissionSlot &slot = m_session.Mission();
+		slot.SetFailOnDeath(c.missionFailOnDeath);
+		slot.SetMarginCm(c.missionMarginCm);
+		slot.SetEnemies(c.missionEnemies, c.missionScale);
+		slot.SetCheckpointRules(c.missionCheckpointWaitS, c.missionTimedCheckpoints,
+		                        c.missionCatchUpM, c.missionBehindM, c.missionBehindS);
+		slot.SetBusyWaitMs(static_cast<uint32_t>(c.missionIntroWaitS) * 1000u);
+		m_payHelpers = c.missionPayHelpers;
+
+		m_cutscenes.SetRule(c.cutsceneSkip);
+		m_vote.SetRule(c.rampageVote, static_cast<uint32_t>(c.rampageVoteS) * 1000u);
+
+		if (first) {
+			Log(LogKind::Info,
+			    "missions: everybody has to be within %.1f m of a start or a checkpoint, and a "
+			    "death %s", MarginMetres(c.missionMarginCm),
+			    c.missionFailOnDeath ? "fails the mission" : "does not");
+			if (c.missionCheckpointWaitS == 0)
+				Log(LogKind::Info, "missions: checkpoints wait for nobody");
+			else
+				Log(LogKind::Info, "missions: a checkpoint waits %u s for whoever is not there%s",
+				    static_cast<unsigned>(c.missionCheckpointWaitS),
+				    c.missionTimedCheckpoints ? ", races and timed ones too" : "");
+			if (c.missionEnemies != MISSION_ENEMIES_ORIGINAL)
+				Log(LogKind::Info, "missions: every player after the first makes the enemies "
+				    "%u%% tougher", static_cast<unsigned>(c.missionScale));
+			if (!c.missionPayHelpers)
+				Log(LogKind::Info, "missions: only the player who started one is paid for it");
+			if (c.maxPlayers < MAX_PLAYERS)
+				Log(LogKind::Info, "up to %u players", static_cast<unsigned>(c.maxPlayers));
+			if (c.maxWanted < WANTED_LEVEL_CEILING)
+				Log(LogKind::Info, "nobody can have more than %u stars",
+				    static_cast<unsigned>(c.maxWanted));
+			return;
+		}
+
+		const S_MissionState missionAfter = m_session.Mission().State();
+		if (m_listening && std::memcmp(&missionBefore, &missionAfter, sizeof missionAfter) != 0)
+			BroadcastMissionState();
+		if (m_listening && (SessionFlagsNow() != flagsBefore || m_maxWanted != wantedBefore))
+			BroadcastSessionRules();
+	}
+
+	// For the window's player count and a test.
+	uint8_t PlayerLimit() const { return m_session.PlayerLimit(); }
+	uint8_t MaxWanted() const { return m_maxWanted; }
+	bool    RampageRulePending() const { return m_pendingRampageRule != INVALID_RULE; }
 
 	// `waitMs` is how long Service may block waiting for the first event. The
 	// console server can afford to wait; the window cannot, because it is also
@@ -208,6 +326,8 @@ public:
 		}
 		// And the vote before one, which runs out on this clock.
 		TickRampageVote(now);
+		// And a rampage rule the host changed while one ran, once it is over.
+		ApplyPendingRampageRule();
 		// And a skipped mission scene's grace for a participant late into it.
 		FlushCutsceneVotes(now);
 
@@ -303,7 +423,7 @@ private:
 			    "vehicle %u released - nobody has been in it or within %.0f m "
 			    "of it for %u s (%u session cars left)",
 			    netId, static_cast<double>(VEHICLE_KEEP_RADIUS_M),
-			    static_cast<unsigned>(VEHICLE_RELEASE_MS / 1000),
+			    static_cast<unsigned>(m_session.VehicleReleaseMs() / 1000),
 			    static_cast<unsigned>(m_session.LiveVehicleCount()));
 		}
 	}
@@ -1414,7 +1534,7 @@ private:
 		else if (reject == REJECT_FULL)
 			Log(LogKind::Warn, "turned %s away: %s (%u slots)",
 			    nick.empty() ? "a player" : nick.c_str(), RejectText(reject),
-			    static_cast<unsigned>(MAX_PLAYERS));
+			    static_cast<unsigned>(m_session.PlayerLimit()));
 		else
 			Log(LogKind::Warn, "turned %s away: %s", nick.empty() ? "a player" : nick.c_str(),
 			    why ? why : RejectText(reject));
@@ -1438,38 +1558,22 @@ private:
 
 		welcome.playerId   = p->id;
 		welcome.netId      = p->netId;
-		welcome.maxPlayers = MAX_PLAYERS;
+		welcome.maxPlayers = m_session.PlayerLimit();
 		welcome.snapshotHz = SNAPSHOT_HZ;
 		welcome.hour         = m_session.Clock().Hour();
 		welcome.minute       = m_session.Clock().Minute();
 		welcome.weather      = m_session.Weather();
 		welcome.weatherOld   = m_session.WeatherOld();
 		welcome.hostPlayerId = m_session.HostId();
-		// The session's own rules. All three are here because each governs
-		// something the server cannot see: an explosion is the one kind of
-		// damage that never passes through here to be refused, ammunition for
-		// a weapon nobody is holding is refused here but applied there, and a
-		// wanted level never passes through here at all (protocol.h,
-		// SessionFlags).
-		welcome.flags        = 0;
-		if (m_session.FriendlyFire())
-			welcome.flags |= SESSION_FRIENDLY_FIRE;
-		if (m_session.AmmoSync())
-			welcome.flags |= SESSION_AMMO_SYNC;
-		welcome.flags        = FlagsWithWantedRule(welcome.flags, m_session.WantedRule());
-		// docs/roadmap.md 5.10. Same shape as the wanted rule above and for
-		// the same reason: it governs something inside each client's own
-		// CDarkel that never passes through here.
-		welcome.flags        =
-		    FlagsWithRampageRule(welcome.flags, m_session.RampageRuleValue());
-		// And the cheat rule, which the server can only half enforce: a
-		// personal cheat never leaves the machine it was typed on, so `off`
-		// for one of those is that machine's to carry out. docs/cheats.md.
-		welcome.flags        =
-		    FlagsWithCheatRule(welcome.flags, m_session.CheatRuleValue());
+		// The session's own rules (SessionFlagsNow), and straight after the
+		// welcome the same again with what the flags have no room for
+		// (S_SessionRules), which is also what a change of rule is sent as.
+		welcome.flags        = SessionFlagsNow();
 		m_net.SendTo(peer, welcome, CH_EVENT);
+		m_net.SendTo(peer, SessionRulesNow(), CH_EVENT);
 		// The money rule has no bit left in those flags, so it follows the
-		// welcome on its own - and with money off, not at all.
+		// welcome on its own - and with money off, not at all until the host
+		// changes the rule (Configure).
 		if (m_session.MoneyRuleValue() != MONEY_RULE_OFF)
 			m_net.SendTo(peer, m_session.MoneyFor(p->id, INVALID_PLAYER, 0, NowMs()),
 			             CH_EVENT);
@@ -2984,6 +3088,11 @@ private:
 			return;
 		if (in.body.length > MISSION_EFFECT_CODE)
 			return;
+		// A reward goes to the owner alone with missionPayHelpers off. The
+		// owner's own engine has paid them already; this is only everybody
+		// else's copy of the payment.
+		if (!m_payHelpers && in.body.kind == MISSION_EFFECT_PAY)
+			return;
 		S_MissionEffect out;
 		InitHeader(out, in.hdr.sendTimeMs);
 		out.ownerId = p->id;
@@ -3313,6 +3422,49 @@ private:
 		NoteSkyHolder();
 	}
 
+	// The session's rules as S_Welcome's flags byte carries them (protocol.h,
+	// SessionFlags). Each governs something the server cannot see: an
+	// explosion is the one kind of damage that never passes through here to
+	// be refused, ammunition for a weapon nobody is holding is refused here
+	// but applied there, a wanted level never passes through here at all,
+	// the rampage rule lives in each client's own CDarkel, and a personal
+	// cheat never leaves the machine it was typed on.
+	uint8_t SessionFlagsNow() const {
+		uint8_t flags = 0;
+		if (m_session.FriendlyFire())
+			flags |= SESSION_FRIENDLY_FIRE;
+		if (m_session.AmmoSync())
+			flags |= SESSION_AMMO_SYNC;
+		flags = FlagsWithWantedRule(flags, m_session.WantedRule());
+		flags = FlagsWithRampageRule(flags, m_session.RampageRuleValue());
+		flags = FlagsWithCheatRule(flags, m_session.CheatRuleValue());
+		return flags;
+	}
+
+	S_SessionRules SessionRulesNow() const {
+		S_SessionRules out;
+		InitHeader(out, NowMs());
+		out.flags     = SessionFlagsNow();
+		out.maxWanted = m_maxWanted;
+		return out;
+	}
+
+	void BroadcastSessionRules() { m_net.Broadcast(SessionRulesNow(), CH_EVENT); }
+
+	// A rampage, or the vote before one, is running: a change of rampage rule
+	// waits for it.
+	bool RampageBusy() const { return m_session.CurrentRampage().open || m_vote.IsOpen(); }
+
+	void ApplyPendingRampageRule() {
+		if (m_pendingRampageRule == INVALID_RULE || RampageBusy())
+			return;
+		m_session.SetRampageRule(m_pendingRampageRule);
+		m_pendingRampageRule = INVALID_RULE;
+		Log(LogKind::Info, "rampages: the rampage is over, and the new rule is in force");
+		if (m_listening)
+			BroadcastSessionRules();
+	}
+
 	// Who the clock and the sky belong to moves with the session's mission
 	// (coopiii/sky.h). Nothing goes out for it: every client works it out
 	// from the S_MissionState it has just been sent. This only says so.
@@ -3602,7 +3754,7 @@ private:
 		    "rampage vote %u open: %s wants to start a rampage at (%.0f %.0f %.0f), "
 		    "%u of %u have to say yes, %u s",
 		    m_vote.Id(), p.nick.c_str(), ident.pos.x, ident.pos.y, ident.pos.z,
-		    m_vote.Needed(), m_vote.Voters(), static_cast<unsigned>(RAMPAGE_VOTE_MS / 1000));
+		    m_vote.Needed(), m_vote.Voters(), static_cast<unsigned>(m_vote.TimeMs() / 1000));
 		BroadcastVote(RAMPAGE_VOTE_OPEN, now);
 		m_vote.TakeDirty();
 		// Two players and a skull: the toucher's yes may be all it takes if
@@ -4285,6 +4437,14 @@ private:
 	RampageVote m_vote;
 	// Who is in which cutscene, and who said skip. cutscenevote.h.
 	CutsceneVotes m_cutscenes;
+
+	// What Configure set that lives nowhere else. INVALID_RULE is no rampage
+	// rule waiting.
+	static constexpr uint8_t INVALID_RULE = 0xFF;
+	bool                      m_configured         = false;
+	uint8_t                   m_maxWanted          = WANTED_LEVEL_CEILING;
+	uint8_t                   m_pendingRampageRule = INVALID_RULE;
+	bool                      m_payHelpers         = true;
 
 	std::string               m_password;
 	std::vector<PendingHello> m_pendingHellos;

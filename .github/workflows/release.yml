@@ -71,20 +71,24 @@ jobs:
           # the payload did not go in.
           test "$size" -gt 2000000
 
+      # Everything the release carries, with the names the Setup and the
+      # website expect: tools/release/stage.ps1 says what each file is for. It
+      # checks every third-party file against components.json and refuses to
+      # stage a gta3.exe. Framerate Vigilante has no upstream download, so on
+      # CI it is carried forward from the previous release; the very first
+      # release has to be staged by hand, where the owner's copy is found.
+      - name: Stage the release
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File tools\release\stage.ps1 -SkipBuild
+
       - uses: actions/upload-artifact@v4
         with:
-          name: CoopIII-Setup
-          path: |
-            build/windows/x86/release/CoopIII-Setup.exe
-            build/windows/x86/release/CoopIII.asi
-            build/windows/x86/release/coopiii-launcher.exe
-            build/windows/x86/release/server.exe
+          name: CoopIII-release
+          path: build/release-staging/*
 
       - name: Attach to the release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            build/windows/x86/release/CoopIII-Setup.exe
-            build/windows/x86/release/server.exe
+          files: build/release-staging/*
           generate_release_notes: true

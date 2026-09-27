@@ -863,6 +863,19 @@ public:
 	const std::vector<Player> &Players() const { return m_players; }
 	uint8_t Count() const;
 
+	// How many players the session takes (the server's maxPlayers), 1 to
+	// MAX_PLAYERS. AddPlayer turns the next one away as full once this many are
+	// in; lowering it turns nobody out.
+	uint8_t PlayerLimit() const { return m_playerLimit; }
+	void    SetPlayerLimit(uint8_t limit) {
+		m_playerLimit = limit < 1 ? uint8_t(1) : limit > MAX_PLAYERS ? MAX_PLAYERS : limit;
+	}
+
+	// How long a session car nobody needs is kept (VEHICLE_RELEASE_MS unless
+	// the server's abandonedCars says otherwise).
+	uint32_t VehicleReleaseMs() const { return m_vehicleReleaseMs; }
+	void     SetVehicleReleaseMs(uint32_t ms) { m_vehicleReleaseMs = ms; }
+
 	GameClock &Clock() { return m_clock; }
 	uint8_t Weather() const { return m_weather; }
 	uint8_t WeatherOld() const { return m_weatherOld; }
@@ -1540,6 +1553,8 @@ private:
 	uint8_t              m_hostId     = INVALID_PLAYER;
 	uint16_t             m_nextNetId  = 1;   // 0 is INVALID_NETID
 	bool                 m_friendlyFire = false;   // docs/roadmap.md §5.2
+	uint8_t              m_playerLimit  = MAX_PLAYERS;
+	uint32_t             m_vehicleReleaseMs = VEHICLE_RELEASE_MS;
 	bool                 m_ammoSync     = false;   // docs/protocol.md 1.9.6
 	uint8_t              m_rampageRule  = RAMPAGE_RULE_SHARED;  // roadmap.md 5.10
 	uint8_t              m_cheatRule    = CHEAT_RULE_SHARED;    // roadmap.md 5.14

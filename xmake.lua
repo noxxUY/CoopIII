@@ -20,6 +20,9 @@ set_runtimes(is_mode("debug") and "MTd" or "MT")
 add_requires("enet")
 add_requires("minhook")
 
+-- The Setup's zip reader and the downgrade patch's compression.
+add_requires("miniz")
+
 -- The GUIs. Dear ImGui with its Win32 and Direct3D 11 backends, and stb_image
 -- for the one PNG the apps carry (the logo).
 add_requires("imgui", {configs = {win32 = true, dx11 = true}})
@@ -136,6 +139,7 @@ target("installer-core")
     add_files("installer/assets/components.json")
     add_includedirs("installer/include", {public = true})
     add_deps("launcher-core")
+    add_packages("miniz")
     add_syslinks("winhttp", "ole32", "shell32", "uuid", {public = true})
 
 -- design/screens/Installer*.dc.html. One self-contained exe, which is why
@@ -160,6 +164,10 @@ target("installer-payload")
             {name = "CoopIII.asi", path = project.target("client"):targetfile()},
             {name = "coopiii-launcher.exe", path = project.target("launcher"):targetfile()},
             {name = "CoopIII.ini", path = path.join(os.projectdir(), "CoopIII.ini")},
+            -- Written only where the player has none: the ASI loader's settings
+            -- CoopIII was tested with, and Framerate Vigilante's 60 FPS cap.
+            {name = "global.ini", path = path.join(os.projectdir(), "installer", "assets", "global.ini")},
+            {name = "FramerateVigilante.ini", path = path.join(os.projectdir(), "installer", "assets", "FramerateVigilante.ini")},
         }
 
         local out = path.join(os.projectdir(), "build", ".gens", "installer", "payload.inc")
@@ -233,7 +241,7 @@ target("server")
     add_files("server/*.cpp", "server/cli/*.cpp", "server/gui/*.cpp")
     add_includedirs("server")
     add_deps("ui", "server-core")
-    add_syslinks("iphlpapi", "ws2_32")
+    add_syslinks("iphlpapi", "ws2_32", "winhttp", "ole32", "oleaut32", "shell32")
     add_ldflags("/subsystem:windows", "/entry:mainCRTStartup", {force = true})
 
 -- One coopiii-launcher.exe with two front ends, the same way as the server:

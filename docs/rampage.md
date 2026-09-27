@@ -18,7 +18,7 @@ transcriptions; nothing below rests on `re3`.
 
 `roadmap.md` said two different things about this:
 
-- the M4 table said **"Rampage sharing ❌ ... nothing starts `CDarkel` on the
+- the M4 table said **"Rampage sharing: no ... nothing starts `CDarkel` on the
   other machines, so a `KILLFRENZY` pickup today starts a rampage for whoever
   reached it"**;
 - the M4 checklist and the pickups table said the frenzy **already** starts for
@@ -252,8 +252,8 @@ frenzy is running.
 The last two, `C_RampageCar` `0x8E` and `S_RampageCar` `0x8F`, are the cars
 in §9. The feature is `PROTOCOL_VERSION` 25; the history comment in
 `protocol.h` says why the number had to move even though an old client against
-a new server plays the same session it always did. The car pair has no number
-yet.
+a new server plays the same session it always did. The car pair came in
+version 29.
 
 ---
 

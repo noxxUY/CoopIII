@@ -836,6 +836,11 @@ void TestTheHostTakesASkyAndSendsItAtOnce() {
 S_MissionState MissionRunning(uint8_t owner, uint8_t state = MISSION_STATE_RUNNING) {
 	S_MissionState s;
 	InitHeader(s, 1000);
+	// The server's defaults, as every server sends them.
+	s.checkpointWaitS = MISSION_CHECKPOINT_WAIT_MS / 1000;
+	s.catchUpM        = MISSION_CATCH_UP_M_DEFAULT;
+	s.behindM         = MISSION_BEHIND_M_DEFAULT;
+	s.behindS         = MISSION_BEHIND_S_DEFAULT;
 	s.campaignLog   = 77;
 	s.state         = state;
 	s.ownerId       = owner;

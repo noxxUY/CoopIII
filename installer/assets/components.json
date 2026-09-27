@@ -1,25 +1,42 @@
 {
   "note": [
-    "The Essential Pack: the mods CoopIII was built and tested alongside.",
+    "What CoopIII-Setup can install. docs/installer.md describes every key and",
+    "where each component comes from, its licence, and how to bump one.",
     "",
-    "CoopIII does not redistribute any of them. Every entry below is fetched",
-    "from its own project's download and checked against the hash recorded",
-    "here, so what lands in a player's game folder is the file its authors",
-    "published and nothing else.",
+    "CoopIII does not rehost anybody's work unless their licence says it may.",
+    "A download comes from its authors' own release first; `mirrors` are copies",
+    "of the same file in CoopIII's own GitHub release, and exist only for MIT",
+    "components. Whichever source answers, the file is kept only if its SHA-256",
+    "is the one written here.",
     "",
-    "url and sha256 are deliberately empty. Fill one pair in per component",
-    "once you have read that project's licence and are happy to point the",
-    "Setup at it; the Setup shows a component with no url but refuses to",
-    "install it, rather than pretending it worked.",
+    "To get a sha256:  certutil -hashfile <file> SHA256",
     "",
-    "To get a sha256 for a download:  certutil -hashfile <file> SHA256"
+    "downgrader is where a player whose gta3.exe has no patch (the Steam one)",
+    "is sent: pages that explain downgrading your own copy, never a file host",
+    "or a direct download. The Setup refuses a url that looks like a file."
   ],
+
+  "builds": [
+    {"md5": "85414BF9EB414D00AD81062360F0DB1F", "size": 2383872, "name": "v1.0 retail"},
+    {"md5": "12BDB699AA2F4922240C454C2E567F3F", "size": 2801664, "name": "Steam"}
+  ],
+
+  "patches": [],
+
+  "downgrader": {
+    "name": "Steam to 1.0 downgrade guide (GTAForums)",
+    "url": "https://gtaforums.com/topic/973108-gta-3-steam-to-10-retail-downgrade-and-moddingfixes-tutorial/",
+    "infoName": "More info",
+    "infoUrl": "https://www.pcgamingwiki.com/wiki/Grand_Theft_Auto_III"
+  },
+
   "components": [
     {
       "id": "coopiii",
       "name": "CoopIII",
       "description": "The co-op mod, its launcher and CoopIII.ini.",
-      "version": "0.0.1",
+      "version": "0.1.1",
+      "license": "see LICENSE",
       "required": true,
       "source": "local",
       "destination": "",
@@ -29,122 +46,170 @@
       "id": "asiloader",
       "name": "Ultimate ASI Loader",
       "description": "Loads .asi mods. CoopIII needs it.",
+      "version": "7.8.0",
+      "license": "MIT",
       "required": true,
+      "homepage": "https://github.com/ThirteenAG/Ultimate-ASI-Loader",
       "source": "download",
-      "homepage": "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases",
-      "url": "",
-      "sha256": "",
-      "destination": ""
-    },
-    {
-      "id": "cleo",
-      "name": "CLEO",
-      "description": "Adds support for custom scripts.",
-      "required": false,
-      "source": "download",
-      "homepage": "",
-      "url": "",
-      "sha256": "",
-      "destination": ""
-    },
-    {
-      "id": "modloader",
-      "name": "Modloader",
-      "description": "Install and manage mods from one folder.",
-      "required": false,
-      "source": "download",
-      "homepage": "",
-      "url": "",
-      "sha256": "",
-      "destination": ""
+      "url": "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/v7.8.0/Ultimate-ASI-Loader.zip",
+      "mirrors": ["https://github.com/noxxUY/CoopIII/releases/latest/download/mirror-Ultimate-ASI-Loader-v7.8.0.zip"],
+      "sha256": "37d41ca93702b92f88235ad88a941ff01a65e8b538ef0d6d0673a42bf4afd8d6",
+      "size": 777015,
+      "archive": "zip",
+      "extract": [{"from": "dinput8.dll", "to": "dinput8.dll"}],
+      "defaults": [{"file": "global.ini", "to": "scripts/global.ini"}]
     },
     {
       "id": "silentpatch",
       "name": "SilentPatch",
-      "description": "Fixes many bugs, improves performance.",
-      "required": false,
+      "description": "Fixes hundreds of bugs, and the CD check v1.0 has.",
+      "version": "1.1.9.1",
+      "license": "MIT",
+      "required": true,
+      "homepage": "https://github.com/CookiePLMonster/SilentPatch",
       "source": "download",
-      "homepage": "",
-      "url": "",
-      "sha256": "",
-      "destination": ""
+      "url": "https://github.com/CookiePLMonster/SilentPatch/releases/download/1.1-BUILD33.1-SA/SilentPatchIII.zip",
+      "mirrors": ["https://github.com/noxxUY/CoopIII/releases/latest/download/mirror-SilentPatchIII-BUILD33.1.zip"],
+      "sha256": "90e9d41274668682f5ed597e091e9f7b3681eea2ae05edc610d8c5ec13bd974f",
+      "size": 98211,
+      "archive": "zip",
+      "extract": [
+        {"from": "SilentPatchIII.asi", "to": "SilentPatchIII.asi"},
+        {"from": "SilentPatchIII.ini", "to": "SilentPatchIII.ini"}
+      ]
+    },
+    {
+      "id": "silentpatchddraw",
+      "name": "SilentPatch DDraw",
+      "description": "Proper resolutions and a sharper picture.",
+      "version": "1.1.6.0",
+      "license": "MIT",
+      "homepage": "https://github.com/CookiePLMonster/SilentPatch",
+      "source": "download",
+      "url": "https://github.com/CookiePLMonster/SilentPatch/releases/download/1.1-BUILD33.1-SA/SilentPatchDDraw.zip",
+      "mirrors": ["https://github.com/noxxUY/CoopIII/releases/latest/download/mirror-SilentPatchDDraw-BUILD33.1.zip"],
+      "sha256": "291370e8cf41a089ce7547debd37a16fa9298024515c1e33ba3d5d3b07fac9c5",
+      "size": 61819,
+      "archive": "zip",
+      "extract": [{"from": "ddraw.dll", "to": "ddraw.dll"}]
     },
     {
       "id": "widescreen",
       "name": "Widescreen Fix",
       "description": "Proper support for modern resolutions.",
-      "required": false,
+      "version": "2026-09-25",
+      "license": "MIT",
+      "homepage": "https://github.com/ThirteenAG/WidescreenFixesPack",
       "source": "download",
-      "homepage": "",
-      "url": "",
-      "sha256": "",
-      "destination": ""
+      "url": "https://github.com/ThirteenAG/WidescreenFixesPack/releases/download/gta3/GTA3.WidescreenFix.zip",
+      "mirrors": ["https://github.com/noxxUY/CoopIII/releases/latest/download/mirror-GTA3.WidescreenFix-2026-09-25.zip"],
+      "sha256": "a8ceb0399db0b34f92979d8cd05efaaccd7d4c98922f09f7ad1f4261b68c5df0",
+      "size": 7729250,
+      "archive": "zip",
+      "extract": [
+        {"from": "scripts/GTA3.WidescreenFix.asi", "to": "scripts/GTA3.WidescreenFix.asi"},
+        {"from": "scripts/GTA3.WidescreenFix.ini", "to": "scripts/GTA3.WidescreenFix.ini"}
+      ]
     },
     {
       "id": "vigilante",
       "name": "Framerate Vigilante",
-      "description": "Smoother, steadier frame rate.",
-      "required": false,
+      "description": "Holds a steady 60 FPS without the physics bugs.",
+      "version": "III",
+      "license": "MIT",
+      "homepage": "https://github.com/GTAmodding/FramerateVigilante",
       "source": "download",
-      "homepage": "",
-      "url": "",
-      "sha256": "",
-      "destination": ""
+      "url": "https://github.com/noxxUY/CoopIII/releases/latest/download/FramerateVigilante.III.asi",
+      "sha256": "de1028790d5e57aa65ea772c8e18a8e61446b320c7afcdb8222f1a8b86f02889",
+      "size": 258024,
+      "archive": "file",
+      "destination": "",
+      "defaults": [{"file": "FramerateVigilante.ini", "to": "FramerateVigilante.ini"}]
     },
     {
       "id": "ginput",
       "name": "GInput",
-      "description": "Fixes keyboard, mouse and gamepad input.",
-      "required": false,
+      "description": "Proper gamepad support, XInput and DualShock.",
+      "version": "1.11",
+      "license": "freeware, not redistributable",
+      "homepage": "https://silentsblog.com/mods/gta-iii/",
       "source": "download",
-      "homepage": "",
-      "url": "",
-      "sha256": "",
-      "destination": ""
+      "url": "https://silent.rockstarvision.com/uploads/GInputIII.zip",
+      "sha256": "0278f4115f788b878fcb83b9cc8912df4c6f1bba174f5c34b4ed7dc8c896f7c2",
+      "size": 215660,
+      "archive": "zip",
+      "extract": [
+        {"from": "GInputIII.asi", "to": "GInputIII.asi"},
+        {"from": "GInputIII.ini", "to": "GInputIII.ini"},
+        {"from": "models/", "to": "models/"}
+      ]
     },
     {
-      "id": "rundll32",
-      "name": "RunDLL32 Fix",
-      "description": "Fixes errors when the game starts.",
-      "required": false,
+      "id": "cleo",
+      "name": "CLEO",
+      "description": "Adds support for custom scripts.",
+      "version": "2.0.0.6",
+      "license": "MIT (per the binaries; the repo has no licence file)",
+      "homepage": "https://github.com/cleolibrary/III.VC.CLEO",
       "source": "download",
-      "homepage": "",
-      "url": "",
-      "sha256": "",
-      "destination": ""
+      "url": "https://github.com/cleolibrary/III.VC.CLEO/releases/download/2.0.0.6/III.CLEOv2.0.0.6.zip",
+      "sha256": "8728b6db1256b7c63d2a06a303443db38ff381656c5c14dd0f79c8a71eeef292",
+      "size": 370598,
+      "archive": "zip",
+      "extract": [
+        {"from": "III.CLEO.asi", "to": "III.CLEO.asi"},
+        {"from": "CLEO/", "to": "CLEO/"}
+      ]
     },
     {
-      "id": "nodep",
-      "name": "NoDEP",
-      "description": "Turns off DEP to avoid crashes.",
-      "required": false,
+      "id": "modloader",
+      "name": "Mod Loader",
+      "description": "Install and remove other mods from one folder.",
+      "version": "0.3.7",
+      "license": "MIT",
+      "homepage": "https://github.com/thelink2012/modloader",
       "source": "download",
-      "homepage": "",
-      "url": "",
-      "sha256": "",
-      "destination": ""
-    },
-    {
-      "id": "crashinfo",
-      "name": "CrashInfo",
-      "description": "Tells you what caused a crash.",
-      "required": false,
-      "source": "download",
-      "homepage": "",
-      "url": "",
-      "sha256": "",
-      "destination": ""
+      "url": "https://github.com/thelink2012/modloader/releases/download/v0.3.7/modloader.zip",
+      "mirrors": ["https://github.com/noxxUY/CoopIII/releases/latest/download/mirror-modloader-v0.3.7.zip"],
+      "sha256": "b3d0184b1822c9b0289f326d8958c5697d83726fac844c85aff01372e1a520e2",
+      "size": 2577358,
+      "archive": "zip",
+      "extract": [
+        {"from": "modloader.asi", "to": "modloader.asi"},
+        {"from": "modloader/", "to": "modloader/"}
+      ]
     },
     {
       "id": "windowed",
       "name": "Windowed Mode",
       "description": "Play GTA III in a window.",
-      "required": false,
+      "version": "2.2",
+      "license": "MIT",
+      "selected": false,
+      "homepage": "https://github.com/ThirteenAG/III.VC.SA.WindowedMode",
       "source": "download",
-      "homepage": "",
-      "url": "",
-      "sha256": "",
-      "destination": ""
+      "url": "https://github.com/ThirteenAG/III.VC.SA.WindowedMode/releases/download/v2.2/III.VC.SA.WindowedMode.zip",
+      "mirrors": ["https://github.com/noxxUY/CoopIII/releases/latest/download/mirror-III.VC.SA.WindowedMode-v2.2.zip"],
+      "sha256": "68039e974af4d0312281e5802fce8ef385b4291fbfc77a94229542fa57140b2a",
+      "size": 309237,
+      "archive": "zip",
+      "extract": [{"from": "III.VC.SA.WindowedMode.asi", "to": "III.VC.SA.WindowedMode.asi"}]
+    },
+    {
+      "id": "sacarcam",
+      "name": "SACarCam",
+      "description": "Optional: SA-style car camera by erorcun.",
+      "version": "r6",
+      "license": "none published; fetched from its author, never rehosted",
+      "selected": false,
+      "homepage": "https://github.com/erorcun/SACarCam",
+      "source": "download",
+      "url": "https://github.com/erorcun/SACarCam/releases/download/r6/SACarCam.dll",
+      "sha256": "65d066921d81d97a046d60c56cb53d07513c11aa0a746e6d2567c5fb796fd320",
+      "size": 56832,
+      "archive": "file",
+      "destination": "",
+      "saveAs": "SACarCam.asi"
     }
   ]
 }

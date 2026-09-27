@@ -3856,10 +3856,10 @@ constexpr uintptr_t CDamageManager__FuckCarCompletely = 0x00545B70;
 //
 // One thing is NOT behind that gate, and it is above it: the upside-down
 // health drain at 0x0052F413 (`GetUp().z < 0.0f` -> m_fHealth -= 4.0f * step,
-// the 4.0f at 0x006005A4). An observer holding a remote car on its roof still
-// takes health off its own copy. Harmless today because the wire overwrites
-// health 25 times a second and a wreck is already at zero; it stops being
-// harmless the moment a car with no driver carries health.
+// the 4.0f at 0x006005A4). It is the whole of how a car left on its roof
+// catches fire, so it is not closed with the proofs; its own gate is taken
+// instead, and only the machine that decides the car's health runs it. See
+// "a car left on its roof", below.
 constexpr uintptr_t CAutomobile__VehicleDamage = 0x0052F390;
 
 constexpr float VEH_DAMAGE_IMPULSE_GATE  = 25.0f;    // 0x006005B0
@@ -3874,6 +3874,104 @@ constexpr size_t VEH_DAMAGE_PIECE_TYPE = 0x120;   // uint16, m_nDamagePieceType
 static_assert(offs::VEH_DAMAGE_IMPULSE < offs::VEH_DAMAGE_PIECE_TYPE &&
                   offs::VEH_DAMAGE_PIECE_TYPE < offs::SIZEOF_VEHICLE,
               "both are CPhysical members, so both are inside CVehicle");
+
+// ---- a car left on its roof -------------------------------------------------
+//
+// Verified 2026-09-26 against the retail image. There are two ways a car on
+// its roof catches fire in GTA III, and both end in the same five-second
+// timer (0x00534510 .. 0x005347AB, "the five-second fire timer" above).
+//
+// 1. Any car but the one the local player sits in: VehicleDamage's drain.
+//
+//   0x0052F3F2  mov al,[ebp+1F7h] / shr al,6 / and al,1   bCanBeDamaged, else ret
+//   0x0052F410  lea esi,[ebp+24h]                         the up row
+//   0x0052F413  fld [esi+8] / fcomp [006004F8h]           GetUp().z < 0.0f
+//   0x0052F424  jne 0052F478                              no: on to the impulse
+//   0x0052F426  call FindPlayerVehicle
+//   0x0052F42B  cmp ebp,eax / je 0052F478                 the player's car: no drain
+//   0x0052F42F  [ebp+4DAh] bit 0 -> ret 8                 bNotDamagedUpsideDown
+//   0x0052F439  [ebp+50h] >> 3 == 0Ah -> ret 8            STATUS_PLAYER_REMOTE
+//   0x0052F447  [ebp+122h] bit 3 -> ret 8                 bIsInWater
+//   0x0052F460  fld [006005A4h] / fmul [008E2CB4h]        4.0f * CTimer::ms_fTimeStep
+//   0x0052F46C  fsubr [ebp+200h] / fstp [ebp+200h]        m_fHealth -= it
+//
+// Every frame ProcessControl reaches its one VehicleDamage call (0x00531FE3),
+// which a car on its roof always does. Two hundred health a second at any
+// frame rate, so a car at 1000 is under 250 in 3.75 s; the tail of the same
+// function then sets the engine on fire (0x0052FF7E) and the timer takes it
+// five seconds later. The three early returns leave the whole function, dents
+// and all, exactly as re3's `return` does (Automobile.cpp:3233-3237).
+//
+// 2. The local player's own car: CPlayerInfo::Process, once every 32 frames
+//    (0x004A06E7, CTimer::m_FrameCounter & 1Fh).
+//
+//   0x004A0702  [m_pPed+314h] != 0                        bInVehicle
+//   0x004A0716  FindPlayerVehicle up.z < [005F6A7Ch] 0.0f
+//   0x004A075F  |m_vecMoveSpeed| < [005F6A80h] 0.05f
+//   0x004A077A  [car+284h] == 0 / [car+122h] bit 3 clear  a car, not in water
+//   0x004A079E  up.z < [005F6A84h] -0.5f: += 2, else += 1  [info+0F4h], the counter
+//   0x004A07C0  anything else: counter = 0
+//   0x004A07CA  counter > 6 and [car+1F7h] bit 6          bCanBeDamaged
+//   0x004A0804  m_fHealth = min(249.0f [005F6A88h], m_fHealth)
+//   0x004A083D  push 0E1h / SetEngineStatus               225, on fire
+//   0x004A0858  [car+574h] = 0                            m_pSetOnFireEntity
+//
+// So for the car the local player is in, the drain is skipped at 0x0052F42B
+// and this takes over. CoopIII leaves that one alone: it is only ever the
+// local player's machine deciding about the car that player is in, and that
+// car's health is his to report (or, as a passenger, is overwritten by the
+// driver's snapshot the next frame).
+//
+// What CoopIII takes is the call at 0x0052F426. It answers with the car
+// itself - "this is the player's car", which skips the drain and nothing else
+// - for a car whose health another machine decides (vehicle.h,
+// RoofDrainMayRun): a car somebody else drives or settles, a replica of
+// somebody else's traffic, a session car nobody holds. Every other car drains
+// as it always did. ebp is the car at that call (0x0052F3B5 `mov ebp,ecx`,
+// and nothing between there and the call writes it).
+constexpr uintptr_t ROOF_DRAIN_PLAYER_CAR_CALL = 0x0052F426;
+constexpr uintptr_t ROOF_DRAIN_SKIP            = 0x0052F478;
+constexpr uintptr_t ROOF_DRAIN_WRITE           = 0x0052F460;
+constexpr uintptr_t VEHICLE_DAMAGE_CALL        = 0x00531FE3;
+constexpr uintptr_t PLAYERINFO_ROOF_BLOCK      = 0x004A06E7;
+constexpr uintptr_t PLAYERINFO_ROOF_HEALTH     = 0x004A0804;
+constexpr uintptr_t PLAYERINFO_ROOF_ENGINE     = 0x004A083D;
+constexpr uintptr_t ROOF_DRAIN_PER_STEP_AT     = 0x006005A4;   // 4.0f
+constexpr uintptr_t PLAYER_CAR_ROOF_HEALTH_AT  = 0x005F6A88;   // 249.0f
+
+constexpr float ROOF_DRAIN_PER_STEP    = 4.0f;
+constexpr float PLAYER_CAR_ROOF_HEALTH = 249.0f;
+
+// STATUS_PLAYER_REMOTE, the RC car's status: `cmp eax,0Ah` at 0x0052F442.
+// Named so the drain's test can be transcribed; never written (protocol.md
+// §1.4).
+constexpr uint8_t ENTITY_STATUS_PLAYER_REMOTE = 10;
+
+namespace offs {
+// Byte 0x4DA of CAutomobile, bit 0: bNotDamagedUpsideDown. Cleared by the
+// constructor (0x0052CD94 `and al,0FEh`), set or cleared by
+// SET_UPSIDEDOWN_CAR_NOT_DAMAGED (0x0058857D `and cl,0FEh / or cl,1`,
+// 0x00588591 `and dl,0FEh`), read by the drain at 0x0052F42F.
+constexpr size_t  AUTO_ROOF_FLAGS              = 0x4DA;
+constexpr uint8_t AUTO_NOT_DAMAGED_UPSIDE_DOWN = 0x01;
+// CPhysical's flag byte (bIsHeavy 0, bAffectedByGravity 1, bInfiniteMass 2,
+// "the CPhysical flag byte" below), bit 3: bIsInWater. Read as
+// `shr al,3 / and al,1` by the drain (0x0052F447) and by CPlayerInfo::Process
+// (0x004A0789).
+constexpr size_t  PHYSICAL_FLAGS    = 0x122;
+constexpr uint8_t PHYSICAL_IN_WATER = 0x08;
+} // namespace offs
+
+// bCanBeDamaged: bit 6 of VEH_FLAGS_C, `shr al,6 / and al,1` on [+1F7h] at
+// 0x0052F3F2 (the drain), 0x004A07DC (CPlayerInfo) and 0x00551958
+// (InflictDamage).
+constexpr uint8_t VEH_CAN_BE_DAMAGED = 0x40;
+
+static_assert(offs::AUTO_ROOF_FLAGS < offs::SIZEOF_AUTOMOBILE &&
+                  offs::AUTO_ROOF_FLAGS > offs::SIZEOF_VEHICLE,
+              "a CAutomobile member, past CVehicle");
+static_assert(offs::PHYSICAL_FLAGS == offs::VEH_DAMAGE_PIECE_TYPE + 2,
+              "the flag byte follows the uint16 m_nDamagePieceType");
 
 // ---- making a status byte visible ------------------------------------------
 //
@@ -8946,6 +9044,53 @@ constexpr uint32_t  PED_NODE_HANDR               = 6;
 // a passenger's gun needs the same call or it never finishes a reload.
 constexpr uintptr_t CWeapon__Update = 0x00563A10;
 
+// ---- the car camera's call (game/carcam.h) ----------------------------------
+//
+// Read off the retail image with dumpbin /disasm, 2026-09-26. re3's Cam.cpp
+// CCam::Process was the map for the names.
+//
+// CCam::Process's mode switch at 0x004599AE is `movsx eax,word [ebx+0Ch] /
+// dec eax / cmp eax,2Bh / ja 00459CD0 / jmp [eax*4+005F0B84h]`, so the table
+// is indexed by Mode - 1. Entry 17, MODE_CAM_ON_A_STRING (18, the car camera),
+// is 0x00459A3F and entry 21, MODE_BEHINDBOAT (22), is 0x00459B21. The two
+// arms are byte for byte the same:
+//   lea eax,[esp+18h] / mov ecx,ebx          &TargetCoors, `this`
+//   push [esp+4] / push [ebx+0D0h] / push [esp+10h] / push eax
+//   call ... / jmp 00459D2A
+// so the callee is __thiscall with four dwords. Both callees open
+// `push ebx / push esi / mov ebx,ecx / push edi / sub esp,..` then read
+// CamTargetEntity ([ebx+188h]) and leave unless its type is 2 (a vehicle),
+// and return `ret 10h`. Each has exactly one caller in the image, its arm.
+//
+// Car camera mods (SACarCam and its LCS build) rewrite exactly these two
+// calls' displacements from DllMain, plus a `jmp` over WellBufferMe's first
+// byte (0x00456F40, cdecl, six dwords, eighteen callers). docs/compat.md 2.7
+// has the whole list.
+constexpr uintptr_t CCam__Process_ModeSwitch       = 0x004599AE;
+constexpr uintptr_t CCam__Process_ModeTable        = 0x005F0B84;   // [Mode - 1], 44 entries
+constexpr int16_t   CAM_MODE_CAM_ON_A_STRING       = 18;
+constexpr int16_t   CAM_MODE_BEHINDBOAT            = 22;
+constexpr uintptr_t CCam__Process_CamOnAStringArm  = 0x00459A3F;
+constexpr uintptr_t CCam__Process_BehindBoatArm    = 0x00459B21;
+constexpr uintptr_t CCam__Process_CamOnAStringCall = 0x00459A54;   // E8 rel32
+constexpr uintptr_t CCam__Process_BehindBoatCall   = 0x00459B36;   // E8 rel32
+constexpr uintptr_t CCam__Process_Cam_On_A_String  = 0x0045C090;
+constexpr uintptr_t CCam__Process_BehindBoat       = 0x0045B470;
+constexpr uintptr_t CCam__WellBufferMe             = 0x00456F40;   // for the record
+
+// **A gun's motor.** CAutomobile::TankControl turns the turret and then says
+// so (0x0053D6CD..0x0053D6DE):
+//   mov ecx,95CDBEh / mov eax,[ebx+64h] / push 1Ah / push eax
+//   call 0057C840                    DMAudio.PlayOneShot(m_audioEntityId, 26, |turn|)
+// and cDMAudio::PlayOneShot is a straight hand-on to
+// cAudioManager::PlayOneShot (0x0057A500, called at 0x0057C85A with the
+// global at 880FC0h in ecx), which past its initialised flag tests
+// `cmp dword [esp+34h],0 / jl out` and `cmp dword [esp+34h],0C8h / jge out`
+// at 0x0057A512: an entity index below zero plays nothing.
+constexpr uintptr_t cAudioManager__PlayOneShot     = 0x0057A500;
+constexpr uintptr_t TANK_TURRET_SOUND_CALL         = 0x0053D6DE;
+constexpr uint16_t  SOUND_CAR_TANK_TURRET_ROTATE   = 0x1A;
+
 // ---- pickups --------------------------------------------------------------
 //
 // Found the usual way: opcode 531 CREATE_PICKUP, through the dispatcher at
@@ -9701,7 +9846,7 @@ constexpr int32_t   HOSPITAL_FEE      = 1000;
 // ---- the wanted level (docs/wanted.md) ------------------------------------
 //
 // It hangs off the *ped*, not off CPlayerInfo. docs/roadmap.md §2.3 and the
-// original brief for this work both say `CPlayerInfo::m_pWanted` and both are
+// early design notes both say `CPlayerInfo::m_pWanted` and both are
 // wrong about the name, though right about the consequence: CPlayerPed is the
 // only class in the process that has one, its first member sits at the end of
 // CPed, and a CCivilianPed - which every remote player and every replica is -
@@ -10114,6 +10259,19 @@ static_assert(PickupRespawnMs(PICKUP_ONCE, false) == 0 &&
 constexpr uintptr_t CGarages__aGarages = 0x0072BCD0;
 constexpr size_t    NUM_GARAGES        = 32;
 constexpr size_t    SIZEOF_GARAGE      = 0x8C;
+
+// CGarages::SetTargetCarForMissonGarage, __cdecl (int16 garage, CVehicle*),
+// the one thing SET_TARGET_CAR_FOR_MISSION_GARAGE's handler (0x00443714)
+// calls, with `pop ecx / pop ecx` after it. Its whole body:
+//   00426BD8  test eax,eax / jne            the car
+//   00426BEC  mov [eax*4 + 0072BD2Ch],0     null: m_pTarget = nil, ret
+//   00426C01  mov [edx + 0072BD2Ch],eax     else m_pTarget = car
+//   00426C07  cmp byte [edx+0072BCD1h],5    and GS_CLOSEDCONTAINSCAR
+//   00426C10  mov byte [edx+0072BCD1h],0    becomes GS_FULLYCLOSED
+// 0x0072BD2C is aGarages + GARAGE_TARGET. There is no RegisterReference: re3's
+// version of this function has one, retail's does not, so a car deleted
+// under a garage leaves m_pTarget pointing at a freed slot (game/teardown.h).
+constexpr uintptr_t CGarages__SetTargetCarForMissonGarage = 0x00426BD0;
 
 // CGarage::Update, __thiscall, one garage. This is the whole state machine and
 // it is the function CoopIII detours.
@@ -11760,6 +11918,28 @@ constexpr uintptr_t CAutomobile__Render           = 0x00539EA0;
 constexpr uintptr_t CAutomobile__vtable_Render    = 0x00600C50;   // slot 13
 constexpr uintptr_t TANK_TURRET_READ_BY_RENDER    = 0x00539F33;
 constexpr uint16_t  MODEL_RHINO                   = 0x7A;
+
+// Who works the gun. Both functions take `this` into ebx first (`mov ebx,ecx`
+// at 0x00522598 and 0x0053D55B) and then ask FindPlayerVehicle once, before
+// anything reads the pad:
+//
+//   0052259A  call 004A10C0 / cmp ebx,eax / jne 005227E7    FireTruckControl
+//   0053D5E5  call 004A10C0 / cmp ebx,eax / jne 0053DFB5    TankControl
+//
+// FindPlayerVehicle is m_pMyVehicle whenever bInVehicle is set, whatever the
+// seat, so on a passenger's machine the tank he rides in turns and fires off
+// his pad and the fire truck sprays off his fire button. A null here takes
+// the fire truck to its other arm, the STATUS_PHYSICS AI at 0x005227E7
+// (`mov cl,[ebx+50h] / shr cl,3 / cmp eax,3`), and the tank to its epilogue
+// at 0x0053DFB5 (`add esp,1C8h / pop ebp,edi,esi,ebx / ret`): what the two
+// do for any car the player is not in. Each is the first call in its
+// function, ahead of the stick calls a car camera mod writes (0x005225D2,
+// 0x0052260E, 0x0053D628), and each function has one caller,
+// CAutomobile::ProcessControl's model switch (0x00531FF7, 0x0053200A).
+constexpr uintptr_t FIRE_TRUCK_PLAYER_CAR_CALL = 0x0052259A;
+constexpr uintptr_t FIRE_TRUCK_AI_ARM          = 0x005227E7;
+constexpr uintptr_t TANK_PLAYER_CAR_CALL       = 0x0053D5E5;
+constexpr uintptr_t TANK_CONTROL_EPILOGUE      = 0x0053DFB5;
 
 // The taxi light: bit 3 of CAutomobile's flags byte at +0x4D9 (the bomb is
 // bits 0-2, offs::AUTOMOBILE_BOMB). CAutomobile::SetTaxiLight (0x0053C420,

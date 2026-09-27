@@ -646,6 +646,63 @@ constexpr float SPOT_CAR_RADII_M[2]  = {7.0f, 4.5f};
 
 inline const float *SpotRadii(bool inCar) { return inCar ? SPOT_CAR_RADII_M : SPOT_FOOT_RADII_M; }
 
+// Where the owner's player sat when its mission moved it, in the TELEPORT's
+// ownerBlip (protocol.h, MISSION_EFFECT_TELEPORT): 0 on foot, else one more
+// than the session's name for the car, so 1 for a car it has no name for
+// (INVALID_NETID). Anything else reads as on foot, which moves no car.
+inline int32_t OwnerMoveTag(bool inCar, uint16_t carNetId) {
+	return inCar ? 1 + static_cast<int32_t>(carNetId) : 0;
+}
+inline bool OwnerMovedInCar(int32_t tag) { return tag > 0 && tag <= 0x10000; }
+inline uint16_t OwnerMoveCar(int32_t tag) {
+	return OwnerMovedInCar(tag) ? static_cast<uint16_t>(tag - 1) : INVALID_NETID;
+}
+
+// What a participant does with the owner's SET_PLAYER_COORDINATES or
+// WARP_PLAYER_FROM_CAR_TO_COORD. The handler moves the car of a player in
+// one (0x0043A995: bInVehicle, then the car's own Teleport and
+// ClearSpaceForMissionEntity), on whichever machine runs it. Give Me
+// Liberty's safehouse shot puts the owner, on foot, in the room behind the
+// door; a participant still at the wheel outside had its car put on the
+// ring round that spot, in the walls, and since that machine drives the car
+// every other screen followed it there.
+enum class MissionMove : uint8_t {
+	OnFoot,       // on foot: onto the ring round the spot, as always
+	CarRing,      // a car this machine simulates, the owner in a car too: onto the car ring
+	CarOnSpot,    // the owner rides in the car this machine simulates: onto the spot itself
+	StaySeated,   // a car somebody else simulates: their machine moves it, we ride along
+	StayInCar,    // the owner went on foot, and not far: the car stays where it is
+	OutOfCar,     // out of the car and onto the foot ring; the car stays where it is
+	Count,
+};
+
+// The owner walked this far from us or less, and a player in a car stays in
+// it: the distance a summoned player is left to walk (missionsync.h,
+// MISSION_SUMMON_NEAR_M).
+constexpr float MISSION_MOVE_STAY_M = 60.0f;
+
+struct MissionMoveFacts {
+	bool  warpsOut     = false;   // WARP_PLAYER_FROM_CAR_TO_COORD: it takes us out of any car
+	bool  inCar        = false;   // our player sits in a car
+	bool  simulateHere = false;   // this machine's engine simulates that car
+	bool  ownersCar    = false;   // the owner sat in that same car
+	int32_t ownerTag   = 0;       // OwnerMoveTag
+	float distanceM    = 0.0f;    // from our player to the owner's spot, flat
+};
+
+inline MissionMove MissionMoveFor(const MissionMoveFacts &f) {
+	if (!f.inCar)
+		return MissionMove::OnFoot;
+	if (f.warpsOut)
+		return MissionMove::OutOfCar;
+	if (OwnerMovedInCar(f.ownerTag)) {
+		if (!f.simulateHere)
+			return MissionMove::StaySeated;
+		return f.ownersCar ? MissionMove::CarOnSpot : MissionMove::CarRing;
+	}
+	return f.distanceM <= MISSION_MOVE_STAY_M ? MissionMove::StayInCar : MissionMove::OutOfCar;
+}
+
 // ---- what the owner's mission has up (missions.md 11.5) ------------------------------
 //
 // Somebody who comes into the mission while it runs, back from a dropped

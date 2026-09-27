@@ -2,6 +2,7 @@
 
 #include <coopiii/mission.h>
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -191,6 +192,74 @@ bool ParsePackages(const std::string &text, PackageMode *out) {
 	return false;
 }
 
+const char *Name(VoteRule rule) {
+	switch (rule) {
+	case VoteRule::Most:   return "most";
+	case VoteRule::Half:   return "half";
+	case VoteRule::All:    return "all";
+	case VoteRule::Anyone: return "anyone";
+	}
+	return "most";
+}
+
+const char *Label(VoteRule rule) {
+	switch (rule) {
+	case VoteRule::Most:   return "75%";
+	case VoteRule::Half:   return "Half";
+	case VoteRule::All:    return "Everyone";
+	case VoteRule::Anyone: return "Anyone";
+	}
+	return "75%";
+}
+
+bool ParseVoteRule(const std::string &text, VoteRule *out) {
+	const std::string t = Trim(text);
+	if (_stricmp(t.c_str(), "most") == 0 || t == "75" || t == "75%") {
+		*out = VoteRule::Most;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "half") == 0 || t == "50" || t == "50%") {
+		*out = VoteRule::Half;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "all") == 0 || _stricmp(t.c_str(), "everyone") == 0) {
+		*out = VoteRule::All;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "anyone") == 0 || _stricmp(t.c_str(), "one") == 0) {
+		*out = VoteRule::Anyone;
+		return true;
+	}
+	return false;
+}
+
+const char *MissionEnemiesName(uint8_t rule) {
+	return rule == MISSION_ENEMIES_MORE      ? "more"
+	       : rule == MISSION_ENEMIES_TOUGHER ? "tougher"
+	                                         : "original";
+}
+
+const char *MissionEnemiesLabel(uint8_t rule) {
+	return rule == MISSION_ENEMIES_MORE      ? "More"
+	       : rule == MISSION_ENEMIES_TOUGHER ? "Tougher"
+	                                         : "Original";
+}
+
+namespace {
+
+// A whole number in [lo, hi], or false and `out` left alone.
+template <class T>
+bool ParseWhole(const std::string &value, long lo, long hi, T *out) {
+	char       *end = nullptr;
+	const long  n   = std::strtol(value.c_str(), &end, 10);
+	if (end == value.c_str() || n < lo || n > hi)
+		return false;
+	*out = static_cast<T>(n);
+	return true;
+}
+
+} // namespace
+
 std::string ServerConfig::Path() {
 	char        buf[MAX_PATH] = {0};
 	const DWORD n             = GetModuleFileNameA(nullptr, buf, MAX_PATH);
@@ -273,6 +342,43 @@ bool ServerConfig::Parse(const std::string &text) {
 				hiddenPackages = rule;
 		} else if (_stricmp(key.c_str(), "password") == 0) {
 			password = CleanPassword(value);
+		} else if (_stricmp(key.c_str(), "maxplayers") == 0) {
+			ParseWhole(value, 1, MAX_PLAYERS, &maxPlayers);
+		} else if (_stricmp(key.c_str(), "maxwantedlevel") == 0) {
+			ParseWhole(value, CONFIG_MAX_WANTED_MIN, WANTED_LEVEL_CEILING, &maxWanted);
+		} else if (_stricmp(key.c_str(), "missioncheckpointwait") == 0) {
+			ParseWhole(value, 0, MISSION_CHECKPOINT_WAIT_S_MAX, &missionCheckpointWaitS);
+		} else if (_stricmp(key.c_str(), "missiontimedcheckpoints") == 0) {
+			missionTimedCheckpoints = TruthY(value);
+		} else if (_stricmp(key.c_str(), "missioncatchup") == 0) {
+			ParseWhole(value, 0, MISSION_DISTANCE_M_MAX, &missionCatchUpM);
+		} else if (_stricmp(key.c_str(), "missionfallbehind") == 0) {
+			ParseWhole(value, 0, MISSION_DISTANCE_M_MAX, &missionBehindM);
+		} else if (_stricmp(key.c_str(), "missionfallbehindtime") == 0) {
+			ParseWhole(value, CONFIG_BEHIND_S_MIN, MISSION_BEHIND_S_MAX, &missionBehindS);
+		} else if (_stricmp(key.c_str(), "missionintrowait") == 0) {
+			ParseWhole(value, CONFIG_INTRO_WAIT_S_MIN, CONFIG_INTRO_WAIT_S_MAX,
+			           &missionIntroWaitS);
+		} else if (_stricmp(key.c_str(), "missionpayhelpers") == 0) {
+			missionPayHelpers = TruthY(value);
+		} else if (_stricmp(key.c_str(), "cutsceneskip") == 0) {
+			VoteRule rule = cutsceneSkip;
+			if (ParseVoteRule(value, &rule))
+				cutsceneSkip = rule;
+		} else if (_stricmp(key.c_str(), "rampagevote") == 0) {
+			VoteRule rule = rampageVote;
+			if (ParseVoteRule(value, &rule))
+				rampageVote = rule;
+		} else if (_stricmp(key.c_str(), "rampagevotetime") == 0) {
+			ParseWhole(value, RAMPAGE_VOTE_MS_MIN / 1000, RAMPAGE_VOTE_MS_MAX / 1000,
+			           &rampageVoteS);
+		} else if (_stricmp(key.c_str(), "abandonedcars") == 0) {
+			ParseWhole(value, CONFIG_ABANDONED_S_MIN, CONFIG_ABANDONED_S_MAX, &abandonedCarS);
+		} else if (_stricmp(key.c_str(), "lookuppublicaddress") == 0) {
+			lookUpPublicAddress = TruthY(value);
+		} else if (_stricmp(key.c_str(), "openrouterport") == 0 ||
+		           _stricmp(key.c_str(), "upnp") == 0) {
+			openRouterPort = TruthY(value);
 		}
 	}
 	return true;
@@ -304,109 +410,213 @@ bool ServerConfig::Load(const std::string &path) {
 	return Parse(text);
 }
 
+namespace {
+
+void Appendf(std::string &out, const char *fmt, ...) {
+	char    buf[1024];
+	va_list args;
+	va_start(args, fmt);
+	const int n = std::vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+	if (n > 0)
+		out.append(buf, static_cast<size_t>(n) < sizeof(buf) ? static_cast<size_t>(n)
+		                                                     : sizeof(buf) - 1);
+}
+
+const char *YesNo(bool on) { return on ? "true" : "false"; }
+
+} // namespace
+
 std::string ServerConfig::ToIni() const {
-	char out[8192];
-	std::snprintf(
-	    out, sizeof(out),
-	    "; CoopIII server. Sits next to server.exe; both the console server and\n"
-	    "; the window read it, and the options dialog writes it.\n"
-	    ";\n"
-	    "; The defaults are docs/roadmap.md 5: where single player and co-op\n"
-	    "; convenience disagree, single player wins.\n"
-	    "\n"
-	    "[CoopIII]\n"
-	    "\n"
-	    "; UDP port to listen on. Players have to use the same one. Players who\n"
-	    "; are not on this machine's network usually reach it through the\n"
-	    "; router, which then has to forward this UDP port to this machine -\n"
-	    "; not with a public address of its own, or a VPN everybody is on. The\n"
-	    "; server's log says which applies when it starts.\n"
-	    "port = %u\n"
-	    "\n"
-	    "; Whether players can hurt and kill each other. Off by default.\n"
-	    "friendlyFire = %s\n"
-	    "\n"
-	    "; How the police treat the session:\n"
-	    ";   perplayer  everyone keeps their own stars, shared while riding\n"
-	    ";              in the same car (the default)\n"
-	    ";   shared     the whole session shares the highest wanted level\n"
-	    ";   off        no wanted level at all\n"
-	    "wantedLevel = %s\n"
-	    "\n"
-	    "; If anyone dies or is busted during a mission, it fails for everyone,\n"
-	    "; as it does in single player. For the missions the session shares,\n"
-	    "; which the players' games do with `missions = on` in their CoopIII.ini.\n"
-	    "missionFailOnDeath = %s\n"
-	    "\n"
-	    "; How far outside a mission's start or one of its checkpoints still\n"
-	    "; counts as being there, in metres. Everybody has to be there before a\n"
-	    "; mission starts or moves on; 5 lets a friend parked beside you count.\n"
-	    "missionMargin = %g\n"
-	    "\n"
-	    "; How a shared mission's enemies stand up to more than one player:\n"
-	    ";   original   as in single player\n"
-	    ";   tougher    their health and armour grow with the players\n"
-	    ";   more       tougher, and more of them (not built yet: as tougher)\n"
-	    "; and what each player after the first adds to them, in percent.\n"
-	    "missionEnemies = %s\n"
-	    "missionScale = %u\n"
-	    "\n"
-	    "; Whether everybody sees everybody else's real ammunition. Off by\n"
-	    "; default, and with it off a remote player's gun never runs dry on\n"
-	    "; your screen. It does not share weapons - players still carry\n"
-	    "; whatever they picked up, this only makes the counts honest.\n"
-	    "ammoSync = %s\n"
-	    "\n"
-	    "; What a rampage is worth in a group:\n"
-	    ";   shared   one rampage for the whole session, everybody's kills\n"
-	    ";            count toward it, and the target is the one the game\n"
-	    ";            asks for (the default)\n"
-	    ";   scaled   the same, but the target is multiplied by the number of\n"
-	    ";            players - four of you murder 80 Diablos, not 20\n"
-	    ";   off      nobody's kills are shared; each machine counts only its\n"
-	    ";            own player and can end the rampage differently\n"
-	    "rampages = %s\n"
-	    "\n"
-	    "; What a cheat typed by one player does to everybody else:\n"
-	    ";   shared    every cheat works. The ones about the player who typed\n"
-	    ";             them stay theirs; a weather cheat changes the host's sky,\n"
-	    ";             which is everybody's, and the game speed, MADWEATHER,\n"
-	    ";             ITSALLGOINGMAAAD and WEAPONSFORALL happen for everybody\n"
-	    ";             (the default)\n"
-	    ";   personal  only the cheats about the player who typed them: health,\n"
-	    ";             armour, weapons, money, stars, skins, the tank, the car\n"
-	    ";             handling ones\n"
-	    ";   off       no cheats at all while connected\n"
-	    "cheats = %s\n"
-	    "\n"
-	    "; What happens to the players' cash:\n"
-	    ";   off     every machine pays its own player for what its own game\n"
-	    ";           saw, as it always has (the default)\n"
-	    ";   own     everyone keeps their own money, but the reward for a car\n"
-	    ";           or a police helicopter goes to whoever destroyed it, once\n"
-	    ";   shared  one wallet for everybody: anything anyone earns, spends\n"
-	    ";           or is fined comes out of the same money\n"
-	    "money = %s\n"
-	    "\n"
-	    "; Who a hidden package counts for:\n"
-	    ";   shared     one player collects it and it is gone for everybody,\n"
-	    ";              and everybody's count goes up (the default)\n"
-	    ";   perplayer  every player finds their own hundred\n"
-	    "hiddenPackages = %s\n"
-	    "\n"
-	    "; What players have to give to join, or nothing for anybody who knows\n"
-	    "; the address. Each of them puts the same in their CoopIII.ini as\n"
-	    "; `password = ...`. It crosses the network as it is typed, so it keeps\n"
-	    "; strangers out and nothing more; up to 31 characters.\n"
-	    "password = %s\n",
-	    port, friendlyFire ? "true" : "false", Name(wantedLevel),
-	    missionFailOnDeath ? "true" : "false", MarginMetres(missionMarginCm),
-	    missionEnemies == MISSION_ENEMIES_MORE      ? "more"
-	    : missionEnemies == MISSION_ENEMIES_TOUGHER ? "tougher"
-	                                                : "original",
-	    static_cast<unsigned>(missionScale),
-	    ammoSync ? "true" : "false",
-	    Name(rampage), Name(cheats), Name(money), Name(hiddenPackages), password.c_str());
+	std::string out;
+	out.reserve(12000);
+
+	out += "; CoopIII server. Sits next to server.exe; both the console server and\n"
+	       "; the window read it, and the options dialog writes it. A key this build\n"
+	       "; does not know is ignored, and so is a value that makes no sense.\n"
+	       ";\n"
+	       "; The defaults are docs/roadmap.md 5: where single player and co-op\n"
+	       "; convenience disagree, single player wins.\n"
+	       "\n"
+	       "[CoopIII]\n";
+
+	// ---- server ----
+	out += "\n"
+	       "; ---- Server ----\n"
+	       "\n"
+	       "; UDP port to listen on. Players have to use the same one. Players who\n"
+	       "; are not on this machine's network usually reach it through the\n"
+	       "; router, which then has to forward this UDP port to this machine -\n"
+	       "; not with a public address of its own, or a VPN everybody is on. The\n"
+	       "; server's log says which applies when it starts. Takes a restart.\n";
+	Appendf(out, "port = %u\n", static_cast<unsigned>(port));
+	out += "\n"
+	       "; What players have to give to join, or nothing for anybody who knows\n"
+	       "; the address. Each of them puts the same in their CoopIII.ini as\n"
+	       "; `password = ...`. It crosses the network as it is typed, so it keeps\n"
+	       "; strangers out and nothing more; up to 31 characters.\n";
+	Appendf(out, "password = %s\n", password.c_str());
+	out += "\n"
+	       "; How many players the session takes, 1 to 8. Lowering it turns\n"
+	       "; nobody out; it only stops the next one joining.\n";
+	Appendf(out, "maxPlayers = %u\n", static_cast<unsigned>(maxPlayers));
+	out += "\n"
+	       "; Whether the server asks a what-is-my-IP service (api.ipify.org, or\n"
+	       "; checkip.amazonaws.com or icanhazip.com if that one does not answer)\n"
+	       "; for this network's public address when it starts, so it can show the\n"
+	       "; address friends on the internet connect to. Takes a restart.\n";
+	Appendf(out, "lookUpPublicAddress = %s\n", YesNo(lookUpPublicAddress));
+	out += "\n"
+	       "; Whether the server asks the router, over UPnP, to forward the port to\n"
+	       "; this machine when it starts, and to stop again when it stops. A router\n"
+	       "; with UPnP turned off says no, and then the port has to be forwarded by\n"
+	       "; hand. Takes a restart.\n";
+	Appendf(out, "openRouterPort = %s\n", YesNo(openRouterPort));
+
+	// ---- players and combat ----
+	out += "\n"
+	       "; ---- Players and combat ----\n"
+	       "\n"
+	       "; Whether players can hurt and kill each other. Off by default.\n";
+	Appendf(out, "friendlyFire = %s\n", YesNo(friendlyFire));
+	out += "\n"
+	       "; Whether everybody sees everybody else's real ammunition. Off by\n"
+	       "; default, and with it off a remote player's gun never runs dry on\n"
+	       "; your screen. It does not share weapons - players still carry\n"
+	       "; whatever they picked up, this only makes the counts honest.\n";
+	Appendf(out, "ammoSync = %s\n", YesNo(ammoSync));
+
+	// ---- wanted level ----
+	out += "\n"
+	       "; ---- Wanted level ----\n"
+	       "\n"
+	       "; How the police treat the session:\n"
+	       ";   perplayer  everyone keeps their own stars, shared while riding\n"
+	       ";              in the same car (the default)\n"
+	       ";   shared     the whole session shares the highest wanted level\n"
+	       ";   off        no wanted level at all\n";
+	Appendf(out, "wantedLevel = %s\n", Name(wantedLevel));
+	out += "\n"
+	       "; The most stars anybody can have, 1 to 6. 6 is the game's own.\n";
+	Appendf(out, "maxWantedLevel = %u\n", static_cast<unsigned>(maxWanted));
+
+	// ---- missions ----
+	out += "\n"
+	       "; ---- Missions ----\n"
+	       "; For the missions the session shares, which the players' games do\n"
+	       "; with `missions = on` in their CoopIII.ini.\n"
+	       "\n"
+	       "; If anyone dies or is busted during a mission, it fails for everyone,\n"
+	       "; as it does in single player.\n";
+	Appendf(out, "missionFailOnDeath = %s\n", YesNo(missionFailOnDeath));
+	out += "\n"
+	       "; How far outside a mission's start or one of its checkpoints still\n"
+	       "; counts as being there, in metres, up to 50. Everybody has to be\n"
+	       "; there before a mission starts or moves on; 5 lets a friend parked\n"
+	       "; beside you count.\n";
+	Appendf(out, "missionMargin = %g\n", MarginMetres(missionMarginCm));
+	out += "\n"
+	       "; How long a checkpoint waits for the players who are not at it before\n"
+	       "; the mission goes on without them, in seconds, up to 600. 0 and no\n"
+	       "; checkpoint waits for anybody.\n";
+	Appendf(out, "missionCheckpointWait = %u\n", static_cast<unsigned>(missionCheckpointWaitS));
+	out += "\n"
+	       "; Whether checkpoints wait in races, side jobs and missions with a\n"
+	       "; clock on the screen too. Off by default, because the clock and the\n"
+	       "; rivals do not wait; turned on, the clock keeps running.\n";
+	Appendf(out, "missionTimedCheckpoints = %s\n", YesNo(missionTimedCheckpoints));
+	out += "\n"
+	       "; A player who joins in the middle of a mission, or comes back from the\n"
+	       "; hospital or the police station, is brought beside its owner when\n"
+	       "; further away than this, in metres. 0 and nobody is.\n";
+	Appendf(out, "missionCatchUp = %u\n", static_cast<unsigned>(missionCatchUpM));
+	out += "\n"
+	       "; Where checkpoints do not wait, a player further than this from the\n"
+	       "; owner, in metres, for this long, in seconds, is brought beside them.\n"
+	       "; 0 metres and nobody is.\n";
+	Appendf(out, "missionFallBehind = %u\n", static_cast<unsigned>(missionBehindM));
+	Appendf(out, "missionFallBehindTime = %u\n", static_cast<unsigned>(missionBehindS));
+	out += "\n"
+	       "; How long a mission's start waits for a player whose game is busy\n"
+	       "; with a mission of its own, a new game's intro say, before it goes\n"
+	       "; on without them, in seconds, 10 to 600.\n";
+	Appendf(out, "missionIntroWait = %u\n", static_cast<unsigned>(missionIntroWaitS));
+	out += "\n"
+	       "; How a shared mission's enemies stand up to more than one player:\n"
+	       ";   original   as in single player\n"
+	       ";   tougher    their health and armour grow with the players\n"
+	       ";   more       tougher, and more of them\n"
+	       "; and what each player after the first adds to them, in percent.\n";
+	Appendf(out, "missionEnemies = %s\n", MissionEnemiesName(missionEnemies));
+	Appendf(out, "missionScale = %u\n", static_cast<unsigned>(missionScale));
+	out += "\n"
+	       "; Whether everybody in a mission gets its reward, or only the player\n"
+	       "; who started it. With money = shared there is one wallet, and it is\n"
+	       "; paid once either way.\n";
+	Appendf(out, "missionPayHelpers = %s\n", YesNo(missionPayHelpers));
+	out += "\n"
+	       "; How many of the players watching a cutscene have to press skip:\n"
+	       ";   most     75% of them, rounded up (the default)\n"
+	       ";   half     half of them, rounded up\n"
+	       ";   all      every one of them\n"
+	       ";   anyone   the first one to press it\n";
+	Appendf(out, "cutsceneSkip = %s\n", Name(cutsceneSkip));
+
+	// ---- money and progress ----
+	out += "\n"
+	       "; ---- Money and progress ----\n"
+	       "\n"
+	       "; What happens to the players' cash:\n"
+	       ";   off     every machine pays its own player for what its own game\n"
+	       ";           saw, as it always has (the default)\n"
+	       ";   own     everyone keeps their own money, but the reward for a car\n"
+	       ";           or a police helicopter goes to whoever destroyed it, once\n"
+	       ";   shared  one wallet for everybody: anything anyone earns, spends\n"
+	       ";           or is fined comes out of the same money\n";
+	Appendf(out, "money = %s\n", Name(money));
+	out += "\n"
+	       "; Who a hidden package counts for:\n"
+	       ";   shared     one player collects it and it is gone for everybody,\n"
+	       ";              and everybody's count goes up (the default)\n"
+	       ";   perplayer  every player finds their own hundred\n";
+	Appendf(out, "hiddenPackages = %s\n", Name(hiddenPackages));
+	out += "\n"
+	       "; What a rampage is worth in a group:\n"
+	       ";   shared   one rampage for the whole session, everybody's kills\n"
+	       ";            count toward it, and the target is the one the game\n"
+	       ";            asks for (the default)\n"
+	       ";   scaled   the same, but the target is multiplied by the number of\n"
+	       ";            players - four of you murder 80 Diablos, not 20\n"
+	       ";   off      nobody's kills are shared; each machine counts only its\n"
+	       ";            own player and can end the rampage differently\n"
+	       "; A change while a rampage runs waits for it to end.\n";
+	Appendf(out, "rampages = %s\n", Name(rampage));
+	out += "\n"
+	       "; How many players have to say yes before a rampage one of them\n"
+	       "; picked up starts for everybody - most, half, all or anyone, as for\n"
+	       "; cutsceneSkip - and how long they have to answer, 5 to 60 seconds.\n";
+	Appendf(out, "rampageVote = %s\n", Name(rampageVote));
+	Appendf(out, "rampageVoteTime = %u\n", static_cast<unsigned>(rampageVoteS));
+
+	// ---- world ----
+	out += "\n"
+	       "; ---- World ----\n"
+	       "\n"
+	       "; What a cheat typed by one player does to everybody else:\n"
+	       ";   shared    every cheat works. The ones about the player who typed\n"
+	       ";             them stay theirs; a weather cheat changes the host's sky,\n"
+	       ";             which is everybody's, and the game speed, MADWEATHER,\n"
+	       ";             ITSALLGOINGMAAAD and WEAPONSFORALL happen for everybody\n"
+	       ";             (the default)\n"
+	       ";   personal  only the cheats about the player who typed them: health,\n"
+	       ";             armour, weapons, money, stars, skins, the tank, the car\n"
+	       ";             handling ones\n"
+	       ";   off       no cheats at all while connected\n";
+	Appendf(out, "cheats = %s\n", Name(cheats));
+	out += "\n"
+	       "; How long a car the players have used stays once nobody is in it or\n"
+	       "; within 200 m of it, in seconds, 10 to 600.\n";
+	Appendf(out, "abandonedCars = %u\n", static_cast<unsigned>(abandonedCarS));
 	return out;
 }
 

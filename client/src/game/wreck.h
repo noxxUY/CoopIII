@@ -47,6 +47,40 @@ inline bool FireTimerRunsHere(uint8_t holder, uint8_t localPlayerId,
 	return hostPlayerId == localPlayerId;
 }
 
+// ---- a car left on its roof ----------------------------------------------------
+//
+// VehicleDamage takes 4 health a step off any car lying on its roof
+// (addresses.h, "a car left on its roof"), and that is the whole of how one
+// catches fire and goes up by itself. Every machine used to run it on its own
+// copy, and every machine but one wrote the session's word back over it the
+// next frame: a car somebody rolled and walked away from drained on its
+// custodian for the two seconds the settle lasts, came to rest, was handed
+// back, and lay on its roof at whatever health that left, on every screen,
+// for good. Nothing that pins a car nobody holds can drain it.
+//
+// So two rules, one per half:
+//
+//   - only the machine whose word is the car's health runs the drain
+//     (vehicle.h, RoofDrainMayRun), and every other copy is left to show what
+//     that machine says;
+//   - a custodian keeps a car on its roof (client.h, RoofKeepsCustody), the
+//     way it keeps a burning one, so the drain has a machine to run on until
+//     the car catches fire - and from there the burning rule keeps it until it
+//     goes up, its snapshots carry the fire to everybody, and its BlowUpCar
+//     goes out as UNOWNED_SESSION.
+//
+// This is the drain's own test, less the "is it the local player's car" half,
+// which is CPlayerInfo::Process's to handle and ends in the same fire.
+// `status` is bits 3-7 of the entity flags.
+inline bool CarOnItsRoof(bool automobile, float upZ, bool canBeDamaged,
+                         bool notDamagedUpsideDown, uint8_t status, bool inWater) {
+	if (!automobile || !canBeDamaged || notDamagedUpsideDown || inWater)
+		return false;
+	if (status == ENTITY_STATUS_WRECKED || status == ENTITY_STATUS_PLAYER_REMOTE)
+		return false;
+	return upZ < 0.0f;
+}
+
 // ---- a blast on a car nobody holds -------------------------------------------
 //
 // Every machine replays the explosion at the same place, so every copy takes

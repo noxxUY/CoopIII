@@ -22,6 +22,7 @@
 
 #include <shellapi.h>
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -48,34 +49,23 @@ constexpr float kRightPadB = 28.0f;
 constexpr float kLogoW    = 216.0f;
 constexpr float kTileH    = 58.0f;
 
-// The patch the downgrader looks for, next to the Setup. The repo ships no
-// gta3.exe and no patch: tools/mkpatch is how the project owner makes one from
-// their own two copies.
-constexpr const char *kPatchName = "gta3-v10.patch";
-
 enum class Screen { Downgrade, Components, Installing, Done };
 
 struct State {
 	Screen screen = Screen::Components;
 
-	char gameDir[MAX_PATH] = "";
-	launcher::Checks checks;
-	bool             isV10        = false;
-	std::string      currentMd5;
-	unsigned long long currentSize = 0;
+	char    gameDir[MAX_PATH] = "";
+	GameExe game;               // what gta3.exe is, and whether it can be downgraded
+	bool    downgrade = false;  // the player said yes on the downgrade screen
+	bool    hasRecord = false;  // the Setup has installed into this folder before
 
 	std::vector<bool> selected;
-	bool              keepBackup   = true;
 	bool              shortcut     = true;
 	std::string       message;      // a failure worth showing under the buttons
-
-	PatchInfo   patch;
-	bool        patchPresent = false;
-	std::string patchError;
+	bool              messageIsError = true;
 
 	InstallJob job;
 	Progress   progress;
-	bool       backedUp = false;
 
 	// What the right column is coming from, so a screen change can be drawn
 	// as one: forward slides in from the right, back from the left.
@@ -87,28 +77,19 @@ State g_state;
 
 const Manifest &Components() { return BuiltInManifest(); }
 
-std::string PatchPath() { return launcher::Join(SetupDir(), kPatchName); }
-
 void LookAtGame() {
-	g_state.checks = launcher::RunChecks(g_state.gameDir);
-	g_state.isV10  = false;
-	g_state.currentMd5.clear();
-	g_state.currentSize = 0;
-
-	const std::string exe = launcher::Join(g_state.gameDir, "gta3.exe");
-	if (launcher::FileExists(exe)) {
-		g_state.currentMd5 = launcher::Md5File(exe);
-		WIN32_FILE_ATTRIBUTE_DATA d;
-		if (GetFileAttributesExA(exe.c_str(), GetFileExInfoStandard, &d))
-			g_state.currentSize =
-			    (static_cast<unsigned long long>(d.nFileSizeHigh) << 32) | d.nFileSizeLow;
-		g_state.isV10 = g_state.currentMd5 == launcher::GAME_MD5;
-	}
-
-	g_state.patchPresent = ReadPatchInfo(PatchPath(), &g_state.patch, &g_state.patchError);
-	g_state.direction    = 1.0f;
-	g_state.screen       = g_state.isV10 ? Screen::Components : Screen::Downgrade;
+	g_state.game      = InspectGame(g_state.gameDir, Components());
+	g_state.hasRecord = HasInstallRecord(g_state.gameDir);
+	g_state.downgrade = false;
+	g_state.direction = 1.0f;
+	g_state.screen    = (g_state.game.present && !g_state.game.isV10) ? Screen::Downgrade
+	                                                                  : Screen::Components;
 }
+
+// v1.0 already, or about to be.
+bool WillBeV10() { return g_state.game.isV10 || (g_state.downgrade && g_state.game.CanDowngrade()); }
+
+std::string ShortMd5(const std::string &md5) { return md5.size() > 8 ? md5.substr(0, 8) + "..." : md5; }
 
 int SelectedCount() {
 	int n = 0;
@@ -167,7 +148,9 @@ void DrawLeft(App &app, const Theme &theme, ImVec2 screen) {
 	              static_cast<int>(Components().components.size()));
 
 	const Step steps[4] = {
-	    {"Game version", g_state.isV10 ? "v1.0 retail" : "Needs v1.0 retail"},
+	    {"Game version", g_state.game.isV10 ? "v1.0 retail"
+	                     : g_state.downgrade ? "Downgrade planned"
+	                                         : "Needs v1.0 retail"},
 	    {"Components", componentsNote},
 	    {"Install", "Copies files into the game folder"},
 	    {"Done", "Open the launcher and play"},
@@ -193,7 +176,7 @@ void DrawLeft(App &app, const Theme &theme, ImVec2 screen) {
 		const bool reachable = (g_state.screen == Screen::Downgrade ||
 		                        g_state.screen == Screen::Components) &&
 		                       i != current &&
-		                       ((i == 0 && !g_state.isV10) || i == 1);
+		                       ((i == 0 && g_state.game.present && !g_state.game.isV10) || i == 1);
 
 		Touched touch;
 		if (reachable) {
@@ -282,33 +265,37 @@ float DrawGameFolder(const Theme &theme, float x, float y, float width) {
 	                  "Browse", Icon::Folder, theme)) {
 		const std::string picked = App::PickFolder("Where is GTA III installed?", g_state.gameDir);
 		if (!picked.empty()) {
-			// The files this Setup carries.
-	RegisterPayload();
-
-	std::snprintf(g_state.gameDir, sizeof(g_state.gameDir), "%s", picked.c_str());
+			std::snprintf(g_state.gameDir, sizeof(g_state.gameDir), "%s", picked.c_str());
 			LookAtGame();
 		}
 	}
 
 	const float statusY = box.Max().y + 8.0f;
-	const char *verdict;
+	const GameExe &g = g_state.game;
+	std::string verdict;
 	Icon        icon;
 	ImU32       colour;
-	if (!launcher::FileExists(launcher::Join(g_state.gameDir, "gta3.exe"))) {
+	if (!g.present) {
 		verdict = "no gta3.exe in this folder";
 		icon    = Icon::CircleX;
 		colour  = theme.statusFail;
-	} else if (g_state.isV10) {
+	} else if (g.running) {
+		verdict = "GTA III is running. Close it before installing.";
+		icon    = Icon::CircleX;
+		colour  = theme.statusFail;
+	} else if (g.isV10) {
 		verdict = "gta3.exe is v1.0 retail";
 		icon    = Icon::CircleCheck;
 		colour  = theme.statusOk;
 	} else {
-		verdict = "gta3.exe is a 1.1-lineage build, as shipped on Steam";
-		icon    = Icon::TriangleAlert;
-		colour  = theme.statusWarn;
+		verdict = g.buildName.empty()
+		              ? "gta3.exe is a build the Setup does not recognise (MD5 " + ShortMd5(g.md5) + ")"
+		              : "gta3.exe is the " + g.buildName + " build";
+		icon   = Icon::TriangleAlert;
+		colour = theme.statusWarn;
 	}
 	DrawIcon(ImGui::GetWindowDrawList(), icon, ImVec2(x, statusY + 1.0f), 16.0f, colour);
-	Text(ImVec2(x + 24.0f, statusY), Type::BodySmall, theme.textSecondary, verdict);
+	Text(ImVec2(x + 24.0f, statusY), Type::BodySmall, theme.textSecondary, verdict.c_str());
 
 	return statusY + 18.0f - y;
 }
@@ -316,12 +303,31 @@ float DrawGameFolder(const Theme &theme, float x, float y, float width) {
 // ---- the downgrade screen -------------------------------------------------
 
 void DrawDowngrade(App &app, const Theme &theme, ImVec2 screen, float x, float width) {
-	ImDrawList *draw = ImGui::GetWindowDrawList();
-	float       y    = kTitleBar + kRightPadT;
+	ImDrawList   *draw = ImGui::GetWindowDrawList();
+	const GameExe &g   = g_state.game;
+	float         y    = kTitleBar + kRightPadT;
 
-	y += DrawHeading(theme, x, y, width, "Downgrade to v1.0",
-	                 "CoopIII's addresses only match GTA III v1.0 retail. This copy is a newer "
-	                 "build, so the Setup patches it back to v1.0 before installing anything.");
+	// Two cases. A build the Setup has a patch for is downgraded as the
+	// install's first step. Anything else - the Steam exe above all, which is
+	// wrapped in SteamStub so that a patch from it would have to carry most of
+	// v1.0 as it is - the Setup does not touch: the player downgrades it with
+	// a community tool and comes back. docs/installer.md section 2.
+	const bool         patchable = g.CanDowngrade();
+	const Downgrader  &tool      = Components().downgrader;
+	const std::string  howTo     = tool.url.empty()
+	                                   ? "Downgrade your own copy with a community guide"
+	                                   : "Downgrade your own copy following the guide";
+	const std::string  intro =
+	    patchable ? std::string("CoopIII's addresses only match GTA III v1.0 retail. This copy is "
+	                            "another build, so the Setup patches it back to v1.0 as the first "
+	                            "step of the install.")
+	    : (g.buildName.empty() ? std::string("This gta3.exe is not a build the Setup knows.")
+	                           : "Your GTA III is the " + g.buildName + " version.") +
+	          " CoopIII needs v1.0. " + howTo +
+	          ", keep a backup of the original gta3.exe, then press Check again.";
+
+	y += DrawHeading(theme, x, y, width, patchable ? "Downgrade to v1.0" : "Downgrade GTA III first",
+	                 intro.c_str());
 	y += 22.0f;
 	y += DrawGameFolder(theme, x, y, width);
 	y += 22.0f;
@@ -350,11 +356,8 @@ void DrawDowngrade(App &app, const Theme &theme, ImVec2 screen, float x, float w
 	Text(ImVec2(colC + 15.0f, table.pos.y + 10.0f), Type::MetaLabel, theme.statusOk,
 	     "After the downgrade");
 
-	const std::string sizeNow =
-	    g_state.currentSize == launcher::GAME_SIZE_BYTES ? "Matches" : "Doesn't match";
-	const std::string md5Now =
-	    g_state.currentMd5 == launcher::GAME_MD5 ? "Matches" : "Doesn't match";
-	char expectedSize[32];
+	char sizeNow[32], expectedSize[32];
+	std::snprintf(sizeNow, sizeof(sizeNow), "%s bytes", WithCommas(g.size).c_str());
 	std::snprintf(expectedSize, sizeof(expectedSize), "%s bytes",
 	              WithCommas(launcher::GAME_SIZE_BYTES).c_str());
 
@@ -365,9 +368,9 @@ void DrawDowngrade(App &app, const Theme &theme, ImVec2 screen, float x, float w
 		bool        mono;
 	};
 	const Row rows[3] = {
-	    {"Build", "Steam, 1.1-lineage", "v1.0 retail", false},
-	    {"Size", sizeNow, expectedSize, false},
-	    {"MD5", md5Now, launcher::GAME_MD5, true},
+	    {"Build", g.buildName.empty() ? "Not recognised" : g.buildName, "v1.0 retail", false},
+	    {"Size", g.present ? sizeNow : "-", expectedSize, false},
+	    {"MD5", g.present ? ShortMd5(g.md5) : "-", launcher::GAME_MD5, true},
 	};
 
 	float rowY = table.pos.y + headerH + 1.0f;
@@ -387,62 +390,107 @@ void DrawDowngrade(App &app, const Theme &theme, ImVec2 screen, float x, float w
 	}
 	y = table.Max().y + 22.0f;
 
-	Checkbox("##backup", ImVec2(x, y), &g_state.keepBackup, "Keep the original as ", theme);
-	Text(ImVec2(x + 18.0f + 10.0f + MeasureText(Type::Body, "Keep the original as ").x, y + 1.0f),
-	     Type::Mono, theme.textPrimary, "gta3.exe.bak");
-	y += 18.0f + 20.0f;
+	if (patchable) {
+		const float keptW =
+		    Text(ImVec2(x, y), Type::Body, theme.textSecondary, "The original is kept as ");
+		const float bakW =
+		    Text(ImVec2(x + keptW, y + 1.0f), Type::Mono, theme.textPrimary, "gta3.exe.bak");
+		Text(ImVec2(x + keptW + bakW, y), Type::Body, theme.textSecondary,
+		     ", and Uninstall puts it back.");
+		y += 18.0f + 20.0f;
+	}
 
-	// The note about Steam putting the exe back, and - when there is no patch
-	// to apply - what to do about that.
-	const char *note =
-	    g_state.patchPresent
-	        ? "Steam can put the newer exe back after an update or a file check. If the "
-	          "launcher says the version is wrong again, run the Setup and downgrade once more."
-	        : "No gta3-v10.patch next to this Setup, so there is nothing to downgrade with. "
-	          "Build one with tools/mkpatch from a copy of each build, and put it here.";
-	const float noteH = MeasureWrapped(Type::BodySmall, width - 60.0f, note).y;
+	// Where the patch comes from and the Steam caveat, or why the Setup will
+	// not do it itself.
+	std::string note;
+	if (!g.localPatch.empty())
+		note = "Using the patch beside this Setup. Steam can put the newer exe back after an update "
+		       "or a file check; if the launcher says the version is wrong again, run the Setup once "
+		       "more.";
+	else if (g.knownPatch)
+		note = "The patch for this build is downloaded from CoopIII's release and checked before it "
+		       "is applied. Steam can put the newer exe back after an update or a file check; if the "
+		       "launcher says the version is wrong again, run the Setup once more.";
+	else if (!g.buildName.empty())
+		note = "The Setup leaves this gta3.exe exactly as it is. The " + g.buildName +
+		       " exe is wrapped in the store's copy protection, so it cannot be turned into v1.0 by "
+		       "a small patch, and CoopIII does not try. Steam can put the newer exe back after an "
+		       "update or a file check; if the launcher says the version is wrong again, downgrade "
+		       "again and press Check again.";
+	else
+		note = "The Setup leaves this gta3.exe exactly as it is. Its MD5 is " + g.md5 +
+		       ", which is neither v1.0 nor a build CoopIII knows. Once it is v1.0, press Check "
+		       "again.";
+	const float noteH = MeasureWrapped(Type::BodySmall, width - 60.0f, note.c_str()).y;
 	const Rect  noteBox{ImVec2(x, y), ImVec2(width, noteH + 28.0f)};
 	Card(noteBox, theme, radius::kInput, theme.bgWindow, theme.border);
-	DrawIcon(draw, g_state.patchPresent ? Icon::Info : Icon::TriangleAlert,
-	         ImVec2(x + 16.0f, y + 15.0f), 18.0f,
-	         g_state.patchPresent ? theme.textTertiary : theme.statusWarn);
+	DrawIcon(draw, patchable ? Icon::Info : Icon::TriangleAlert, ImVec2(x + 16.0f, y + 15.0f), 18.0f,
+	         patchable ? theme.textTertiary : theme.statusWarn);
 	TextWrapped(ImVec2(x + 16.0f + 18.0f + 12.0f, y + 14.0f), width - 62.0f, Type::BodySmall,
-	            theme.textSecondary, note);
+	            theme.textSecondary, note.c_str());
+	y = noteBox.Max().y + 14.0f;
+
+	// The background reading, as a plain link under the note.
+	if (!patchable && !tool.infoUrl.empty() &&
+	    LinkText("##moreinfo", ImVec2(x, y), Type::BodySmall, theme.textSecondary,
+	             (tool.infoName.empty() ? std::string("More info") : tool.infoName).c_str()))
+		ShellExecuteA(nullptr, "open", tool.infoUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 
 	// Footer.
 	const float footerY = screen.y - kRightPadB - 56.0f;
 	if (!g_state.message.empty())
-		TextWrapped(ImVec2(x, footerY - 24.0f), width, Type::BodySmall, theme.statusFail,
+		TextWrapped(ImVec2(x, footerY - 24.0f), width, Type::BodySmall,
+		            g_state.messageIsError ? theme.statusFail : theme.textTertiary,
 		            g_state.message.c_str());
 
-	const float downW = 220.0f;
-	if (OutlineButton("##cancel",
-	                  {ImVec2(x + width - downW - 10.0f - 100.0f, footerY), ImVec2(100.0f, 56.0f)},
-	                  "Cancel", Icon::None, theme, false, Type::ButtonSmall))
-		app.Close();
+	const std::string guide = tool.name.empty() ? std::string("Open the guide") : tool.name;
+	const float       mainW =
+	    patchable ? 220.0f
+	              : ImMin(width - 100.0f - 150.0f - 20.0f,
+	                      MeasureText(Type::ButtonSmall, guide.c_str()).x + 18.0f + 10.0f + 52.0f);
+	float       left  = x + width - mainW - 10.0f;
 
-	const bool canPatch = g_state.patchPresent && !g_state.currentMd5.empty() &&
-	                      g_state.patch.oldMd5 == g_state.currentMd5;
-	if (PrimaryButton("##downgrade", {ImVec2(x + width - downW, footerY), ImVec2(downW, 56.0f)},
-	                  "Downgrade to v1.0", Icon::RotateCcw, canPatch, theme)) {
-		const std::string exe    = launcher::Join(g_state.gameDir, "gta3.exe");
-		const std::string backup = g_state.keepBackup
-		                               ? launcher::Join(g_state.gameDir, "gta3.exe.bak")
-		                               : std::string();
-		std::string error;
-		if (ApplyPatch(exe, PatchPath(), backup, &error)) {
-			g_state.backedUp = g_state.keepBackup;
-			g_state.message.clear();
+	if (!patchable) {
+		// Re-reads gta3.exe: the player has just run the downgrader, or has
+		// not yet, and either way the screen should say which.
+		const float checkW = 150.0f;
+		left -= checkW;
+		if (OutlineButton("##checkagain", {ImVec2(left, footerY), ImVec2(checkW, 56.0f)},
+		                  "Check again", Icon::RotateCcw, theme, false, Type::ButtonSmall)) {
 			LookAtGame();
-		} else {
-			g_state.message = error;
+			g_state.messageIsError = false;
+			g_state.message =
+			    g_state.game.isV10 ? std::string()
+			    : !g_state.game.present
+			        ? "There is no gta3.exe in that folder."
+			        : "gta3.exe is still not v1.0 (MD5 " + ShortMd5(g_state.game.md5) + ").";
 		}
+		left -= 10.0f;
 	}
 
-	if (!canPatch && g_state.patchPresent && !g_state.currentMd5.empty() &&
-	    g_state.patch.oldMd5 != g_state.currentMd5) {
-		TextRight(x + width, footerY + 60.0f, Type::Hint, theme.textTertiary,
-		          "The patch here was built from a different copy of gta3.exe.");
+	if (OutlineButton("##cancel", {ImVec2(left - 100.0f, footerY), ImVec2(100.0f, 56.0f)}, "Cancel",
+	                  Icon::None, theme, false, Type::ButtonSmall))
+		app.Close();
+
+	if (!patchable) {
+		// The guide the manifest names: a page, never a file (Parse refuses one).
+		// With none set, the button stays off rather than pointing at a guess.
+		if (PrimaryButton("##downgrader", {ImVec2(x + width - mainW, footerY), ImVec2(mainW, 56.0f)},
+		                  guide.c_str(), Icon::ArrowUpRight, !tool.url.empty(), theme,
+		                  Type::ButtonSmall))
+			ShellExecuteA(nullptr, "open", tool.url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+		return;
+	}
+
+	// Nothing is patched here: the downgrade is the install's first step, so it
+	// shows in the same progress as everything else and a failure stops the
+	// rest rather than leaving mods on an exe CoopIII cannot use.
+	if (PrimaryButton("##downgrade", {ImVec2(x + width - mainW, footerY), ImVec2(mainW, 56.0f)},
+	                  "Continue", Icon::RotateCcw, !g.running, theme)) {
+		g_state.downgrade = true;
+		g_state.message.clear();
+		g_state.direction = 1.0f;
+		g_state.screen    = Screen::Components;
 	}
 }
 
@@ -466,6 +514,11 @@ void DrawComponentTile(const Theme &theme, Rect box, size_t index, const Compone
 	} else {
 		touch.key = ImGui::GetID(id);
 	}
+	// Who made it and under what terms, for every tile: most of the Essential
+	// Pack is other people's work, and this is where they get the credit.
+	if (ImGui::IsMouseHoveringRect(box.pos, box.Max()) && !c.homepage.empty())
+		ImGui::SetTooltip("%s\nLicence: %s\n%s", c.name.c_str(),
+		                  c.license.empty() ? "not stated" : c.license.c_str(), c.homepage.c_str());
 
 	Card(box, theme, radius::kPrimary, Lift(theme.bgCard, theme, touch.t * 0.6f),
 	     locked ? theme.borderStrong : Mix(theme.border, theme.borderStrong, touch.t * 2.0f));
@@ -491,7 +544,8 @@ void DrawComponentTile(const Theme &theme, Rect box, size_t index, const Compone
 	float       right = box.Max().x - 14.0f;
 
 	if (!c.version.empty()) {
-		const std::string version = "v" + c.version;
+		const std::string version =
+		    std::isdigit(static_cast<unsigned char>(c.version[0])) ? "v" + c.version : c.version;
 		right -= TextRight(right, box.pos.y + 20.0f, Type::MonoSmall, theme.textTertiary,
 		                   version.c_str()) +
 		         10.0f;
@@ -517,13 +571,25 @@ void DrawComponents(App &app, const Theme &theme, ImVec2 screen, float x, float 
 	float y = kTitleBar + kRightPadT;
 
 	y += DrawHeading(theme, x, y, width, "Choose what to install",
-	                 "CoopIII goes in with the Essential Pack by default. Untick anything you "
-	                 "already manage yourself.");
+	                 g_state.downgrade && !g_state.game.isV10
+	                     ? "gta3.exe is downgraded first, then CoopIII goes in with the Essential "
+	                       "Pack. Untick anything you already manage yourself."
+	                     : "CoopIII goes in with the Essential Pack by default. Untick anything you "
+	                       "already manage yourself.");
 	y += 22.0f;
 	y += DrawGameFolder(theme, x, y, width);
 	y += 22.0f;
 
 	const auto &all = Components().components;
+	if (all.empty()) {
+		std::string why;
+		BuiltInManifest(&why);
+		TextWrapped(ImVec2(x, y), width, Type::Body, theme.statusFail,
+		            ("This Setup's list of components is damaged (" + why +
+		             "). Download the Setup again.")
+		                .c_str());
+		return;
+	}
 	Text(ImVec2(x, y), Type::SectionTitle, theme.textPrimary, "Components");
 
 	char count[48];
@@ -535,11 +601,9 @@ void DrawComponents(App &app, const Theme &theme, ImVec2 screen, float x, float 
 	                  {ImVec2(x + width - buttonW, y - 4.0f), ImVec2(buttonW, 28.0f)},
 	                  anyOn ? "Select none" : "Select all", Icon::None, theme, false,
 	                  Type::Hint)) {
-		// "Select all" means all of what can actually be installed - it is
-		// not an offer to attempt ten components everybody already knows
-		// will fail. A component still without a download stays exactly as
-		// it was, so a player who ticked one anyway to see the fix text is
-		// not overruled by a button they pressed for the others.
+		// "Select all" means all of what can actually be installed. A
+		// component without a download stays exactly as it was rather than
+		// being ticked into a failure the player did not ask for.
 		for (size_t i = 0; i < all.size(); ++i)
 			if (all[i].required)
 				g_state.selected[i] = true;
@@ -566,8 +630,26 @@ void DrawComponents(App &app, const Theme &theme, ImVec2 screen, float x, float 
 	// Footer.
 	const float footerY = screen.y - kRightPadB - 56.0f;
 	if (!g_state.message.empty())
-		TextWrapped(ImVec2(x, footerY - 24.0f), width, Type::BodySmall, theme.statusFail,
+		TextWrapped(ImVec2(x, footerY - 24.0f), width, Type::BodySmall,
+		            g_state.messageIsError ? theme.statusFail : theme.textTertiary,
 		            g_state.message.c_str());
+
+	// Everything the Setup wrote here is in CoopIII-Setup.record, so it can
+	// all come out again: files removed, replaced ones and gta3.exe put back.
+	if (g_state.hasRecord &&
+	    OutlineButton("##uninstall", {ImVec2(x, footerY), ImVec2(130.0f, 56.0f)}, "Uninstall",
+	                  Icon::RotateCcw, theme, false, Type::ButtonSmall)) {
+		std::vector<std::string> log;
+		std::string              error;
+		const bool               ok = Uninstall(g_state.gameDir, &log, &error);
+		LookAtGame();
+		g_state.messageIsError = !ok;
+		g_state.message        = ok ? "Uninstalled. Everything the Setup put in this folder has been "
+		                              "taken out, and anything it replaced is back."
+		                            : error;
+		if (!ok && !log.empty())
+			g_state.message += " (" + log.back() + ")";
+	}
 
 	const float installW = 200.0f;
 	if (OutlineButton("##cancel",
@@ -576,15 +658,17 @@ void DrawComponents(App &app, const Theme &theme, ImVec2 screen, float x, float 
 	                  "Cancel", Icon::None, theme, false, Type::ButtonSmall))
 		app.Close();
 
-	const bool canInstall = g_state.isV10 && SelectedCount() > 0;
+	const bool canInstall = WillBeV10() && !g_state.game.running && SelectedCount() > 0;
 	if (PrimaryButton("##install", {ImVec2(x + width - installW, footerY), ImVec2(installW, 56.0f)},
 	                  "Install", Icon::Download, canInstall, theme)) {
-		std::vector<std::string> chosen;
+		InstallOptions options;
+		options.gameDir   = g_state.gameDir;
+		options.downgrade = !g_state.game.isV10;
 		for (size_t i = 0; i < all.size(); ++i)
 			if (g_state.selected[i])
-				chosen.push_back(all[i].id);
+				options.components.push_back(all[i].id);
 		g_state.message.clear();
-		g_state.job.Start(g_state.gameDir, chosen);
+		g_state.job.Start(options);
 		g_state.direction = 1.0f;
 		g_state.screen    = Screen::Installing;
 	}
@@ -645,7 +729,9 @@ void DrawInstalling(App &app, const Theme &theme, ImVec2 screen, float x, float 
 		           step.name.c_str());
 
 		const char *note = step.state == StepState::Done      ? "Done"
-		                   : step.state == StepState::Working ? "Installing"
+		                   : step.state == StepState::Working
+		                       ? (step.note.find("MB") != std::string::npos ? step.note.c_str()
+		                                                                    : "Installing")
 		                   : step.state == StepState::Failed  ? "Failed"
 		                   : step.state == StepState::Skipped ? "Skipped"
 		                                                      : "Waiting";
@@ -655,11 +741,16 @@ void DrawInstalling(App &app, const Theme &theme, ImVec2 screen, float x, float 
 		          : step.state == StepState::Working ? theme.textPrimary
 		                                             : theme.textTertiary,
 		          note);
-		if (step.state == StepState::Failed && !step.note.empty())
-			ImGui::SetItemTooltip("%s", step.note.c_str());
+		if ((step.state == StepState::Failed || step.state == StepState::Skipped) &&
+		    !step.note.empty() && ImGui::IsMouseHoveringRect(box.pos, box.Max()))
+			ImGui::SetTooltip("%s", step.note.c_str());
 	};
 
-	const float tileH = 52.0f;
+	// As many rows as there are steps, shrunk if need be so the last row
+	// stays clear of the details console under it.
+	const float rows      = 1.0f + std::ceil((static_cast<float>(p.steps.size()) - 1.0f) * 0.5f);
+	const float detailTop = screen.y - kRightPadB - 56.0f - 18.0f - 130.0f - 26.0f - 12.0f;
+	const float tileH     = ImClamp((detailTop - y) / ImMax(rows, 1.0f) - gap, 36.0f, 52.0f);
 	if (!p.steps.empty()) {
 		tile({ImVec2(x, y), ImVec2(width, tileH)}, p.steps[0]);
 		y += tileH + gap;
@@ -705,6 +796,9 @@ void DrawInstalling(App &app, const Theme &theme, ImVec2 screen, float x, float 
 	} else {
 		g_state.direction = 1.0f;
 		g_state.screen    = Screen::Done;
+		// What the folder holds now, once, rather than an MD5 of gta3.exe every frame.
+		g_state.game      = InspectGame(g_state.gameDir, Components());
+		g_state.hasRecord = HasInstallRecord(g_state.gameDir);
 	}
 	(void)app;
 }
@@ -742,12 +836,16 @@ void DrawDone(App &app, const Theme &theme, ImVec2 screen, float x, float width)
 		bool        mono;
 	};
 	char installed[64];
-	std::snprintf(installed, sizeof(installed), "%d of %d components", p.finished, p.total);
+	std::snprintf(installed, sizeof(installed), "%d of %d done", p.finished, p.total);
 
+	const bool  v10     = g_state.game.isV10;   // looked at once, when the install ended
 	const Row rows[4] = {
 	    {"Game folder", g_state.gameDir, true},
 	    {"Game version",
-	     g_state.backedUp ? "v1.0 retail, original kept as gta3.exe.bak" : "v1.0 retail", false},
+	     !v10              ? "Not v1.0 - the downgrade did not finish"
+	     : p.downgraded    ? "v1.0 retail, original kept as " + p.backup
+	                       : std::string("v1.0 retail"),
+	     false},
 	    {"Installed", installed, false},
 	    {"Launcher", "coopiii-launcher.exe", true},
 	};
@@ -821,18 +919,19 @@ int main() {
 		return 1;
 	}
 
+	// The files this Setup carries inside itself: CoopIII and its defaults.
+	RegisterPayload();
+
 	std::snprintf(g_state.gameDir, sizeof(g_state.gameDir), "%s",
 	              launcher::FindGameDir().c_str());
 	// Required components stay selected regardless - the player cannot
-	// untick them either. An optional one starts selected only when it is
-	// actually installable: a component with "no download yet" on its own
-	// tile has no business also being checked, and today that is most of the
-	// Essential Pack. Once its owner fills in a url and a hash, Ready()
-	// starts saying yes and this starts checking it by default again.
+	// untick them either. An optional one starts the way the manifest says,
+	// and never ticked while it has no download to install from.
 	const auto &components = Components().components;
 	g_state.selected.resize(components.size());
 	for (size_t i = 0; i < components.size(); ++i)
-		g_state.selected[i] = components[i].required || components[i].Ready();
+		g_state.selected[i] =
+		    components[i].required || (components[i].selected && components[i].Ready());
 	LookAtGame();
 
 	return app.Run([&] {
@@ -854,7 +953,7 @@ int main() {
 		                                          theme.bgPanel);
 		DrawLeft(app, theme, screen);
 
-		const TitleBarResult bar = TitleBar(app, "Installer", "v0.0.1", false);
+		const TitleBarResult bar = TitleBar(app, "Installer", "v0.1.1", false);
 		if (bar.minimise) app.Minimize();
 		if (bar.close)    app.Close();
 		if (bar.theme)    app.SetTheme(!app.IsLight());

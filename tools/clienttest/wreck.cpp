@@ -265,11 +265,107 @@ void TestWhoseBlastAgainstTheImage() {
 	      "after five seconds on the timer the host is the one machine not holding");
 }
 
+void TestTheRoofAgainstTheImage() {
+	std::printf("\na car left on its roof, against gta3.exe\n");
+	std::vector<uint8_t> img;
+	std::string          from;
+	if (!LoadExe(img, from)) {
+		std::printf("  [skipped] no retail gta3.exe\n");
+		return;
+	}
+
+	// VehicleDamage, from `this` into ebp to the drain's write.
+	Check(Bytes(img, 0x0052F3B5, {0x89, 0xCD}) &&
+	          CallsTo(img, VEHICLE_DAMAGE_CALL, CAutomobile__VehicleDamage) &&
+	          Bytes(img, VEHICLE_DAMAGE_CALL - 10, {0x89, 0xE9, 0x6A, 0x00, 0xFF, 0x35}),
+	      "ProcessControl's one VehicleDamage call hands it the car, and ebp keeps it");
+	// The one pop in between is the !bCanBeDamaged exit at 0x0052F3FF, which
+	// leaves the function.
+	bool ebpKept = Bytes(img, 0x0052F3FF, {0x83, 0xC4, 0x38, 0x5D, 0x5F, 0x5E, 0x5B, 0xC2});
+	for (uint32_t va = 0x0052F3B7; va < ROOF_DRAIN_PLAYER_CAR_CALL; ++va) {
+		if (va >= 0x0052F3FF && va < 0x0052F410)
+			continue;
+		if (Bytes(img, va, {0x89, 0xC5}) || Bytes(img, va, {0x8B, 0xE8}) || Byte(img, va) == 0x5D)
+			ebpKept = false;
+	}
+	Check(ebpKept, "nothing between there and the drain's gate writes ebp");
+	Check(Bytes(img, 0x0052F3F2, {0x8A, 0x85}) && Dword(img, 0x0052F3F4) == offs::VEH_FLAGS_C &&
+	          Bytes(img, 0x0052F3F8, {0xC0, 0xE8, 0x06, 0x24, 0x01, 0x75}) &&
+	          (1u << 6) == VEH_CAN_BE_DAMAGED,
+	      "bCanBeDamaged first, bit 6 of +0x1F7");
+	Check(Bytes(img, 0x0052F410, {0x8D, 0x75, uint8_t(offs::MATRIX_UP)}) &&
+	          Bytes(img, 0x0052F413, {0xD9, 0x46, 0x08, 0xD8, 0x1D}) &&
+	          Dword(img, 0x0052F418) == 0x006004F8 && Float(img, 0x006004F8) == 0.0f &&
+	          Bytes(img, 0x0052F41E, {0x80, 0xE4, 0x05, 0x80, 0xFC, 0x01, 0x75}) &&
+	          0x0052F426u + Byte(img, 0x0052F425) == ROOF_DRAIN_SKIP,
+	      "then GetUp().z < 0.0f, and past the drain when it is not");
+	Check(CallsTo(img, ROOF_DRAIN_PLAYER_CAR_CALL, FindPlayerVehicle) &&
+	          Bytes(img, ROOF_DRAIN_PLAYER_CAR_CALL + 5, {0x39, 0xC5, 0x74}) &&
+	          ROOF_DRAIN_PLAYER_CAR_CALL + 9 + Byte(img, ROOF_DRAIN_PLAYER_CAR_CALL + 8) ==
+	              ROOF_DRAIN_SKIP,
+	      "the gate CoopIII takes: FindPlayerVehicle against ebp, equal skips the drain alone");
+	Check(Bytes(img, 0x0052F42F, {0x8A, 0x85}) &&
+	          Dword(img, 0x0052F431) == offs::AUTO_ROOF_FLAGS &&
+	          Bytes(img, 0x0052F435, {0x24, offs::AUTO_NOT_DAMAGED_UPSIDE_DOWN, 0x75}) &&
+	          Bytes(img, 0x0052F439, {0x8A, 0x4D, uint8_t(offs::ENTITY_FLAGS), 0xC0, 0xE9,
+	                                  ENTITY_STATUS_SHIFT}) &&
+	          Bytes(img, 0x0052F442, {0x83, 0xF8, ENTITY_STATUS_PLAYER_REMOTE, 0x74}) &&
+	          Bytes(img, 0x0052F447, {0x8A, 0x85}) &&
+	          Dword(img, 0x0052F449) == offs::PHYSICAL_FLAGS &&
+	          Bytes(img, 0x0052F44D, {0xC0, 0xE8, 0x03, 0x24, 0x01, 0x74}) &&
+	          (1u << 3) == offs::PHYSICAL_IN_WATER,
+	      "bNotDamagedUpsideDown, the RC car and bIsInWater, each leaving the function");
+	Check(Bytes(img, 0x0052F454, {0x83, 0xC4, 0x38, 0x5D, 0x5F, 0x5E, 0x5B, 0xC2, 0x08, 0x00}),
+	      "(that exit is the whole function's return)");
+	Check(Bytes(img, ROOF_DRAIN_WRITE, {0xD9, 0x05}) &&
+	          Dword(img, ROOF_DRAIN_WRITE + 2) == ROOF_DRAIN_PER_STEP_AT &&
+	          Float(img, ROOF_DRAIN_PER_STEP_AT) == ROOF_DRAIN_PER_STEP &&
+	          Bytes(img, ROOF_DRAIN_WRITE + 6, {0xD8, 0x0D}) &&
+	          Dword(img, ROOF_DRAIN_WRITE + 8) == CTimer__ms_fTimeStep &&
+	          Bytes(img, ROOF_DRAIN_WRITE + 12, {0xD8, 0xAD}) &&
+	          Dword(img, ROOF_DRAIN_WRITE + 14) == offs::VEH_HEALTH &&
+	          Bytes(img, ROOF_DRAIN_WRITE + 18, {0xD9, 0x9D}) &&
+	          Dword(img, ROOF_DRAIN_WRITE + 20) == offs::VEH_HEALTH &&
+	          ROOF_DRAIN_WRITE + 24 == ROOF_DRAIN_SKIP,
+	      "m_fHealth -= 4.0f * CTimer::ms_fTimeStep, and on to the rest of the damage");
+	Check(Bytes(img, 0x0052CD94, {0x8A, 0x81}) && Dword(img, 0x0052CD96) == offs::AUTO_ROOF_FLAGS &&
+	          Bytes(img, 0x0052CD9A, {0x24, uint8_t(~offs::AUTO_NOT_DAMAGED_UPSIDE_DOWN)}) &&
+	          Bytes(img, 0x00588583, {0x80, 0xE1, uint8_t(~offs::AUTO_NOT_DAMAGED_UPSIDE_DOWN),
+	                                  0x80, 0xC9, offs::AUTO_NOT_DAMAGED_UPSIDE_DOWN}),
+	      "the constructor clears bNotDamagedUpsideDown and only the script sets it");
+
+	// CPlayerInfo::Process's own, for the car the local player is in.
+	Check(Bytes(img, PLAYERINFO_ROOF_BLOCK, {0xA1}) &&
+	          Dword(img, PLAYERINFO_ROOF_BLOCK + 1) == CTimer__m_FrameCounter &&
+	          Bytes(img, PLAYERINFO_ROOF_BLOCK + 5, {0x83, 0xE0, 0x1F}),
+	      "the player's car is looked at once every 32 frames");
+	Check(Float(img, 0x005F6A7C) == 0.0f && Float(img, 0x005F6A80) == 0.05f &&
+	          Float(img, 0x005F6A84) == -0.5f,
+	      "on its roof, slower than 0.05, and counted twice as fast past -0.5");
+	Check(Bytes(img, 0x004A07CA, {0x83, 0xBB, 0xF4, 0x00, 0x00, 0x00, 0x06, 0x0F, 0x86}) &&
+	          Bytes(img, 0x004A07DC, {0x8A, 0x80}) && Dword(img, 0x004A07DE) == offs::VEH_FLAGS_C &&
+	          Bytes(img, 0x004A07E2, {0xC0, 0xE8, 0x06}),
+	      "past six counts, and only a car that can be damaged");
+	Check(Bytes(img, PLAYERINFO_ROOF_HEALTH, {0xD9, 0x05}) &&
+	          Dword(img, PLAYERINFO_ROOF_HEALTH + 2) == PLAYER_CAR_ROOF_HEALTH_AT &&
+	          Float(img, PLAYER_CAR_ROOF_HEALTH_AT) == PLAYER_CAR_ROOF_HEALTH &&
+	          PLAYER_CAR_ROOF_HEALTH < VEH_FIRE_HEALTH &&
+	          Bytes(img, 0x004A0828, {0xD9, 0x98}) && Dword(img, 0x004A082A) == offs::VEH_HEALTH,
+	      "its health is taken to 249, under the fire's 250");
+	Check(Bytes(img, PLAYERINFO_ROOF_ENGINE, {0x68, 0xE1, 0x00, 0x00, 0x00}) &&
+	          CallsTo(img, 0x004A084E, CDamageManager__SetEngineStatus) &&
+	          Bytes(img, 0x004A0858, {0xC7, 0x80}) &&
+	          Dword(img, 0x004A085A) == offs::AUTO_SET_ON_FIRE_ENTITY &&
+	          Dword(img, 0x004A085E) == 0,
+	      "the engine set alight at 225, with nobody to blame");
+}
+
 } // namespace
 
 int RunWreckTests() {
 	TestTheShellsPlan();
 	TestTheShellAgainstTheImage();
 	TestWhoseBlastAgainstTheImage();
+	TestTheRoofAgainstTheImage();
 	return g_wreckFailures;
 }

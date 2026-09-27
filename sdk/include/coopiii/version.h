@@ -7,4 +7,4 @@
 // protocol.h, and it moves on its own schedule.
 #pragma once
 
-#define COOPIII_VERSION "0.0.1"
+#define COOPIII_VERSION "0.1.1"

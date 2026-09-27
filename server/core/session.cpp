@@ -46,7 +46,8 @@ Player *Session::AddPlayer(uint32_t peer, const char *nick, uint16_t modelId,
 
 	auto slot = std::find_if(m_players.begin(), m_players.end(),
 	                         [](const Player &p) { return !p.active; });
-	if (slot == m_players.end()) {
+	// Full at the server's maxPlayers as well as at the last slot.
+	if (slot == m_players.end() || Count() >= m_playerLimit) {
 		reject = REJECT_FULL;
 		return nullptr;
 	}
@@ -1850,7 +1851,7 @@ std::vector<uint16_t> Session::ReleaseIdleVehicles(uint32_t nowMs) {
 			continue;
 		}
 		// Unsigned, so a clock that wraps still measures forwards.
-		if (nowMs - v.neededAtMs < VEHICLE_RELEASE_MS)
+		if (nowMs - v.neededAtMs < m_vehicleReleaseMs)
 			continue;
 		// A wreck goes the same way. A copy is locked, so PossiblyRemoveVehicle
 		// skips its distance removal (the bIsLocked test at 0x00418448); this

@@ -11,7 +11,8 @@
 //     scope and name alike, right now. A player who comes into it later is
 //     counted from then on; one who leaves it, or the session, is taken out
 //     of the count, his skip with him;
-//   - it takes 75% of them, rounded up, the rampage vote's rule: two players
+//   - it takes 75% of them, rounded up, the rampage vote's rule, unless the
+//     server's cutsceneSkip says half, all or anyone: two players
 //     is both of them, four is three;
 //   - pressing skip is a yes and stays one for as long as he is in it. There
 //     is no no and no clock: a scene nobody skips ends on its own;
@@ -33,7 +34,7 @@ namespace coopiii {
 
 constexpr uint32_t CUTSCENE_SKIP_LATE_MS = 5000;
 
-// 75% rounded up, the same count as the rampage vote.
+// 75% rounded up, the same count as the rampage vote, and the default rule.
 constexpr uint8_t CutsceneVotesNeeded(uint8_t voters) { return RampageVotesNeeded(voters); }
 
 // What the server has to send, worked out by CutsceneVotes::Evaluate.
@@ -84,6 +85,11 @@ public:
 	}
 
 	void Leave(uint8_t player) { Report(player, CutsceneKey{}, 0); }
+
+	// The server's cutsceneSkip (config.h): how many of the players in a scene
+	// have to press skip. Counted with it from the next press or departure on.
+	void     SetRule(VoteRule rule) { m_rule = rule; }
+	VoteRule Rule() const { return m_rule; }
 
 	// A press of skip. False for somebody in no cutscene, the wrong vote, a
 	// scene already skipped for him, or a second press.
@@ -140,7 +146,7 @@ public:
 				continue;
 			}
 
-			if (yes > 0 && yes >= CutsceneVotesNeeded(voters)) {
+			if (yes > 0 && yes >= VotesNeeded(m_rule, voters)) {
 				CutsceneVoteSend e;
 				e.kind         = CutsceneVoteSend::SKIP;
 				e.to           = members;
@@ -267,12 +273,12 @@ private:
 		return mask;
 	}
 
-	static CutsceneVoteBody Body(const Group &g, uint32_t members, uint32_t yesMask) {
+	CutsceneVoteBody Body(const Group &g, uint32_t members, uint32_t yesMask) const {
 		CutsceneVoteBody b{};
 		b.voteId  = g.voteId;
 		b.voters  = VoteBitCount(members);
 		b.yes     = VoteBitCount(yesMask);
-		b.needed  = CutsceneVotesNeeded(b.voters);
+		b.needed  = VotesNeeded(m_rule, b.voters);
 		b.yesMask = static_cast<uint8_t>(yesMask & 0xFFu);
 		b.key     = g.key;
 		return b;
@@ -283,6 +289,7 @@ private:
 	uint8_t  m_nextId     = 0;
 	uint16_t m_passSerial = 0;
 	uint32_t m_late       = 0;
+	VoteRule m_rule       = VoteRule::Most;
 };
 
 } // namespace coopiii

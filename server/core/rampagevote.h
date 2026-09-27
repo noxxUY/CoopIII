@@ -34,6 +34,30 @@ constexpr uint8_t RampageVotesNeeded(uint8_t voters) {
 	return static_cast<uint8_t>((static_cast<uint32_t>(voters) * 3u + 3u) / 4u);
 }
 
+// How many of the players asked have to say yes: the server's rampageVote
+// and cutsceneSkip (config.h). `Most` is the rule both votes were built with
+// and the default; the others are a group that would rather not wait, or
+// would rather nobody is moved anywhere without saying so.
+enum class VoteRule : uint8_t {
+	Most   = 0,   // 75%, rounded up: two players is both, four is three
+	Half   = 1,   // half, rounded up: two players is one, five is three
+	All    = 2,   // every one of them
+	Anyone = 3,   // one yes is enough
+};
+
+constexpr uint8_t VotesNeeded(VoteRule rule, uint8_t voters) {
+	return voters == 0                ? uint8_t(0)
+	       : rule == VoteRule::Half   ? static_cast<uint8_t>((voters + 1u) / 2u)
+	       : rule == VoteRule::All    ? voters
+	       : rule == VoteRule::Anyone ? uint8_t(1)
+	                                  : RampageVotesNeeded(voters);
+}
+
+// A rampage vote's time can be set from 5 s to a minute: msLeft on the wire
+// is 16 bits of milliseconds.
+constexpr uint32_t RAMPAGE_VOTE_MS_MIN = 5000;
+constexpr uint32_t RAMPAGE_VOTE_MS_MAX = 60000;
+
 // Whether a claim for a skull opens a vote at all. Not with rampages off,
 // where every machine keeps its own frenzy, and not alone.
 constexpr bool RampageNeedsVote(uint8_t rampageRule, uint8_t players) {
@@ -57,6 +81,18 @@ public:
 		FAILED_TIME,
 		CANCELLED,   // the toucher died or left
 	};
+
+	// The server's rampageVote and rampageVoteTime. Taken by the next vote;
+	// one already open is counted with the new rule from now on, and keeps
+	// the time it was opened with only as long as the new one allows.
+	void SetRule(VoteRule rule, uint32_t ms) {
+		m_rule = rule;
+		m_ms   = ms < RAMPAGE_VOTE_MS_MIN   ? RAMPAGE_VOTE_MS_MIN
+		         : ms > RAMPAGE_VOTE_MS_MAX ? RAMPAGE_VOTE_MS_MAX
+		                                    : ms;
+	}
+	VoteRule Rule() const { return m_rule; }
+	uint32_t TimeMs() const { return m_ms; }
 
 	bool               IsOpen() const { return m_open; }
 	uint8_t            Id() const { return m_id; }
@@ -121,7 +157,7 @@ public:
 			out = Outcome::PASSED;
 		else if (Yes() + Undecided() < Needed())
 			out = Outcome::FAILED_NO;
-		else if (nowMs - m_sinceMs >= RAMPAGE_VOTE_MS)
+		else if (nowMs - m_sinceMs >= m_ms)
 			out = Outcome::FAILED_TIME;
 
 		if (out != Outcome::OPEN) {
@@ -142,7 +178,7 @@ public:
 	}
 
 	uint8_t Voters() const { return VoteBitCount(m_voters); }
-	uint8_t Needed() const { return RampageVotesNeeded(Voters()); }
+	uint8_t Needed() const { return VotesNeeded(m_rule, Voters()); }
 	uint8_t Yes() const { return VoteBitCount(m_yes & m_voters); }
 	uint8_t No() const { return VoteBitCount(m_no & m_voters); }
 	uint8_t Undecided() const { return static_cast<uint8_t>(Voters() - Yes() - No()); }
@@ -150,7 +186,7 @@ public:
 
 	uint16_t MsLeft(uint32_t nowMs) const {
 		const uint32_t gone = nowMs - m_sinceMs;
-		return gone >= RAMPAGE_VOTE_MS ? 0 : static_cast<uint16_t>(RAMPAGE_VOTE_MS - gone);
+		return gone >= m_ms ? 0 : static_cast<uint16_t>(m_ms - gone);
 	}
 
 	// What goes on the wire. While it's open, the live count; once it has
@@ -169,13 +205,15 @@ public:
 			b.voters = m_endedVoters;
 			b.msLeft = 0;
 		}
-		b.needed = RampageVotesNeeded(b.voters);
+		b.needed = VotesNeeded(m_rule, b.voters);
 		return b;
 	}
 
 	uint8_t EndedNo() const { return m_endedNo; }
 
 private:
+	VoteRule    m_rule    = VoteRule::Most;
+	uint32_t    m_ms      = RAMPAGE_VOTE_MS;
 	bool        m_open    = false;
 	uint8_t     m_id      = 0;
 	uint8_t     m_starter = INVALID_PLAYER;

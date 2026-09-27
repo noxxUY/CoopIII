@@ -160,6 +160,9 @@ bool VehicleBurning(RemoteVehicle &vehicle);
 // Under the water's surface and still moving: a car on its way to the bottom.
 bool VehicleSinking(RemoteVehicle &vehicle);
 
+// Lying on its roof where VehicleDamage drains it (game/wreck.h, CarOnItsRoof).
+bool VehicleOnItsRoof(RemoteVehicle &vehicle);
+
 // Still going down, or still drifting, in the engine's per-step units: faster
 // than a tenth of a metre a second down, or a fifth of one any way at all. Not
 // the rest test, whose 3.5 m/s is CanPedExitCar's: the water holds a sinking
@@ -760,10 +763,11 @@ inline ReplayTarget ClassifyReplayCar(CarOwner owner, bool weDrive, bool weSettl
 // did not kill a parked car was undone the next frame.
 //
 // The blast's number and not the engine's own. The engine lowers a copy's
-// health outside InflictDamage too - the upside-down drain at 0x0052F472 sits
-// above the bCollisionProof gate, a burning occupant writes 75 at 0x00479959 -
-// and each of those is this machine alone: kept, a parked car lying on its
-// roof drained to a fire and a wreck on one screen.
+// health outside InflictDamage too - a burning occupant writes 75 at
+// 0x00479959, and the upside-down drain did until RoofDrainMayRun kept it off
+// copies - and each of those is this machine alone: kept, a parked car lying
+// on its roof drained to a fire and a wreck on one screen. A car on its roof
+// is drained by whoever holds it, and reaches here through their word.
 inline float HealthToWrite(float wire, bool blasted, float blastHealth) {
 	if (!(wire == wire && wire > -1.0e9f && wire < 1.0e9f))
 		wire = 1000.0f;
@@ -779,6 +783,23 @@ inline float HealthToWrite(float wire, bool blasted, float blastHealth) {
 // custodian left goes up there and reaches everybody else as UNOWNED_SESSION.
 inline bool MayBlowUpCar(CarOwner owner) {
 	return owner == CarOwner::Local || owner == CarOwner::Nobody;
+}
+
+// May VehicleDamage's upside-down drain run on this car here (addresses.h, "a
+// car left on its roof")? Only where this machine's word is the car's health:
+// the car we drive or settle, traffic we host, a parked car. Everywhere else
+// the health is written from the wire, so a drain here was one machine
+// deciding alone for the frame until the wire put it back - or, on a car
+// nobody holds, for good once it crossed 250 on the host, whose fire timer
+// is not held. The machine that does decide it drains it, and what it says
+// carries the fire to everybody.
+//
+// A session car nobody holds included: it is pinned where it was left on
+// every machine and nobody's engine is simulating it. A car on its roof is
+// kept by its custodian until it burns (client.h, RoofKeepsCustody) rather
+// than left to that.
+inline bool RoofDrainMayRun(CarOwner owner) {
+	return owner == CarOwner::Local;
 }
 
 // How many machines get to decide that this car is a wreck, for the money a

@@ -158,6 +158,11 @@ S_MissionState State(uint8_t state, uint8_t owner, uint16_t number, uint8_t part
                      uint8_t outcome = MISSION_OUTCOME_NONE, uint32_t campaignLog = 77) {
 	S_MissionState s;
 	InitHeader(s, 1000);
+	// The server's defaults, as every server sends them.
+	s.checkpointWaitS = MISSION_CHECKPOINT_WAIT_MS / 1000;
+	s.catchUpM        = MISSION_CATCH_UP_M_DEFAULT;
+	s.behindM         = MISSION_BEHIND_M_DEFAULT;
+	s.behindS         = MISSION_BEHIND_S_DEFAULT;
 	s.campaignLog   = campaignLog;
 	s.state         = state;
 	s.ownerId       = owner;
@@ -1408,6 +1413,68 @@ void TestEverybodyStandsBesideTheOwner() {
 	Check(g_teleports.size() == 1 && g_teleports[0].first == 0 && g_teleports[0].second == 3 &&
 	          g_effects == 0,
 	      "the owner's SET_PLAYER_COORDINATES moves us, as the first of three, not as a plain run");
+}
+
+// Give Me Liberty's safehouse: the owner, on foot, is put in the room behind
+// the door (895.9, -311.4) while a participant sits at the wheel of the
+// Kuruma outside, 21 m off. The handler moves a player's car with him, and
+// the ring round that spot is in the walls; the participant drives the car,
+// so every screen followed it there.
+void TestAPedestriansMoveLeavesTheCar() {
+	std::printf("\nthe owner's move on foot, and a participant in a car\n");
+	using namespace game;
+	Check(OwnerMoveTag(false, 4) == 0 && !OwnerMovedInCar(0) && OwnerMoveCar(0) == INVALID_NETID,
+	      "on foot is 0, and names no car");
+	Check(OwnerMovedInCar(OwnerMoveTag(true, 4)) && OwnerMoveCar(OwnerMoveTag(true, 4)) == 4,
+	      "in a car is that car's netId, one up");
+	Check(OwnerMovedInCar(OwnerMoveTag(true, INVALID_NETID)) &&
+	          OwnerMoveCar(OwnerMoveTag(true, INVALID_NETID)) == INVALID_NETID,
+	      "and a car the session has no name for is still a car");
+	Check(OwnerMovedInCar(OwnerMoveTag(true, 0xFFFF)) &&
+	          OwnerMoveCar(OwnerMoveTag(true, 0xFFFF)) == 0xFFFF,
+	      "the highest netId fits");
+	Check(!OwnerMovedInCar(-1), "an older owner's -1 reads as on foot, which moves no car");
+
+	MissionMoveFacts f;
+	f.inCar        = true;
+	f.simulateHere = true;   // we are at its wheel
+	f.ownerTag     = OwnerMoveTag(false, 0);
+	f.distanceM    = 21.0f;
+	Check(MissionMoveFor(f) == MissionMove::StayInCar,
+	      "Give Me Liberty: the owner walked into the safehouse, and the car we drive stays "
+	      "where it is parked rather than going onto the ring round a room");
+	f.distanceM = 400.0f;
+	Check(MissionMoveFor(f) == MissionMove::OutOfCar,
+	      "a move on foot across town takes us out of the car and beside the owner on foot");
+	f.distanceM    = 21.0f;
+	f.simulateHere = false;
+	Check(MissionMoveFor(f) == MissionMove::StayInCar,
+	      "and a passenger stays in their seat for a move on foot nearby too");
+
+	f.ownerTag     = OwnerMoveTag(true, 9);
+	f.simulateHere = true;
+	Check(MissionMoveFor(f) == MissionMove::CarRing,
+	      "the owner moved in a car of their own: ours goes onto the car ring");
+	f.ownersCar = true;
+	Check(MissionMoveFor(f) == MissionMove::CarOnSpot,
+	      "the owner rides in the car we drive: it goes onto the owner's spot, where the "
+	      "owner's copy of it was put");
+	f.simulateHere = false;
+	Check(MissionMoveFor(f) == MissionMove::StaySeated,
+	      "we ride in the owner's car: the owner's own move carries it, and we stay seated");
+	f.ownersCar = false;
+	Check(MissionMoveFor(f) == MissionMove::StaySeated,
+	      "we ride in somebody else's car: its driver's machine moves it, not ours");
+
+	MissionMoveFacts out;
+	out.inCar    = true;
+	out.warpsOut = true;
+	out.ownerTag = OwnerMoveTag(false, 0);
+	Check(MissionMoveFor(out) == MissionMove::OutOfCar,
+	      "WARP_PLAYER_FROM_CAR_TO_COORD takes us out of any car, and leaves the car");
+	MissionMoveFacts foot;
+	foot.ownerTag = OwnerMoveTag(true, 4);
+	Check(MissionMoveFor(foot) == MissionMove::OnFoot, "on foot, we are simply put on the ring");
 }
 
 void TestTheWidgetsFollowTheOwner() {
@@ -3250,6 +3317,40 @@ int CollectedBy(const std::vector<uint8_t> &img, uint32_t fn) {
 	return -1;
 }
 
+// What the two moves a participant replays do to a car (mission.h,
+// MissionMoveFor): SET_PLAYER_COORDINATES moves a seated player's car,
+// WARP_PLAYER_FROM_CAR_TO_COORD takes the player out and leaves it.
+void TestTheMovesAgainstTheImage() {
+	std::printf("\nthe owner's moves, and what they do to a car, against gta3.exe\n");
+	std::vector<uint8_t> img;
+	std::string          from;
+	if (!LoadGta3(img, from)) {
+		std::printf("  [skipped] no retail gta3.exe; set COOPIII_GTA3_EXE to check them\n");
+		return;
+	}
+	namespace g = game;
+	const uint32_t set = HandlerOf(img, g::scripts::op::SET_PLAYER_COORDINATES);
+	Check(set == 0x0043A92C && CollectedBy(img, set) == 4,
+	      "SET_PLAYER_COORDINATES is 0x0043A92C and takes the player and a place");
+	Check(BytesAt(img, 0x0043A995, {0x80, 0xB9, LE32(static_cast<uint32_t>(g::offs::PED_IN_VEHICLE)), 0}) &&
+	          BytesAt(img, 0x0043A9D0, {0x8B, 0x89, LE32(static_cast<uint32_t>(g::offs::PED_MY_VEHICLE))}) &&
+	          BytesAt(img, 0x0043AA08, {0xFF, 0x55, 0x2C}) && BytesAt(img, 0x0043AA2E, {0xFF, 0x56, 0x2C}),
+	      "and for a player in a car it tests bInVehicle and teleports m_pMyVehicle through its "
+	      "vtable, so whichever machine runs it moves the car");
+	Check(CallTargetAt(img, 0x0043AA43) == 0x00454060,
+	      "then clears the space round it, the car and all (ClearSpaceForMissionEntity)");
+	const uint32_t warp = HandlerOf(img, g::scripts::op::WARP_PLAYER_FROM_CAR_TO_COORD);
+	Check(warp == 0x0043E860 && CollectedBy(img, warp) == 4,
+	      "WARP_PLAYER_FROM_CAR_TO_COORD is 0x0043E860, the same four operands");
+	Check(CallTargetAt(img, 0x0043E910) == g::CVehicle__RemoveDriver &&
+	          CallTargetAt(img, 0x0043E951) == g::CVehicle__RemovePassenger &&
+	          BytesAt(img, 0x0043E958,
+	                  {0xC6, 0x80, LE32(static_cast<uint32_t>(g::offs::PED_IN_VEHICLE)), 0}) &&
+	          BytesAt(img, 0x0043E961,
+	                  {0xC7, 0x80, LE32(static_cast<uint32_t>(g::offs::PED_MY_VEHICLE)), 0, 0, 0, 0}),
+	      "and it takes the driver or the passenger out, clears the seat, and never moves the car");
+}
+
 void TestTheScriptEngineAgainstTheImage() {
 	std::printf("\nthe script engine's addresses against gta3.exe\n");
 	std::vector<uint8_t> img;
@@ -4075,7 +4176,92 @@ void TestTheCarListsAreTheSessions() {
 	      "the session's lists only ever grow");
 }
 
+// The same waits and moves under a host who changed the numbers they run on
+// (S_MissionState: checkpointWaitS, catchUpM, behindM, behindS and
+// MISSION_FLAG_TIMED_CHECKPOINTS).
+void TestTheHostSaysHowLongAndHowFar() {
+	std::printf("\nthe host's own checkpoint wait, catch-up and straggler distance\n");
+	const MissionArea cp = MissionAreaLocate2D(500.0f, 500.0f, 4.0f, 4.0f);
+	Vec3              at{};
+	uint8_t           slot = 0, count = 0;
+
+	S_MissionState quick = State(MISSION_STATE_RUNNING, 0, 21, 0x07);
+	quick.checkpointWaitS = 20;
+	MissionSync m = Fresh();   // alice, 0, owns a story mission
+	m.OnState(quick, 0, 1000);
+	Check(m.CheckpointWaitS() == 20, "the owner takes the host's 20 s");
+	g_roster.others = {{1, true, {502.0f, 500.0f, 0.0f}}, {2, true, {1540.0f, 500.0f, 0.0f}}};
+	Check(!m.AskCheckpoint(cp, 0, 10000) && !m.AskCheckpoint(cp, 0, 10000 + 19900),
+	      "and waits for carol for as long as that");
+	Check(m.AskCheckpoint(cp, 0, 10000 + 20000) && m.CheckpointsGivenUp() == 1,
+	      "and no longer, a long way short of the minute");
+
+	S_MissionState never = quick;
+	never.checkpointWaitS = 0;
+	MissionSync n = Fresh();
+	g_roster.others = {{1, true, {502.0f, 500.0f, 0.0f}}, {2, true, {1540.0f, 500.0f, 0.0f}}};
+	n.OnState(never, 0, 1000);
+	Check(n.AskCheckpoint(cp, 0, 2000) && SentCount<C_MissionCheckpoint>() == 0,
+	      "with a wait of 0 no checkpoint waits, and nobody is reported missing");
+
+	S_MissionState race = State(MISSION_STATE_RUNNING, 0, 40, 0x07);   // Turismo
+	race.flags = static_cast<uint8_t>(race.flags | MISSION_FLAG_TIMED_CHECKPOINTS);
+	MissionSync r = Fresh();
+	g_roster.others = {{1, true, {502.0f, 500.0f, 0.0f}}, {2, true, {1540.0f, 500.0f, 0.0f}}};
+	r.OnState(race, 0, 1000);
+	Check(!r.AskCheckpoint(cp, 0, 2000), "a race waits for carol once the host says races do");
+	r.SetTimerUp(true);
+	Check(!r.AskCheckpoint(cp, 0, 2100), "and so does one with its clock up");
+
+	S_MissionState noCatchUp = State(MISSION_STATE_RUNNING, 0, 21, 0x0F);
+	noCatchUp.catchUpM = 0;
+	MissionSync late = Fresh();   // dave, 3, joins alice's mission a long way off
+	g_roster.others = {{0, true, {100.0f, 100.0f, 10.0f}}};
+	late.OnState(noCatchUp, 3, 1000);
+	Check(!late.TakeSummon({2000.0f, -500.0f, 10.0f}, 3, 1000 + MISSION_SUMMON_DELAY_MS, &at,
+	                       &slot, &count),
+	      "with catch-up off, somebody who comes in late is not moved");
+
+	S_MissionState wide = State(MISSION_STATE_RUNNING, 0, 21, 0x0F);
+	wide.catchUpM = 500;
+	MissionSync walk = Fresh();
+	g_roster.others = {{0, true, {100.0f, 100.0f, 10.0f}}};
+	walk.OnState(wide, 3, 1000);
+	Check(!walk.TakeSummon({400.0f, 100.0f, 10.0f}, 3, 1000 + MISSION_SUMMON_DELAY_MS, &at, &slot,
+	                       &count),
+	      "and with it at 500 m, 300 m away walks");
+
+	S_MissionState stragglers = State(MISSION_STATE_RUNNING, 0, 7, 0x03);   // a 4x4 run
+	stragglers.behindM = 300;
+	stragglers.behindS = 30;
+	MissionSync bob = Fresh();
+	bob.OnState(State(MISSION_STATE_IDLE, INVALID_PLAYER, MISSION_NONE, 0), 1, 500);
+	bob.OnState(stragglers, 1, 1000);
+	g_roster.others = {{0, true, {0.0f, 0.0f, 0.0f}}};
+	const Vec3 far{400.0f, 0.0f, 0.0f}, middling{200.0f, 0.0f, 0.0f};
+	bob.WatchBehind(middling, 1, 2000);
+	bob.WatchBehind(middling, 1, 60000);
+	Check(!bob.SummonPending(), "200 m behind is fine when the host says 300");
+	bob.WatchBehind(far, 1, 61000);
+	bob.WatchBehind(far, 1, 61000 + 29999);
+	Check(!bob.SummonPending(), "400 m behind for under the host's 30 s is not moved");
+	bob.WatchBehind(far, 1, 61000 + 30000);
+	Check(bob.SummonPending() && bob.TakeSummon(far, 1, 61000 + 30000, &at, &slot, &count),
+	      "and is brought along at 30 s");
+
+	S_MissionState off = stragglers;
+	off.behindM = 0;
+	MissionSync stays = Fresh();
+	g_roster.others = {{0, true, {0.0f, 0.0f, 0.0f}}};
+	stays.OnState(State(MISSION_STATE_IDLE, INVALID_PLAYER, MISSION_NONE, 0), 1, 500);
+	stays.OnState(off, 1, 1000);
+	stays.WatchBehind({5000.0f, 0.0f, 0.0f}, 1, 2000);
+	stays.WatchBehind({5000.0f, 0.0f, 0.0f}, 1, 200000);
+	Check(!stays.SummonPending(), "and with the straggler distance at 0, nobody ever is");
+}
+
 int RunMissionTests() {
+	TestTheHostSaysHowLongAndHowFar();
 	TestARaceDoesNotWaitAtItsCheckpoints();
 	TestWhoeverFallsFarBehindIsBroughtAlong();
 	TestAChargeIsTheOwnersAlone();
@@ -4085,11 +4271,13 @@ int RunMissionTests() {
 	TestWhatAMissionWritesIntoTheCampaign();
 	TestTheCampaignInTheScript();
 	TestEverybodyStandsBesideTheOwner();
+	TestAPedestriansMoveLeavesTheCar();
 	TestAConditionIsWidenedToEverybody();
 	TestEachLaunchKnowsItsKind();
 	TestTheEnemiesStandUpToMorePlayers();
 	TestTheWidgetsFollowTheOwner();
 	TestTheScriptEngineAgainstTheImage();
+	TestTheMovesAgainstTheImage();
 	TestTheSkyAgainstTheImage();
 	TestWhatTheOwnersMissionShows();
 	TestAnInstructionWaitsForTheCopyItNames();

@@ -3,8 +3,8 @@
 What the scripted half of GTA III can become in a session, and whether that
 needs a Sanny Builder SDK and a modified `main.scm`.
 
-The question, from the owner on 2026-09-24: free roam is nearly done, so what
-can we do with the rampages, the missions and the rest? Do we write a mission
+The question, on 2026-09-24: free roam is nearly done, so what can we do with
+the rampages, the missions and the rest? Do we write a mission
 SDK for Sanny Builder and modify `main.scm`, or is there an easier way?
 
 This file is the investigation. `campaign.md` is still the campaign's design
@@ -12,9 +12,9 @@ document. Where the two disagree, the measurement is here and `campaign.md` has
 a dated note pointing to it.
 
 **The first of it is built** (§15 says what, and what is next). The rest is
-the plan the owner decided on, with the numbers behind it. [mission-audit.md](mission-audit.md) checks every
+the plan that was settled on, with the numbers behind it. [mission-audit.md](mission-audit.md) checks every
 one of the 80 missions against it and adds sixteen requirements this file
-doesn't cover. §9 records what the owner decided on 2026-09-24:
+doesn't cover. §9 records what was decided on 2026-09-24:
 a shared campaign, everybody paid, a death failing the mission, everybody at
 the start and at every checkpoint. §10 to §14
 work out what those decisions need: difficulty for more players, everybody in
@@ -474,8 +474,8 @@ settled:
 
 `0417` is where the mission's number becomes known, so the owner reports it
 there and the effect stream starts. Odd jobs, RC, the 4x4 runs and Mayhem
-never pass through `03EE`. The owner decided they're session missions too
-(§9). So each one gets the same claim at its own start gate, the last player
+never pass through `03EE`. They're session missions too, as decided in
+§9. So each one gets the same claim at its own start gate, the last player
 check its trigger makes before its `0417` (`mission-audit.md` C1).
 
 Tier 3's "any player can start a mission" therefore needs no trigger
@@ -568,7 +568,7 @@ a main.scm that differs is refused per delta, by its hash, not at the join.
 > in the mission car and another at the destination would pass a check that
 > no single player passed.
 
-The owner decided the rule instead (`mission-audit.md` C1), CoopAndreas'
+The rule chosen instead (`mission-audit.md` C1) is CoopAndreas'
 rule: **everybody has to be there.**
 
 - **At the start**, everybody has to be in the start's area before a mission
@@ -601,7 +601,7 @@ rule: **everybody has to be there.**
 "Everybody" is safe where "anybody" wasn't: it distributes over an `if and`,
 so a compound check still needs one state that satisfies all of it.
 
-Actions are a separate question, and the owner's decisions answer it: what
+Actions are a separate question, and the decisions in §9 answer it: what
 the story does to "the player" happens to every participant
 (`mission-audit.md` R12). That covers:
 
@@ -787,9 +787,9 @@ slot) needs checking against retail before any override depends on it.
 
 ---
 
-## 9. What the owner decided, and what's still open
+## 9. What was decided, and what's still open
 
-Decided by the owner on 2026-09-24, after reading the sections above:
+Decided on 2026-09-24, after reading the sections above:
 
 1. **The target is a shared campaign.** The whole game, played together from
    start to end, with one progress for everybody. Phase 1 stays in the plan
@@ -1019,9 +1019,8 @@ it, which is what everybody should see.
 
 ### 11.2 Gathering
 
-> **Changed 2026-09-24.** The owner decided that everybody has to be at the
-> start before a mission launches (§5.6), so nobody needs bringing to it any
-> more. Moving everybody along with the mission's own teleports stays.
+> **Changed 2026-09-24.** Everybody now has to be at the start before a
+> mission launches (§5.6), so nobody needs bringing to it any more. Moving everybody along with the mission's own teleports stays.
 
 Every participant is already beside the owner when the mission launches
 (§5.6's start gate). After that, each `SET_PLAYER_COORDINATES` the mission
@@ -1029,6 +1028,14 @@ runs on the owner (82 sites in 49 missions) moves the participants the same
 way: to spots around the owner's new position, controls frozen, a fade over
 the move. That's what puts everybody where the play starts after a cutscene,
 and at the next scene after the next one.
+
+A participant in a car is moved car and all only when the owner was in a car
+as well and the participant's machine is the one simulating it; a move of the
+owner on foot leaves a car where it is, with its driver in it when the spot is
+within 60 m and out on foot beside the owner when it is further
+(`protocol.md`, "Moving everybody with the mission"). Give Me Liberty puts the
+owner in the safehouse room behind the door, and a car on the ring round that
+spot is in the walls.
 
 It also solves a problem nobody would see until it bit. A cutscene plays at a
 place, and a machine whose player is across town doesn't have that place
@@ -1186,7 +1193,9 @@ without ending, reports the mission failed.
 
 The mission's `ADD_SCORE` on the owner (89 sites) is replayed to every
 participant, whose own engine pays its own player. Under the server's
-`money = shared` there's only one wallet, so there it's paid once.
+`money = shared` there's only one wallet, so there it's paid once. A
+server with `missionPayHelpers = false` pays the owner alone: it does not
+relay the reward (`protocol.md` §1.46).
 
 What a mission *charges* is the owner's alone (decided 2026-09-25): Bomb Da
 Base: Act II takes $100,000 and The Exchange $500,000 (`ADD_SCORE` with a
@@ -1215,7 +1224,7 @@ participant would count each of them twice.
 ### 12.2 A death fails the mission
 
 `missionFailOnDeath` already sits in `ServerConfig`, default `true`. It's the
-switch the owner meant.
+switch for this.
 
 - **The owner dies or is busted:** the engine fails the mission, exactly as
   in single player.
@@ -1357,7 +1366,10 @@ audit found by how many missions each opens up.
   a timed mission is never lost with its owner standing in the checkpoint.
   A mission with a countdown up, a race, an odd job and the RC, 4x4 and
   Mayhem runs don't wait at all, and bring along whoever is more than 150 m
-  behind for 10 s instead (§5.6).
+  behind for 10 s instead (§5.6). The wait, whether races and timed
+  missions wait too, and the two distances are the server's
+  (`missionCheckpointWait`, `missionTimedCheckpoints`, `missionCatchUp`,
+  `missionFallBehind`, `protocol.md` §1.46); these are their defaults.
 - Who a start or a checkpoint waits for, and for how long more, is a small
   line in the HUD's bottom-right corner on every machine it concerns, in the
   version mark's face: "Waiting for carol - 42 s", "alice is waiting for you
@@ -1642,7 +1654,7 @@ bridge for everybody's intro to end. A participant's game that loads or
 starts over mid-mission is handed what the mission has up again, and the
 owner's fails the mission.
 
-**Failing and trying again** (the owner's run on 2026-09-24, Give Me Liberty
+**Failing and trying again** (a test run on 2026-09-24, Give Me Liberty
 failed and retried three times over). A failure runs `MISSION_HAS_FINISHED`
 twice, once in the failure and once in the cleanup after the critical
 restart has put its player back at the bridge, and the session's mission
@@ -1673,9 +1685,10 @@ already sent as they stood. Now:
 
 **Next, in this order:**
 
-1. **A game.** None of the above has run in one yet. The first thing to find
-   out is whether the owner's mission, its effects and its campaign delta do
-   what the tests say they do on two real machines (§5).
+1. **More games.** Most of the above has only been through the test suites
+   and short sessions. What matters is whether the owner's mission, its
+   effects and its campaign delta do what the tests say they do on two real
+   machines, mission after mission (§5).
 2. Deal Steal's and Plaster Blaster's stealth checks (R13). Their scripts are
    not in the converted source this was measured on, so which instructions
    decide "you have been spotted" has to be read off the retail main.scm
@@ -1688,15 +1701,11 @@ already sent as they stood. Now:
    of globals every machine's own scripts leave alone once a delta has set
    them, or it would cry wolf.
 
-**For whoever has the game and its exe.** Everything above was written and
-tested without gta3.exe. What only the game can settle, in the order worth
-doing it:
+**What only the game can settle**, in the order worth doing it:
 
 1. `COOPIII_GTA3_EXE=<path to a 1.0 gta3.exe> clienttest` checks the script
    engine's addresses against the image ("the script engine's addresses
-   against gta3.exe"). On a 64-bit Linux host the moving-list sweep's checks
-   fail by themselves, since a 32-bit process's stack is above 2 GB there,
-   and that is not the change under test.
+   against gta3.exe").
 2. Done statically on 2026-09-24: `DoSettingsBeforeStartingAGame`, the bomb
    bits, `APPLY_BRAKES_TO_PLAYERS_CAR`, the garages' and the Cessnas'
    questions all held. `IS_CAR_IN_MISSION_GARAGE` was `03D4` and is `021C`,

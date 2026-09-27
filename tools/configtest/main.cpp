@@ -62,7 +62,7 @@ void TestPassword() {
 	written.hiddenPackages = PackageMode::PerPlayer;
 	const std::string ini = written.ToIni();
 	Check(ini.find("password = open sesame\n") != std::string::npos,
-	      "the file says the password, on the last line and whole");
+	      "the file says the password, on a line of its own and whole");
 	ServerConfig read;
 	read.Parse(ini);
 	Check(read == written, "and reads back the same");
@@ -258,6 +258,23 @@ void TestRoundTrip() {
 	written.missionMarginCm    = 333;
 	written.missionEnemies     = MISSION_ENEMIES_MORE;
 	written.missionScale       = 120;
+	written.maxPlayers              = 5;
+	written.maxWanted               = 4;
+	written.missionCheckpointWaitS  = 90;
+	written.missionTimedCheckpoints = true;
+	written.missionCatchUpM         = 120;
+	written.missionBehindM          = 220;
+	written.missionBehindS          = 12;
+	written.missionIntroWaitS       = 45;
+	written.missionPayHelpers       = false;
+	written.cutsceneSkip            = VoteRule::All;
+	written.rampageVote             = VoteRule::Half;
+	written.rampageVoteS            = 20;
+	written.abandonedCarS           = 90;
+	written.cheats                  = CheatMode::Personal;
+	written.password                = "letmein";
+	written.lookUpPublicAddress     = false;
+	written.openRouterPort          = false;
 
 	const std::string ini = written.ToIni();
 	Check(ini.find("[CoopIII]") != std::string::npos, "the file has its section header");
@@ -273,6 +290,126 @@ void TestRoundTrip() {
 	ServerConfig back;
 	back.Parse(fresh.ToIni());
 	Check(back == fresh, "the defaults round trip");
+}
+
+// The settings that were numbers built into the server and the clients until
+// the window could change them. Their defaults are those numbers, so a file
+// without them is the server it always was.
+void TestTheSettingsThatWereBuiltIn() {
+	std::printf("the settings that used to be built in\n");
+
+	const ServerConfig c;
+	Check(c.maxPlayers == MAX_PLAYERS, "every slot is open");
+	Check(c.maxWanted == 6, "six stars, the game's own");
+	Check(c.missionCheckpointWaitS == 60 && !c.missionTimedCheckpoints,
+	      "a checkpoint waits a minute, and not in a race or against a clock");
+	Check(c.missionCatchUpM == 60 && c.missionBehindM == 150 && c.missionBehindS == 10,
+	      "latecomers past 60 m and stragglers past 150 m for 10 s are brought along");
+	Check(c.missionIntroWaitS == 60, "a start waits a minute for a game in its own intro");
+	Check(c.missionPayHelpers, "everybody in a mission is paid (missions.md 12.1)");
+	Check(c.cutsceneSkip == VoteRule::Most && c.rampageVote == VoteRule::Most &&
+	          c.rampageVoteS == 15,
+	      "both votes take 75%, and the rampage vote 15 s");
+	Check(c.abandonedCarS == 60, "an abandoned car goes after a minute");
+
+	ServerConfig p;
+	Check(p.Parse("maxPlayers = 4\nmaxWantedLevel = 3\nmissionCheckpointWait = 0\n"
+	              "missionTimedCheckpoints = yes\nmissionCatchUp = 0\nmissionFallBehind = 400\n"
+	              "missionFallBehindTime = 30\nmissionIntroWait = 120\nmissionPayHelpers = false\n"
+	              "cutsceneSkip = anyone\nrampageVote = all\nrampageVoteTime = 30\n"
+	              "abandonedCars = 300\n"),
+	      "every one of them parses");
+	Check(p.maxPlayers == 4 && p.maxWanted == 3, "the player limit and the stars");
+	Check(p.missionCheckpointWaitS == 0 && p.missionTimedCheckpoints,
+	      "checkpoints that never wait, and the timed ones too");
+	Check(p.missionCatchUpM == 0 && p.missionBehindM == 400 && p.missionBehindS == 30,
+	      "nobody brought in late, stragglers past 400 m for 30 s");
+	Check(p.missionIntroWaitS == 120 && !p.missionPayHelpers, "the intro wait and the pay");
+	Check(p.cutsceneSkip == VoteRule::Anyone && p.rampageVote == VoteRule::All &&
+	          p.rampageVoteS == 30,
+	      "the two votes");
+	Check(p.abandonedCarS == 300, "and the abandoned cars");
+
+	// Out of range, or not a number: left where it was.
+	ServerConfig keep;
+	keep.Parse("maxPlayers = 0\nmaxPlayers = 9\nmaxWantedLevel = 0\nmaxWantedLevel = 7\n"
+	           "missionCheckpointWait = 601\nmissionCatchUp = -5\nmissionFallBehind = lots\n"
+	           "missionFallBehindTime = 0\nmissionIntroWait = 5\nrampageVoteTime = 61\n"
+	           "rampageVoteTime = 4\nabandonedCars = 9\nabandonedCars = 601\n"
+	           "cutsceneSkip = maybe\nrampageVote = \n");
+	Check(keep == ServerConfig{}, "every value out of its range, or not one at all, is ignored");
+
+	ServerConfig spelled;
+	spelled.Parse("cutsceneSkip = 50%\nrampageVote = everyone\n");
+	Check(spelled.cutsceneSkip == VoteRule::Half && spelled.rampageVote == VoteRule::All,
+	      "a vote rule can be written as a share or a word");
+	spelled.Parse("cutsceneSkip = MOST\nrampageVote = One\n");
+	Check(spelled.cutsceneSkip == VoteRule::Most && spelled.rampageVote == VoteRule::Anyone,
+	      "in any case");
+
+	Check(std::string(Name(VoteRule::Half)) == "half" && std::string(Name(VoteRule::Anyone)) == "anyone",
+	      "the file says half and anyone");
+	Check(std::string(Label(VoteRule::Most)) == "75%", "and the window says 75%");
+
+	// Each of them on its own survives the file, so none is written under
+	// the wrong key or read into the wrong field.
+	ServerConfig each[13];
+	each[0].maxPlayers              = 3;
+	each[1].maxWanted               = 2;
+	each[2].missionCheckpointWaitS  = 125;
+	each[3].missionTimedCheckpoints = true;
+	each[4].missionCatchUpM         = 250;
+	each[5].missionBehindM          = 0;
+	each[6].missionBehindS          = 45;
+	each[7].missionIntroWaitS       = 15;
+	each[8].missionPayHelpers       = false;
+	each[9].cutsceneSkip            = VoteRule::Half;
+	each[10].rampageVote            = VoteRule::Anyone;
+	each[11].rampageVoteS           = 5;
+	each[12].abandonedCarS          = 600;
+	bool allBack = true;
+	for (const ServerConfig &one : each) {
+		ServerConfig read;
+		read.Parse(one.ToIni());
+		allBack = allBack && read == one && one != ServerConfig{};
+	}
+	Check(allBack, "and each of them, changed alone, reads back as itself");
+}
+
+// The two things the server does outside the session when it starts: look up
+// the public address and ask the router for the port. On unless the host says
+// otherwise, since a host who has to learn about port forwarding first is a
+// host whose friends never get in.
+void TestTheRouterAndThePublicAddress() {
+	std::printf("the public address and the router\n");
+
+	const ServerConfig c;
+	Check(c.lookUpPublicAddress, "the public address is looked up by default");
+	Check(c.openRouterPort, "and the router asked for the port");
+
+	ServerConfig p;
+	Check(p.Parse("lookUpPublicAddress = false\nopenRouterPort = no\n") &&
+	          !p.lookUpPublicAddress && !p.openRouterPort,
+	      "both can be turned off");
+	p.Parse("LOOKUPPUBLICADDRESS = on\nupnp = 1\n");
+	Check(p.lookUpPublicAddress && p.openRouterPort,
+	      "in any case, and upnp is taken for the router's");
+
+	const std::string ini = c.ToIni();
+	Check(ini.find("lookUpPublicAddress = true\n") != std::string::npos &&
+	          ini.find("openRouterPort = true\n") != std::string::npos,
+	      "the file says both, under the names it reads");
+
+	ServerConfig each[2];
+	each[0].lookUpPublicAddress = false;
+	each[1].openRouterPort      = false;
+	bool allBack = true;
+	for (const ServerConfig &one : each) {
+		ServerConfig read;
+		read.Parse(one.ToIni());
+		allBack = allBack && read == one && one != ServerConfig{};
+	}
+	Check(allBack, "and each, changed alone, reads back as itself and is a different config");
 }
 
 void TestNames() {
@@ -298,10 +435,12 @@ int main() {
 	TestParse();
 	TestRoundTrip();
 	TestNames();
+	TestTheSettingsThatWereBuiltIn();
 	TestCheats();
 	TestMoney();
 	TestHiddenPackages();
 	TestPassword();
+	TestTheRouterAndThePublicAddress();
 
 	std::printf("\n%s\n", g_failures == 0 ? "all server config checks passed"
 	                                      : "server config checks FAILED");

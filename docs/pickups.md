@@ -718,7 +718,7 @@ Both types are short-lived, which turns out to decide more than it looks.
 
 ### 10.2 The ambient ped sync changed the answer, and not in the direction the question expected
 
-The brief asked what happens today when a remote player kills a hosted ambient
+The question was what happens today when a remote player kills a hosted ambient
 ped, because the answer decides where the drop is decided. The answer is that
 **it cannot happen**. `game/population.cpp`'s replica recipe sets
 `bBulletProof`, `bFireProof`, `bCollisionProof`, `bMeleeProof` and
@@ -737,7 +737,7 @@ Follow that through the two creators and the whole problem dissolves:
 | ambient replica of somebody else's | refused: `CharCreatedBy == MISSION_CHAR` | nothing: the replica was never given a weapon |
 | remote player's ped | refused: `MISSION_CHAR` | **created, and this is a bug** |
 
-So for the case the brief was actually about - an ambient pedestrian -
+So for the case the question was actually about - an ambient pedestrian -
 **the drop is already made exactly once in the session, on the machine that
 owns the ped, and there is nothing to suppress.** The ownership rule holds by
 construction rather than by a lock, and it holds through two independent

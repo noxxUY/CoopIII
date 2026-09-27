@@ -137,6 +137,11 @@ wants the strict experience can still have it:
 None of these change how a mission plays. They change what happens when
 multiplayer creates a situation the SCM was never written to see.
 
+> **Changed since.** `roadmap.md` §5.4 reversed the first: a death fails the
+> mission by default (`missionFailOnDeath = true`). The third went with the
+> host-only script: every machine keeps its own campaign, kept in step by the
+> campaign delta (`missions.md` §5.5), so every machine's save has it.
+
 ---
 
 ## 3. Why not the alternatives

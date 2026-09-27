@@ -112,12 +112,18 @@ struct WantedPlan {
 	bool    borrowed = false;   // the bit to put on the wire beside `target`
 };
 
+// `cap` is the session's maxWanted (S_SessionRules): nobody holds more,
+// earned, borrowed or reported, and the engine is brought down to it the way
+// `off` brings it down to 0.
 inline WantedPlan PlanWanted(uint8_t rule, uint8_t engine, uint8_t applied,
-                             uint8_t own, uint8_t floor) {
+                             uint8_t own, uint8_t floor,
+                             uint8_t cap = WANTED_LEVEL_CEILING) {
+	if (cap == 0 || cap > WANTED_LEVEL_CEILING)
+		cap = WANTED_LEVEL_CEILING;
 	if (engine > WANTED_LEVEL_CEILING)
 		engine = WANTED_LEVEL_CEILING;
-	if (floor > WANTED_LEVEL_CEILING)
-		floor = WANTED_LEVEL_CEILING;
+	if (floor > cap)
+		floor = cap;
 
 	// The engine moved by itself since we last looked.
 	//
@@ -131,8 +137,8 @@ inline WantedPlan PlanWanted(uint8_t rule, uint8_t engine, uint8_t applied,
 		own = engine;
 	else if (engine < applied && engine < own)
 		own = engine;
-	if (own > WANTED_LEVEL_CEILING)
-		own = WANTED_LEVEL_CEILING;
+	if (own > cap)
+		own = cap;
 
 	WantedPlan plan;
 	plan.target = (rule == WANTED_RULE_OFF) ? uint8_t(0)

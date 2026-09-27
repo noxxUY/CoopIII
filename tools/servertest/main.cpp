@@ -1597,7 +1597,7 @@ C_WorldState WorldAt(uint8_t hour, uint8_t minute, uint8_t weather, uint8_t weat
 	return w;
 }
 
-// The owner's test in two games: noxx2 hosts, noxx3 runs Give Me Liberty,
+// A test in two games: noxx2 hosts, noxx3 runs Give Me Liberty,
 // whose script sets 04:00 and a cloudy sky on noxx3's machine alone.
 void TestTheSkyFollowsTheMission() {
 	std::printf("\nthe clock and the sky while noxx3's mission runs and noxx2 hosts\n");
@@ -2165,6 +2165,159 @@ void TestGatesAndBrokenObjectsReachEverybody() {
 	rig.server.Stop();
 }
 
+// The host changing the rules while two players are in: what the window's Save
+// does, through Server::Configure.
+void TestTheHostsRulesReachEverybody() {
+	std::printf("\nthe host's rules, at the join and when they change\n");
+	Rig rig;
+	rig.server.SetLogSink([](LogKind, const char *line) {
+		if (g_verbose)
+			std::printf("    | %s\n", line);
+	});
+	bool listening = false;
+	for (uint16_t port = 24250; port < 24270 && !listening; ++port) {
+		listening = rig.server.Start(port, false);
+		if (listening)
+			rig.port = port;
+	}
+	if (!listening) {
+		std::printf("  [skipped] no port to listen on\n");
+		return;
+	}
+	ServerConfig cfg;
+	rig.server.Configure(cfg);
+
+	NetClient first, second, third;
+	rig.clients = {&first, &second, &third};
+	rig.inbox.resize(3);
+	const uint8_t alice = Join(rig, 0, "alice");
+	rig.Pump(1000, [&] { return Last<S_SessionRules>(rig.inbox[0]) != nullptr; });
+	const S_Welcome      *welcome = Last<S_Welcome>(rig.inbox[0]);
+	const S_SessionRules *rules   = Last<S_SessionRules>(rig.inbox[0]);
+	Check(welcome && rules && IndexOf(rig.inbox[0], OP_S_SESSION_RULES) >
+	                              IndexOf(rig.inbox[0], OP_S_WELCOME),
+	      "the rules follow the welcome");
+	Check(welcome && rules && rules->flags == welcome->flags && rules->maxWanted == 6,
+	      "with the welcome's flags and six stars");
+	const uint8_t bob = Join(rig, 1, "bob");
+	Check(alice == 0 && bob == 1, "alice and bob are in");
+
+	// The host changes several things at once.
+	cfg.friendlyFire            = true;
+	cfg.wantedLevel             = WantedLevelRule::Shared;
+	cfg.maxWanted               = 3;
+	cfg.missionCheckpointWaitS  = 30;
+	cfg.missionTimedCheckpoints = true;
+	cfg.missionCatchUpM         = 0;
+	cfg.money                   = MoneyMode::Shared;
+	cfg.maxPlayers              = 2;
+	rig.ClearInboxes();
+	rig.server.Configure(cfg);
+	rig.Pump(1500, [&] {
+		return Last<S_SessionRules>(rig.inbox[1]) && Last<S_MissionState>(rig.inbox[1]) &&
+		       Last<S_Money>(rig.inbox[1]);
+	});
+	rules = Last<S_SessionRules>(rig.inbox[1]);
+	Check(rules && (rules->flags & SESSION_FRIENDLY_FIRE) != 0 &&
+	          WantedRuleFromFlags(rules->flags) == WANTED_RULE_SHARED && rules->maxWanted == 3,
+	      "bob, already in, is told friendly fire is on, stars are shared and stop at three");
+	const S_MissionState *st = Last<S_MissionState>(rig.inbox[1]);
+	Check(st && st->checkpointWaitS == 30 && st->catchUpM == 0 &&
+	          (st->flags & MISSION_FLAG_TIMED_CHECKPOINTS) != 0,
+	      "and the mission rules, with no mission running");
+	const S_Money *money = Last<S_Money>(rig.inbox[1]);
+	Check(money && money->rule == MONEY_RULE_SHARED, "and that the session has one wallet now");
+
+	// A limit of two with two in: the third is told it is full.
+	NetClient *c = rig.clients[2];
+	c->Connect("127.0.0.1", rig.port);
+	rig.Pump(3000, [&] { return c->IsConnected(); });
+	c->Send(Hello("carol"), CH_EVENT);
+	rig.Pump(3000, [&] { return Last<S_Welcome>(rig.inbox[2]) != nullptr; });
+	const S_Welcome *full = Last<S_Welcome>(rig.inbox[2]);
+	Check(full && full->reject == REJECT_FULL, "carol, third under a limit of two, is turned away");
+
+	// The same rules again tell nobody anything.
+	rig.ClearInboxes();
+	rig.server.Configure(cfg);
+	rig.Settle(250);
+	Check(Count<S_SessionRules>(rig.inbox[1]) == 0 && Count<S_MissionState>(rig.inbox[1]) == 0 &&
+	          Count<S_Money>(rig.inbox[1]) == 0,
+	      "saving without a change sends nothing");
+
+	// Only the owner is paid: the server keeps a mission's reward from the
+	// helpers, and passes everything else on.
+	cfg.missionPayHelpers = false;
+	rig.server.Configure(cfg);
+	C_MissionStarted started;
+	InitHeader(started, 100);
+	started.launchKey     = 0x4242;
+	started.missionNumber = 19;
+	rig.clients[0]->Send(started, CH_EVENT);
+	rig.Pump(1500, [&] {
+		const S_MissionState *s = Last<S_MissionState>(rig.inbox[1]);
+		return s && s->state == MISSION_STATE_RUNNING;
+	});
+	C_MissionEffect pay;
+	InitHeader(pay, 100);
+	pay.body.missionNumber = 19;
+	pay.body.kind          = MISSION_EFFECT_PAY;
+	pay.body.length        = 12;
+	C_MissionEffect text = pay;
+	text.body.kind       = MISSION_EFFECT_RUN;
+	rig.ClearInboxes();
+	rig.clients[0]->Send(pay, CH_EVENT);
+	rig.clients[0]->Send(text, CH_EVENT);
+	rig.Pump(1500, [&] { return Last<S_MissionEffect>(rig.inbox[1]) != nullptr; });
+	rig.Settle(150);
+	const S_MissionEffect *got = Last<S_MissionEffect>(rig.inbox[1]);
+	Check(Count<S_MissionEffect>(rig.inbox[1]) == 1 && got && got->body.kind == MISSION_EFFECT_RUN,
+	      "with helpers unpaid, bob gets the mission's words and not its reward");
+	cfg.missionPayHelpers = true;
+	rig.server.Configure(cfg);
+	rig.ClearInboxes();
+	rig.clients[0]->Send(pay, CH_EVENT);
+	rig.Pump(1500, [&] { return Last<S_MissionEffect>(rig.inbox[1]) != nullptr; });
+	got = Last<S_MissionEffect>(rig.inbox[1]);
+	Check(got && got->body.kind == MISSION_EFFECT_PAY, "and paid again once the host says so");
+
+	// A rampage rule changed while a rampage vote is open waits for it.
+	C_PickupClaim skull{};
+	InitHeader(skull, 100);
+	skull.ident.pos        = {958.0f, -431.0f, 14.5f};
+	skull.ident.modelIndex = 1361;
+	skull.ident.type       = 3;
+	skull.ident.flags      = PICKUP_F_RAMPAGE;
+	rig.ClearInboxes();
+	rig.clients[0]->Send(skull, CH_EVENT);
+	rig.Pump(1500, [&] { return Last<S_RampageVote>(rig.inbox[1]) != nullptr; });
+	const S_RampageVote *vote = Last<S_RampageVote>(rig.inbox[1]);
+	Check(vote && vote->body.state == RAMPAGE_VOTE_OPEN, "(alice's skull opens a vote)");
+	cfg.rampage = RampageMode::Off;
+	rig.ClearInboxes();
+	rig.server.Configure(cfg);
+	rig.Settle(200);
+	Check(rig.server.RampageRulePending() && Count<S_SessionRules>(rig.inbox[1]) == 0,
+	      "rampages off while the vote runs: held back, and nobody told yet");
+	if (vote) {
+		C_RampageVote no;
+		InitHeader(no, 100);
+		no.voteId = vote->body.voteId;
+		no.yes    = 0;
+		rig.clients[1]->Send(no, CH_EVENT);
+	}
+	rig.Pump(1500, [&] { return Last<S_SessionRules>(rig.inbox[1]) != nullptr; });
+	rules = Last<S_SessionRules>(rig.inbox[1]);
+	Check(!rig.server.RampageRulePending() && rules &&
+	          RampageRuleFromFlags(rules->flags) == RAMPAGE_RULE_OFF,
+	      "bob says no, the vote is over, and then everybody hears rampages are off");
+
+	for (NetClient *client : rig.clients)
+		client->Disconnect();
+	rig.Settle(300);
+	rig.server.Stop();
+}
+
 int main(int argc, char **argv) {
 	g_verbose = argc > 1 && std::strcmp(argv[1], "-v") == 0;
 	Rig rig;
@@ -2212,6 +2365,7 @@ int main(int argc, char **argv) {
 	TestACutsceneIsSkippedTogether();
 	TestAnOwnerWhoDroppedOffIsTakenUpAgain();
 	TestGatesAndBrokenObjectsReachEverybody();
+	TestTheHostsRulesReachEverybody();
 	g_failures += RunEmergencyTests();
 
 	std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures,

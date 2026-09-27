@@ -6,7 +6,7 @@
 //
 // The first version of this file registered a BLIP_CHAR in the game's own
 // CRadar::ms_RadarTrace and let CRadar::DrawBlips draw it. That worked - the
-// blips appeared, the owner confirmed it - and it was still the wrong answer,
+// blips appeared, a live game confirmed it - and it was still the wrong answer,
 // for one reason stated in one sentence:
 //
 //     "se ve un coso verde no se ve el blip como el jugador local de la

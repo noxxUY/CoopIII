@@ -13,7 +13,7 @@ and the constants are the binary's.
 
 ## 1. What GTA Online actually does
 
-Asked for, so researched rather than assumed. The sourcing is thinner than it
+Researched rather than assumed. The sourcing is thinner than it
 should be and the gaps are named, because a design that quietly invents a rule
 and attributes it to Rockstar is worse than one that admits it chose.
 
@@ -90,8 +90,8 @@ all reached from script opcodes through the dispatcher at `0x00439500`
 004F4A76  mov eax,[eax+53Ch]       CPopulation::AddToPopulation
 ```
 
-`roadmap.md` §2.3 is right about the consequence and wrong about the name: the
-task brief and §5.1 both call it `CPlayerInfo::m_pWanted`, and it is not. It
+`roadmap.md` §2.3 is right about the consequence and wrong about the name:
+§5.1 used to call it `CPlayerInfo::m_pWanted`, and it is not. It
 hangs off the *ped*, and `CWorld::Players[0].m_pPed` is the only ped in the
 process that has one, because a `CCivilianPed` is exactly `0x53C` bytes and
 there is no room for it. **Every remote player in CoopIII is a `CCivilianPed`.
@@ -326,15 +326,15 @@ a rule the client has to enforce locally because the server cannot see the
 thing being governed.
 
 **No struct grew and no layout moved.** The meaning of two existing bytes
-changed, which is still a wire change, so `PROTOCOL_VERSION` moves: the merged
-build is **18**, one number for the ten branches that landed together.
+changed, which is still a wire change, so `PROTOCOL_VERSION` moves: it went out
+in version **18**, together with nine other changes.
 
-The bits were checked against the other trees rather than assumed free, and one
-of those checks turned out to matter. `PlayerFlags` bits 4-7 really were free
+The bits were checked against the other work in flight rather than assumed
+free, and one of those checks turned out to matter. `PlayerFlags` bits 4-7 really were free
 and still are. `SessionFlags` was not: this work wrote the rule as `3 << 1`
 while the ammunition work took bit 1 for `SESSION_AMMO_SYNC`, so a session with
 ammo sync on would also have announced its wanted rule as `shared`. The rule
-moved to bits 2-3 at the merge — neither number had shipped, and moving the
+moved to bits 2-3 before release — neither number had shipped, and moving the
 two-bit field was cheaper than moving the flag. This feature still allocates
 **no opcode at all**, which is the other thing worth saying out loud when
 several people are cutting into the same enum.
@@ -484,7 +484,9 @@ where to look.
 
 ### 4.8 What the server does, and what it cannot
 
-The server sends the rule in `S_Welcome` and nothing else. It does not compute
+The server sends the rule in `S_Welcome`, again in `S_SessionRules` whenever the
+host changes it, with `maxWanted`, the most stars anybody may have
+(`protocol.md` §1.46), and nothing else. It does not compute
 a session maximum, because every client already receives every other client's
 snapshot and can do that arithmetic itself; adding a server-side copy would be
 a second answer to the same question, arriving later.

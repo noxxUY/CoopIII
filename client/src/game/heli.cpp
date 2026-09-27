@@ -3,6 +3,7 @@
 #include "addresses.h"
 #include "combat.h"
 #include "pedanim.h"
+#include "teardown.h"
 #include "vehicle.h"
 #include "../client.h"
 #include "../hook/hook.h"
@@ -760,7 +761,6 @@ bool SpawnHeliReplica(RemoteHeli &row) {
 }
 
 void DespawnHeliReplica(RemoteHeli &row) {
-	using RemoveFn = void(__cdecl *)(void *);
 	Replica *const r = ReplicaByHandle(row.poolHandle);
 	row.poolHandle   = -1;
 	if (!r)
@@ -768,15 +768,8 @@ void DespawnHeliReplica(RemoteHeli &row) {
 	void *const heli = r->heli;
 	*r = Replica{};
 
-	// The vehicles' teardown (vehicle.cpp, DespawnRemoteVehicle): off the
-	// moving list by hand first, because CWorld::Remove won't do it for an
-	// entity that has gone static, then Remove, the references, and the
-	// deleting destructor through the object's own vtable.
-	Func<ThisFn>(CPhysical__RemoveFromMovingList)(heli);
-	Func<RemoveFn>(CWorld__Remove)(heli);
-	Func<RemoveFn>(CWorld__RemoveReferencesToDeletedObject)(heli);
-	using DtorFn = void *(__thiscall *)(void *, uint8_t);
-	Func<DtorFn>(*reinterpret_cast<uintptr_t *>(Field<void *>(heli, 0)))(heli, 1);
+	// The vehicles' teardown (game/teardown.h).
+	DestroyVehicle(heli, "a helicopter replica's despawn");
 }
 
 bool PoseHeliReplica(RemoteHeli &row, const VehicleTransform &at, const HeliLook &look) {

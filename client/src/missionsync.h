@@ -121,13 +121,17 @@ constexpr uint32_t MISSION_CHECKPOINT_IDLE_MS = 1000;
 // are over, and only when they are further than this from the owner.
 // Anybody nearer can walk, and a start everybody was at brings nobody.
 constexpr uint32_t MISSION_SUMMON_DELAY_MS = 3000;
-constexpr float    MISSION_SUMMON_NEAR_M   = 60.0f;
+// The distance is the server's missionCatchUp (S_MissionState::catchUpM);
+// this is what it is by default.
+constexpr float    MISSION_SUMMON_NEAR_M   = MISSION_CATCH_UP_M_DEFAULT;
 // In a mission whose checkpoints don't wait (CheckpointsWait: a countdown on
 // the screen, a race, an odd job, the RC, 4x4 and Mayhem runs), a participant
 // who stays further than this from the owner for this long is brought beside
-// them the same way, so they can go on helping.
-constexpr float    MISSION_BEHIND_FAR_M    = 150.0f;
-constexpr uint32_t MISSION_BEHIND_MS       = 10000;
+// them the same way, so they can go on helping. Both are the server's
+// missionFallBehind and missionFallBehindTime (S_MissionState::behindM and
+// behindS), and these are their defaults.
+constexpr float    MISSION_BEHIND_FAR_M    = MISSION_BEHIND_M_DEFAULT;
+constexpr uint32_t MISSION_BEHIND_MS       = MISSION_BEHIND_S_DEFAULT * 1000u;
 // An instruction of the owner's mission that names a pedestrian or car our
 // copy of is still being built waits this long for it, with everything that
 // came after it waiting behind it in order, and then goes for what it is
@@ -207,12 +211,19 @@ public:
 
 	// A checkpoint of the local mission that the owner is in. True once every
 	// participant is there too; until then the others are told who is missing.
-	// True as well once it has waited MISSION_CHECKPOINT_WAIT_MS for them: the
+	// True as well once it has waited the server's checkpoint wait for them: the
 	// mission goes on without them. Always true when this machine does not
 	// own the session's mission.
 	// Not at all while CheckpointsWait says no: the owner's arrival is the
 	// checkpoint then.
 	bool AskCheckpoint(const MissionArea &area, uint8_t localPlayerId, uint32_t nowMs);
+	// Whether the session's mission's checkpoints wait for everybody, with the
+	// server's say in it (CheckpointsWait in coopiii/mission.h).
+	bool CheckpointsWaitNow() const {
+		return CheckpointsWait(m_number, m_timerUp, m_flags, m_cpWaitS);
+	}
+	uint16_t CheckpointWaitS() const { return m_cpWaitS; }
+	uint16_t CatchUpM() const { return m_catchUpM; }
 	// Whether the session's mission has a countdown on this machine's screen
 	// now: the owner's own, or the one replayed here. Every frame.
 	void SetTimerUp(bool up) { m_timerUp = up; }
@@ -508,6 +519,11 @@ private:
 	uint16_t m_marginCm     = MISSION_MARGIN_CM_DEFAULT;
 	uint8_t  m_enemies      = MISSION_ENEMIES_ORIGINAL;
 	uint16_t m_scalePct     = MISSION_SCALE_DEFAULT;
+	// The rest of the server's mission rules (S_MissionState).
+	uint16_t m_cpWaitS      = MISSION_CHECKPOINT_WAIT_MS / 1000;
+	uint16_t m_catchUpM     = MISSION_CATCH_UP_M_DEFAULT;
+	uint16_t m_behindM      = MISSION_BEHIND_M_DEFAULT;
+	uint16_t m_behindS      = MISSION_BEHIND_S_DEFAULT;
 	bool     m_mirroring    = false;
 
 	// Our claim at a start gate.
@@ -639,6 +655,8 @@ private:
 
 	// A move to the owner that is owed (MISSION_SUMMON_*), since when.
 	bool     m_summon       = false;
+	// The move owed is for falling behind (WatchBehind), not for coming in late.
+	bool     m_summonBehind = false;
 	uint32_t m_summonSinceMs = 0;
 	uint32_t m_summons      = 0;
 	// Far behind the owner in a mission that does not wait, since when.

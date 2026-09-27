@@ -41,7 +41,7 @@ namespace coopiii::game {
 // Virtual-key codes for the two keys, from CoopIII.ini (config.h).
 void SetChatKeys(int chatKey, int listKey);
 
-// "CoopIII 0.0.1" in the bottom-left corner, under the radar. On unless
+// "CoopIII 0.1.1" in the bottom-left corner, under the radar. On unless
 // CoopIII.ini says otherwise.
 void SetVersionMarkShown(bool shown);
 

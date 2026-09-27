@@ -682,7 +682,7 @@ inline KickTarget ResolveKickTarget(const char *arg, const RosterEntry *roster, 
 
 // ---- the version mark --------------------------------------------------------
 //
-// "CoopIII 0.0.1", small and grey in the bottom-left corner, under the radar:
+// "CoopIII 0.1.1", small and grey in the bottom-left corner, under the radar:
 // which build is running, readable off any screenshot or video somebody sends
 // with a bug in it.
 

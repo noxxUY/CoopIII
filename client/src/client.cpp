@@ -245,6 +245,8 @@ void Client::ClearRoster() {
 	// clamping its own player to zero because the server it has just lost had
 	// the wanted level switched off.
 	m_wantedRule          = WANTED_RULE_PERPLAYER;
+	m_maxWanted           = WANTED_LEVEL_CEILING;
+	m_rulesSeen           = false;
 	// A rampage belongs to a session, so it goes with one. The rule goes back
 	// to §5.10's default and the seam is told, which puts this machine's
 	// rampage.sc back in touch with its own CDarkel - a script held waiting
@@ -630,6 +632,8 @@ void Client::PostFrame() {
 void Client::HandleMessage(const Message &msg) {
 	if (const S_Welcome *p = msg.as<S_Welcome>()) {
 		OnWelcome(*p);
+	} else if (const S_SessionRules *p = msg.as<S_SessionRules>()) {
+		OnSessionRules(*p);
 	} else if (const S_PlayerJoin *p = msg.as<S_PlayerJoin>()) {
 		OnJoin(*p);
 	} else if (const S_PlayerLeave *p = msg.as<S_PlayerLeave>()) {
@@ -942,6 +946,69 @@ void Client::OnWelcome(const S_Welcome &pkt) {
 
 	// After ClearRoster, which throws the last session's estimate away.
 	NoteServerTime(pkt.hdr.sendTimeMs);
+}
+
+// The same rules the welcome carried, straight after it, and again whenever
+// the host saves a change in the server's options. Applied the way the
+// welcome applies them, less everything the welcome does to start a session.
+void Client::OnSessionRules(const S_SessionRules &pkt) {
+	// Always behind its welcome on the same channel, so one that arrives
+	// with no session is left over from a connection that has gone.
+	if (m_localPlayerId == 0xFF)
+		return;
+
+	const bool    ff      = (pkt.flags & SESSION_FRIENDLY_FIRE) != 0;
+	const bool    ammo    = (pkt.flags & SESSION_AMMO_SYNC) != 0;
+	const uint8_t wanted  = WantedRuleFromFlags(pkt.flags);
+	const uint8_t rampage = RampageRuleFromFlags(pkt.flags);
+	const uint8_t cheats  = CheatRuleFromFlags(pkt.flags);
+	const uint8_t cap     = SaneMaxWanted(pkt.maxWanted);
+	const bool    changed = ff != m_friendlyFire || ammo != m_ammoSync || wanted != m_wantedRule ||
+	                     rampage != m_rampageRule || cheats != m_cheatRule || cap != m_maxWanted;
+	const bool    first   = !m_rulesSeen;
+	m_rulesSeen           = true;
+	if (!changed)
+		return;
+
+	Log("client: the session's rules%s: friendly fire %s, ammo sync %s, wanted level %s "
+	    "up to %u stars, rampages %u, cheats %u",
+	    first ? "" : " changed", ff ? "on" : "off", ammo ? "on" : "off",
+	    wanted == WANTED_RULE_SHARED ? "shared" : wanted == WANTED_RULE_OFF ? "off" : "per player",
+	    cap, rampage, cheats);
+	if (!first)
+		m_feed.Push(FeedKind::Notice, "the host changed the session's rules", WallClock::NowMs());
+
+	if (ff != m_friendlyFire) {
+		m_friendlyFire = ff;
+		if (m_bridge.SetFriendlyFire)
+			m_bridge.SetFriendlyFire(m_friendlyFire);
+	}
+	if (ammo != m_ammoSync) {
+		m_ammoSync = ammo;
+		if (m_bridge.SetAmmoSync)
+			m_bridge.SetAmmoSync(m_ammoSync);
+		// Turned on, our counts have to go out again whatever was said
+		// before; turned off, nothing reads them. Either way, from nothing.
+		for (uint8_t w = 0; w < INVENTORY_SLOTS; ++w) {
+			m_sentAmmo[w]        = AmmoSlotBody{};
+			m_sentAmmo[w].weapon = w;
+		}
+	}
+	// The wanted rule and the cap are read on the next send tick, where
+	// PlanWanted brings our own stars into line with them.
+	m_wantedRule = wanted;
+	m_maxWanted  = cap;
+	// The server holds a change of rampage rule back while one runs, so this
+	// never lands in the middle of a frenzy.
+	if (rampage != m_rampageRule) {
+		m_rampageRule = rampage;
+		if (m_bridge.SetRampageRule)
+			m_bridge.SetRampageRule(m_rampageRule);
+	}
+	if (cheats != m_cheatRule) {
+		m_cheatRule = cheats;
+		PushCheatSession();
+	}
 }
 
 void Client::OnJoin(const S_PlayerJoin &pkt) {
@@ -1700,7 +1767,8 @@ void Client::TickWanted() {
 	}
 
 	const game::WantedPlan plan =
-	    game::PlanWanted(m_wantedRule, engine, m_appliedWanted, m_ownWanted, WantedFloor(now));
+	    game::PlanWanted(m_wantedRule, engine, m_appliedWanted, m_ownWanted, WantedFloor(now),
+	                    m_maxWanted);
 
 	if (plan.write && m_bridge.WriteLocalWantedLevel) {
 		if (plan.target > engine && !m_saidWantedRaised) {
@@ -5681,6 +5749,7 @@ void Client::OnVehicleCustody(const S_VehicleCustody &pkt) {
 		v->holdUntilMs    = 0;
 		v->burnSinceMs    = 0;
 		v->sinkSinceMs    = 0;
+		v->roofSinceMs    = 0;
 		if (hadIt)
 			Log("client: we have handed vehicle %u back to the session; every "
 			    "machine holds it where it stands now", pkt.netId);
@@ -5693,6 +5762,7 @@ void Client::OnVehicleCustody(const S_VehicleCustody &pkt) {
 	v->holdUntilMs    = 0;
 	v->burnSinceMs    = 0;
 	v->sinkSinceMs    = 0;
+	v->roofSinceMs    = 0;
 
 	// A fresh high-water mark for the dents, every time. Whatever the last
 	// custody of this car left in it may be above what the car wears now - a
@@ -6558,6 +6628,24 @@ void Client::SendCustodyVehicles() {
 		if (sinking && nowMs - v.sinkSinceMs < CUSTODY_SINK_CAP_MS)
 			v.holdUntilMs = nowMs + CUSTODY_HIT_HOLD_MS;
 
+		// Lying on its roof, the same way: until it catches fire, and then
+		// the burning rule above has it. Ours is the one engine draining it
+		// (game/wreck.h, "a car left on its roof"); handed back at rest, as
+		// a car on its roof comes to rest at once, it lay there on every
+		// screen at whatever health two seconds of draining had left it.
+		const bool onRoof = m_bridge.VehicleOnItsRoof && m_bridge.VehicleOnItsRoof(v);
+		if (onRoof && v.roofSinceMs == 0)
+			v.roofSinceMs = nowMs != 0 ? nowMs : 1;
+		if (RoofKeepsCustody(onRoof, burning, nowMs, v.roofSinceMs)) {
+			v.holdUntilMs = nowMs + CUSTODY_HIT_HOLD_MS;
+			if (!m_saidKeptRoofCar) {
+				m_saidKeptRoofCar = true;
+				Log("client: vehicle %u is on its roof while we settle it, so we keep "
+				    "it until it catches fire - our engine is the one draining it",
+				    v.netId);
+			}
+		}
+
 		// Burned the whole cap without going up here. Ours is the only timer
 		// that has been counting, so ours decides, now, rather than handing it
 		// back to every machine's (BurnOutlastedCustody). The next pass reads
@@ -6602,6 +6690,7 @@ void Client::StartWreckSettle(RemoteVehicle &v, uint32_t nowMs) {
 	v.holdUntilMs    = 0;
 	v.burnSinceMs    = 0;
 	v.sinkSinceMs    = 0;
+	v.roofSinceMs    = 0;
 	v.settleEndsAtMs = nowMs + VEHICLE_SETTLE_MS;
 }
 

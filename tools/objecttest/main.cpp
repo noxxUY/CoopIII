@@ -161,7 +161,7 @@ void TestWireLayout() {
 // What object.dat says, as a regression test rather than as a paragraph
 // ---------------------------------------------------------------------------
 //
-// The brief this work started from said a lamp post that is *shot* falls over
+// The first guess was that a lamp post that is *shot* falls over
 // on the shooter's screen only. It does not fall over on anybody's screen,
 // and the reason is one column of a text file that ships with the game.
 //

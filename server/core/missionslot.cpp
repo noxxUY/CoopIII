@@ -144,9 +144,9 @@ bool MissionSlot::Checkpoint(uint8_t playerId, uint8_t missing, const Vec3 &wher
 	if (!same)
 		m_cpSinceMs = nowMs;
 	const uint32_t waited = nowMs - m_cpSinceMs;
-	const uint32_t left =
-	    waited < MISSION_CHECKPOINT_WAIT_MS ? MISSION_CHECKPOINT_WAIT_MS - waited : 0;
-	uint32_t goesOnAt = m_cpSinceMs + MISSION_CHECKPOINT_WAIT_MS;
+	const uint32_t waitMs = static_cast<uint32_t>(m_cpWaitS) * 1000u;
+	const uint32_t left   = waited < waitMs ? waitMs - waited : 0;
+	uint32_t goesOnAt     = m_cpSinceMs + waitMs;
 	goesOnAt          = goesOnAt != 0 ? goesOnAt : 1;
 	const uint32_t inS = (left + 999) / 1000;
 	SetWait(m_owner, missing, MISSION_WAIT_CHECKPOINT, m_number, where, 0, goesOnAt,
@@ -233,6 +233,12 @@ S_MissionState MissionSlot::State() const {
 	s.marginCm      = m_marginCm;
 	s.enemies       = m_enemies;
 	s.scalePct      = m_scalePct;
+	s.checkpointWaitS = m_cpWaitS;
+	s.catchUpM        = m_catchUpM;
+	s.behindM         = m_behindM;
+	s.behindS         = m_behindS;
+	if (m_timedCp)
+		s.flags = static_cast<uint8_t>(s.flags | MISSION_FLAG_TIMED_CHECKPOINTS);
 	return s;
 }
 

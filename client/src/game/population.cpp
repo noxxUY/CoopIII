@@ -9,6 +9,7 @@
 #include "ped.h"
 #include "pedanim.h"
 #include "streampick.h"
+#include "teardown.h"
 #include "vehicle.h"
 #include "wreckqueue.h"
 #include "../hook/hook.h"
@@ -1699,7 +1700,29 @@ void __cdecl AddHook(void *entity) {
 		    HostingWhy(h));
 }
 
+// Whether an entity handed to CWorld::Remove has already been through its
+// destructor. CWorld::Remove's virtual Remove through what is left of it
+// calls CPlaceable's slot 2, which is zero (game/teardown.h). This cannot make
+// that call safe - whoever passed it will delete it next - but it can say who
+// passed it, which the crash itself never does.
+bool g_saidRemoveDead = false;
+
+void NoteRemoveOfDeadEntity(void *entity, uintptr_t from) {
+	if (g_saidRemoveDead || !entity)
+		return;
+	EntityState s = VehicleState(entity);
+	if (s == EntityState::NotInPool)
+		s = PedState(entity);
+	if (s != EntityState::FreedSlot && s != EntityState::Destructed)
+		return;
+	g_saidRemoveDead = true;
+	Log("world: CWorld::Remove was handed %p, which is %s, from 0x%08X; the engine is "
+	    "about to call through the vtable its destructor left behind",
+	    entity, EntityStateName(s), static_cast<unsigned>(from));
+}
+
 void __cdecl RemoveHook(void *entity) {
+	NoteRemoveOfDeadEntity(entity, reinterpret_cast<uintptr_t>(_ReturnAddress()));
 	// Noticed before the engine's own teardown, because ~CPed calls
 	// CWorld::Remove as its first statement and by the time it returns the
 	// object is on its way to being freed. Reading the pointer's identity is
@@ -3377,33 +3400,22 @@ void DespawnAmbientReplica(RemoteAmbientPed &ped) {
 	if (vtable != CCivilianPed__vtable)
 		return;
 
-	// The asymmetry, again, and this is the side of it that crashed the game.
-	// CWorld::Remove only unlinks from ms_listMovingEntityPtrs when bIsStatic
-	// is clear, so a ped that went to sleep keeps its node - and destroying it
-	// leaves that node pointing at a pool slot that has just been freed.
-	// A replica is exactly the entity this happens to: it is put where the
-	// wire says and then stands perfectly still, which is what puts a
-	// CPhysical to sleep.
-	if (NeedsMovingListUnlink(Field<uint8_t>(mem, offs::ENTITY_FLAGS_A),
-	                          Field<void *>(mem, offs::MOVING_LIST_NODE) != nullptr))
-		Log("population: a ped replica went static while still in the moving "
-		    "list; unlinking by hand, because CWorld::Remove walks past it");
-	Func<ThisFn>(CPhysical__RemoveFromMovingList)(mem);
-
-	Func<RemoveRefsFn>(CWorld__RemoveReferencesToDeletedObject)(mem);
-
+	// game/teardown.h, which unlinks from the moving list by hand first: a
+	// replica is put where the wire says and then stands perfectly still,
+	// which is what puts a CPhysical to sleep, and CWorld::Remove only
+	// unlinks a ped that is not asleep. That asymmetry is the side of it that
+	// crashed the game once.
+	//
+	// ~CPed's first statement is CWorld::Remove(this), so the destructor
+	// reaches our own Remove hook. Suppressed for the same reason the Add is:
+	// this is not a pedestrian leaving the session, it is the session taking
+	// a replica away.
 	{
-		// ~CPed's first statement is CWorld::Remove(this), so the destructor
-		// reaches our own Remove hook. Suppressed for the same reason the Add
-		// is: this is not a pedestrian leaving the session, it is the session
-		// taking a replica away.
 		ReplicaScope scope;
-		void *const *vt = *reinterpret_cast<void *const *const *>(mem);
-		auto deleter    = reinterpret_cast<DtorFn>(vt[VTABLE_DELETING_DTOR]);
-		deleter(mem, 1);   // 1 = free the memory too
+		if (!DestroyPed(mem, /*countedMissionPed=*/true, "a pedestrian replica's despawn"))
+			return;
 	}
 
-	--Global<uint32_t>(CPopulation__ms_nTotalMissionPeds);
 	if (g_replicas > 0)
 		--g_replicas;
 }

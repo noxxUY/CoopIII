@@ -177,6 +177,11 @@ constexpr int32_t CAMERA_ON_PLAYER                       = 0x0157;
 constexpr int32_t CAMERA_ON_VEHICLE                      = 0x0158;
 constexpr int32_t CAMERA_ON_PED                          = 0x0159;
 constexpr int32_t SET_PLAYER_COORDINATES                 = 0x0055;
+// The 200 table (0x0043D530, base 214, jump table 0x005EEC40) entry 84,
+// 0x0043E860: RemoveDriver (0x005520A0) or RemovePassenger (0x00551EB0),
+// bInVehicle and m_pMyVehicle cleared, then the ped put down. The car is
+// left where it is, which SET_PLAYER_COORDINATES (0x0043A995) never does.
+constexpr int32_t WARP_PLAYER_FROM_CAR_TO_COORD          = 0x012A;
 constexpr int32_t SET_PLAYER_VISIBLE                     = 0x0336;
 constexpr int32_t SET_EVERYONE_IGNORE_PLAYER             = 0x03BF;
 constexpr int32_t SET_POLICE_IGNORE_PLAYER               = 0x01F7;
@@ -204,6 +209,12 @@ constexpr int32_t DROP_NAUTICAL_MINE                     = 0x02F1;
 // it reads it (0x004274F0: reads [garage+5], then writes 0 there).
 constexpr int32_t IS_CAR_IN_MISSION_GARAGE               = 0x021C;
 constexpr int32_t HAS_RESPRAY_HAPPENED                   = 0x0329;
+// A mission garage's car (mission-audit.md R5). Its handler (0x00443714)
+// passes CPools::GetVehicle of the operand, or null for a negative one
+// (`test eax,eax / jge`, else `push 0`), to
+// CGarages::SetTargetCarForMissonGarage, which stores the raw pointer and
+// registers no reference (game/teardown.h).
+constexpr int32_t SET_TARGET_CAR_FOR_MISSION_GARAGE      = 0x021B;
 // The mission Cessnas (mission-audit.md R7): their starts, and whether each
 // has gone down. Both questions only compare the plane's mission status with
 // 2 (0x0054E150, 0x0054E250) and write nothing.

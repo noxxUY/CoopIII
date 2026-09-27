@@ -1,5 +1,6 @@
 #include "emergency.h"
 
+#include "cargun.h"
 #include "leadcheck.h"
 #include "ped.h"
 #include "population.h"
@@ -23,7 +24,6 @@ using ExtinguishAtFn = void(__thiscall *)(void *, float, float, float, float);
 using SideFn         = int(__thiscall *)(void *, const void *);
 using ForceFn        = void(__thiscall *)(void *, float, float, float);
 using FallFn         = void(__thiscall *)(void *, uint32_t, uint32_t, uint32_t);
-using VehicleFn      = void *(__cdecl *)();
 
 // Points the `call` at `site` at `to`, only while it still calls `from`.
 bool RedirectCall(uintptr_t site, uintptr_t from, uintptr_t to) {
@@ -38,8 +38,6 @@ bool RedirectCall(uintptr_t site, uintptr_t from, uintptr_t to) {
 	FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void *>(site), 5);
 	return true;
 }
-
-void *PlayerVehicle() { return Func<VehicleFn>(FindPlayerVehicle)(); }
 
 void *AccidentVictim(size_t i) {
 	return Field<void *>(Ptr<void>(gAccidentManager + i * SIZEOF_CACCIDENT), ACCIDENT_VICTIM);
@@ -230,10 +228,13 @@ void HoldJet(uint16_t netId, const Vec3 &pos, const Vec3 &dir) {
 		g_jets[g_jetCount++] = {netId, pos, dir};
 }
 
-// FireTruckControl's jet, from either arm.
+// FireTruckControl's jet, from either arm. Whether we drive is asked of the
+// car, not of FindPlayerVehicle, which names a passenger's car too: should
+// game/cargun.h's gate be down, a passenger's player arm still runs, and this
+// is what keeps his jet off a truck somebody else drives.
 void __cdecl CannonInput(uint32_t id, Vec3 *pos, Vec3 *dir) {
 	void *const car      = reinterpret_cast<void *>(static_cast<uintptr_t>(id));
-	const bool  driver   = car != nullptr && car == PlayerVehicle();
+	const bool  driver   = LocalPlayerDrives(car);
 	uint16_t    netId    = INVALID_NETID;
 	bool        othersMove = false;
 	const bool  named    = car != nullptr && SessionCarFor(car, netId, othersMove);
@@ -262,10 +263,11 @@ uint32_t DrainLocalJets(LocalCannonJet *out, uint32_t max) {
 }
 
 // Somebody else's jet, from our copy of the truck, the way FireTruckControl
-// hands one over.
+// hands one over. A passenger's copy sprays it as well: it is the jet of the
+// truck he rides in, and its driver's to aim.
 bool SprayCopy(uint16_t netId, const Vec3 &pos, const Vec3 &dir) {
 	void *const car = CopyOfCar(netId);
-	if (!car || car == PlayerVehicle())
+	if (!car || LocalPlayerDrives(car))
 		return false;
 	if (Field<int16_t>(car, offs::MODEL_INDEX) != FIRETRUCK_MODEL)
 		return false;

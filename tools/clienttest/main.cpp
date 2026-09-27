@@ -7417,6 +7417,11 @@ S_MissionState MakeMissionState(uint8_t state, uint8_t owner, uint16_t number,
                                 uint8_t participants, uint8_t outcome = MISSION_OUTCOME_NONE) {
 	S_MissionState s;
 	InitHeader(s, 1000);
+	// The server's defaults, as every server sends them.
+	s.checkpointWaitS = MISSION_CHECKPOINT_WAIT_MS / 1000;
+	s.catchUpM        = MISSION_CATCH_UP_M_DEFAULT;
+	s.behindM         = MISSION_BEHIND_M_DEFAULT;
+	s.behindS         = MISSION_BEHIND_S_DEFAULT;
 	s.campaignLog   = 77;
 	s.state         = state;
 	s.ownerId       = owner;
@@ -8133,7 +8138,7 @@ void TestAWreckedSpawnSaysSo() {
 
 // ---- getting into a car the session already knows about ---------------------
 //
-// This is the other half of what the owner reported, and it is a late-joiner
+// This is the other half of what was reported, and it is a late-joiner
 // bug for a reason that is worth stating plainly: a car only ever arrives as
 // a CVehicle *CoopIII created* for somebody who was not in the session when
 // it was claimed. Everyone who was there has it as a car from their own
@@ -8283,7 +8288,7 @@ void TestOurOwnReportsHoldTheCarWeParked() {
 
 // ---- being jacked -----------------------------------------------------------
 //
-// The three things the owner reported on the 2026-09-23 build are one defect
+// The three things reported on the 2026-09-23 build are one defect
 // and this is it: a car has no handover. "Volvió a pasar lo de que se bugeó y
 // el auto no avanza o va hacia atrás. O también me pasó que solo iba para
 // adelante solo sin que yo apriete la W." And, from the other side of a jack:
@@ -12046,6 +12051,7 @@ void TestACorpseTheSessionReportedIsNotResurrected() {
 // does, so a test can write a sequence of ticks and read the outcome.
 struct WantedSim {
 	uint8_t rule    = WANTED_RULE_PERPLAYER;
+	uint8_t cap     = WANTED_LEVEL_CEILING;   // the session's maxWanted
 	uint8_t engine  = 0;   // stands in for CWanted::m_nWantedLevel
 	uint8_t own     = 0;
 	uint8_t applied = 0;
@@ -12055,7 +12061,7 @@ struct WantedSim {
 
 	void Tick(uint8_t floor) {
 		const game::WantedPlan plan =
-		    game::PlanWanted(rule, engine, applied, own, floor);
+		    game::PlanWanted(rule, engine, applied, own, floor, cap);
 		if (plan.write) {
 			++writes;
 			engine = plan.target;
@@ -12276,6 +12282,84 @@ void TestWantedOffIsAClamp() {
 	Check(s.writes == 2,
 	      "a crime committed between two ticks raises the level and is taken "
 	      "back on the next one - off is a clamp, not a police-free city");
+}
+
+// The host's maxWantedLevel (S_SessionRules): a ceiling below the game's own.
+void TestTheMostStarsIsACeiling() {
+	std::printf("\nthe most stars the host allows\n");
+	WantedSim s;
+	s.cap = 2;
+	s.engine = 4;   // a crime took us to four
+	s.Tick(0);
+	Check(s.engine == 2 && s.sent == 2 && s.writes == 1, "four stars are brought down to two");
+	s.Tick(0);
+	Check(s.engine == 2 && s.writes == 1, "and two is left alone, chaos and all");
+	s.Tick(5);
+	Check(s.engine == 2 && s.writes == 1, "nobody in the car can lend us more than two either");
+
+	WantedSim shared;
+	shared.rule = WANTED_RULE_SHARED;
+	shared.cap  = 3;
+	shared.Tick(6);
+	Check(shared.engine == 3 && shared.borrowed, "shared: the session's six reaches us as three");
+
+	WantedSim raised;
+	raised.cap    = 1;
+	raised.engine = 3;
+	raised.Tick(0);
+	raised.cap = WANTED_LEVEL_CEILING;
+	raised.Tick(0);
+	Check(raised.engine == 1,
+	      "the cap raised again gives nothing back: what was taken was taken, as a bribe is");
+
+	WantedSim zero;
+	zero.cap    = 0;
+	zero.engine = 5;
+	zero.Tick(0);
+	Check(zero.engine == 5 && zero.writes == 0, "a cap of 0 is no cap, never a way of saying off");
+}
+
+// The rules a host changes with players in (S_SessionRules), through Client.
+void TestTheRulesChangeWithEverybodyIn() {
+	std::printf("\nthe host changes the rules with us in the session\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+
+	S_SessionRules early;
+	InitHeader(early, 1000);
+	early.flags     = SESSION_FRIENDLY_FIRE;
+	early.maxWanted = 1;
+	c.HandleMessage(Wrap(early, CH_EVENT));
+	Check(g_rec.friendlyFireCalls == 0 && c.MaxWanted() == WANTED_LEVEL_CEILING,
+	      "rules with no welcome before them belong to no session and change nothing");
+
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	S_SessionRules same;
+	InitHeader(same, 1000);
+	same.flags     = 0;
+	same.maxWanted = WANTED_LEVEL_CEILING;
+	c.HandleMessage(Wrap(same, CH_EVENT));
+	Check(g_rec.friendlyFireCalls == 1 && c.MaxWanted() == WANTED_LEVEL_CEILING,
+	      "the welcome's own rules again tell the bridge nothing new");
+
+	S_SessionRules changed;
+	InitHeader(changed, 2000);
+	changed.flags     = FlagsWithCheatRule(
+	    FlagsWithRampageRule(FlagsWithWantedRule(SESSION_FRIENDLY_FIRE | SESSION_AMMO_SYNC,
+	                                             WANTED_RULE_SHARED),
+	                         RAMPAGE_RULE_SCALED),
+	    CHEAT_RULE_PERSONAL);
+	changed.maxWanted = 3;
+	c.HandleMessage(Wrap(changed, CH_EVENT));
+	Check(g_rec.friendlyFireCalls == 2 && g_rec.friendlyFire, "friendly fire reaches the bridge");
+	Check(g_rec.ammoSyncCalls >= 2, "and ammunition");
+	Check(g_rec.rampageRule == RAMPAGE_RULE_SCALED, "and the rampage rule");
+	Check(c.WantedRuleNow() == WANTED_RULE_SHARED && c.MaxWanted() == 3,
+	      "the stars are shared now, up to three");
+	Check(c.CheatRule() == CHEAT_RULE_PERSONAL, "and cheats are personal");
+
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	Check(c.MaxWanted() == WANTED_LEVEL_CEILING, "a new session starts from six again");
 }
 
 void TestOnlyTheCarYouAreInLendsYouStars() {
@@ -16003,6 +16087,132 @@ void TestASinkingCarIsKeptUntilTheBottom() {
 	g_rec.carAtRest = false;
 }
 
+bool g_onRoof = false;
+bool RecVehicleOnItsRoof(RemoteVehicle &) { return g_onRoof; }
+
+void TestACarOnItsRoofBurnsOnOneMachine() {
+	std::printf("\na car left on its roof burns, on one machine\n");
+
+	// The drain's own test (addresses.h, "a car left on its roof").
+	const uint8_t abandoned = ENTITY_STATUS_ABANDONED;
+	Check(game::CarOnItsRoof(true, -0.9f, true, false, abandoned, false),
+	      "a car upside down is drained");
+	Check(game::CarOnItsRoof(true, -0.01f, true, false, ENTITY_STATUS_PHYSICS, false),
+	      "however little past its side, and with a driver in it");
+	Check(!game::CarOnItsRoof(true, 0.0f, true, false, abandoned, false) &&
+	          !game::CarOnItsRoof(true, 0.9f, true, false, abandoned, false),
+	      "on its side or its wheels it is not");
+	Check(!game::CarOnItsRoof(false, -0.9f, true, false, abandoned, false),
+	      "a boat has no such drain");
+	Check(!game::CarOnItsRoof(true, -0.9f, false, false, abandoned, false),
+	      "nor a car the script made undamageable");
+	Check(!game::CarOnItsRoof(true, -0.9f, true, true, abandoned, false),
+	      "nor one SET_UPSIDEDOWN_CAR_NOT_DAMAGED spared");
+	Check(!game::CarOnItsRoof(true, -0.9f, true, false, abandoned, true),
+	      "nor one lying in water");
+	Check(!game::CarOnItsRoof(true, -0.9f, true, false, ENTITY_STATUS_WRECKED, false) &&
+	          !game::CarOnItsRoof(true, -0.9f, true, false, ENTITY_STATUS_PLAYER_REMOTE, false),
+	      "nor a wreck, nor the RC car");
+
+	// Where the drain runs: where the car's health is decided, and nowhere else.
+	using game::CarOwner;
+	Check(game::RoofDrainMayRun(CarOwner::Local),
+	      "the car we drive or settle, our traffic, a parked car: ours drains it");
+	Check(!game::RoofDrainMayRun(CarOwner::RemoteDriver) &&
+	          !game::RoofDrainMayRun(CarOwner::RemoteCustodian) &&
+	          !game::RoofDrainMayRun(CarOwner::RemoteHost),
+	      "somebody else's car, somebody else's settle, somebody else's traffic: theirs does");
+	Check(!game::RoofDrainMayRun(CarOwner::Nobody),
+	      "and a session car nobody holds drains nowhere, so no host copy burns alone");
+	Check(game::RoofDrainMayRun(game::ClassifyCar(false, false, false, false, false, false)) &&
+	          !game::RoofDrainMayRun(game::ClassifyCar(false, false, false, true, false, false)) &&
+	          !game::RoofDrainMayRun(game::ClassifyCar(false, false, false, false, true, false)) &&
+	          game::RoofDrainMayRun(game::ClassifyCar(false, true, true, false, false, false)),
+	      "(and the local player's wheel wins, as for every other question)");
+
+	// How long a custodian keeps one.
+	Check(RoofKeepsCustody(true, false, 5000, 5000) &&
+	          RoofKeepsCustody(true, false, 5000 + CUSTODY_ROOF_CAP_MS - 1, 5000),
+	      "on its roof and not yet burning: kept");
+	Check(!RoofKeepsCustody(true, false, 5000 + CUSTODY_ROOF_CAP_MS, 5000),
+	      "until the cap, counted from the first frame on its roof");
+	Check(!RoofKeepsCustody(true, true, 6000, 5000),
+	      "once it burns the burning rule has it");
+	Check(!RoofKeepsCustody(false, false, 6000, 5000), "and on its wheels nothing keeps it");
+	Check(CUSTODY_ROOF_CAP_MS / 1000.0f * 50.0f * ROOF_DRAIN_PER_STEP >= 3.0f * 1000.0f,
+	      "the cap is room to drain three times a full car's health to a fire");
+
+	// Through the roster: the settle that used to hand a car on its roof back
+	// at rest, two seconds into a four-second drain.
+	WorldBridge b = RecordingBridge();
+	b.VehicleOnItsRoof = &RecVehicleOnItsRoof;
+	Client c;
+	c.SetBridge(b);
+	ParkOneCar(c);
+	c.HandleMessage(Wrap(MakeCustody(80, /*us=*/0), CH_EVENT));
+	RemoteVehicle *const v = const_cast<RemoteVehicle *>(c.VehicleByNetId(80));
+	g_rec.carAtRest = true;
+	g_onRoof        = true;
+	v->settleEndsAtMs = 1;
+	const int samples = g_rec.observedSamples;
+	for (int i = 0; i < VEHICLE_REST_FRAMES + 2; ++i)
+		c.TickCustody();
+	Check(!v->settleReported, "at rest on its roof, out of time, it is kept");
+	Check(v->roofSinceMs != 0, "(and when it went over is noted)");
+	Check(g_rec.observedSamples >= samples + VEHICLE_REST_FRAMES + 2,
+	      "and its health keeps going out, which is the fire everybody else will draw");
+	const uint32_t since = v->roofSinceMs;
+	g_onRoof = false;
+	c.TickCustody();
+	g_onRoof = true;
+	c.TickCustody();
+	Check(v->roofSinceMs == since && !v->settleReported,
+	      "a frame rocked off it does not start the count again, nor end the hold");
+
+	// It catches: the burning rule takes over and holds it however long.
+	g_rec.carBurning = true;
+	v->roofSinceMs   = WallClock::NowMs() - CUSTODY_ROOF_CAP_MS - 10;
+	v->holdUntilMs   = 0;
+	for (int i = 0; i < 5; ++i)
+		c.TickCustody();
+	Check(!v->settleReported && v->burnSinceMs != 0,
+	      "alight, it is kept by the fire past the roof's cap");
+	g_rec.carBurning = false;
+
+	// One that never catches is given back at the cap.
+	Client c2;
+	c2.SetBridge(b);
+	ParkOneCar(c2);
+	c2.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	RemoteVehicle *const v2 = const_cast<RemoteVehicle *>(c2.VehicleByNetId(80));
+	v2->settleEndsAtMs = 1;
+	c2.TickCustody();
+	Check(!v2->settleReported, "on its roof");
+	v2->roofSinceMs = WallClock::NowMs() - CUSTODY_ROOF_CAP_MS - 10;
+	v2->holdUntilMs = 0;
+	for (int i = 0; i < VEHICLE_REST_FRAMES + 2; ++i)
+		c2.TickCustody();
+	Check(v2->settleReported, "and never catching, it goes back at the cap");
+
+	c2.HandleMessage(Wrap(MakeCustody(80, INVALID_PLAYER), CH_EVENT));
+	Check(v2->roofSinceMs == 0, "the count goes with the custody");
+
+	// A build without the bridge keeps nothing, as before.
+	Client c3;
+	c3.SetBridge(RecordingBridge());
+	ParkOneCar(c3);
+	c3.HandleMessage(Wrap(MakeCustody(80, 0), CH_EVENT));
+	RemoteVehicle *const v3 = const_cast<RemoteVehicle *>(c3.VehicleByNetId(80));
+	v3->settleEndsAtMs = 1;
+	for (int i = 0; i < VEHICLE_REST_FRAMES + 2; ++i)
+		c3.TickCustody();
+	Check(v3->settleReported && v3->roofSinceMs == 0,
+	      "with nobody to ask, a car at rest is given back as it always was");
+
+	g_onRoof        = false;
+	g_rec.carAtRest = false;
+}
+
 void TestABlastOnAParkedCarStays() {
 	std::printf("\na blast on a parked car stays\n");
 	Check(HealthToWrite(1000.0f, true, 620.0f) == 620.0f,
@@ -16711,6 +16921,7 @@ int RunSirenTests();
 // tools/clienttest/carextras.cpp
 int RunCarExtrasTests();
 int RunCarRemovalTests();
+int RunTeardownTests();
 
 // tools/clienttest/cheats.cpp
 int RunCheatTests();
@@ -16775,6 +16986,10 @@ int RunAnimReviveTests();
 int RunCrowdRangeTests();
 // tools/clienttest/carletgo.cpp
 int RunCarLetGoTests();
+// tools/clienttest/carcam.cpp
+int RunCarCameraTests();
+// tools/clienttest/cargun.cpp
+int RunCarGunTests();
 
 // ---- who the ambient batches are ranked for (game/streampick.h) ------------
 
@@ -19362,6 +19577,8 @@ int main() {
 	TestSharedComesBackDown();
 	TestSharedDoesNotUnearnAnybody();
 	TestWantedOffIsAClamp();
+	TestTheMostStarsIsACeiling();
+	TestTheRulesChangeWithEverybodyIn();
 	TestOnlyTheCarYouAreInLendsYouStars();
 	TestABorrowedLevelDoesNotEchoInSharedMode();
 	TestNoPlayerPedMeansNoWantedDecision();
@@ -19443,6 +19660,7 @@ int main() {
 	g_failures += RunSirenTests();
 	g_failures += RunCarExtrasTests();
 	g_failures += RunCarRemovalTests();
+	g_failures += RunTeardownTests();
 	g_failures += RunCheatTests();
 	g_failures += RunDriveByTests();
 	g_failures += RunPassengerAimTests();
@@ -19469,6 +19687,8 @@ int main() {
 	g_failures += RunAnimReviveTests();
 	g_failures += RunCrowdRangeTests();
 	g_failures += RunCarLetGoTests();
+	g_failures += RunCarCameraTests();
+	g_failures += RunCarGunTests();
 	g_failures += RunAdoptTests();
 	TestALeaversPedIsAdoptedByUs();
 	TestSomebodyElseAdoptsAndWeFollow();
@@ -19502,6 +19722,7 @@ int main() {
 	TestWireMotionIsHeld();
 	TestACarsOwnBlastIsNotRelayed();
 	TestASinkingCarIsKeptUntilTheBottom();
+	TestACarOnItsRoofBurnsOnOneMachine();
 	TestACarWeHoldIsOursToDent();
 	TestALateExitEchoKeepsOurNewCar();
 	TestOurOwnTrafficPromotedIsNotBuiltAgain();

@@ -17,6 +17,7 @@
 #include "population.h"
 #include "ride.h"
 #include "seatplan.h"
+#include "teardown.h"
 #include "vehicle.h"
 
 #include <cstring>
@@ -553,24 +554,11 @@ bool LookupRemotePed(const void *ped, uint16_t &netId) {
 // nils both the fire's m_pEntity and the ped's m_pFire. Worth stating rather
 // than assuming, since the last two crashes in this project were both a
 // container nobody had checked.
+//
+// All of it is game/teardown.h's DestroyPed now, which also refuses a ped
+// that is no longer live in its pool slot or is already being taken apart.
 void DestroyRemotePed(void *ped) {
-	using ThisFn       = void(__thiscall *)(void *);
-	using RemoveRefsFn = void(__cdecl *)(void *);
-	using DtorFn       = void(__thiscall *)(void *, int);
-
-	if (NeedsMovingListUnlink(Field<uint8_t>(ped, offs::ENTITY_FLAGS_A),
-	                          Field<void *>(ped, offs::MOVING_LIST_NODE) != nullptr))
-		Log("bridge: a remote ped went static while still in the moving list; "
-		    "unlinking it by hand, because CWorld::Remove would have walked past it");
-	Func<ThisFn>(CPhysical__RemoveFromMovingList)(ped);
-
-	Func<RemoveRefsFn>(CWorld__RemoveReferencesToDeletedObject)(ped);
-
-	void *const *vtable  = *reinterpret_cast<void *const *const *>(ped);
-	auto         deleter = reinterpret_cast<DtorFn>(vtable[VTABLE_DELETING_DTOR]);
-	deleter(ped, 1);   // 1 = also free the memory
-
-	--Global<uint32_t>(CPopulation__ms_nTotalMissionPeds);
+	DestroyPed(ped, /*countedMissionPed=*/true, "a remote player's ped");
 }
 
 void *ResolveRemote(RemotePlayer &player) {
@@ -4198,6 +4186,7 @@ WorldBridge MakeWorldBridge() {
 	b.VehicleBurning        = &VehicleBurning;
 	b.VehiclePushedByUs     = &VehiclePushedByUs;
 	b.VehicleSinking        = &VehicleSinking;
+	b.VehicleOnItsRoof      = &VehicleOnItsRoof;
 	b.TakeVehicleBack       = &TakeVehicleBack;
 	// What shape a car is in (docs/cardamage.md). Beside the state pair
 	// because they are the same seam, and separate from it because damage is

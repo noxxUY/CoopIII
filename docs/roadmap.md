@@ -1,29 +1,38 @@
 # Roadmap
 
 The goal: the GTA III campaign, played co-op, with the game otherwise 1:1
-faithful. This document is the path from where we are to that, and the list of
-things that have to be true along the way.
+faithful. This file says where CoopIII is, what is left, and the decisions
+that shape the rest.
 
-Read `protocol.md` for the wire contract, `campaign.md` for the mission design,
-`missions.md` for what the script actually contains and the recommended route
-to co-op missions, and `compat.md` for the constraints the player's other mods
-impose. This file is the *plan*; those are the *decisions*.
+Read `protocol.md` for the wire contract, `missions.md` for how the story is
+shared, `campaign.md` for the original campaign design, and `compat.md` for
+the constraints the player's other mods impose. The feature write-ups are
+`population.md`, `wanted.md`, `pickups.md`, `rampage.md`, `cardamage.md`,
+`objects.md`, `radio.md` and `cheats.md`.
 
 ---
 
-## 1. Where we actually are
+## 1. Where it stands
 
-Verified running inside retail GTA III v1.0 on the target machine:
+Free roam is close to done. Players, traffic, pedestrians, the police, cars
+and everything that happens to them, pickups, garages, rampages, the clock and
+the weather are the same on every screen. The story can be played together:
+one player starts a mission, it runs on their game, and everybody else in the
+session plays it with them.
 
-| | |
-|---|---|
-| Image guard | Refuses to load against any other build. ✅ |
-| Frame hook | `CGame::Process` detoured; verified by reading the `E9` in live memory. ✅ |
-| Socket thread + queues | Connected, 2 ms RTT on loopback, never touches game memory. ✅ |
-| Roster | Join/leave/backfill, self-echo rejection, two-phase spawn. ✅ |
-| Local player sampling | Position, heading, velocity, health, armour, ped state and move state, read from real memory every 25 Hz tick. ✅ Animation (base + partial, with phase), held weapon and aim yaw/pitch were added for M1 and are sampled from verified offsets, but have not been through a live session yet. |
-| Remote ped creation | Created via the engine's own `CREATE_CHAR` path. Survived 18 000 frames. ✅ |
-| Remote ped **rendering** | ✅ Fixed. Remote players are now visible in-game. |
+It is still in active development. Nearly everything below is covered by the
+test suites, but a lot of it has only had short sessions in a real game, and
+playtesting keeps turning up bugs that get fixed as they are found. §7 is the
+list of what is known to be open.
+
+Protocol version **70**. `sdk/include/coopiii/protocol.h` has the history of
+every version and what an older build does against a newer one.
+
+Status words used below:
+
+- **Done**: built, tested, and in the build.
+- **In progress**: being built or being tested in real sessions.
+- **Planned**: decided or designed, not started.
 
 ---
 
@@ -51,8 +60,7 @@ Consequences to design for:
 
 Options, none free: keep players soft-tethered; stream a reduced set around
 remote players; or accept that distant players are represented by a blip only.
-This needs a decision before milestone 2, because vehicles make players separate
-much faster than legs do.
+Settled in §5.3: a distant player is a blip.
 
 ### 2.2 Only one island's collision is in memory
 
@@ -67,9 +75,10 @@ global. So two players on different islands is not a distance problem at all.
 The other island does not exist in this process.
 
 The campaign gates islands behind story progress, so in a co-op campaign
-everyone is usually on the same island, which saves us. Free roam has no such
-guarantee, though, and the bridge sequences deliberately move players between
-islands.
+everyone is usually on the same island, which saves us. The missions keep
+their players together (the start gate, the checkpoints, and moving everybody
+with the mission's own teleports, loading the island first). Free roam has no
+such guarantee, and it stays the known limit there.
 
 ### 2.3 There is exactly one player slot
 
@@ -89,562 +98,256 @@ a host-authoritative script (`campaign.md` §2).
 
 ## 3. Milestones
 
-### M1 - See each other *(current)*
+A bare §1.x, or §2.5 and above, is a section of `protocol.md`. §2.1 to §2.4
+and §5 are this file's.
 
-- [x] Fix remote ped rendering. Remote players are now visible in-game.
-- [x] Animation sync: `animId` + time, base and partial, plus the held weapon
-      and aim yaw. Built and unit-tested, but it still needs an in-game run to
-      confirm it looks right. Protocol 2. See `protocol.md` §1.8 for the wire
-      format and `client/src/game/addresses.h` for the offsets it reads.
-- [x] Nametags over remote players. Weapon icon, name, health, drawn with the
-      game's own `CFont` and its own `hud.txd` sprites from a detour on
-      `CHud::Draw`. Fade out by 50 m and fade out behind walls, the second
-      through one `CWorld::GetIsLineOfSightClear` per frame shared round robin
-      across the roster. Run in game 2026-09-22 and the size settled at
-      nametagScale 1.35. See
-      `client/src/game/nametag.h` for the design and the numbers.
-- [x] Remote players on the minimap, as the rotating arrow the engine draws
-      the local player with — so a team-mate reads as a person facing a
-      direction rather than as a coloured square. Drawn from a detour on
-      `CRadar::DrawBlips`, after the original, out of the engine's own
-      `CentreSprite` and its own four-step blip preamble
-      (`TransformRealWorldPointToRadarSpace`, `LimitRadarPoint`,
-      `CalculateBlipAlpha`, `TransformRadarPointToScreenSpace`). Green on foot
-      and red in a car, which are `ADD_BLIP_FOR_CHAR`'s and
-      `ADD_BLIP_FOR_CAR`'s own colours, fetched from
-      `CRadar::GetRadarTraceColour` rather than written down. No protocol
-      change. It went through `CRadar::ms_RadarTrace` first and the table is
-      gone: the square is the one thing a table entry cannot stop being. See
-      `client/src/game/radar.h`. Not yet run in game.
-- [x] Decide the streaming policy (§2.1). Settled, see §5.3.
+### M1 - See each other: done
 
-Done when: two players can see each other walk around Portland and it looks
-right.
+- Remote players are real peds in the world, created through the engine's own
+  `CREATE_CHAR` path.
+- Animation: base and partial, with their phase, so the pose, the run and the
+  weapon in hand match (`protocol.md` §1.8).
+- Aim: yaw through `CPed::SetAimFlag`, pitch through the engine's own IK, so
+  the arm or the torso bends the way it does for the local player.
+- Clothes: Claude's outfit follows the story on every screen (§1.32).
+- Nametags with weapon, name and health, drawn with the game's own font and
+  `hud.txd`, faded by distance and behind walls (`client/src/game/nametag.h`).
+- Remote players on the radar as the same rotating arrow the local player gets
+  (`client/src/game/radar.h`), including players too far away to have a ped
+  (§5.3).
+- A player standing on something that moves (a car, a boat, the El, the
+  subway) is drawn on it, not beside it (protocol version 66).
 
-### M2 - Vehicles
+### M2 - Vehicles: done
 
-**Unblocked 2026-09-21.** M2 was gated on `CVehicle` offsets that had been
-located and never verified; all 22 have now been proved against the retail
-binary and moved into `client/src/game/addresses.h`, along with the engine's
-own `CREATE_CAR` creation path. Start with the spawn, and mind the reference
-registration and the double deletion it guards against: a vehicle has two
-deletion gates (`!bIsLocked && CanBeDeleted()`), so the Area B trap is waiting
-here in a slightly nastier form. `client/src/game/vehicle.cpp` and `vehicle.h`
-are where that path lives.
+- A car joins the session when a player gets into it. Cars nobody has touched
+  stay each machine's own; traffic is shared through the population sync (M4).
+- Transform and velocities at 25 Hz, full rotation as a quaternion, controls,
+  interpolation, and correction after physics every frame.
+- Getting in and out plays through the engine's own `CPed::SetEnterCar` and
+  `SetExitCar`, with the door announced when the entry starts, and a warp
+  behind it so the seat is always right (`protocol.md` §1.14).
+- Passengers: `seatKey` (G) takes the first free passenger seat of the nearest
+  car. When a mission puts its player in a car, the free seats go to the other
+  players and whoever gets none follows in their own (§1.40).
+- Ownership: the player in seat 0 owns the car; a car still moving with
+  nobody driving gets a custodian until it stops (§5.8.1, §5.8.2). A carjack
+  plays as one on every screen and hands the car over.
+- Colours and extras are the same on every copy (§5.9).
+- Damage: health, panels and doors, fire, and the wreck, for cars somebody
+  drives and for cars nobody does (§5.8, `cardamage.md`, `protocol.md` §1.38).
+- Horn, siren, lights, alarms, the tank turret and the fire truck cannon, the
+  taxi light and the handbrake (§1.39).
+- The car radio: everybody in a car hears the same station at the same moment
+  (`radio.md`, §1.33).
+- **Boats.** `SpawnRemoteVehicle` builds a `CBoat` for a boat model, chosen
+  the way `CREATE_CAR` chooses (model info type and `+0x58`, not model ids).
+  The car-only writers are guarded on `m_vehType`: the damage model is
+  skipped both ways, and the fire timer is held on the boat's own member
+  (`+0x2CC`, not `+0x530`). A replica is seated in a boat by warp.
+  `addresses.h`, "boats", and `game/boat.h`.
+- A parked car somebody takes is gone from its spot on every screen, and the
+  crusher, the Portland crane, Craig's garages and the safehouse garages act
+  only on the copy of the machine holding the car (§1.44).
+- A traffic car its host's engine would drop next to another player is handed
+  to that player instead of vanishing (§1.45).
+- Never `STATUS_PLAYER_REMOTE`: it is RC-car mode and it detonates cars
+  (`protocol.md` §1.4).
 
-**Started 2026-09-21.** `client/src/game/vehicle.*` and the client/server
-roster are in. What works and what does not is in the checklist below.
+### M3 - Combat: done
 
-**How a vehicle enters the session, decided 2026-09-21.** GTA III generates
-its own traffic and parked cars, locally and differently on every machine, so
-there is no shared vehicle world to refer to, and synchronising Liberty City's
-whole car population is not on the table. So a car joins the session when a
-player first gets into it. The client sends `C_EnterVehicle` with the car's
-identity and `netId == INVALID_NETID`, the server allocates a netId and tells
-everyone else to create a matching one, and the reply tells the claimer what
-its own car is called. Cars nobody has touched stay local and unsynchronised:
-two players see different traffic and neither can tell. Leaving a car does not
-remove it. Somebody parked it, it is still there.
+- Weapon, aim and, behind the server's `ammoSync`, ammunition (§5.12).
+- Shots replayed through the real `CWeapon::Fire`, along the shooter's own
+  direction, so impacts, trails and decals happen for real (§1.9). Sniper
+  rounds are heard and land on every screen.
+- Damage and death through `CPed::InflictDamage`, `SetDie` and `SetDead`, the
+  victim's machine deciding its own health. Respawn at the hospital, arrest at
+  the police station.
+- Melee, with the right reaction on the victim's screen.
+- Friendly fire, off by default (§5.2).
+- Fire: whatever lit it, it burns on every screen and burns everybody (§5.7).
+- Explosions, car bombs (bought or fitted by a mission) and mines, blamed on
+  the right player (§1.36).
+- Drive-bys, and passengers aiming a pistol or uzi out of any window with the
+  mouse camera (§1.42).
+- The lock-on skips teammates (§1.41).
 
-- [x] Vehicle spawn/despawn, driver-authoritative.
-- [x] Transform + velocities at 25 Hz, full rotation as a quaternion
-      (`client/src/quat.h`, round-tripped in `basetest` over orientations a
-      yaw-only sync would lose).
-- [x] Steering, throttle, brake, gear, engine state, siren, lights.
-- [x] Interpolation, with a slerp for the rotation (`VehicleInterpBuffer`).
-- [x] Simulate and correct: the transform is written after `CGame::Process`,
-      every frame, so local physics cannot own a car somebody else is driving.
-- [x] Seat the remote driver. `SeatRemotePed`/`UnseatRemotePed`
-      (`client/src/game/ped.cpp`), driven live from `UpdateRemoteSeats`
-      (`client/src/client.cpp`). A remote driver now sits in their car instead
-      of standing where it is.
-- [x] Play it through the engine's own API. `CPed::SetEnterCar` opens the
-      door and `CPed::SetExitCar` closes it, both verified against the retail
-      image (`addresses.h`). The warp is still there and is still what
-      guarantees the seat: the animation is an attempt with a deadline, and
-      every way it can end short - refused, interrupted, the car driving off,
-      the player dying, the clock running out - falls back to
-      `WarpPedIntoCar` in the same frame. `CPed::SetCarJack` is recorded and
-      deliberately not called; see docs/protocol.md §1.14.
-      **Not yet run in the game.**
-- [x] Tell the session an entry has *started*, and which door it goes in
-      through. `C_EnteringVehicle`/`S_EnteringVehicle`, a statement of intent
-      that claims nothing: the claim that names the car and moves ownership
-      is still the `C_EnterVehicle` at the end. The door matters because the
-      seat does not name it - `CPed::SeekCar` walks a driver to the *nearest*
-      door via `CPed::GetNearestDoor` (`0x004E1CF0`) and the engine shuffles
-      him across the front seats inside the car, so pressing the enter key on
-      the passenger side and being seen to teleport to the driver's door was
-      one observer opening the wrong one. docs/protocol.md §1.14.7.
-- [x] Shut a door an abandoned entry left open. `CPed::QuitEnteringCar`
-      touches the car's flags and not its doors, so an entry given up on
-      after the door-opening animation left that car with a door hanging open
-      and nobody in it. `AbandonPedEnterCar` now makes the engine's own
-      closing call. docs/protocol.md §1.14.8.
-- [x] Passengers: several players in one car, with the driver owning physics.
-      A key the original game has no binding for (`seatKey`, G by default)
-      puts the local player in the first free passenger seat of the nearest
-      of the session's own cars. The engine picks the slot - `WarpPedIntoCar`
-      takes the passenger arm for any objective that is not
-      `ENTER_CAR_AS_DRIVER` - and CoopIII reads back which one it got,
-      because that number is what the session is told. Getting out is the
-      game's own exit key; there is no CoopIII way out, and the client
-      notices the seat is empty. `client/src/game/seat.h`.
-- [x] Same car on every screen: colours **and extras**. `EnterVehicleBody` and
-      `S_VehicleSpawn` carry `m_aExtras`, forced on the receiving machine
-      through `CVehicleModelInfo::ms_compsToUse` before the constructor runs,
-      because they cannot be applied after it. `protocol.md` §1.12.
-- [x] Ownership handoff when the driver changes. Decided and built: §5.8.1
-      is the rule (the player in seat 0 owns it, and between an exit and the
-      next enter nobody does) and §5.8.2 the two halves that were missing.
-      What this line said before that, kept for the history: it had a
-      **stopgap in front of it**: `CorrectRemoteVehicle` stops
-      correcting a car the local player is sitting in the driver's seat of.
-      Without that, a car another player claimed is a car you can get into and
-      cannot drive an inch, because the session's transform is written over
-      yours sixty times a second. The session still thinks the other netId
-      names it and the local claim makes a second one; the guard only buys
-      time. `protocol.md` §1.11.5.
-- [x] The car blows up on every screen. `C_VehicleBlowUp` / `S_VehicleBlowUp`
-      (0x36/0x37), decided by the driver's machine, replayed by every observer
-      through the engine's own `CAutomobile::BlowUpCar` at the owner's
-      transform. `protocol.md` §1.11.
-- [x] **Vehicle damage short of destruction: panels, doors, lights, wheels.**
-      Built since, as panels and doors on a change-only reliable packet
-      (version 18, [cardamage.md](cardamage.md)); not run in the game. The
-      notes below are from before it, when it was deliberately left out of
-      the destruction work and the addresses proved while doing that were the
-      head start:
+### M4 - The world: done
 
-      | Symbol | Address / offset | How it was proved |
-      |---|---|---|
-      | `CVehicle::m_damageManager` (`CDamageManager`) | `+0x288` | `BlowUpCar`'s `lea ecx,[ebx+288h]`; also `== SIZEOF_VEHICLE`, i.e. `CAutomobile`'s first member |
-      | `CDamageManager::FuckCarCompletely` | `0x00545B70` | the call `BlowUpCar` makes on that sub-object |
-      | a `CAutomobile` panel/door setter | `0x00530120` | `BlowUpCar` calls it four times with `(id, status, 0)` triples - `(7,5,0)`, `(8,6,0)`... It takes the **vehicle**, not the damage manager: `lea ecx,[ebp+288h] / call 0x005458E0` records the damage, then `[ebp+ebx*4+37Ch]` reaches what is almost certainly `m_aCarNodes` and hides the frame. Both halves have to happen or the panel stays on screen |
-      | `CDamageManager` engine-status setter | `0x00545940` | `mov [ecx+4], min(arg, 0FAh)`, a saturating byte write. `CVehicle::InflictDamage`'s "set on fire" arm pushes `0E1h` (225) into it, so `m_engineStatus >= 225` is what "this car is burning" means. `+4` is the engine byte and 250 is its cap |
-      | `CDamageManager` layout, partially | `+5`, `+9`..`+0E`, `+4` | `0x00545B70` writes 2 into `+5` and 3 into the six consecutive bytes `+9`..`+0E`, which is the wreck state for six separate parts |
-      | `m_nTimeOfDeath` | `+0x210` | `BlowUpCar`'s `mov eax,[0x885B48] / mov [ebx+210h],eax` |
-      | `bRenderScorched` | byte B (`+0x52`) bit 4 | `BlowUpCar`'s `and al,0EFh / or al,10h` |
+- Ambient pedestrians and traffic: whoever's engine made one hosts it, and
+  everybody else sees the same crowd (`population.md`). They fight every
+  player, not only their host's. A leaving player's crowd and traffic are
+  adopted by the others rather than dropped.
+- The wanted level, per player by default, with the police chasing whoever is
+  wanted (§5.1, `wanted.md`). The police helicopter and its gunfire. A
+  Pay'n'Spray or a bribe clears stars for the car or the shared session
+  (protocol version 70).
+- Pickups: one player gets each one, the server decides who (`pickups.md`).
+  Money and weapons a dead ped drops. Hidden packages, shared by default
+  (§5.11).
+- Rampages, shared, with a vote before one starts, for pedestrians and cars
+  (§5.10, `rampage.md`).
+- All 32 garages and their doors, Pay'n'Spray repairs and repaints (§1.16),
+  and the scripted gates `gates.sc` opens (§1.43).
+- Street objects: broken and knocked over on every screen, and still broken
+  for a player who comes back (§5.13, `objects.md`).
+- The clock and the weather follow the host (§2.7). Trains, planes, traffic
+  lights and the Shoreside lift bridge run on the session's clock.
+- Medics revive and fire trucks spray on every screen (§1.37).
+- Cheats run where what they change is owned (§5.14, `cheats.md`).
+- Money: off, own wallets or one shared wallet, as a server setting.
 
-      Three things a reader of those should know before building on them.
-      Everything in the "how it was proved" column was read out of the binary
-      on 2026-09-22 and the three function addresses are in
-      `docs/addresses-unverified.md` rather than in `addresses.h`, because
-      what has been read is their *shape* and their call sites, not their
-      whole bodies matched against re3 - which is the standard the rest of
-      `addresses.h` is held to. Do not promote them without doing that.
-      Second: `m_aCarNodes` at `+0x37C` is a guess from one subscript and
-      nothing else, and a wrong node array is a write into a neighbouring
-      member rather than a crash. Third, and the design point: this is a
-      *state*, not an event. Unlike a blast it belongs in the snapshot beside
-      health, which means the snapshot grows and the wire changes again -
-      whereas destruction deliberately did not touch the snapshot at all.
-- [x] Boats. `SpawnRemoteVehicle` builds a `CBoat` for a boat model, chosen
-      the way `CREATE_CAR` chooses (model info type and `+0x58`, not model
-      ids). The car-only writers are guarded on `m_vehType`: the damage model
-      is skipped both ways, and the fire timer is held on the boat's own
-      member (`+0x2CC`, not `+0x530`). A replica is seated in a boat by
-      warp, with the objective `CPed::SetObjective` takes away from
-      non-players put back by hand. No wire change. `addresses.h`, "boats",
-      and `game/boat.h`. Not run in the game yet.
-- [x] Never use `STATUS_PLAYER_REMOTE`. It is RC-car mode and it detonates
-      cars (`protocol.md` §1.4). Held to: nothing in the client writes it.
-- [x] Run in the game. A car spawns, renders upright, survives in the pool
-      and is corrected against local physics every frame. Not yet with a real
-      second player: `ghost -car` is what has driven it so far.
-- [x] A car changing hands between two other players is played on its new
-      driver's clock. The buffer used to keep the old driver's samples, so a
-      machine whose game had started later had every snapshot dropped as older
-      than the last and the car stood still on every other screen for as long
-      as the two games' start times were apart (`Client::OnReportersClock`,
-      2026-09-24). No wire change. Not run in game.
+### M5 - Campaign together: done, being played through
 
-Done when: one player drives, another rides, and it looks the same on both
-screens.
+The design changed from `campaign.md`'s "only the host runs the script" to
+the one in `missions.md`: every machine keeps running its own `main.scm`, a
+mission runs on the machine of the player who started it, and what it does is
+replayed on everybody else's through the engine's own interpreter.
+`missions.md` §15 is the full list of what is built.
 
-### M3 - Combat
+- One mission at a time for the whole session, for two players or more. It
+  starts only when everybody is at the marker (`missionMargin`, 5 m), and
+  every checkpoint waits for everybody, 60 s at most.
+- What the mission shows reaches everybody: text, blips, spheres, markers,
+  coronas, HUD timers and counters, dialogue, sounds, the mission's
+  pedestrians and cars, its pickups, objects, explosions and fires.
+- Cutscenes play for everybody, loaded together, and a skip is a vote of
+  everybody in it (§1.34). The mission's teleports move every participant,
+  loading the island first when needed.
+- Everybody is paid. A death or an arrest fails the mission for everybody,
+  as in single player (§5.4, `missionFailOnDeath`). A failed mission can be
+  retried from its marker.
+- Campaign progress is shared: when a mission ends, the globals and threads
+  it changed go to everybody (§1.30), so the next missions unlock on every
+  machine and a late joiner or a loaded save catches up.
+- A player who joins or reconnects during a mission is brought into it.
+- Mission enemies can be made tougher, or more of them, for more players
+  (`missionEnemies`, `missions.md` §10).
+- Odd jobs, the RC, 4x4 and Mayhem runs are session missions too; a passenger
+  can't start the driver's side job.
 
-- [x] Weapon sync: current weapon, ammo, aim yaw/pitch. The weapon and both
-      aim angles are sent and applied, pitch through the engine's own IK;
-      ammo since version 18, behind the server's ammo switch. See the sync
-      inventory.
-- [x] Shot events (reliable), replayed through the real `CWeapon::Fire` so
-      impacts happen for real (`combat.cpp`, `C_Shot`, `CH_EVENT`). Muzzle
-      flash not separately handled.
-- [x] Damage application and death, through `InflictDamage` / `SetDie` /
-      `SetDead` rather than by writing health. **Run end to end in game
-      2026-09-21**: the shooter's `C_Damage`, the victim applying it, the
-      death and the respawn all appear in the two logs for the same hit. See
-      `protocol.md` §1.10.2 for the exemption that makes it work, which is
-      the whole fix.
-- [x] Respawn. The engine's own, on the machine that died; what travels is
-      that it happened, and observers see the ped die and come back. Run in
-      game 2026-09-21. The clock jumping 12 hours on death comes free, since
-      that is `CGameLogic::PassTime(720)` and the host's clock is the
-      session's.
-- [x] Arrest: police station, the same. The busted player's machine sends
-      leaving `PED_ARRESTED` as `C_Respawn`, and a player a cop drags out of
-      a car is taken out of the seat on the snapshot instead of at the end
-      of the drag. No packet, no version. `protocol.md` §1.10.8. Built
-      2026-09-23, not run in game.
-- [x] Melee. The hit always travelled as damage; since version 36 it also
-      says which fight path landed it and with what move, so the victim's own
-      engine plays the defend, the knockdown or the shove, and copies never
-      react to a melee hit (`client/src/game/melee.h`). Not run in game.
-- [x] Decide friendly fire. Settled in §5.2: off by default, server option.
+Done when a group can play the story from start to end together. The work
+now is playing it through in order and fixing what each mission shows up.
 
-### M4 - The world
+### M6 - Anybody starts a mission: done
 
-- [x] Pickups: weapons, health, armour, hidden packages. Collection is
-      exclusive - the client detects, the server arbitrates, the engine
-      awards, **in that order**, because a pickup reward cannot honestly be
-      taken back. Designed and built 2026-09-22; not yet run in game.
-      **[docs/pickups.md](pickups.md)** is the investigation and the design,
-      `client/src/game/pickup.*` is the seam, protocol **11**.
-      - The finding that shaped it: no spawn packet was needed. Every machine
-        already runs `main.scm` and creates all 448 script pickups itself from
-        literal coordinates, so the worlds already agreed and only the
-        exclusivity was missing.
-- [x] Ped drops: the money and weapons a dead ped leaves. Out of M4's pickup
-      line deliberately - it is a *spawn* problem, not an exclusivity one. The
-      positions and amounts come straight out of `CGeneral::GetRandomNumber()`
-      and the ped is usually ambient, so it exists on one machine only
-      (`pickups.md` §1). Built on `C_PickupDrop` / `S_PickupDrop`
-      (0x86/0x87): the host reads back what its own engine created and every
-      observer replays it (the sync inventory, "Pickups a dead ped drops").
-- [x] Remote players' kills counting toward a rampage. The frenzy already
-      started for everybody (§5.10); what did not work was the counting, and
-      it was worse than "each machine counts its own". `CPed::InflictDamage`
-      only reaches `CDarkel::RegisterKillByPlayer` when the damaging entity is
-      `FindPlayerPed()` or `FindPlayerVehicle()` (the test at `0x004EAD1A`),
-      so a pedestrian hosted here and shot from there was credited to
-      **nobody** - the host saw a replica, and the shooter's own engine had
-      returned before that line. Built 2026-09-23, not yet run in game.
-      **[rampage.md](rampage.md)** is the investigation and the design.
-      Kills ride the engine's own three arguments (victim model, weapon,
-      headshot), the ending is arbitrated by the server, and
-      `CDarkel::ReadStatus` - one caller in the whole image, script opcode
-      `01FA` - is what holds every machine's `rampage.sc` on the same value.
-      Vehicle rampages (`RegisterCarBlownUpByPlayer`) are the same three lines
-      and are deliberately still open; `rampage.md` §7.
-- [x] Doors and garages. Built 2026-09-22, not yet run in game.
-      **[protocol.md §1.16](protocol.md)** is the design,
-      `client/src/game/garage.*` is the seam, four opcodes in `0xA0..0xAF`.
-      - The finding that shaped it: nothing has to be spawned. All 32 garages
-        come out of `main.scm` at literal coordinates, so the worlds already
-        agree - only `CGarage::Update` asking `FindPlayerPed()` was missing.
-      - What travels is the **state transition**, never `m_fDoorPos`. The
-        door's height is derived on every machine from the state, at its own
-        frame rate, through the engine's own ramp - and it could not travel
-        even if it were worth it, because it is read against a door `CEntity`
-        that each machine resolves to its own pool pointer (§5.8's rule).
-      - Authority is a **union**, not §5.8's first-report-wins. A garage
-        belongs to the map so there is no owner, and a door is a *level*
-        rather than an event: first-report-wins would mean a door that never
-        closes, last-writer-wins would mean the first player to walk away
-        shutting it on the second.
-      - **The safehouse pedestrian door and the save point are NOT garages**
-        and are not done. They are `main.scm` objects (`#PLAYERSDOOR`,
-        swung by `034D ROTATE_OBJECT` from `save.sc`) gated on the local
-        player standing in a box, so syncing them means running the script
-        host-only or intercepting that opcode - M5, `campaign.md`. The save
-        menu staying local is also the safe answer.
-- [x] The scripted gates. Built 2026-09-25, not yet run in game. The seven
-      gates `gates.sc` opens only for the local player (police HQ, the
-      Colombians', Phil's, the two factories) are held open while anybody's
-      own thread wants them open - the garages' union, one bit per gate, on
-      `C_GateState` / `S_GateState` (0xC8/0xC9). `client/src/game/gates.*`;
-      **[protocol.md §1.43](protocol.md)**. Needs `missions = on` to report
-      this machine's own gates.
-- [x] A broken street object stays broken for a player who leaves and comes
-      back. Built 2026-09-25, not yet run in game. The server keeps breaks and
-      resting places while anybody is within 120 m, and a machine rebuilding
-      one it heard about asks (`C_ObjectRebuilt`, 0xCD). **[objects.md
-      §8.5](objects.md)**.
-- [x] Pickup reservations are one pickup, not everything in 4 m, and a moved
-      one is announced to its old holder. Built 2026-09-25. **[pickups.md
-      §12](pickups.md)**.
-- [x] Pay'n'Spray: the repair and the repaint. The colours travel because the
-      retail `ChooseVehicleColour` is a per-machine round robin rather than an
-      RNG roll (§1.16.5) - same class as §5.9, third time, and re3 would have
-      given the wrong *reason* for the same right answer. The wanted level
-      does not travel; see the next line.
-- [x] The wanted level a Pay'n'Spray clears. Left as a marked seam rather
-      than a second mechanism, and §5.1 landed without it having to change:
-      the player who paid gets their own stars cleared by their own engine,
-      under `shared` their own `PlanWanted` works out what that does to the
-      session, and an *observer* never clears its own player's stars
-      (`protocol.md` §1.16.6).
-- [x] Destructible objects, explosions, fires. Explosions are replayed at the
-      owner's position, fires are world state (§5.7, all three phases), and a
-      broken or knocked-over street object is shared (§5.13). See the sync
-      inventory's World table for what has been run in the game. A window
-      somebody else's drive-by hits breaks on every screen, through the
-      engine's own `CGlass` call for that round (objects.md §8.4; the address
-      is a lead checked at run time). Not run in game.
-- [x] Wanted level. Per-player, GTA Online's vehicle rule, server-configurable
-      (§5.1). Designed and built 2026-09-22; **not yet run in the game**.
-      **[docs/wanted.md](wanted.md)** is the investigation and the design,
-      `client/src/game/wanted.*` is the seam, and the wire cost is four spare
-      bits of a flags byte that was already going out plus two in `S_Welcome`.
-      - The finding that shaped it: **the police needed nothing.** A cop ped
-        is a `RANDOM_CHAR` and a police car a `RANDOM_VEHICLE`, so both
-        already passed population.md's host tests unchanged - the wanted
-        player's own engine spawns them, `CCopPed` can only chase
-        `FindPlayerPed()` so they chase that player, and every other machine
-        has been receiving them as ambient replicas all along. Nobody had
-        noticed because no machine had ever had a reason to make one.
-      - The other one: crimes are already attributed correctly, because
-        `CEventList::RegisterEvent` reports nothing unless the criminal is
-        the local player's own ped. M3 replaying somebody else's shot here
-        cannot raise this machine's stars.
-      - **Except the helicopter.** From three stars (`CWanted::NumOfHelisRequired`,
-        `0x004ADC00`: 3-4 stars one, 5-6 two) `CHeli::UpdateHelis` builds a
-        `CHeli` as `PERMANENT_VEHICLE`, locked, that chases `FindPlayerCoors()`.
-        population.md's host test refuses both, so only the wanted player's
-        own screen had it. It has its own opcodes now (0xA4-0xAB): the
-        machine that spawned it streams it, every other machine flies a
-        replica, and hits and its gunfire travel (`protocol.md` §4).
-- [x] Ambient peds and traffic: an ownership model, or accept divergence.
-      `protocol.md` §3 accepted divergence for v1, which was honest then and
-      wrong for a finished mod. **Designed 2026-09-22 in [population.md](population.md)**:
-      whoever's engine made it owns it, caught at `CWorld::Add`. **Built and
-      measured in a live session 2026-09-22 for pedestrians**: two machines,
-      eleven pedestrians between them, and both engines counting eleven rather
-      than twenty-two. The counter rewriting the design called for turned out
-      to be unnecessary - `CPed::CPed` already counts a replica the moment it
-      is constructed, so the generator was seeing the shared crowd all along
-      (`population.md` §1.3.1). Traffic was step 4, and the same measurement
-      had to be repeated for it because `CCarCtrl`'s counters are not
-      maintained the same way; it was, the same day, with the same result as
-      long as the replica is put in the right counter (`population.md`
-      §1.3.2).
+Any player can walk into a marker and start the mission for the session. No
+trigger opcodes had to be intercepted: every machine already runs its own
+triggers, so starting only needed arbitrating at `CAN_PLAYER_START_MISSION`
+(`missions.md` §3.2, §5.2). The hooks are on the script engine's range
+handlers, which works with or without III.CLEO installed.
 
-### M5 - Campaign, Tier 2
+### M7 - Everything that makes it usable: done
 
-The design is settled in `campaign.md`; this is implementation.
-
-> **2026-09-24:** [missions.md](missions.md) measured the whole script and
-> recommends against the first item below. Free roam already depends on every
-> machine running its own main script. Instead, the mission runs on the machine
-> of the player who started it, and its effects are replayed through the
-> engine's own interpreter. Its §7 is a phased plan for this milestone and M6,
-> and its §9 lists what the owner has to decide first. The checklist below is
-> left as it was until the owner decides.
-
-- [ ] Suppress `CTheScripts::Process()` on clients.
-- [ ] Settle what *else* the main script drives that clients would lose:
-      pickups, garages, save points, the intro (`campaign.md` §6). Do this
-      first, it may change the shape of the rest.
-- [ ] Replicate script effects: subtitles, blips, script spheres, mission
-      state, cutscenes, fades.
-- [ ] Mission entities as ordinary netid entities.
-- [ ] Mission cleanup on pass/fail.
-- [ ] Cutscene handling: freeze remote players too, or they wander through the
-      scripted camera.
-- [ ] Server options for the three deliberate SP divergences (`campaign.md`
-      §2.3): death fails the mission, cutscene freezing, host-owned save.
-- [x] **The session's one mission** (`missions.md` §15, `protocol.md` §1.29).
-      One mission at a time with everybody in it: a contact's or a payphone's
-      start is held until every player is at it (5 m, `missionMargin`), a
-      participant's `$ONMISSION` follows the session's, a checkpoint waits for
-      everybody, and `missionFailOnDeath` fails the owner's mission through the
-      engine's own death path when a participant dies or is busted. The server
-      half and its wiring are tested (`sessiontest`, `servertest`); the script
-      engine's half is behind `missions = on` until its addresses are proved
-      (`addresses-unverified.md`). Built 2026-09-24, not run in game.
-
-Done when: a group can play a mission from start to finish together.
-
-### M6 - Campaign, Tier 3
-
-- [ ] Intercept the three trigger opcodes so *any* player can start a
-      mission, not only the host. Measured over the real campaign: 123 call
-      sites across `IS_PLAYER_IN_AREA_3D` (63), `IS_PLAYER_IN_AREA_2D` (57),
-      `IS_PLAYER_IN_ZONE` (3). `campaign.md` §4.
-      **Corrected 2026-09-24:** those counts are of the `.sc` files by name.
-      The mission markers are `LOCATE_PLAYER_ON_FOOT_3D`, and since every
-      machine already runs its own triggers, starting only needs arbitrating
-      at `CAN_PLAYER_START_MISSION`. It doesn't need intercepting.
-      `missions.md` §3.2 and §5.2.
-- [x] Decide: one detour on `ProcessCommands` switching on opcode, or patch
-      the individual handlers. **Neither: the range handlers.** III.CLEO owns
-      `ProcessCommands` itself, and it calls the same twelve range handlers the
-      engine does, so a detour on a range handler is reached with or without
-      it (`game/mission.cpp`, 2026-09-24).
-
-### M7 - Everything that makes it usable
-
-- [x] Chat on the HUD. T opens a line, Enter sends it through the `C_Chat`
-      the protocol always carried, and the last ten lines sit above the radar
-      for ten seconds each, every name in its player's colour and a long
-      message broken over as many lines as it takes (`client/src/chatfeed.h`,
-      `game/chat.cpp`). The line being typed has a caret the arrows, Home and
-      End move, Up and Down go back through the last ten lines sent, Ctrl+V
-      or Shift+Insert pastes and Shift+Delete empties it. An accented letter
-      is typed as its plain one, because CFont's `FONT_BANK` has no glyph for
-      it. The keys are read off the game's own window, and while a line is
-      open the controls are held through the same `DisablePlayerControls` bit
-      the menu uses. Both keys are settable (`chatKey`, `listKey`). Built
-      2026-09-23, not run in game.
-- [x] The version in the bottom-left corner, under the radar, grey and small:
-      "CoopIII 0.0.1", from `sdk/include/coopiii/version.h`, which basetest
-      holds to `set_version` in `xmake.lua` and to the installer's component.
-      Also the first line of both logs. `showVersion = false` in CoopIII.ini
-      hides it.
-- [x] Player list on screen: F9 shows who is in the session, with their
-      health, whether they are dead or in a car, and their stars.
-- [x] Ping on screen, in the F9 list beside every name, yours included. The
-      server broadcasts each slot's round trip as ENet measures it once a
-      second (`S_PlayerPings`, 0xB2), so every machine shows the same number
-      for everybody. Not a version: an older client drops the opcode.
-- [x] Join/leave messages in game, and a line when the connection to the
-      server is lost. A join is only announced for somebody arriving now,
-      not for everybody a joiner is told about (`PJF_ARRIVED`, not a
-      version). The chat is otherwise the players': who a mission start
-      waits for, who started, passed or failed what, whose seat is kept and
-      an ordinary "connected" all go to CoopIII.log instead.
-- [x] Reconnection that restores you where you were. The network thread
-      reconnects by itself every two seconds after a loss, and the game on
-      the player's own machine never stopped, so where they are, what they
-      carry and their stars are all still theirs; the HUD says "lost the
-      connection" and then "back in the session". The one thing that used to
-      come back wrong was the car they were sitting in: the old session
-      handed it to their engine, the backfill then built a second copy on top
-      of it, and their claim named the one they were in as a new car. Now the
-      car is remembered when the session ends and taken up again when the
-      backfill names it (`Client::OnVehicleSpawn`). The claim on it waits
-      1.5 s after the welcome (`REJOIN_WAIT_MS`), long enough for the seats
-      behind the spawns to arrive: if one says somebody else has been
-      driving it since, or our old connection still is, the row goes back to
-      being their car and ours is claimed as a new one instead of being taken
-      off them. A car the backfill never hands back is claimed as new once
-      the wait is over. Not run in game.
-- [ ] A server that can be run by a person who is not us: config file, clear
-      logs, a README that covers port forwarding. The config file is
-      `CoopIII-Server.ini`, written with a comment on every setting. The logs:
-      on start both the window and `--nogui` say which of the machine's
-      addresses to hand out, whether it needs UDP forwarded on the router or
-      has a public address of its own, and that the firewall has to let the
-      port in (`server/core/reach.h`); a player turned away is told apart by
-      name and why, with both protocol numbers for a version mismatch; and
-      the three lines that went to stdout past the window's log go through it
-      now. A `password` (off by default) keeps strangers out of a server on
-      the open internet, and a refused player now hears why and stops asking
-      every two seconds (protocol.md §1.27). The README section is what is
-      left.
-- [x] Desync diagnostics. When someone says "he was in a different place on
-      my screen", there has to be something to look at. The F9 list marks a
-      player nothing has arrived from for three seconds as "quiet" and for
-      how long - the menu, a loading screen, a cutscene or a game left in the
-      background, which is what a frozen ped on screen usually is - and its
-      last line says how many packets have gone each way and how many peds
-      and cars this machine hosts and holds. And the two machines are
-      compared: every two seconds a client tells the server where its engine
-      has each remote player and each session car it watches, at which
-      instant of the owner's clock, and the server answers with the distance
-      from where the owner said it was at that instant (`C_DesyncProbe`,
-      protocol.md §1.26). Traffic and pedestrian replicas are compared
-      with what their host streamed, the same way. F9 shows "off 7.4 m"
-      beside a player a metre or more out and names the furthest copy of
-      anything else; both logs name the worst past 5 m. Not a version. Not
-      run in game.
-- [x] The host kicks from inside the game. The F9 list numbers every row
-      and marks the host, and the host types `/kick 3` or `/kick bob` in the
-      chat. The server takes `C_Kick` (0xB6) from the session's host alone
-      (`Session::MayKick`) and kicks through the window's own path, so
-      everybody reads "was kicked". The missions needed it: their start gate
-      waits for every player, so somebody who never comes has to be thrown
-      out (`missions.md` §9, decided 2026-09-24). `listKey = Tab` works now.
-      protocol.md §1.28. Built 2026-09-24, not run in game.
+- Chat on the HUD (T), with join and leave lines and a line when the
+  connection drops.
+- The scoreboard (hold Tab, or pin it with F9): health, stars, what each
+  player is doing, who is paused, and ping.
+- Reconnection that puts you back where you were, in the same car.
+- Desync diagnostics: the F9 list and both logs say when a copy of something
+  is more than a few metres from where its owner has it (§1.26).
+- The host kicks from the chat (`/kick 3`, `/kick bob`) (§1.28).
+- The version in the bottom-left corner.
+- The dedicated server: a window with the log, the players and an options
+  dialog, or `--nogui` for a console. `CoopIII-Server.ini` with a comment on
+  every setting, an optional password, and a start-up line that says which
+  address to hand out and whether the port needs forwarding. On start it
+  looks up the public address, asks the router to forward the port over UPnP
+  (closed again on a clean stop) and reads Windows Firewall's rules, with a
+  button that adds an allow rule through an elevated netsh. The UPnP and
+  firewall parts have not met a real router or a blocking firewall yet.
+- The launcher: checks the install, starts the game with the mod on (§5.6),
+  and has a lobby where everybody waits and the host starts every game at
+  once, into a new game or at the menu (§1.31).
+- CoopIII Setup: one installer that carries the mod and the launcher and
+  turns a Steam copy of the game into v1.0 if needed.
 
 ---
 
 ## 4. Sync inventory
 
-Everything that has to travel, and where it stands. Sources are re3 members
-(`protocol.md` §1.7).
+What travels, in one place. Everything here is **Done** unless it says
+otherwise; the linked section has the details. Sources are re3 members
+(`protocol.md` §1.7) and every offset is proved in
+`client/src/game/addresses.h`.
 
 ### Player
 
-| What | Fields | Status |
-|---|---|---|
-| Transform | `m_matrix` position, `m_fRotationCur` | ✅ sent |
-| Velocity | `m_vecMoveSpeed` | ✅ sent |
-| Vitals | `m_fHealth`, `m_fArmour` | ✅ sent, and on the join packet as well as the snapshot, so a late joiner creates a ped on the health it really has (`protocol.md` §2.8.1) |
-| State | `m_nPedState`, `m_nMoveState` | ✅ sent; `m_nMoveState` is also applied, so the engine picks the walk/run animation itself |
-| Animation | `AnimationId` + time, base **and** partial | ✅ sent and applied via `CAnimManager::BlendAnimation`. Run in game 2026-09-22, every weapon the owner tried |
-| Weapon | `m_weapons[]`, `m_currentWeapon` | ✅ sent and applied via `CPed::GiveWeapon` + `SetCurrentWeapon`, so the model is in the hand. Ammo is the next row down: on the wire since version 18, behind a server switch |
-| Aim | yaw/pitch | ✅ both sent and applied, not yet run in game. Yaw goes in through `CPed::SetAimFlag`; pitch through a detour on `CPedIK::PointGunInDirection` that swaps it in for the 0 `CPed::AimGun` passes every non-player ped, so the engine's own IK bends the arm (pistol, uzi) or the torso (shotgun, AK, M16). The sender reads both angles off that same call, which also fixes the yaw of a player locked on to a target (`m_fLookDirection` is 999999 then). Sniper, rocket launcher, flamethrower and drive-bys never aim through the IK on anyone's screen and stay level |
-| Shots | event | ✅ sent reliably and replayed through the real `CWeapon::Fire`, so impacts happen for real (`combat.cpp`). Since 2026-09-22 the shot's own direction is on the wire and the observer aims with it, so the trail, the decal and the line of sight follow the shooter instead of an interpolated ped's heading (`protocol.md` §1.9.7). A sniper round, which `CWeapon::Fire` cannot replay on anyone but the shooter, carries the line the shooter's camera looked down, and the observer plays the report and the impact where that line meets something (`combat.h`, `SniperProbe`); not yet run in game |
-| Ammo | `m_weapons[].m_nAmmoTotal` | ✅ since version 18, behind the server switch `SESSION_AMMO_SYNC` (`-ammosync`, off by default). `PlayerStateBody` carries the clip and the total, so with it on an observer sees somebody run dry and reload. With it off a remote player's gun still holds CoopIII's invented 1000 rounds, which is the point of the switch: two players may reasonably not want to share an inventory |
-| Damage / death | event | ✅ sent by the shooter, applied by the victim through `CPed::InflictDamage`, with the one exemption that lets an authorised hit past the remote-attacker rule. Run end to end in game 2026-09-21. Death is also **held by the session** and replayed on the join packet, so somebody who joins while a player is lying in the road gets a corpse rather than a live player on zero health (`protocol.md` §2.8.1) |
-| Enter/exit vehicle | event | ✅ the remote ped opens the door and climbs in through `CPed::SetEnterCar`, and climbs out through `CPed::SetExitCar`. `UpdateRemoteSeats` drives it on a deadline with `WarpPedIntoCar` behind it, so the seat is guaranteed even when the animation is not (§1.14). An entry is now announced when it starts and says which door it goes in through, so the observer plays the same entry at the same time instead of a teleport to the driver's door (§1.14.7); an abandoned one shuts the door behind it (§1.14.8). Carjacking still plays the ordinary entry rather than the jack animation, and re-examining that after the protocol 22 handover did not change it: `CPed::SetCarJack` bails on a `MISSION_VEHICLE` for any non-player ped, which every replica is on every car a session has (§1.14.6). Not yet run in the game |
-| Riding as a passenger | event | ✅ CoopIII's own control, since the original game has none: a key asks for the first free passenger seat and the engine picks it (`game/seat.cpp`) |
-| Wanted level | `CPlayerPed::m_pWanted` (**not** `CPlayerInfo`, +0x53C on the ped) | ✅ 4 spare bits of `PlayerStateBody::flags` — three for the level, one for whether it is the player's own or the session's — plus 2 bits of `S_Welcome::flags` for the rule. Per-player by default with GTA Online's shared-vehicle rule; `shared` and `off` are server options. The police themselves travel as ambient replicas and cost nothing extra (**[wanted.md](wanted.md)**). Not yet run in the game |
+| What | How |
+|---|---|
+| Transform, velocity | snapshot at 25 Hz |
+| Health, armour | snapshot, and on the join packet so a late joiner gets the real value (§2.8.1) |
+| Ped state, move state | snapshot; the move state is applied so the engine picks the walk or run |
+| Animation | base and partial with their time, through `CAnimManager::BlendAnimation` |
+| Weapon, aim | `GiveWeapon` + `SetCurrentWeapon`; yaw through `SetAimFlag`, pitch through the IK |
+| Ammo | behind `ammoSync`, off by default (§5.12) |
+| Shots | reliable, replayed through `CWeapon::Fire` along the shooter's direction (§1.9.7) |
+| Damage, death, respawn, arrest | the victim applies it through `InflictDamage`; death is held by the session for joiners |
+| Enter/exit, carjack | through the engine's own entry and exit, the door announced at the start (§1.14) |
+| Passenger seat | `seatKey`; the engine picks the seat (`game/seat.cpp`) |
+| Wanted level | spare bits of the snapshot's flags, with the rule in `S_Welcome` (`wanted.md`) |
+| Clothes | `C_PlayerLook` (§1.32) |
+| Riding on something | `C_PlayerStateRide` (protocol version 66) |
+| In the pause menu | `C_PlayerAway` (§1.41) |
 
 ### Vehicle
 
-Offsets verified 2026-09-21 (Area E) and now in `client/src/game/addresses.h`
-with the proof for each, so a "❌ nothing sends it" below is about the wire and
-nothing else. The address is no longer the obstacle.
-
-| What | Fields | Status |
-|---|---|---|
-| Transform | full rotation, not yaw | ✅ sent and applied, as a quaternion (`client/src/quat.h`) |
-| Velocities | `m_vecMoveSpeed` `0x78`, `m_vecTurnSpeed` `0x84` | ✅ sent and applied |
-| Controls | `m_fSteerAngle` `0x1E8`, `m_fGasPedal` `0x1EC`, `m_fBrakePedal` `0x1F0`, `m_nCurrentGear` `0x204` | ✅ sent and applied |
-| Health / state | `m_fHealth` `0x200` (1000 = full), `bEngineOn` `0x1F5` bit 4, `m_bSirenOrAlarm` `0x22E` | ✅ sent and applied. The engine and siren flags are written on change only, the horn (`VEH_HORN`, protocol 31) and the headlights every frame, because the engine takes both back from a parked car by itself (`game/siren.h`, `VehicleFlagsWrittenOnChange`). Rewriting the siren does not restart it; the old reason given here was wrong |
-| Appearance | `m_currentColour1/2` `0x19C`/`0x19D` | ✅ carried by the spawn packet, so both machines get the same car rather than two random paint jobs |
-| Occupants | `pDriver` `0x1A4`, `pPassengers[8]` `0x1A8`, `m_nNumMaxPassengers` `0x1CC` | ✅ every seat is sent, seated (`SeatRemotePed`) and, since `protocol.md` §2.8.2, remembered by the session so a late joiner is told about passengers and not just drivers |
-| Destroyed | `VEH_WRECKED` on the wire | ✅ all four kinds of car have somebody entitled to report it — a driver through `C_VehicleBlowUp`, and the three ownerless kinds (a map generator's car, a traffic car, a session car somebody parked) through `C_UnownedBlowUp`. §5.8, closed 2026-09-22. A traffic car carries the transform it blew up at, since its host stops streaming it the moment it burns out — protocol 16 |
-| Extra components | `m_aExtras[2]` `0x19E` | ✅ carried by the spawn packet and applied through `ms_compsToUse` around the constructor, since they are cloned into the clump at construction and cannot be written afterwards. §5.9 |
-| Spawn / despawn | `CREATE_CAR` path, `sizeof(CAutomobile)` `0x5A8` | ✅ run in the game, both deletion gates shut |
-| Alarm, gun, taxi light, handbrake | `m_nAlarmState` `0x1A0`, `m_fCarGunLR/UD` `0x580`/`0x584`, bit 3 of `0x4D9`, bit 5 of `0x1F5` | ⚠️ sent and applied, not run in the game. The alarm and the gun on their own packets, the other two in the snapshot's flags (`protocol.md` §1.36) |
-| Damage model | `CDamageManager` at `+0x288`: panels, doors, lights, wheels | ⚠️ designed, built, and **not run in the game**. [docs/cardamage.md](cardamage.md). Only panels and doors travel, and the other two rows of that list came off the wire with a measurement rather than a shrug: a tyre never bursts in retail 1.0 (`CAutomobile::BurstTyre` is in the vtable and nothing dispatches to it), and a broken light is exactly a damaged panel, so the receiver derives it. Gunfire and explosions turn out not to dent a car at all — they reach `CVehicle::InflictDamage`, which takes health and nothing else — so the one thing that diverges is a collision, which is the one thing nobody simulates twice. A change-only reliable packet, merged as a componentwise maximum because every ladder in `CDamageManager` climbs and none descends. On the wire since version 18 (opcodes 0x3A/0x3B). A car with a driver reports its own dents, and since 2026-09-23 so does a car its custodian is settling (`Client::SendCustodyVehicleDamage`, accepted by `Session::MayReportVehicle`) and a traffic car its host is simulating (`Session::NoteCarDamage`, `cardamage.md` §4). A parked generator car and a session car that has finished settling are simulated by nobody, so each machine keeps its own (§5.8) |
+| What | How |
+|---|---|
+| Transform, velocities, controls | snapshot, quaternion rotation |
+| Health, engine, siren, lights, horn, taxi light, handbrake | snapshot flags |
+| Colours, extras | spawn packet (§1.12, §5.9) |
+| Occupants | every seat, remembered by the session for joiners (§2.8.2) |
+| Destruction | the driver, or for a car nobody drives the machine entitled to it (§5.8) |
+| Damage model | panels and doors, change-only, merged as a maximum (`cardamage.md`) |
+| Alarm, turret, fire truck cannon | own packets, kept for joiners (§1.39) |
+| Radio station | one per car, on the session clock (§1.33) |
+| Bomb | whose it is and what is left of the fuse (§1.36) |
+| Boats | same packets, `CBoat` on the receiving side |
 
 ### World
 
-| What | Status |
+| What | How |
 |---|---|
-| Clock | ✅ follows the host's `CClock`, not a clock the server keeps on its own. The host reports at 1 Hz; everyone else is moved only once they are more than 3 game minutes out, so the HUD clock and the sun do not stutter. Run in game 2026-09-21, including a host handover mid-session and the 12-hour jump the engine makes on death |
-| Weather | ✅ follows the host's `CWeather`. Both ends of the blend are sent, since a single type describes where the sky is going and not where it is. Needs an in-game run |
-| Trains | ✅ the El and the subway run on the server's clock. `CTrain::UpdateTrains` (`0x0054F3A0`) places every train from `CTimer::m_snTimeInMilliseconds` alone, so nothing about a train travels: the client estimates the server's clock from the headers of `S_Welcome` and `S_WorldState` and hands it to `UpdateTrains` for that one call. No wire change. `addresses.h` has the proof, `client/src/sessiontime.h` the estimate. Not yet run in game |
-| Planes | ✅ the three airliners and the three Dodos fly on the same clock as the trains. `CPlane::UpdatePlanes` (`0x0054BEC0`) places them from `CTimer::m_snTimeInMilliseconds` the way `UpdateTrains` places the trains, and `game/planes.cpp` hands it the session's clock for that one call. The catch is the two mission Cessnas, which fly from a start time the script stamped with `CTimer`'s own value, so both start times are moved with the clock for the call and put back after (`client/src/planetime.h`). No wire change. Not yet run in game |
-| Traffic lights | ✅ every junction on the same clock as the trains. `LightForCars1`, `LightForCars2` and `LightForPeds` (`0x00455760`, `0x00455790`, `0x004557D0`) are `CTimer & 3FFFh` against fixed thresholds and are the only way anything asks a light, so `game/lights.cpp` detours the three and answers from the session's clock, read once a frame, without touching `CTimer`; with no session it calls the engine's own. The one decision a light makes that outlasts a frame is a pedestrian setting off to cross (`CPed::Wait`, `0x004D5DE6`). The walk sign's 256 ms blink reads `CTimer` directly and stays local. No wire change. Not yet run in game |
-| Lift bridge | ✅ the Shoreside lift bridge on the same clock. `CBridge::Update` (`0x00413AC0`) works from `(t - epoch) & FFFFh` with an epoch stamped from the local `CTimer`, so `game/liftbridge.cpp` writes the epoch that makes the phase `session & FFFFh` on every machine - agreed without a packet - and re-applies `SetLinksBridgeLights` when a jump onto that clock skips one of the two state changes that switch the traffic links. Only matters after A Drop in the Ocean (`COMMERCIAL_PASSED`); before that the bridge is up and locked everywhere. No wire change. Not yet run in game |
-| Pickups | ✅ exclusive. Claim on approach, first claim wins at the server, and the winner's own engine does the awarding through its own `CPickup::Update` switch. Observers replay the engine's removal and push the collection into their own `aPickUpsCollected`, which is what makes a rampage start and a hidden package count everywhere for free. [docs/pickups.md](pickups.md). Not yet run in game |
-| Pickups a dead ped drops | ✅ the host reads back what its own engine created - the money roll, the scatter, the ammo - and every observer replays it through `CPickups::GenerateNewOne`, after which it is an ordinary pickup. Fixed a bug on the way: a player's death used to drop a gun on the pavement of every machine except their own |
-| Rampage sharing | ✅ §5.10, and this line used to say the opposite. The *start* was already shared and always had been - the pickup work pushes a remote collection into every machine's own `aPickUpsCollected` and every machine's own `rampage.sc` calls `CDarkel::StartFrenzy` off it. What was missing was the counting, and not in the way anybody expected: a pedestrian hosted by one machine and shot from another was credited to **nobody**, because `CPed::InflictDamage` only reaches the kill register when the damager is `FindPlayerPed()` or `FindPlayerVehicle()` (`0x004EAD1A`). Kills now travel as the engine's own three arguments and the ending is arbitrated. [rampage.md](rampage.md). Not yet run in game |
-| Vehicle rampages | ✅ since version 29, `C_RampageCar` / `S_RampageCar` (0x8E/0x8F). `CDarkel::RegisterCarBlownUpByPlayer` (`0x00421070`) is **not** the same shape as the ped register: `CAutomobile::BlowUpCar` calls it with no culprit test, so every machine holding a copy of a wreck would count it. The machine that decided the wreck reports it, every replay keeps the register out, and the relay does the counting. `rampage.md` §9. Not yet run in game |
-| Pickup mines | ❌ deliberately left local. Script-only, barely used in retail III, and their branch is about arming and exploding rather than giving anybody anything |
-| Garages / doors | ✅ all 32 garages. One bit each on the wire - "my own state machine has this one away from where this type rests" - and the union of everybody's bits is what each machine holds its own doors to, so a safehouse opens for whoever walks up and a spray shop closes over whoever is inside. The door's *height* never travels: every machine derives it from the state through the engine's own ramp, which is §1.11's health-versus-destruction argument applied to a door. `protocol.md` §1.16, on the wire since version 18, not yet run in game. **The safehouse pedestrian door and the save point are not garages** and are not covered - they are `main.scm` objects swung by `034D ROTATE_OBJECT`, so they belong to M5 (§1.16.7) |
-| Pay'n'Spray | ✅ repair and repaint travel as one reliable event carrying the two colours the owner's engine chose. They have to: the retail `ChooseVehicleColour` is **not** an RNG roll, it is `(m_lastColorVariation + 1) % m_numColours` plus a tiebreak against the local player's own car - both machine-local, so two engines calling it paint two different cars. Same class as §5.9, third time. The wanted level deliberately does **not** travel and there is a marked seam where it would (§1.16.6); an observer is stopped from running the arm that would clear its own player's stars |
-| Fires | ✅ §5.7, all three phases. Whatever lit it - a molotov, a rocket, a burning car, a burning player - and it burns the other player for real |
-| Explosions | ✅ replayed at the position the owner sends, and the engine's own `CWorld::TriggerExplosion` then damages everything in the radius on every machine |
-| Destroyed objects | 🟡 §5.13 and [docs/objects.md](objects.md). Breaking is shared: the machine that owns whatever hit it reports, the host reports what nobody owns, and every observer replays the engine's own `CObject::ObjectDamage`. **Uprooting is shared too**, as one resting place per knocked-over object, sent when the engine's own sleep test says it stopped - because where it lands is local physics (§2.4) and no impulse on the wire would reproduce it. Four of the five measurements took work away rather than adding it: an explosion breaks *and* uproots the same objects everywhere for free, a bullet has never broken one, a bullet cannot uproot a lamp post at all (`object.dat` says 400, the gate is `<= 0`), and the uproot a bullet *can* cause travels with §1.9.2's shot replay. Not yet run in game |
-| Ambient peds | ✅ shared, and the crowd does not double - measured in game 2026-09-22 (`population.md` §1.3.1). Since 2026-09-23 they also fight every player, not only the one whose machine hosts them: the host forwards a hit its ped landed on another player's copy to that player, the weapon rides the ped row, and the rounds are drawn on the replica (`population.md` §6). Not yet run in game |
-| Ambient traffic | ✅ shared the same way, model, both colours and both extras on the spawn so nobody builds a differently-painted car. Measured the same day, same result: the two engines count the union rather than twice it |
+| Clock, weather | the host's, or the mission owner's during a mission (§2.7) |
+| Trains, planes, traffic lights, lift bridge | the session's clock, no packets |
+| Ambient peds and traffic | hosted by whoever's engine made them (`population.md`) |
+| Police, helicopter | the police are ambient peds; the helicopter has its own opcodes |
+| Pickups, ped drops, hidden packages | exclusive, arbitrated by the server (`pickups.md`) |
+| Rampages | shared, with a vote, for peds and cars (`rampage.md`) |
+| Garages, doors, Pay'n'Spray | one bit per garage, the union held on every machine (§1.16) |
+| Scripted gates | one bit per gate, the same union (§1.43) |
+| Fires, explosions | §5.7; explosions replayed at the owner's position |
+| Street objects | breaks and resting places (§5.13, `objects.md`) |
+| Medics, fire truck hose | §1.37 |
+| Mines | the first machine whose mine goes off says where |
+| Cheats | routed to where what they change is owned (§5.14) |
+| Money | server setting: off, own, shared |
+| Safehouse pedestrian door | **Planned**: a `main.scm` object, still each machine's own (§1.16.7) |
 
 ### Campaign
 
-| What | Status |
+| What | How |
 |---|---|
-| Script execution | ❌ host-only, designed not built |
-| Mission entities | ❌ |
-| Subtitles, blips, spheres | ❌ new packets needed |
-| Cutscenes | ❌ |
-| Mission pass/fail | ❌ |
-| Triggers (Tier 3) | ❌ 3 opcodes, 123 sites |
-| Save / progress | ❌ host-owned |
+| Starting a mission | one at a time, everybody at the marker (§1.29) |
+| The mission's script | runs on the owner's machine only |
+| What it shows | replayed through each machine's own interpreter (`game/replay.h`) |
+| Its peds and cars | hosted by the owner as mission entities |
+| Cutscenes | loaded together, skipped by vote (§1.34) |
+| Pass, fail, retry | the script's own end; a death fails it for everybody |
+| Pay | everybody paid; charges are the owner's alone |
+| Progress | the campaign delta, logged by the server (§1.30) |
+| Late joiners | handed what the mission has up |
+| Saving | each player saves at their own safehouse, outside missions; **In progress**: not tested well enough to call safe (§7) |
 
 ---
 
 ## 5. Decisions - settled
 
 These change how the game *feels*, so they were decided deliberately rather
-than left to fall out of the code. Decided 2026-09-21. Treat them as settled;
-reopen only with the owner.
+than left to fall out of the code. Most were decided on 2026-09-21, the rest
+as the work reached them. They stay settled unless there is a good reason to
+reopen one.
 
 ### 5.1 Wanted level - per-player, GTA Online style, server-configurable
 
@@ -729,8 +432,8 @@ without leaving a corpse, and how to bring somebody back in mid-stride.
 If a player dies during a mission, the mission fails. Faithful to SP.
 
 This reverses the provisional default in `campaign.md` §2.3, which assumed
-co-op should keep going while someone is alive. `campaign.md` §2.3 must be
-updated. The server option can still exist, but its default now matches SP.
+co-op should keep going while someone is alive. The server option exists
+(`missionFailOnDeath`), and its default matches SP.
 
 ### 5.5 Fidelity wins by default
 
@@ -742,7 +445,7 @@ may relax it; the defaults do not.
 
 ### 5.6 CoopIII only runs when launched through the launcher
 
-New requirement, and a good one. Dropping `CoopIII.asi` into the game folder
+Dropping `CoopIII.asi` into the game folder
 must not change single-player. The mod activates only when the game was
 started by `coopiii-launcher`. Started any other way, the `.asi` loads, logs
 that it is standing down, and installs nothing.
@@ -951,7 +654,8 @@ row). A wrecked session car is still left out of the backfill, as §2.8.5 of
 from here on is the section as it was written.
 
 Found while making the join path late-joiner safe (`protocol.md` §2.8) and
-**not fixed**, because the half that matters is somebody else's file.
+**not fixed then**, because the half that matters lives in the vehicle code
+(`client/src/game/vehicle.*`).
 
 `C_VEHICLE_STATE` is sent by one machine and one only: the driver's. So a
 synced car that is parked receives no updates at all, and its row in the
@@ -963,7 +667,7 @@ Which leaves the commonest way a car is destroyed with no carrier: you blow up
 a parked one. Nobody is in it, nobody reports it, the session keeps a healthy
 row for it forever, and every joiner from then on is handed a pristine car
 standing where a burnt-out shell is on every other screen. That is very
-probably the exact path the owner's car took.
+probably the exact path the car in the first report took.
 
 It is deliberately open rather than half-built, for two reasons:
 
@@ -1149,10 +853,6 @@ claimer samples them beside the colours, the receiver writes them after
 construction and before the model is set up.
 
 ---
-
-
----
-
 ### 5.10 A rampage is shared - one at a time, for the whole session
 
 Decided 2026-09-22. Collecting a `KILLFRENZY` pickup starts the frenzy for
@@ -1248,6 +948,7 @@ firefight has the same numbers on every screen.
   faithful when it works.
 - **Same shape as §5.2.** One bit in `S_Welcome.flags`, enforced by the server
   refusing to relay and by the client refusing to apply.
+
 ### 5.13 A broken street object is a latch, and the measurement took most of the job away
 
 Decided 2026-09-22. [docs/objects.md](objects.md) is the investigation; this is
@@ -1278,8 +979,8 @@ object, and it does not.
   `CWeapon::DoBulletImpact`, `FireShotgun` and `FireMelee` adds sparks, clears
   `bIsStatic` and applies a force, and stops. A whole-image scan for calls to
   `ObjectDamage` finds five sites and **none of them is in `CWeapon`**. The
-  brief for this work said "a car driving into them and gunfire"; the binary
-  says gunfire was never in it.
+  first guess was "a car driving into them and gunfire"; the binary says
+  gunfire was never in it.
 - **And a bullet cannot uproot one either.** That arm's uproot gate is
   `GetIsStatic() && m_fUprootLimit <= 0.0f` - the three constants it compares
   against all read `00000000`, so it is a sign test and not a threshold - and
@@ -1395,182 +1096,72 @@ Learned the hard way this far in; worth not relearning.
   not a hand-rolled pool allocation.
 - **Fail loudly.** With this many mods patching the same binary, "CoopIII
   loaded and quietly did nothing" is the failure mode to design against.
-- **Test what can be tested without the game.** Six suites cover the protocol,
-  the roster, interpolation, patterns and hooks. What is left needing a live
+- **Test what can be tested without the game.** The suites cover the
+  protocol, the session, the server, interpolation, patterns, hooks, the
+  launcher, the installer and the UI, and `clienttest` checks the addresses
+  against a real `gta3.exe` when it is given one. What is left needing a live
   game is then small enough to reason about.
 
 ---
 
-## 7. Not built yet
+## 7. Open work and known issues
 
-What is still missing from free roam and from playing together, as of
-2026-09-24. Each item is one piece of work for one branch. Nothing here has a
-protocol number yet; each one decides whether it needs one when it lands.
+### In progress: playing it through
 
-### Being built
+- **The story, mission by mission.** The mission sync passes its tests and
+  has been played in short sessions (Give Me Liberty, failed and retried, is
+  where the retry fixes came from). The rest of the campaign has not been
+  played through in order yet. That is the current work: play each mission
+  with two or more players and fix what it shows up (`missions.md` §14, §15).
+- **Three or four players in a mission.** Checkpoints counting down, a third
+  player joining mid-mission, a helper dying with `missionFailOnDeath = off`,
+  the owner's connection dropping and coming back, and four cars moved by one
+  teleport without touching. All built, all needing a real session.
+- **Missions a helper drives.** A helper driving Lips' car to 8-Ball's,
+  delivering to a lock-up, taking a car through a Pay'n'Spray, or driving the
+  owner in a car the mission moves or brakes. Until a game has shown these,
+  the owner at the wheel is the safe way (`mission-audit.md` C2).
+- **Free roam features that are built and tested but have seen little of a
+  real session**: car damage between players, the car radio, bombs and mines,
+  medics and fire trucks, passenger free aim, the scripted gates, the traffic
+  hand-over near another player (§1.45).
 
-- [ ] **A leaving player's crowd and traffic are adopted, not dropped.** Today
-      `DropPedsOf` / `DropCarsOf` (`server/core/server.h`) take every ambient
-      ped and car the leaver hosted off every screen at once. A remaining
-      machine should take each one over under the same netId. Session cars
-      already change hands this way.
-- [ ] **A carjack plays as one on every screen.** Observers see an ordinary
-      entry and the victim teleported out, because the jack byte in the entry
-      is ignored (`client.cpp`, the remote entry replay). The victim's own
-      machine has to play the drag-out on its real ped.
+### Known issues
 
-### Players and the session
+- **Alt-tab.** The pause menu no longer stops the world (`game/pause.h`), but
+  losing focus is a different path: retail stops its loop while the window is
+  not in front. If that freezes a player's car, traffic and helicopter on
+  everybody else's screen, they need keeping alive or hosting handed over
+  while unfocused. Not checked on a game without a windowed-mode mod.
+- **Saving in co-op** is not tested well enough to call safe. Session copies
+  are kept out of `CPools::SaveVehiclePool`; a co-op save still has to be
+  shown to load clean in single player.
+- **The instant replay** is taken for the game starting over when it ends,
+  because the frame counter it puts back is the witness for that
+  (`addresses-unverified.md`, REFUTED).
+- **Two stealth checks** (Deal Steal, Plaster Blaster) still answer for the
+  owner alone. Their scripts have to be read off the retail `main.scm` first.
+- **The Catalina helicopter** in The Exchange is only on the owner's screen:
+  the helicopter sync covers the two police slots. The RC buggy and the power
+  pills are listed in `mission-audit.md` R7 with what a game has to show.
+- **Money edge cases.** Under `money = own`, if the helicopter owner's
+  take-back of the $250 fails in the same frame, both keep it. Under
+  `money = shared`, a shared rampage's reward lands once per player.
+- **Rampage kills made by a teammate** never reach the stats screen
+  (`rampage.md` §7).
+- **The safehouse's pedestrian door** opens only on the screen of whoever
+  walks up to it; it is a `main.scm` object, not a garage (`protocol.md`
+  §1.16.7).
+- **Players on different islands** in free roam: only one island's collision
+  is in memory (§2.2). Missions keep their players together; free roam does
+  not.
 
-- [ ] **Alt-tab.** The ESC menu no longer stops the world (`game/pause.h`), but
-      losing focus is a different path: retail stops its loop while the window
-      is not in front. The windowed-mode mod on the test machine
-      (`autoPause=0`) hides it. Check on a game without that mod; if the
-      machine's player, car, traffic and helicopter freeze on everybody
-      else's screen, keep them alive or hand hosting over while unfocused.
-- [ ] **Saving in co-op** is untested. Session copies are kept out of
-      `CPools::SaveVehiclePool`; confirm a co-op save loads clean in single
-      player before telling anybody it is safe.
-- [ ] **A mid-session Load or New Game, and the instant replay**, are not
-      handled.
-- [x] **Nametags vanish in the lower part of a window taller than it is
-      wide.** Same cause as the version mark had: `CFont::PrintChar`
-      (0x00500C30) culls a glyph whose top is past the screen *width*.
-      `game/fontcull.cpp` makes that test read the height (0x00500C7F) when
-      the bytes are retail, which fixes the game's own text too; if another
-      mod got there first, tags and the chat line are kept above the line
-      instead. Unit-tested, still needs an in-game run.
-- [x] **Landing after a jump wipes a remote player's overlay animations**
-      (the arm holding a weapon). Our own engine's `SetLanding` and
-      `PedGetupCB` zero every partial and delete none; `game/animrevive.h`
-      puts back what the wire still names once that landing or get-up is
-      over. Not yet run in-game.
+### Planned
 
-### Vehicles
-
-- [x] An explosion that damages a parked session car without destroying it
-      is undone the next frame. Each machine kept the blast on its own copy
-      and the session never heard; now the thrower asks for the car the way a
-      shot does, so one engine keeps the health and the fire timer and its
-      snapshots reach the session (`game/wreck.h`, BlastAsksForCar). Not yet
-      run in-game.
-- [x] A car another player drives does only small, fixed damage when it hits
-      you, so a teammate can barely be run over. The engine prices the hit by
-      speed only when a player drives, and a remote player's ped was not one
-      (`game/runover.h`). Friendly fire off keeps the health, not the
-      knockdown. Not yet run in-game.
-- [x] If the custodian of a burning car quits, or its 15 s cap runs out,
-      every machine goes back to its own fire timer and blows it up on its
-      own. Only the host runs the timer of a car nobody holds now, and a
-      custodian at the cap blows the car up itself (`game/wreck.h`,
-      FireTimerRunsHere; `BurnOutlastedCustody`). Not yet run in-game.
-- [x] A wrecked car is held where the blast happened, a car sinking in water
-      can freeze mid-sink, and a late joiner sees no wrecks. The machine that
-      decided a wreck settles it like a car nobody drives, sinking included,
-      and a joiner gets the shell built without the blast. Needs a protocol
-      version. Not yet run in-game.
-- [x] Car alarms and the tank turret's angle are not sent. Only a car
-      generator arms a car, so an alarm only ever went off on the machine
-      whose generator parked it; the engine simulating a session car now says
-      how long it has left (`C_VehicleAlarm`) and every copy is written from
-      the wall clock. The turret (`m_fCarGunLR`, which `CAutomobile::Render`
-      turns for every tank) and the fire truck cannon's two angles come from
-      the driver (`C_VehicleAim`); both are backfilled. The shell was already
-      relayed as the tank's explosion; its muzzle smoke is not.
-      `protocol.md` §1.39. Not yet run in-game.
-- [x] A police car stuck in traffic plays the fast wail on its host and the
-      normal one elsewhere. The horn bit goes out for it now: every build
-      since the siren bit writes the siren from the same row beside the horn,
-      so its replica takes the audio's own early out and wails fast; only
-      builds 32 to 34, which a server at 35 or later turns away, would have
-      honked (`game/horn.h`, `TrafficHornOnWire`). Not yet run in-game.
-- [x] A taxi's light and a car's handbrake were each machine's own: the taxi
-      side job lit the roof only on its driver's screen, and a handbrake turn
-      locked no wheels anywhere else. Two free bits of the snapshot's flags,
-      `VEH_TAXI_LIGHT` and `VEH_HANDBRAKE`. Not yet run in-game.
-- [x] The crusher, the military crane at the Portland docks, Craig's
-      import/export garages, the police and bank-van garage, a mission
-      garage and a safehouse garage each ran on every machine's own copy of a
-      session car: every nearby machine crushed its copy and paid its own
-      player, and the car then came back because a session car that leaves
-      the pool is rebuilt. Only the machine holding the car (driver, else
-      custodian, else last driver, else host) lets its engine do it now; the
-      crusher and the crane cannot see the car anywhere else, a safehouse
-      leaves it alone, and `C_VehicleRemoved` ends it everywhere like a wreck.
-      Only the deliverer is paid, and the lists travel as they already did
-      (`C_CarLists`) (`game/carremoval.h`, `protocol.md` §1.44).
-      Needs a protocol version. Not yet run in-game.
-- [x] Another player's copy of a car could not be delivered to Craig or
-      stored in a safehouse, both of which refuse a mission car, and a copy
-      left in a closed safehouse was released from under its storer a minute
-      later. The holder's copy reads as an ordinary car for Craig's check,
-      and one the holder stores becomes that engine's own car, which is what
-      a stored car is, and leaves the session. Not yet run in-game.
-- [x] Police cars, Enforcers and Rhinos were locked on everybody else's
-      screen: the automobile constructor locks the three models and only the
-      engine's own driver exit unlocks them. Copies, promoted traffic and a
-      remote driver unseated by CoopIII unlock it now. Not yet run in-game.
-- [x] Taking a parked car left the parked car on every other screen beside
-      the one being driven away. The claim and the spawn name its car
-      generator, and every other machine deletes its own car there and holds
-      the generator the way its engine does for its own player. Needs a
-      protocol version. Not yet run in-game.
-
-### Combat and the police
-
-- [x] Shooting a cop hosted on another machine counts as shooting a
-      civilian, so it gives fewer stars. `game/copcrime.*`: the host's ped
-      type, already on the wire, turns the event into its police twin at
-      `CEventList::ReportCrimeForEvent`. Not yet run in-game.
-- [x] A car bomb exists only on the buyer's machine, and a bomb on a car
-      somebody else drives explodes nowhere. The engine went by pointers
-      each machine filled with its own player. `C_VehicleBomb` now says whose
-      bomb it is and what is left of a lit fuse; every copy names that
-      player's ped as the rigger and lights the fuse, a detonator's `C_Shot`
-      sets the bomber's remote bombs off on every copy, and a replayed wreck
-      is blamed on the bomber (`protocol.md` §1.36). Kept for joiners. A bomb
-      a mission's script fits is its owner's on every copy (`C_MissionBomb`),
-      set off by anybody in the mission, and the machine a bomb goes off on
-      pays the bomber for the car under money `own`/`shared`. Not yet run
-      in-game.
-- [x] Pickup mines stay local. `DROP_MINE` and `DROP_NAUTICAL_MINE` are
-      replayed, and the first machine whose mine goes off says where
-      (`C_MineBlast`); everybody else takes theirs away and sets off the same
-      explosion (`game/mine.*`). Not yet run in-game.
-
-### Emergency services
-
-- [x] A medic's revive happens only on the machine hosting the ambulance.
-      A replica's corpse is now an accident our medics answer, and the
-      medic's one SetGetUp (0x004C3B33) sends the revive to everybody, the
-      pedestrian's host included (`game/emergency.*`, protocol §1.37). Not
-      yet run in-game.
-- [x] A fire truck's hose is local only. The jet goes out from the
-      machine that aims the truck and is sprayed from every copy of it; the
-      water puts out and knocks down only what each machine owns, and in
-      retail it never moves a car. Firemen on foot put nothing out at all.
-      Not yet run in-game.
-
-### Passengers
-
-- [x] A passenger can start taxi and the other side jobs, collects unique
-      stunt jump payouts as if driving, and the camera runs a frame behind
-      the car. `game/sidejob.h`: the sub-mission key is not heard from a
-      passenger seat, and a vehicle's start waits there unclaimed; the
-      driver's shift is the session's mission. `game/stunt.h`: a car you
-      ride in is never in the air to your stunt threads, and the driver's
-      jump shot reaches his riders (`game/ridecam.h`, `protocol.md` §1.35).
-      The car you ride in is corrected before the camera, not after it. Not
-      yet run in-game.
-- [x] A passenger can shoot: right mouse aims with the on-foot mouse camera
-      and its crosshair around the car, left fires, pistol or uzi, out of any
-      window, synced like a round on foot, never into the car or anybody in
-      it (`game/passengeraim.h`, `protocol.md` §1.42). The driver's drive-by
-      is unchanged. Not yet run in-game.
-
-### Money and rampages
-
-- [ ] Under `money = own`, if the helicopter owner's take-back of the $250
-      fails in the same frame, both keep it. Under `money = shared`, a shared
-      rampage's reward lands once per player.
-- [ ] Rampage kills made by a teammate never reach the stats screen
-      (`rampage.md` §7).
+- **A CLEO/Sanny Builder SDK for new co-op content**: `COOP_*` opcodes
+  registered through III.CLEO, for races, co-op rampages and new missions,
+  without touching `main.scm` (`missions.md` §4.3).
+- **Per-mission overrides** for the few stock missions that still don't play
+  well once the rest is done, through the same toolchain.
+- The alt-tab and safehouse door fixes above, once they have been looked at
+  in a game.

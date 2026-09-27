@@ -513,7 +513,7 @@ int RunWindow(const Startup &startup) {
 		CityMap::DrawFade(draw, ImVec2(0, bodyTop), mapSize, theme,
 		                  MapFade{true, 0.35f, 0.92f, theme.bgWindow});
 
-		const TitleBarResult bar = TitleBar(app, "Launcher", "v0.0.1", false);
+		const TitleBarResult bar = TitleBar(app, "Launcher", "v0.1.1", false);
 		if (bar.minimise) app.Minimize();
 		if (bar.close)    app.Close();
 		if (bar.theme)    app.SetTheme(!app.IsLight());

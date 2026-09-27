@@ -191,11 +191,13 @@ bool MissionSync::AskCheckpoint(const MissionArea &area, uint8_t localPlayerId, 
 	uint8_t         missing = 0;
 	// A timed or raced checkpoint is the owner's alone: nobody is counted
 	// missing from it, and whoever is far behind is brought along instead.
-	const bool waits = CheckpointsWait(m_number, m_timerUp);
+	const bool waits = CheckpointsWaitNow();
 	if (!waits && !m_cpSaidNoWait) {
 		m_cpSaidNoWait = true;
 		Statusf("%s's checkpoints don't wait for anybody: %s", MissionName(m_number),
-		        m_timerUp ? "its clock is running" : "it is a race or a side job");
+		        m_cpWaitS == 0 ? "the server says so"
+		        : m_timerUp    ? "its clock is running"
+		                       : "it is a race or a side job");
 	}
 	for (size_t i = 0; waits && i < n; ++i) {
 		const uint8_t id = others[i].playerId;
@@ -220,7 +222,7 @@ bool MissionSync::AskCheckpoint(const MissionArea &area, uint8_t localPlayerId, 
 		m_cpSinceMs = nowMs;
 	}
 	if (missing != 0 && !m_cpGaveUp &&
-	    static_cast<uint32_t>(nowMs - m_cpSinceMs) >= MISSION_CHECKPOINT_WAIT_MS) {
+	    static_cast<uint32_t>(nowMs - m_cpSinceMs) >= static_cast<uint32_t>(m_cpWaitS) * 1000u) {
 		// Nobody waits for ever: whoever has not come by now is left behind,
 		// and the mission, and its own timer, go on.
 		m_cpGaveUp = true;
@@ -228,7 +230,7 @@ bool MissionSync::AskCheckpoint(const MissionArea &area, uint8_t localPlayerId, 
 		char who[160];
 		Names(who, sizeof who, missing, localPlayerId);
 		Statusf("%s went on without %s, who did not reach the checkpoint in %u s",
-		        MissionName(m_number), who, static_cast<unsigned>(MISSION_CHECKPOINT_WAIT_MS / 1000));
+		        MissionName(m_number), who, static_cast<unsigned>(m_cpWaitS));
 	}
 	const bool    goOn   = missing == 0 || m_cpGaveUp;
 	const uint8_t report = goOn ? 0 : missing;
@@ -638,6 +640,11 @@ void MissionSync::OnState(const S_MissionState &pkt, uint8_t localPlayerId, uint
 	m_marginCm     = pkt.marginCm;
 	m_enemies      = pkt.enemies;
 	m_scalePct     = pkt.scalePct <= MISSION_SCALE_MAX ? pkt.scalePct : MISSION_SCALE_MAX;
+	m_cpWaitS      = pkt.checkpointWaitS <= MISSION_CHECKPOINT_WAIT_S_MAX ? pkt.checkpointWaitS
+	                                                                 : MISSION_CHECKPOINT_WAIT_S_MAX;
+	m_catchUpM     = pkt.catchUpM <= MISSION_DISTANCE_M_MAX ? pkt.catchUpM : MISSION_DISTANCE_M_MAX;
+	m_behindM      = pkt.behindM <= MISSION_DISTANCE_M_MAX ? pkt.behindM : MISSION_DISTANCE_M_MAX;
+	m_behindS      = pkt.behindS <= MISSION_BEHIND_S_MAX ? pkt.behindS : MISSION_BEHIND_S_MAX;
 
 	const bool ours = pkt.ownerId == localPlayerId;
 	if (pkt.state != was) {
@@ -750,6 +757,7 @@ void MissionSync::OnState(const S_MissionState &pkt, uint8_t localPlayerId, uint
 		if (first || was == MISSION_STATE_RUNNING) {
 			m_summon        = true;
 			m_summonSinceMs = nowMs;
+			m_summonBehind  = false;
 		}
 	}
 	if (!m_mirroring)
@@ -1214,6 +1222,10 @@ void MissionSync::Clear() {
 	m_participants = 0;
 	m_flags        = 0;
 	m_marginCm     = MISSION_MARGIN_CM_DEFAULT;
+	m_cpWaitS      = MISSION_CHECKPOINT_WAIT_MS / 1000;
+	m_catchUpM     = MISSION_CATCH_UP_M_DEFAULT;
+	m_behindM      = MISSION_BEHIND_M_DEFAULT;
+	m_behindS      = MISSION_BEHIND_S_DEFAULT;
 	m_claimLive    = false;
 	m_haveVerdict  = false;
 	m_saidBusy     = false;
@@ -1246,6 +1258,7 @@ void MissionSync::Clear() {
 	m_cpWaiting     = false;
 	m_cpGaveUp      = false;
 	m_summon        = false;
+	m_summonBehind  = false;
 	m_behind        = false;
 	m_timerUp       = false;
 	m_cpSaidNoWait  = false;
@@ -1355,13 +1368,14 @@ void MissionSync::Respawned(uint8_t localPlayerId, uint32_t nowMs) {
 		return;
 	m_summon        = true;
 	m_summonSinceMs = nowMs;
+	m_summonBehind  = false;
 	Log("missions: back from the hospital or the police station in the middle of %s; "
 	    "going to %s once we can",
 	    MissionName(m_number), NickOf(m_owner));
 }
 
 void MissionSync::WatchBehind(const Vec3 &localPos, uint8_t localPlayerId, uint32_t nowMs) {
-	if (!ParticipantHere(localPlayerId) || m_summon || CheckpointsWait(m_number, m_timerUp)) {
+	if (!ParticipantHere(localPlayerId) || m_summon || CheckpointsWaitNow() || m_behindM == 0) {
 		m_behind = false;
 		return;
 	}
@@ -1377,7 +1391,8 @@ void MissionSync::WatchBehind(const Vec3 &localPos, uint8_t localPlayerId, uint3
 	}
 	const float dx = owner->pos.x - localPos.x, dy = owner->pos.y - localPos.y,
 	            dz = owner->pos.z - localPos.z;
-	if (dx * dx + dy * dy + dz * dz <= MISSION_BEHIND_FAR_M * MISSION_BEHIND_FAR_M) {
+	const float far = static_cast<float>(m_behindM);
+	if (dx * dx + dy * dy + dz * dz <= far * far) {
 		m_behind = false;
 		return;
 	}
@@ -1386,16 +1401,17 @@ void MissionSync::WatchBehind(const Vec3 &localPos, uint8_t localPlayerId, uint3
 		m_behindSinceMs = nowMs;
 		return;
 	}
-	if (static_cast<uint32_t>(nowMs - m_behindSinceMs) < MISSION_BEHIND_MS)
+	if (static_cast<uint32_t>(nowMs - m_behindSinceMs) < static_cast<uint32_t>(m_behindS) * 1000u)
 		return;
 	// Owed now, with the summon's own delay already served.
 	m_behind        = false;
 	m_summon        = true;
 	m_summonSinceMs = nowMs - MISSION_SUMMON_DELAY_MS;
 	++m_behindMoves;
+	m_summonBehind  = true;
 	Statusf("more than %u m behind %s for %u s in %s; brought along",
-	        static_cast<unsigned>(MISSION_BEHIND_FAR_M), NickOf(m_owner),
-	        static_cast<unsigned>(MISSION_BEHIND_MS / 1000), MissionName(m_number));
+	        static_cast<unsigned>(m_behindM), NickOf(m_owner),
+	        static_cast<unsigned>(m_behindS), MissionName(m_number));
 }
 
 bool MissionSync::TakeSummon(const Vec3 &localPos, uint8_t localPlayerId, uint32_t nowMs,
@@ -1419,8 +1435,18 @@ bool MissionSync::TakeSummon(const Vec3 &localPos, uint8_t localPlayerId, uint32
 		return false;
 	const float dx = owner->pos.x - localPos.x, dy = owner->pos.y - localPos.y,
 	            dz = owner->pos.z - localPos.z;
-	m_summon = false;
-	if (dx * dx + dy * dy + dz * dz <= MISSION_SUMMON_NEAR_M * MISSION_SUMMON_NEAR_M) {
+	m_summon          = false;
+	const bool behind = m_summonBehind;
+	m_summonBehind    = false;
+	// A latecomer is brought only as far out as the server's missionCatchUp
+	// says, and not at all with it 0; somebody who fell behind has been far
+	// away for the whole of the server's time already.
+	if (!behind && m_catchUpM == 0) {
+		Log("missions: this server brings nobody who comes in late to %s", NickOf(m_owner));
+		return false;
+	}
+	const float near = behind ? MISSION_SUMMON_NEAR_M : static_cast<float>(m_catchUpM);
+	if (dx * dx + dy * dy + dz * dz <= near * near) {
 		Log("missions: near enough to %s already; nobody is moved", NickOf(m_owner));
 		return false;
 	}

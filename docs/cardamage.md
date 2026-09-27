@@ -2,7 +2,7 @@
 
 `roadmap.md` §4 has carried this line since the sync inventory was written:
 
-| Damage model | panels, doors, lights, wheels | ❌ not designed. `CDamageManager` is the first `CAutomobile` member, at `+0x288` |
+| Damage model | panels, doors, lights, wheels | not designed. `CDamageManager` is the first `CAutomobile` member, at `+0x288` |
 
 Health travels and damage does not, so the same car is dented, missing a door
 and sitting on a flat tyre on one screen and showroom-new on the other. This is
@@ -501,9 +501,9 @@ C_VehicleDamage     hdr + body                                13
 S_VehicleDamage     hdr + playerId u8 + pad[3] + body         17
 ```
 
-`PROTOCOL_VERSION` moves for the two new opcodes. The merged build is **18**,
-one number for the ten branches that landed together; see the version history
-in `sdk/include/coopiii/protocol.h`.
+`PROTOCOL_VERSION` moves for the two new opcodes. It went out in version
+**18**, together with nine other changes; see the version history in
+`sdk/include/coopiii/protocol.h`.
 
 ---
 
@@ -722,9 +722,8 @@ Two consequences to write down rather than discover:
   dentable again in the same frame it stops being corrected, or you get a car
   you can drive into a wall forever without marking it.
 
-One residual, stated because it is real and small rather than because it is
-fixed. `VehicleDamage`'s upside-down health drain sits *above* the
-`bCollisionProof` test:
+One thing the flag does not cover. `VehicleDamage`'s upside-down health drain
+sits *above* the `bCollisionProof` test:
 
 ```
 0052F413  fld  dword ptr [esi+8]               GetUp().z
@@ -733,11 +732,14 @@ fixed. `VehicleDamage`'s upside-down health drain sits *above* the
           m_fHealth -= 4.0f * CTimer::GetTimeStep()
 ```
 
-so an observer holding a remote car on its roof still takes health off its own
-copy. For a driven car the wire overwrites it 25 times a second; for a wreck the
-health is already zero. It is invisible today and it would stop being invisible
-if a car with no driver ever started carrying health, so it belongs in the same
-note as §4's phase two.
+so an observer holding a remote car on its roof took health off its own copy,
+which the wire put back the next frame. That stopped being invisible once a car
+nobody holds had a fire timer on the host, and it was never harmless for the
+car itself: the drain is the whole of how a car left on its roof catches fire,
+and with every copy's drain undone by the wire, no car left on its roof ever
+did. `protocol.md` §1.38.4 has the fix: the drain's own gate is taken, so it
+runs only where the car's health is decided, and a custodian keeps a car on
+its roof until it burns.
 
 ---
 

@@ -12,7 +12,9 @@
 #include "client.h"
 #include "clock.h"
 #include "config.h"
+#include "game/carcam.h"
 #include "game/carextras.h"
+#include "game/cargun.h"
 #include "game/chat.h"
 #include "game/cheats.h"
 #include "game/combat.h"
@@ -370,6 +372,12 @@ DWORD WINAPI Boot(LPVOID) {
 	// the car tables, so after both. Not fatal: whatever is not taken stays
 	// each machine's own, as it always was.
 	game::InstallEmergencyHooks();
+	// The tank's cannon and the fire truck's water cannon answer to the
+	// driver's pad only, never a passenger's (game/cargun.h). Two call sites,
+	// no detour. Not fatal: without them a passenger works the tank's gun as
+	// in single player, though the emergency hooks above still refuse his
+	// jet from a fire truck somebody else drives.
+	game::InstallCarGunGate();
 	// The crusher, the crane and the garages (game/carremoval.h). Reads the
 	// car tables, so after them. Not fatal: whatever is not taken goes on
 	// acting on every machine's own copy, as it always did.
@@ -659,6 +667,12 @@ DWORD WINAPI Boot(LPVOID) {
 	if (game::RideCameraOrderTaken())
 		game::InstallPassengerAim();
 
+	// A car camera mod such as SACarCam: read and logged, and when one owns
+	// the car camera's call, chained so it keeps off the gun of a car
+	// somebody else drives (game/carcam.h). One call site, no detour. Not
+	// fatal.
+	game::InstallCarCamera();
+
 	Log("CoopIII ready");
 	return 0;
 }
@@ -691,6 +705,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			game::RemoveRadarArrows();
 			game::RemoveRampageVote();
 			game::RemoveCutsceneSkip();
+			game::RemoveCarCamera();
 			game::RemovePassengerAim();
 			game::RemoveRideCamera();
 			g_client.Stop();
@@ -731,6 +746,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 			game::RemoveMoneyHook();
 			game::RemoveCopCrimeHook();
 			game::RemoveEmergencyHooks();
+			game::RemoveCarGunGate();
 			game::RemoveCarRemovalHooks();
 			game::RemoveCrowdRange();
 			game::RemoveCarLetGo();

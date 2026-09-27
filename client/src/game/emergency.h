@@ -48,10 +48,12 @@ void AddEmergencyToBridge(WorldBridge &bridge);
 
 // ---- the rules, pure so tools/clienttest walks them ---------------------------
 
-// FireTruckControl's jet, on this machine's copy of a truck. The driver's own
-// arm always runs: it only runs for FindPlayerVehicle. The AI's arm runs on a
-// truck the session has no name for or that this machine moves, and is refused
-// on one another machine moves - its jet comes off the wire.
+// FireTruckControl's jet, on this machine's copy of a truck. The local
+// driver's always runs: his is the truck's jet. `localDriver` is the car's
+// m_pDriver being our ped, never FindPlayerVehicle, which names a passenger's
+// truck as well (game/cargun.h). Any other jet runs on a truck the session
+// has no name for or that this machine moves, and is refused on one another
+// machine moves - a passenger's included; its jet comes off the wire.
 inline constexpr bool CannonInputMayRun(bool localDriver, bool sessionCar, bool othersMoveIt) {
 	return localDriver || !(sessionCar && othersMoveIt);
 }

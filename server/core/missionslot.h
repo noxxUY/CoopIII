@@ -37,6 +37,27 @@ public:
 	// own before it goes on without them. MISSION_BUSY_WAIT_MS unless a test
 	// wants to see it happen.
 	void     SetBusyWaitMs(uint32_t ms) { m_busyWaitMs = ms; }
+	uint32_t BusyWaitMs() const { return m_busyWaitMs; }
+	// The server's missionCheckpointWait and missionTimedCheckpoints, and who
+	// is brought to the owner (missionCatchUp, missionFallBehind): all of it
+	// the owner's machine and the participants' apply, and all of it in
+	// S_MissionState. The wait is also what the countdown everybody is shown
+	// runs from.
+	void SetCheckpointRules(uint16_t waitS, bool timedToo, uint16_t catchUpM, uint16_t behindM,
+	                        uint16_t behindS) {
+		m_cpWaitS  = waitS;
+		m_timedCp  = timedToo;
+		m_catchUpM = catchUpM;
+		m_behindM  = behindM;
+		m_behindS  = behindS;
+	}
+	uint16_t CheckpointWaitS() const { return m_cpWaitS; }
+	bool     TimedCheckpoints() const { return m_timedCp; }
+	uint16_t CatchUpM() const { return m_catchUpM; }
+	uint16_t BehindM() const { return m_behindM; }
+	uint16_t BehindS() const { return m_behindS; }
+	uint8_t  Enemies() const { return m_enemies; }
+	uint16_t ScalePct() const { return m_scalePct; }
 	bool     FailOnDeath() const { return m_failOnDeath; }
 	uint16_t MarginCm() const { return m_marginCm; }
 
@@ -74,7 +95,7 @@ public:
 	// The owner at a checkpoint, waiting for `missing` (none: the wait is over).
 	// Only the owner of a running mission is heard. The wait is counted down
 	// from the first report at `where`: the owner's mission goes on without
-	// whoever is still missing MISSION_CHECKPOINT_WAIT_MS after it, and
+	// whoever is still missing the server's checkpoint wait after it, and
 	// everybody is told how long is left.
 	bool Checkpoint(uint8_t playerId, uint8_t missing, const Vec3 &where, uint32_t nowMs = 0);
 
@@ -130,6 +151,11 @@ private:
 	uint8_t  m_enemies     = MISSION_ENEMIES_ORIGINAL;    // missions.md 10
 	uint16_t m_scalePct    = MISSION_SCALE_DEFAULT;
 	uint32_t m_busyWaitMs  = MISSION_BUSY_WAIT_MS;
+	uint16_t m_cpWaitS     = MISSION_CHECKPOINT_WAIT_MS / 1000;
+	bool     m_timedCp     = false;
+	uint16_t m_catchUpM    = MISSION_CATCH_UP_M_DEFAULT;
+	uint16_t m_behindM     = MISSION_BEHIND_M_DEFAULT;
+	uint16_t m_behindS     = MISSION_BEHIND_S_DEFAULT;
 
 	uint8_t  m_state        = MISSION_STATE_IDLE;
 	uint8_t  m_owner        = INVALID_PLAYER;

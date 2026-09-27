@@ -976,6 +976,9 @@ struct RemoteVehicle {
 	// And since when it has been going down in water in this custody, 0 for
 	// not yet.
 	uint32_t sinkSinceMs = 0;
+	// And since when it has been lying on its roof in this custody, 0 for not
+	// yet (RoofKeepsCustody).
+	uint32_t roofSinceMs = 0;
 
 	// The dents we have told the session about while settling this car: the
 	// custodian's version of Client::m_sentDamagePanels / m_sentDamageDoors,
@@ -1187,6 +1190,24 @@ constexpr uint32_t CUSTODY_BURN_CAP_MS = 15000;
 // to reach the bottom of Liberty City's harbour; this only ends one the
 // engine never lets settle.
 constexpr uint32_t CUSTODY_SINK_CAP_MS = 20000;
+
+// And the most it keeps a car lying on its roof that has not caught fire.
+// The drain takes 200 health a second (addresses.h, "a car left on its roof"),
+// so a car at the full 1000 burns in under four seconds and one the script
+// gave three times that in under fifteen; this only ends one the engine has
+// stopped draining - a paused game, a car past a collision boundary.
+constexpr uint32_t CUSTODY_ROOF_CAP_MS = 15000;
+
+// Does a car on its roof keep the custodian holding it? Until it catches fire,
+// and from then the burning rule has it. Counted from the first frame it was
+// seen on its roof in this custody, and not started again when it rocks off
+// for a frame, so a car balanced on its side cannot hold on for ever.
+inline bool RoofKeepsCustody(bool onRoof, bool burning, uint32_t nowMs,
+                             uint32_t roofSinceMs) {
+	if (!onRoof || burning)
+		return false;
+	return roofSinceMs == 0 || nowMs - roofSinceMs < CUSTODY_ROOF_CAP_MS;
+}
 
 // May the custodian hand this car back now?
 //
@@ -1806,6 +1827,12 @@ struct WorldBridge {
 	// up: handed back halfway it was pinned mid-water on every screen. Null
 	// never sinks anything.
 	bool (*VehicleSinking)(RemoteVehicle &vehicle) = nullptr;
+
+	// Is the car we are settling lying on its roof where the engine drains it
+	// (game/wreck.h, CarOnItsRoof)? Kept until it catches fire, and then the
+	// burning rule keeps it until it goes up: handed back sooner, it lay on
+	// its roof on every screen for good. Null never keeps anything.
+	bool (*VehicleOnItsRoof)(RemoteVehicle &vehicle) = nullptr;
 
 	// Blow up the burning car we are settling, through the engine's own
 	// BlowUpCar and the detour, so the wreck goes out as UNOWNED_SESSION like
@@ -2938,6 +2965,9 @@ public:
 	// the world at once. Test seams: neither leaves any other trace without a
 	// socket.
 	uint8_t CheatRule() const { return m_cheatRule; }
+	// What S_SessionRules said: the wanted rule and the most stars anybody may have.
+	uint8_t WantedRuleNow() const { return m_wantedRule; }
+	uint8_t MaxWanted() const { return m_maxWanted; }
 	bool    WorldSendPending() const { return m_worldSendNow; }
 	uint8_t              VehicleCount() const;
 
@@ -3222,6 +3252,8 @@ public:
 
 private:
 	void OnWelcome(const S_Welcome &pkt);
+	// The session's rules after the welcome, and whenever the host changes one.
+	void OnSessionRules(const S_SessionRules &pkt);
 	void OnJoin(const S_PlayerJoin &pkt);
 	void OnLeave(const S_PlayerLeave &pkt);
 	void OnRampageVote(const S_RampageVote &pkt);
@@ -3760,6 +3792,12 @@ private:
 	// to set the bits behaves the way docs/roadmap.md §5.1 says the session
 	// should by default.
 	uint8_t m_wantedRule = WANTED_RULE_PERPLAYER;
+	// The most stars the session lets anybody have (S_SessionRules), the
+	// engine's own six until a server says less.
+	uint8_t m_maxWanted = WANTED_LEVEL_CEILING;
+	// Whether this session has sent its rules yet: the first S_SessionRules
+	// after a welcome is the rules, and any later one is the host changing them.
+	bool    m_rulesSeen = false;
 
 	// ---- cheats (game/cheats.h) -------------------------------------------
 	//
@@ -3972,7 +4010,8 @@ private:
 	bool m_saidVehicleHitSent      = false;
 	bool m_saidLateCustodyHit      = false;
 	bool m_saidKeptBurningCar      = false;
-	bool m_saidBurnCapBlowUp       = false;
+	bool m_saidKeptRoofCar         = false;
+	bool m_saidBurnCapBlowUp      = false;
 	bool m_saidWreckSettleHeard    = false;
 	bool m_saidWreckSettleSent     = false;
 	bool m_saidCarHitSent          = false;

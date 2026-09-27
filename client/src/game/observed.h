@@ -46,9 +46,9 @@ struct ObservedRow {
 	// has (vehicle.h, HealthToWrite). Every machine replays the explosion at
 	// the same place and takes the same off, so until somebody who holds the
 	// car has reported it, that is its health. Written by the InflictDamage
-	// detour and nothing else: the upside-down drain and a burning occupant's
-	// write never go through it, happen on one machine only, and must not
-	// stick.
+	// detour and nothing else: a burning occupant's write never goes through
+	// it, happens on one machine only, and must not stick. (Nor does the
+	// upside-down drain, which only runs where the car's health is decided.)
 	bool     blasted           = false;
 	float    blastHealth       = 0.0f;
 };

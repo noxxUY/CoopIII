@@ -18,6 +18,7 @@
 #include "seat.h"
 #include "seatplan.h"
 #include "sidejob.h"
+#include "teardown.h"
 
 #include "../client.h"
 #include "../clock.h"
@@ -328,6 +329,10 @@ struct Shown {
 	// The globals the mission's continuous sounds went into here.
 	uint8_t  soundCount    = 0;
 	uint16_t sounds[8]     = {};
+	// The garages a replayed SET_TARGET_CAR_FOR_MISSION_GARAGE pointed at one
+	// of our cars, one bit each: let go of at the end, as the owner's
+	// cleanup does, whatever way the mission ended.
+	uint32_t garageTargets = 0;
 };
 Shown g_shown;
 
@@ -1075,6 +1080,8 @@ void ClearLeftCars(uint32_t nowMs) {
 		// The unlink CWorld::Remove skips for a car that went static while
 		// it was on the moving list, as vehicle.cpp's despawn makes it.
 		Func<void(__thiscall *)(void *)>(CPhysical__RemoveFromMovingList)(car);
+		// And the garages, which DELETE_CAR does not tell (game/teardown.h).
+		ForgetEngineRawPointersTo(car);
 		RunOurs(op::DELETE_CAR, {c.handle});
 		++cleared;
 	}
@@ -1257,9 +1264,15 @@ int EffectToWire(MissionEffectBody &body) {
 	uint8_t code[replay::MAX_CODE];
 	std::memcpy(code, body.code, body.length);
 	bool waiting = false, never = false;
+	const bool noCarOk = replay::CarMayBeNone(EffectOpcode(body));
 	replay::EachHandle(code, body.length, [&](replay::Arg a, int32_t *v) {
 		if (a != replay::Arg::Char && a != replay::Arg::Car)
 			return true;
+		// "No car", which everybody can name (replay.h, CarMayBeNone).
+		if (a == replay::Arg::Car && noCarOk && *v < 0) {
+			*v = -1;
+			return true;
+		}
 		// The camera on our own player: everybody's goes to theirs.
 		if (a == replay::Arg::Char && MayNameOwnPlayer(EffectOpcode(body))) {
 			void *const me = Func<PlayerFn>(FindPlayerPed)();
@@ -1898,9 +1911,21 @@ int8_t Record(void *script, int32_t command, RangeFn original) {
 		body.kind      = MISSION_EFFECT_OBJECT_NEW;
 		body.ownerBlip = *reinterpret_cast<const int32_t *>(Params());   // what it stored
 		break;
-	case replay::Kind::Teleport:
+	case replay::Kind::Teleport: {
 		body.kind = MISSION_EFFECT_TELEPORT;
+		// Whether it moved a pedestrian or a car: a participant in a car
+		// otherwise drives it to where only a pedestrian fits (MissionMoveFor).
+		void *const me  = Func<PlayerFn>(FindPlayerPed)();
+		void *const car = me && Field<uint8_t>(me, offs::PED_IN_VEHICLE) != 0
+		                      ? Field<void *>(me, offs::PED_MY_VEHICLE)
+		                      : nullptr;
+		const int32_t named =
+		    car ? NetIdForCar(Func<int32_t(__cdecl *)(void *)>(CPools__GetVehicleRef)(car)) : -1;
+		body.ownerBlip = OwnerMoveTag(car != nullptr, named > 0 && named <= 0xFFFF
+		                                                  ? static_cast<uint16_t>(named)
+		                                                  : INVALID_NETID);
 		break;
+	}
 	case replay::Kind::SphereNew:
 		body.kind      = MISSION_EFFECT_SPHERE_NEW;
 		body.ownerBlip = *reinterpret_cast<const int32_t *>(Params());   // what it stored
@@ -2969,7 +2994,7 @@ void ReleaseCopies(const int32_t *copies, size_t n) {
 
 // ---- everybody has to be quiet (mission-audit.md R13) ----------------------------
 //
-// The owner decided a participant can give the game away as well as the owner
+// It was decided that a participant can give the game away as well as the owner
 // can. Each of these is a single condition wherever the missions ask it, so
 // the owner's answer is only ever widened to true, and only under ANDOR_NONE,
 // where the result is this condition's alone.
@@ -3760,6 +3785,17 @@ void NoteShown(const replay::Encoded &run) {
 		if (replay::LiteralAt(run.code, run.length, 0, &v))
 			g_shown.freeResprays = v != 0;
 		break;
+	case op::SET_TARGET_CAR_FOR_MISSION_GARAGE: {
+		int32_t car = -1;
+		if (replay::LiteralAt(run.code, run.length, 0, &v) && v >= 0 &&
+		    v < static_cast<int32_t>(NUM_GARAGES) &&
+		    replay::LiteralAt(run.code, run.length, 1, &car)) {
+			const uint32_t bit  = 1u << v;
+			g_shown.garageTargets = car >= 0 ? (g_shown.garageTargets | bit)
+			                                 : (g_shown.garageTargets & ~bit);
+		}
+		break;
+	}
 	case op::SET_WANTED_MULTIPLIER: {
 		float f = 1.0f;
 		if (replay::LiteralAt(run.code, run.length, 0, &v)) {
@@ -4279,7 +4315,9 @@ void PreloadIsland(float x, float y, float z) {
 // SET_PLAYER_COORDINATES the owner's mission ran, on this machine's own
 // player: beside the owner's spot rather than on it (missions.md 11.2), on
 // the first of the spots SpreadSpot offers that the buildings leave in
-// sight of it, and on the owner's spot when none is.
+// sight of it, and on the owner's spot when none is. A player in a car moves
+// the car only when the owner moved in one too and this machine simulates it
+// (MissionMoveFor): a pedestrian's move leaves the car where it stands.
 bool Teleport(const MissionEffectBody &body, uint8_t rank, uint8_t count) {
 	if (!g_hooks[R200].detour.IsInstalled() || body.length > replay::MAX_CODE)
 		return false;
@@ -4297,17 +4335,82 @@ bool Teleport(const MissionEffectBody &body, uint8_t rank, uint8_t count) {
 	std::memcpy(&x, &xb, 4);
 	std::memcpy(&y, &yb, 4);
 	std::memcpy(&z, &zb, 4);
+	void *const me  = Func<PlayerFn>(FindPlayerPed)();
+	void *const car = me && Field<uint8_t>(me, offs::PED_IN_VEHICLE) != 0
+	                      ? Field<void *>(me, offs::PED_MY_VEHICLE)
+	                      : nullptr;
+	MissionMove move = MissionMove::OnFoot;
+	if (at == 1 && car && g_client) {
+		// What the handler would do to the car we sit in, and whether it may
+		// (MissionMoveFor): only the machine that simulates a car moves it,
+		// and a pedestrian's move is no car's.
+		MissionMoveFacts f;
+		f.warpsOut           = EffectOpcode(body) != op::SET_PLAYER_COORDINATES;
+		f.inCar              = true;
+		f.ownerTag           = body.ownerBlip;
+		const int32_t handle = Func<int32_t(__cdecl *)(void *)>(CPools__GetVehicleRef)(car);
+		const uint16_t netId = g_client->SessionCarNetIdOf(handle);
+		const RemoteVehicle *row = netId != INVALID_NETID ? g_client->VehicleByNetId(netId) : nullptr;
+		f.simulateHere =
+		    !row || WhoSimulates(true, row->driverPlayerId, row->custodianPlayerId, INVALID_PLAYER,
+		                         LocalId())
+		                    .where == CarSim::Here;
+		const uint16_t ownerCar = OwnerMoveCar(body.ownerBlip);
+		f.ownersCar = ownerCar != INVALID_NETID && CarForNetId(ownerCar) == handle;
+		const float *p = &Field<float>(me, offs::POSITION);
+		f.distanceM    = std::sqrt((p[0] - x) * (p[0] - x) + (p[1] - y) * (p[1] - y));
+		move           = MissionMoveFor(f);
+		static bool said[static_cast<size_t>(MissionMove::Count)] = {};
+		bool &once = said[static_cast<size_t>(move)];
+		if (!once && move != MissionMove::CarRing) {
+			once = true;
+			switch (move) {
+			case MissionMove::StayInCar:
+				Log("missions: the owner's mission put its player, on foot, at (%.1f, %.1f), "
+				    "%.0f m from the car we are in; we stay in it where it is rather than have "
+				    "the car follow a pedestrian's move into a building",
+				    x, y, f.distanceM);
+				break;
+			case MissionMove::OutOfCar:
+				Log("missions: the owner's mission put its player %s at (%.1f, %.1f), %.0f m "
+				    "from the car we are in; we get out and go beside them on foot, and the car "
+				    "stays where it is",
+				    f.warpsOut ? "out of their car" : "on foot", x, y, f.distanceM);
+				break;
+			case MissionMove::StaySeated:
+				Log("missions: the owner's mission moved its player in a car while we ride in "
+				    "car %u, which another machine simulates; that machine moves it and we "
+				    "stay in our seat",
+				    static_cast<unsigned>(netId));
+				break;
+			case MissionMove::CarOnSpot:
+				Log("missions: the owner's mission moved its player in car %u, which we "
+				    "simulate; the car goes onto the owner's spot itself",
+				    static_cast<unsigned>(netId));
+				break;
+			default: break;
+			}
+		}
+		if (move == MissionMove::StayInCar || move == MissionMove::StaySeated)
+			return true;
+	}
 	// A z of -100 asks the engine for the ground, which is inside every
 	// island's zones (map.zon's run from -133 to 467).
 	PreloadIsland(x, y, z);
 	// The handler moves the car of a player in one, so the ring has to fit
-	// cars (SpotRadii).
-	void *const  me    = Func<PlayerFn>(FindPlayerPed)();
-	const bool   inCar = me && Field<uint8_t>(me, offs::PED_IN_VEHICLE) != 0 &&
-	                     Field<void *>(me, offs::PED_MY_VEHICLE) != nullptr;
+	// cars (SpotRadii). WARP_PLAYER_FROM_CAR_TO_COORD leaves the car where it
+	// is and puts the player down on foot.
+	const bool   inCar = car && (move == MissionMove::CarRing || move == MissionMove::CarOnSpot ||
+	                            (at == 0 && move == MissionMove::OnFoot));
+	if (move == MissionMove::OutOfCar) {
+		code[0] = static_cast<uint8_t>(op::WARP_PLAYER_FROM_CAR_TO_COORD & 0xFF);
+		code[1] = static_cast<uint8_t>(op::WARP_PLAYER_FROM_CAR_TO_COORD >> 8);
+	}
 	const float *radii = SpotRadii(inCar);
 	float        sx = x, sy = y;
-	bool         found = false;
+	// The owner rides in the car we drive: it goes where the owner's engine
+	// put its copy of it, with nobody else to make room for.
+	bool         found = move == MissionMove::CarOnSpot;
 	for (uint8_t ring = 0; ring < 2 && !found; ++ring) {
 		for (uint8_t attempt = 0; attempt < SPREAD_ATTEMPTS; ++attempt) {
 			float cx = 0.0f, cy = 0.0f;
@@ -4334,7 +4437,8 @@ bool Teleport(const MissionEffectBody &body, uint8_t rank, uint8_t count) {
 	if (!said) {
 		said = true;
 		Log("missions: moved beside the owner's spot as %u of %u, %s, %.1f m out", rank + 1u,
-		    static_cast<unsigned>(count), inCar ? "in our car" : "on foot",
+		    static_cast<unsigned>(count),
+		    inCar ? "in our car" : car ? "out of our car" : "on foot",
 		    std::sqrt((sx - x) * (sx - x) + (sy - y) * (sy - y)));
 	}
 	int32_t bits = 0;
@@ -4989,6 +5093,15 @@ void EndEffects() {
 	g_pickupMap.Clear();
 	g_stashCount    = 0;
 	g_floatingCount = 0;
+	// And its garages stop waiting for one of our cars. The owner's cleanup
+	// does this with a SET_TARGET_CAR_FOR_MISSION_GARAGE of -1, which now
+	// reaches us (replay.h, CarMayBeNone); a mission that ended any other way
+	// never sends it, and the garage would go on holding a pointer to a copy
+	// the session can delete at any time (game/teardown.h).
+	for (size_t g = 0; g < NUM_GARAGES; ++g)
+		if (g_shown.garageTargets & (1u << g))
+			Func<void(__cdecl *)(int32_t, void *)>(CGarages__SetTargetCarForMissonGarage)(
+			    static_cast<int32_t>(g), nullptr);
 	// And whatever it left of a cutscene, a fade, the camera, the controls or
 	// the HUD: nothing is left for this machine's player to be stuck in.
 	if (g_shown.cutscene)

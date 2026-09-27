@@ -127,6 +127,17 @@ inline bool CheckpointsWait(uint16_t number, bool timerUp) {
 	return !timerUp && MissionKindOf(number) == MISSION_KIND_STORY && !IsRaceMission(number);
 }
 
+// The same with the server's say in it (S_MissionState): no checkpoint waits
+// when its wait is 0 seconds, and every one does, clock or race, when the
+// server turned MISSION_FLAG_TIMED_CHECKPOINTS on.
+inline bool CheckpointsWait(uint16_t number, bool timerUp, uint8_t missionFlags,
+                            uint16_t checkpointWaitS) {
+	if (checkpointWaitS == 0)
+		return false;
+	return (missionFlags & MISSION_FLAG_TIMED_CHECKPOINTS) != 0 ||
+	       CheckpointsWait(number, timerUp);
+}
+
 inline const char *MissionName(uint16_t number) {
 	static const char *const kNames[MISSION_COUNT] = {
 	    "Intro Movie",

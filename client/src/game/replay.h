@@ -977,14 +977,30 @@ inline bool EachHandle(uint8_t *code, size_t length, Fn fn) {
 	return true;
 }
 
+// An instruction whose car may be none. A negative operand there is the
+// engine's "no car", not a handle: SET_TARGET_CAR_FOR_MISSION_GARAGE's
+// handler passes null for one (missionaddr.h), and every mission that points
+// a garage at its car ends with one in its cleanup. It goes to everybody as
+// -1 and is run as -1, where any other car nobody can name is dropped - which
+// used to leave a participant's garage pointing at the copy of a car the
+// session was about to take away.
+constexpr bool CarMayBeNone(uint16_t opcode) {
+	return opcode == scripts::op::SET_TARGET_CAR_FOR_MISSION_GARAGE;
+}
+
 // On the owner, before it is sent: each pedestrian or car the instruction
 // names becomes its netId. False, not to be sent, for one the session has no
 // name for yet (still inside its naming round trip, or never hosted).
 inline bool ToWire(Encoded *enc, int32_t (*charNet)(int32_t handle),
                    int32_t (*carNet)(int32_t handle)) {
+	const bool noneOk = CarMayBeNone(static_cast<uint16_t>(enc->code[0] | (enc->code[1] << 8)));
 	return EachHandle(enc->code, enc->length, [&](Arg a, int32_t *v) {
 		if (a != Arg::Char && a != Arg::Car)
 			return true;
+		if (a == Arg::Car && noneOk && *v < 0) {
+			*v = -1;
+			return true;
+		}
 		int32_t (*const fn)(int32_t) = a == Arg::Char ? charNet : carNet;
 		if (!fn)
 			return false;
@@ -998,6 +1014,8 @@ inline bool ToWire(Encoded *enc, int32_t (*charNet)(int32_t handle),
 // does not have.
 inline bool Translate(const Encoded &in, const Handles &h, Encoded *out) {
 	*out = in;
+	const bool noneOk = in.length >= 2 &&
+	                    CarMayBeNone(static_cast<uint16_t>(in.code[0] | (in.code[1] << 8)));
 	return EachHandle(out->code, out->length, [&](Arg a, int32_t *v) {
 		switch (a) {
 		case Arg::Blip:   *v = h.blips ? h.blips->Ours(*v) : -1; break;
@@ -1006,7 +1024,13 @@ inline bool Translate(const Encoded &in, const Handles &h, Encoded *out) {
 		case Arg::Fire:   *v = h.fires ? h.fires->Ours(*v) : -1; break;
 		case Arg::Sphere: *v = h.spheres ? h.spheres->Ours(*v) : -1; break;
 		case Arg::Char:   *v = h.charOf ? h.charOf(*v) : -1; break;
-		case Arg::Car:    *v = h.carOf ? h.carOf(*v) : -1; break;
+		case Arg::Car:
+			if (noneOk && *v < 0) {
+				*v = -1;
+				return true;
+			}
+			*v = h.carOf ? h.carOf(*v) : -1;
+			break;
 		default:          break;
 		}
 		return *v != -1;

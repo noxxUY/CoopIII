@@ -109,8 +109,8 @@ enum class OverlayStep : uint8_t {
 // `present`/`life`: the liveliest association with that id. `ownerRunning` is
 // PF_ANIM2_RUNNING. `engineMove`: EngineMoveHolds.
 //
-// LET_END is the rocket launcher's rule (AGENTS.md, "The rocket launcher plays
-// once"): an animation that finished and is fading, whose owner has stopped
+// LET_END is the rocket launcher's rule (ApplyOverlay's LET_END case in
+// ped.cpp): an animation that finished and is fading, whose owner has stopped
 // playing theirs, is meant to be ending. A spent one is not that - nothing
 // ended it, the landing did - so it is put back whether or not it runs, which
 // is what brings back an aim, since an aim is a weapon anim held still.

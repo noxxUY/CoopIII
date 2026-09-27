@@ -12,6 +12,8 @@
 
 #include <coopiii/protocol.h>
 
+#include "rampagevote.h"
+
 #include <cstdint>
 #include <string>
 
@@ -119,6 +121,29 @@ const char *Name(PackageMode rule);                // "shared" / "perplayer"
 const char *Label(PackageMode rule);               // "Shared" / "Per player"
 bool        ParsePackages(const std::string &text, PackageMode *out);
 
+// How many have to say yes to a vote (rampagevote.h, VoteRule): the cutscene
+// skip and the rampage vote both take one.
+const char *Name(VoteRule rule);                   // "most" / "half" / "all" / "anyone"
+const char *Label(VoteRule rule);                  // "75%" / "Half" / "Everyone" / "Anyone"
+bool        ParseVoteRule(const std::string &text, VoteRule *out);
+
+// missionEnemies (protocol.h, MissionEnemies), which is a plain number on
+// the wire and so has no enum of its own here.
+const char *MissionEnemiesName(uint8_t rule);      // "original" / "tougher" / "more"
+const char *MissionEnemiesLabel(uint8_t rule);     // "Original" / "Tougher" / "More"
+
+// The ranges the numeric settings are held to. A value outside one in the
+// file is ignored, the same as any value that makes no sense.
+constexpr uint8_t  CONFIG_MAX_WANTED_MIN      = 1;
+constexpr uint16_t CONFIG_INTRO_WAIT_S_MIN    = 10;
+constexpr uint16_t CONFIG_INTRO_WAIT_S_MAX    = 600;
+constexpr uint16_t CONFIG_BEHIND_S_MIN        = 1;
+constexpr uint16_t CONFIG_ABANDONED_S_MIN     = 10;
+constexpr uint16_t CONFIG_ABANDONED_S_MAX     = 600;
+// What session.h's VEHICLE_RELEASE_MS is, in seconds; server.h holds the two
+// to each other.
+constexpr uint16_t CONFIG_ABANDONED_S_DEFAULT = 60;
+
 struct ServerConfig {
 	uint16_t        port               = 2001;
 	bool            friendlyFire       = false;                     // §5.2
@@ -128,7 +153,7 @@ struct ServerConfig {
 	// How far outside a mission's start or one of its checkpoints still
 	// counts as there, in centimetres: everybody has to be there before a
 	// mission starts or moves on (docs/missions.md 5.6 and 9). 5 m, the
-	// owner's number, so a friend parked beside you counts. The file says it
+	// number settled on, so a friend parked beside you counts. The file says it
 	// in metres.
 	uint16_t        missionMarginCm    = MISSION_MARGIN_CM_DEFAULT;
 
@@ -168,9 +193,61 @@ struct ServerConfig {
 	// Who a hidden package counts for (§5.11). `shared` by default.
 	PackageMode     hiddenPackages     = PackageMode::Shared;
 
+	// How many players the session takes, up to MAX_PLAYERS. Lowering it
+	// turns nobody out; it only stops the next join.
+	uint8_t         maxPlayers         = MAX_PLAYERS;
+
+	// The most stars anybody may have, 1 to 6. Six, the game's own, by
+	// default; with the wanted level off it does nothing.
+	uint8_t         maxWanted          = WANTED_LEVEL_CEILING;
+
+	// How long a checkpoint waits for the participants who are not in it
+	// before the owner's mission goes on without them, in seconds; 0 and
+	// checkpoints never wait. And whether one waits in a race, a side job or
+	// with a clock on the screen too, which by default it does not
+	// (protocol.h, MISSION_FLAG_TIMED_CHECKPOINTS).
+	uint16_t        missionCheckpointWaitS  = MISSION_CHECKPOINT_WAIT_MS / 1000;
+	bool            missionTimedCheckpoints = false;
+
+	// Bringing people to the mission's owner (protocol.h, S_MissionState): a
+	// latecomer further than missionCatchUpM, and, in a mission whose
+	// checkpoints do not wait, anybody further than missionBehindM for
+	// missionBehindS seconds. 0 m for either is never.
+	uint16_t        missionCatchUpM    = MISSION_CATCH_UP_M_DEFAULT;
+	uint16_t        missionBehindM     = MISSION_BEHIND_M_DEFAULT;
+	uint16_t        missionBehindS     = MISSION_BEHIND_S_DEFAULT;
+
+	// How long a start waits for a player whose game is in a mission of its
+	// own, the new game's intro say, before it goes on without them.
+	uint16_t        missionIntroWaitS  = MISSION_BUSY_WAIT_MS / 1000;
+
+	// Whether a mission's reward goes to everybody in it (docs/missions.md
+	// 12.1, the owner's decision and the default) or to its owner alone.
+	bool            missionPayHelpers  = true;
+
+	// How many of the players watching a cutscene have to press skip, and how
+	// many have to say yes to a rampage, and for how long it asks.
+	VoteRule        cutsceneSkip       = VoteRule::Most;
+	VoteRule        rampageVote        = VoteRule::Most;
+	uint16_t        rampageVoteS       = RAMPAGE_VOTE_MS / 1000;
+
+	// How long a car the session shares stays after everybody has left it and
+	// walked away (session.h, VEHICLE_RELEASE_MS), in seconds.
+	uint16_t        abandonedCarS      = CONFIG_ABANDONED_S_DEFAULT;
+
 	// What a player has to give to join, or empty for nothing. protocol.h,
 	// C_Password: it keeps strangers out and no more.
 	std::string     password;
+
+	// What happens outside the session when the server starts, none of it
+	// seen by the players (server/probe.cpp). Asking a what-is-my-IP service
+	// for this network's public address, so the window can show what a friend
+	// on the internet types; and asking the router over UPnP to forward the
+	// port here, closed again when the server stops. Both on by default,
+	// because a host who has to find out about port forwarding is a host
+	// whose friends never get in.
+	bool            lookUpPublicAddress = true;
+	bool            openRouterPort      = true;
 
 	// The password as a hello can carry it: control characters out, and no
 	// longer than PASSWORD_LEN - 1.
@@ -202,7 +279,19 @@ struct ServerConfig {
 		       missionEnemies == other.missionEnemies && missionScale == other.missionScale &&
 		       ammoSync == other.ammoSync && rampage == other.rampage &&
 		       cheats == other.cheats && money == other.money &&
-		       hiddenPackages == other.hiddenPackages && password == other.password;
+		       hiddenPackages == other.hiddenPackages && password == other.password &&
+		       maxPlayers == other.maxPlayers && maxWanted == other.maxWanted &&
+		       missionCheckpointWaitS == other.missionCheckpointWaitS &&
+		       missionTimedCheckpoints == other.missionTimedCheckpoints &&
+		       missionCatchUpM == other.missionCatchUpM &&
+		       missionBehindM == other.missionBehindM &&
+		       missionBehindS == other.missionBehindS &&
+		       missionIntroWaitS == other.missionIntroWaitS &&
+		       missionPayHelpers == other.missionPayHelpers &&
+		       cutsceneSkip == other.cutsceneSkip && rampageVote == other.rampageVote &&
+		       rampageVoteS == other.rampageVoteS && abandonedCarS == other.abandonedCarS &&
+		       lookUpPublicAddress == other.lookUpPublicAddress &&
+		       openRouterPort == other.openRouterPort;
 	}
 	bool operator!=(const ServerConfig &other) const { return !(*this == other); }
 };

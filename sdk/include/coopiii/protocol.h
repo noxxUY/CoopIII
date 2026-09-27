@@ -187,10 +187,10 @@ namespace coopiii {
 //    already called CPed::RemoveBodyPart, and observers call the same
 //    function on their replica with the same two arguments.
 //
-// 18: ten branches at once, and one number for all of them. Each was built
-//    against either 16 or 17 and each left its own number unassigned, so this
-//    is the entry those notes said would be written at the merge. There is no
-//    17.5 and no per-branch number: a client and a server that disagree about
+// 18: ten changes at once, and one number for all of them. Each was built
+//    against either 16 or 17 and none took a number of its own, so this
+//    one entry covers them all. There is no
+//    17.5 and no per-change number: a client and a server that disagree about
 //    any one of the changes below cannot safely agree about the rest, so they
 //    stand or fall together on 18.
 //
@@ -1846,8 +1846,44 @@ namespace coopiii {
 //    A mix misbehaves the old way: an older receiver keeps its stars through
 //    somebody else's respray or bribe, and after 3 s puts them back on the
 //    newer machine that paid for it.
+//
+// 71: every server setting the host can
+//    change reaches the players already in the session, and the mission
+//    rules the clients used to hardcode are the server's (docs/protocol.md
+//    1.46). One opcode, 0x07 out of the handshake block: S_SessionRules,
+//    the welcome's SessionFlags byte again plus `maxWanted`, the most stars
+//    anybody may have. It follows every S_Welcome, and goes to everybody
+//    when the host saves a change; a rampage rule change waits for a running
+//    rampage and its vote to end. S_MissionState grows by eight bytes:
+//    `checkpointWaitS`, `catchUpM`, `behindM` and `behindS`, the four
+//    numbers MISSION_CHECKPOINT_WAIT_MS, MISSION_SUMMON_NEAR_M,
+//    MISSION_BEHIND_FAR_M and MISSION_BEHIND_MS used to be, and its flags
+//    gain MISSION_FLAG_TIMED_CHECKPOINTS; it is broadcast when the host
+//    changes any mission rule. What two existing packets mean grows, with no
+//    layout change: S_Money can now arrive in the middle of a session with
+//    a new rule, `off` included, which a receiver already handled by
+//    starting its wallet over; S_CutsceneVote's and S_RampageVote's `needed`
+//    follow the server's cutsceneSkip and rampageVote rules rather than
+//    always being 75%, and S_RampageVote's `msLeft` its rampageVoteTime.
+//    The server no longer relays a mission's MISSION_EFFECT_PAY with
+//    missionPayHelpers off, so only the owner is paid. A mix cannot
+//    connect; were one to, each side would drop the other's S_MissionState
+//    for its size and never learn whose mission runs, and an older client
+//    would keep every rule it was welcomed with until it reconnected.
+//
+// 72: a mission's move of its player says
+//    whether that player sat in a car (docs/protocol.md, "Moving everybody
+//    with the mission"). No layout moves and no opcode is added; a
+//    MISSION_EFFECT_TELEPORT's `ownerBlip`, unused before, is 0 when the
+//    owner's player was on foot and 1 + the netId of its car otherwise. A
+//    participant in a car moves it only when the owner was in one and it
+//    simulates the car (onto the owner's spot when the owner rides in it);
+//    after an owner's move on foot it stays in its car within 60 m and gets
+//    out onto the ring further away. A mix misbehaves the old way: an older
+//    owner sends -1 or 0, which a newer participant reads as on foot, and an
+//    older participant drives its car onto the ring whatever the owner did.
 
-constexpr uint16_t PROTOCOL_VERSION = 70;
+constexpr uint16_t PROTOCOL_VERSION = 72;
 constexpr uint16_t DEFAULT_PORT     = 2001;
 constexpr uint8_t  MAX_PLAYERS      = 8;
 constexpr uint8_t  SNAPSHOT_HZ      = 25;   // docs/protocol.md §1.2
@@ -1880,6 +1916,9 @@ enum Opcode : uint8_t {
 	OP_S_PLAYER_LEAVE    = 0x04,
 	OP_C_PLAYER_MODEL    = 0x05,
 	OP_S_PLAYER_MODEL    = 0x06,
+	// The session's rules, after the welcome and whenever the host changes
+	// one (S_SessionRules). Server to client only.
+	OP_S_SESSION_RULES   = 0x07,
 
 	OP_C_PLAYER_STATE    = 0x10,
 	OP_S_PLAYER_STATE    = 0x11,
@@ -2003,7 +2042,7 @@ enum Opcode : uint8_t {
 	// the seat: the engine walks a driver to the *nearest* door and shuffles
 	// him across inside. See EnteringVehicleBody and docs/protocol.md §1.14.7.
 	//
-	// 0x60/0x61 out of the block below, assigned at the merge. The note there
+	// 0x60/0x61 out of the block below. The note there
 	// called 0x60..0x6F a block for hits travelling towards an owner; this
 	// pair travels the other way, and it is here because it is about getting
 	// into a car and the vehicle block (0x30..0x3F) has no room left.
@@ -2786,6 +2825,25 @@ struct S_Welcome {
 	uint8_t  flags;         // SessionFlags
 };
 
+// The session's rules, to a joiner straight after S_Welcome and to everybody
+// whenever the host changes one in the server's options. `flags` is the same
+// SessionFlags byte the welcome carries, so a receiver applies the two the
+// same way; the welcome's copy is what a player has for the moment between
+// the two packets. A change the server makes while a rampage is running waits
+// for it to end before it is sent, so nobody's CDarkel changes rule halfway
+// through a frenzy.
+//
+// `maxWanted` is the most stars anybody may have, 1 to WANTED_LEVEL_CEILING
+// (the server's maxWantedLevel). Every machine clamps its own player to it,
+// the way `off` clamps to 0; anything out of that range is the ceiling.
+struct S_SessionRules {
+	static constexpr uint8_t OPCODE = OP_S_SESSION_RULES;
+	PacketHeader hdr;
+	uint8_t      flags;       // SessionFlags
+	uint8_t      maxWanted;
+	uint8_t      pad[2];
+};
+
 // What a player is, and what condition they are currently in.
 //
 // Both halves matter, and the second one is version 9. A join packet used to
@@ -3024,6 +3082,13 @@ enum PlayerFlags : uint8_t {
 // jle`), so seven - which three bits can carry - is not a state the engine has
 // and is clamped rather than trusted.
 constexpr uint8_t WANTED_LEVEL_CEILING = 6;
+
+// S_SessionRules::maxWanted as a receiver takes it: 1 to the ceiling, and
+// anything else the ceiling, so a zero from a zeroed packet never reads as
+// "no stars at all" - that is the `off` rule's job, not this cap's.
+inline uint8_t SaneMaxWanted(uint8_t level) {
+	return level == 0 || level > WANTED_LEVEL_CEILING ? WANTED_LEVEL_CEILING : level;
+}
 
 // The wanted level a flags byte carries, clamped to what the engine can hold.
 inline uint8_t WantedFromFlags(uint8_t flags) {
@@ -5628,7 +5693,7 @@ enum PickupIdentFlags : uint8_t {
 	// moved.
 	PICKUP_F_VOTED   = 1 << 2,
 	// A weapon, armour, health or cash pickup the session's mission laid out
-	// (mission-audit.md R2, the owner's decision): every player takes their
+	// (mission-audit.md R2, as decided): every player takes their
 	// own. A claim is weighed against the claimant's own record, and a
 	// collection is told to everybody so the mission's HAS_PICKUP_BEEN_COLLECTED
 	// moves on, but nobody else's copy is taken away.
@@ -6591,6 +6656,28 @@ constexpr uint32_t MISSION_BUSY_WAIT_MS = 60000;
 // everybody's screen (S_MissionWaiting::goesOnInS).
 constexpr uint32_t MISSION_CHECKPOINT_WAIT_MS = 60000;
 
+// The server's own numbers for the rest of it, all in S_MissionState, with
+// the defaults every build before them had hardcoded on the client:
+//
+//   checkpointWaitS  MISSION_CHECKPOINT_WAIT_MS in seconds; 0 and no
+//                    checkpoint waits at all, and whoever falls behind is
+//                    brought along instead, as in a race
+//   catchUpM         a participant who comes into the mission late, or back
+//                    from the hospital or the police station, and is further
+//                    than this from the owner is brought beside them; 0 never
+//   behindM, behindS in a mission whose checkpoints do not wait, a
+//                    participant further than behindM from the owner for
+//                    behindS seconds is brought beside them; 0 m never
+//
+// The ranges are the server's to keep (config.h); a receiver takes whatever
+// arrives, capped at these maxima.
+constexpr uint16_t MISSION_CHECKPOINT_WAIT_S_MAX     = 600;
+constexpr uint16_t MISSION_CATCH_UP_M_DEFAULT        = 60;
+constexpr uint16_t MISSION_BEHIND_M_DEFAULT          = 150;
+constexpr uint16_t MISSION_BEHIND_S_DEFAULT          = 10;
+constexpr uint16_t MISSION_DISTANCE_M_MAX            = 2000;
+constexpr uint16_t MISSION_BEHIND_S_MAX              = 300;
+
 struct C_MissionStarted {
 	static constexpr uint8_t OPCODE = OP_C_MISSION_STARTED;
 	PacketHeader hdr;
@@ -6613,6 +6700,11 @@ enum MissionOutcome : uint8_t {
 
 // S_MissionState::flags
 constexpr uint8_t MISSION_FLAG_FAIL_ON_DEATH = 0x01;   // the server's missionFailOnDeath
+// The server's missionTimedCheckpoints: a checkpoint waits for everybody even
+// while a countdown is on the owner's screen, in a race, an odd job or an RC,
+// 4x4 or Mayhem run (CheckpointsWait). Off by default, which is protocol 63's
+// rule; the countdown still runs while it waits.
+constexpr uint8_t MISSION_FLAG_TIMED_CHECKPOINTS = 0x02;
 
 // How the session's mission's enemies stand up to more than one player
 // (docs/missions.md 10), the server's missionEnemies. The owner's machine
@@ -6648,6 +6740,11 @@ struct S_MissionState {
 	// (C_CampaignSince). Another one than last time is a server that has
 	// started over, and so has its log.
 	uint32_t     campaignLog;
+	// See MISSION_CHECKPOINT_WAIT_S_MAX above for what each of these is.
+	uint16_t     checkpointWaitS;
+	uint16_t     catchUpM;
+	uint16_t     behindM;
+	uint16_t     behindS;
 };
 
 struct C_MissionEnded {
@@ -6705,7 +6802,11 @@ enum MissionEffectKind : uint8_t {
 	MISSION_EFFECT_BLIP_USE = 2,   // `ownerBlip` at code[handleAt], ours in its place
 	MISSION_EFFECT_PAY      = 3,   // ADD_SCORE: not under a shared wallet
 	MISSION_EFFECT_OBJECT_NEW = 4, // run it; its result is ours for `ownerBlip`
-	MISSION_EFFECT_TELEPORT   = 5, // SET_PLAYER_COORDINATES, beside the owner's spot
+	// SET_PLAYER_COORDINATES, beside the owner's spot. `ownerBlip` says where
+	// the owner's player sat: 0 on foot, else 1 + the netId of its car (1 for
+	// a car the session has no name for). A participant in a car moves it only
+	// when the owner was in one and its own machine simulates that car.
+	MISSION_EFFECT_TELEPORT   = 5,
 	MISSION_EFFECT_PICKUP_NEW = 6, // run it; the pickup it made is ours for `ownerBlip`
 	MISSION_EFFECT_FIRE_NEW   = 7, // run it; the script fire it lit is ours for `ownerBlip`
 	MISSION_EFFECT_SPHERE_NEW = 8, // run it; the sphere it put up is ours for `ownerBlip`
@@ -8027,7 +8128,7 @@ static_assert(sizeof(C_MissionClaim)      == 5 + 8 + 28, "mission claim layout")
 static_assert(sizeof(S_MissionClaim)      == 5 + 8, "mission claim answer layout");
 static_assert(sizeof(S_MissionWaiting)    == 5 + 8 + 12, "mission waiting layout");
 static_assert(sizeof(C_MissionStarted)    == 5 + 8, "mission start layout");
-static_assert(sizeof(S_MissionState)      == 5 + 16, "mission state layout");
+static_assert(sizeof(S_MissionState)      == 5 + 24, "mission state layout");
 static_assert(sizeof(C_MissionEnded)      == 5 + 4, "mission end layout");
 static_assert(sizeof(S_MissionFail)       == 5 + 4, "mission fail layout");
 static_assert(sizeof(C_MissionCheckpoint) == 5 + 4 + 12, "mission checkpoint layout");
@@ -8085,6 +8186,7 @@ static_assert(sizeof(C_VehicleState)  == 77, "vehicle snapshot layout");
 static_assert(sizeof(S_VehicleState)  == 78, "vehicle snapshot layout");
 static_assert(sizeof(C_Hello)         == 33, "hello layout");
 static_assert(sizeof(S_Welcome)       == 17, "welcome layout");
+static_assert(sizeof(S_SessionRules)  == 5 + 4, "session rules layout");
 static_assert(sizeof(C_PedBodyPart)   == 9,  "body part layout");
 static_assert(sizeof(S_PedBodyPart)   == 9,  "body part layout");
 static_assert(sizeof(PedBodyPartBody) == 4,  "body part layout");

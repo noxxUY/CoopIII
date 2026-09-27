@@ -1,8 +1,7 @@
 # Mission audit: every mission against the bridge
 
-The owner asked on 2026-09-24 for every mission in the game to be checked
-against the design in [missions.md](missions.md), deeply, to find what wouldn't
-work. This file is that check.
+Every mission in the game, checked on 2026-09-24 against the design in
+[missions.md](missions.md), to find what wouldn't work.
 
 **How it was done.** First, every one of the 80 missions was tagged with the
 mechanics it uses. That's a count of the opcodes behind each kind of hazard
@@ -14,8 +13,10 @@ them one by one. Every claim about a mission below comes from its script.
 Every claim about the engine is tagged with where it comes from, and §5
 lists what can only be settled in a game.
 
-**Nothing here is built, and nothing has been run.** It's the list of what
-the bridge has to do before each mission plays properly.
+When this was written nothing in it was built. Most of it is now, and each
+requirement says so under its own **Built** line. What has no such line is
+still on the list of what the bridge has to do before that mission plays
+properly.
 
 ---
 
@@ -48,8 +49,8 @@ the bridge has to do before each mission plays properly.
 
    Answered per condition, helper A sitting in the mission car and helper B
    standing at the destination would pass a check that no single player
-   passed. So a condition can't be answered for "whoever". The owner decided
-   instead (C1) that **everybody has to be there**:
+   passed. So a condition can't be answered for "whoever". The rule instead
+   (C1) is that **everybody has to be there**:
    - at the start;
    - at every checkpoint;
    - quiet for every stealth check.
@@ -148,7 +149,7 @@ the grant and the award then run as they do for every script pickup. A
 helper's collection lands in the owner's `aPickUpsCollected`, so the owner's
 `HAS_PICKUP_BEEN_COLLECTED` goes true.
 
-**The owner's decision: the stash is for everybody.** Every weapon, ammo,
+**Decided: the stash is for everybody.** Every weapon, ammo,
 armour, health and cash pickup a mission lays out is *per player*:
 
 - everybody takes their own, and nobody's copy disappears when somebody else
@@ -378,7 +379,7 @@ down, and a helper shooting the drop-off plane fails A Drop In The Ocean. The
 owner's own copy flies on after a helper brought theirs down, beside the
 wreck the script then makes, until it lands.
 
-Not built, and why, for whoever has the game:
+Not built, and why:
 
 - **The Catalina helicopter.** It lives in a slot of `CHeli::pHelis` of its
   own, and the helicopter sync covers the two police slots only, so today
@@ -496,7 +497,7 @@ there, the same gap a rampage has.
 
 ### R12. What the story does to "the player" happens to every participant
 
-This follows from the owner's decisions: everybody paid, everybody fails
+This follows from the decisions: everybody paid, everybody fails
 together. The opcodes that change the protagonist's state apply to every
 participant:
 
@@ -547,7 +548,7 @@ Colombian ship, and give nothing away.
 These are single conditions, never chained, so "any participant" is safe
 here.
 
-**The owner's decision: everybody has to be quiet.** Three stealth checks
+**Decided: everybody has to be quiet.** Three stealth checks
 aren't `HAS_CHAR_SPOTTED_PLAYER` at all. They're ordinary distance checks,
 so they need a small table of sites, answered for the participant nearest the
 danger:
@@ -659,7 +660,7 @@ seconds, and each participant writes it into the global its own HUD shows.
 
 ### The design corrections
 
-- **C1. Who has to satisfy a condition**, as the owner decided on
+- **C1. Who has to satisfy a condition**, as decided on
   2026-09-24. It replaces `missions.md` §5.6.
 
   **The start: everybody.** Each of the 85 launches has a *start gate*, the
@@ -724,8 +725,8 @@ seconds, and each participant writes it into the global its own HUD shows.
 
 ## 3. Mission by mission
 
-Codes: ✅ works with the base bridge; 🟡 works once the listed requirements
-exist; ⚠ plays, but see the note. "Owner drives" means C2.
+Codes: **ok** works with the base bridge; **reqs** works once the listed requirements
+exist; **note** plays, but see the note. "Owner drives" means C2.
 
 Two requirements apply across the board, so they're left out of the rows:
 
@@ -736,150 +737,150 @@ Two requirements apply across the board, so they're left out of the rows:
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 0 | Intro | the new-game movie | nothing (C5) | ✅ local on every machine |
-| 1-2 | Hospital / police info scenes | an info pickup, then a scene | nothing | ⚠ the shared-pickup catch in `missions.md` §6 |
-| 3-6 | RC Toyz (Diablo, Mafia, Rumpo, Casino) | blow up as many cars as possible with the RC buggy in 2 minutes | R7 (buggy), R15 (zone car info) | ✅ owner only. A helper's wreck of a target counts, as any wreck does in vanilla |
-| 7-9 | Patriot Playground, A Ride In The Park, Gripped! | checkpoints in a Patriot or a Landstalker | nothing | ⚠ only the owner's car collects. Helpers watch |
-| 10 | Multistorey Mayhem | checkpoints in a Stallion | nothing | ⚠ as above |
-| 11 | Paramedic | patients into the ambulance | R4 | ⚠ owner drives. Everybody's in it (C3) and escorts |
-| 12 | Firefighter | put out burning cars | R8 (car fires) | ⚠ owner drives the fire truck |
-| 13 | Vigilante | kill the criminals | R1 | ✅ helpers can shoot criminals once R1 exists |
-| 14 | Taxi Driver | fares into the taxi | R4 | ⚠ owner drives. Helpers can't take fares |
+| 0 | Intro | the new-game movie | nothing (C5) | **ok** local on every machine |
+| 1-2 | Hospital / police info scenes | an info pickup, then a scene | nothing | **note** the shared-pickup catch in `missions.md` §6 |
+| 3-6 | RC Toyz (Diablo, Mafia, Rumpo, Casino) | blow up as many cars as possible with the RC buggy in 2 minutes | R7 (buggy), R15 (zone car info) | **ok** owner only. A helper's wreck of a target counts, as any wreck does in vanilla |
+| 7-9 | Patriot Playground, A Ride In The Park, Gripped! | checkpoints in a Patriot or a Landstalker | nothing | **note** only the owner's car collects. Helpers watch |
+| 10 | Multistorey Mayhem | checkpoints in a Stallion | nothing | **note** as above |
+| 11 | Paramedic | patients into the ambulance | R4 | **note** owner drives. Everybody's in it (C3) and escorts |
+| 12 | Firefighter | put out burning cars | R8 (car fires) | **note** owner drives the fire truck |
+| 13 | Vigilante | kill the criminals | R1 | **ok** helpers can shoot criminals once R1 exists |
+| 14 | Taxi Driver | fares into the taxi | R4 | **note** owner drives. Helpers can't take fares |
 
 ### Marty Chonks (payphone)
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 15 | The Crook | bank manager into your car, to the crusher | R4, R7 (crusher), R3 (factory door) | 🟡 owner drives and delivers the car to the crusher |
-| 16 | The Thieves | thieves to the dog food factory, respray, back | R4, R5 (respray), R3 | 🟡 owner drives |
-| 17 | The Wife | Mrs Chonks, dump the car in the sea | R4, R3 | 🟡 |
-| 18 | Her Lover | pick up the lover | R4 | 🟡 |
+| 15 | The Crook | bank manager into your car, to the crusher | R4, R7 (crusher), R3 (factory door) | **reqs** owner drives and delivers the car to the crusher |
+| 16 | The Thieves | thieves to the dog food factory, respray, back | R4, R5 (respray), R3 | **reqs** owner drives |
+| 17 | The Wife | Mrs Chonks, dump the car in the sea | R4, R3 | **reqs** |
+| 18 | Her Lover | pick up the lover | R4 | **reqs** |
 
 ### Luigi
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 19 | Give Me Liberty & Luigi's Girls | escape with 8-Ball, reach the hideout, take Misty to Luigi's | C5, C4, R4 (8-Ball, Misty), R10 (bridge wreck objects, swaps), R12 (critical restart point), clock | 🟡 starts by itself at a New Game, arbitrated like any contact |
-| 20 | Don't Spank Ma Bitch Up | bat pickup, beat the dealer, respray his car, stash it in Luigi's lock-up | R2, R5 (respray and lock-up) | 🟡 owner drives the car to the garages |
-| 21 | Drive Misty For Me | horn outside the hospital, Misty to Joey's | R4, R14 | 🟡 owner drives |
-| 22 | Pump-Action Pimp | free Colt pickup, kill the pimp | R1 (pimp's car), R2 | 🟡 |
-| 23 | The Fuzz Ball | round up four girls into your car in time | R4 (24 group sites) | 🟡 the girls follow the owner, so the owner does the driving |
+| 19 | Give Me Liberty & Luigi's Girls | escape with 8-Ball, reach the hideout, take Misty to Luigi's | C5, C4, R4 (8-Ball, Misty), R10 (bridge wreck objects, swaps), R12 (critical restart point), clock | **reqs** starts by itself at a New Game, arbitrated like any contact |
+| 20 | Don't Spank Ma Bitch Up | bat pickup, beat the dealer, respray his car, stash it in Luigi's lock-up | R2, R5 (respray and lock-up) | **reqs** owner drives the car to the garages |
+| 21 | Drive Misty For Me | horn outside the hospital, Misty to Joey's | R4, R14 | **reqs** owner drives |
+| 22 | Pump-Action Pimp | free Colt pickup, kill the pimp | R1 (pimp's car), R2 | **reqs** |
+| 23 | The Fuzz Ball | round up four girls into your car in time | R4 (24 group sites) | **reqs** the girls follow the owner, so the owner does the driving |
 
 ### Joey
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 24 | Mike Lips Last Lunch | Lips' car to 8-Ball's bomb shop and back, lose the cops, arm it | R6, R12 (wanted) | 🟡 anybody can drive it in (R6) |
-| 25 | Farewell 'Chunky' Lee Chong | Colt pickup, kill Chunky | R1 (Chunky and his Triads), R2 | 🟡 without R1, only the owner can hurt Chunky |
-| 26 | Van Heist | ram the security van, take it to the lock-up | R1 (the van), R5, R10 (garage type) | 🟡 |
-| 27 | Cipriani's Chauffeur | drive Toni's mother; Ammu-Nation starts selling the Uzi | R4, R12 (warp into car), R3 (doors), R2 and R10 (the Uzi unlock) | 🟡 |
-| 28 | Dead Skunk In The Trunk | shake the Forellis, the car to the crusher | R1 (Forelli car), R7 (crusher) | 🟡 owner delivers the car |
-| 29 | The Getaway | three thugs into a four-seat car, horn, bank doors, lose the cops | R4 (every seat), R14, R3 (bank doors), R9 (brakes), R12 (wanted) | 🟡 owner drives, nobody rides with him |
+| 24 | Mike Lips Last Lunch | Lips' car to 8-Ball's bomb shop and back, lose the cops, arm it | R6, R12 (wanted) | **reqs** anybody can drive it in (R6) |
+| 25 | Farewell 'Chunky' Lee Chong | Colt pickup, kill Chunky | R1 (Chunky and his Triads), R2 | **reqs** without R1, only the owner can hurt Chunky |
+| 26 | Van Heist | ram the security van, take it to the lock-up | R1 (the van), R5, R10 (garage type) | **reqs** |
+| 27 | Cipriani's Chauffeur | drive Toni's mother; Ammu-Nation starts selling the Uzi | R4, R12 (warp into car), R3 (doors), R2 and R10 (the Uzi unlock) | **reqs** |
+| 28 | Dead Skunk In The Trunk | shake the Forellis, the car to the crusher | R1 (Forelli car), R7 (crusher) | **reqs** owner delivers the car |
+| 29 | The Getaway | three thugs into a four-seat car, horn, bank doors, lose the cops | R4 (every seat), R14, R3 (bank doors), R9 (brakes), R12 (wanted) | **reqs** owner drives, nobody rides with him |
 
 ### Toni
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 30 | Taking Out The Laundry | destroy the laundry vans | R1 (vans), R2 (grenades) | 🟡 without R1 helpers can't destroy vans |
-| 31 | The Pick-Up | briefcase, ambush, cash back to Toni's | R2 | ✅ once R2 exists |
-| 32 | Salvatore's Called A Meeting | Joey, Luigi and Toni in the limo, horn, repair, Salvatore's garage | R4 (every seat), R14, R5, R3 | 🟡 owner drives, nobody rides |
-| 33 | Triads And Tribulations | shotgun, Triad fish van, kill the Triads | R1, R12 (shotgun), R15 (zone gang info) | 🟡 |
-| 34 | Blow Fish | the bomb truck into the fish factory | R6, R8 (explosions, fire), R10 (factory swap), clock | 🟡 |
+| 30 | Taking Out The Laundry | destroy the laundry vans | R1 (vans), R2 (grenades) | **reqs** without R1 helpers can't destroy vans |
+| 31 | The Pick-Up | briefcase, ambush, cash back to Toni's | R2 | **ok** once R2 exists |
+| 32 | Salvatore's Called A Meeting | Joey, Luigi and Toni in the limo, horn, repair, Salvatore's garage | R4 (every seat), R14, R5, R3 | **reqs** owner drives, nobody rides |
+| 33 | Triads And Tribulations | shotgun, Triad fish van, kill the Triads | R1, R12 (shotgun), R15 (zone gang info) | **reqs** |
+| 34 | Blow Fish | the bomb truck into the fish factory | R6, R8 (explosions, fire), R10 (factory swap), clock | **reqs** |
 
 ### Salvatore
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 35 | Chaperone | drive Maria in the Stretch, the raid, back to Salvatore's | R4 (Maria), R12 (warp into the Stretch), R5, R9 | 🟡 owner drives |
-| 36 | Cutting The Grass | Curly Bob in your taxi, then tail him without spooking him | R4 (Curly), R1, R13 (the Spookometer), R16 (its bar) | 🟡 everybody has to keep their distance |
-| 37 | Bomb Da Base: Act I | the briefing | nothing | ✅ |
-| 38 | Bomb Da Base: Act II | $100,000, 8-Ball, snipe the guards, the ship blows | R12 (sniper rifle for everybody), R13 (shooting in the area), R8, R10 (ship swap) | 🟡. The money check is the owner's |
-| 39 | Last Requests | the rigged car, the boat with Maria and Asuka; **the Staunton unlock** | R6, R12 (warp into the boat), R1 (Maria, Asuka), R10 (bridge, roads, tunnel) | 🟡 without R10 only the owner gets Staunton |
+| 35 | Chaperone | drive Maria in the Stretch, the raid, back to Salvatore's | R4 (Maria), R12 (warp into the Stretch), R5, R9 | **reqs** owner drives |
+| 36 | Cutting The Grass | Curly Bob in your taxi, then tail him without spooking him | R4 (Curly), R1, R13 (the Spookometer), R16 (its bar) | **reqs** everybody has to keep their distance |
+| 37 | Bomb Da Base: Act I | the briefing | nothing | **ok** |
+| 38 | Bomb Da Base: Act II | $100,000, 8-Ball, snipe the guards, the ship blows | R12 (sniper rifle for everybody), R13 (shooting in the area), R8, R10 (ship swap) | **reqs**. The money check is the owner's |
+| 39 | Last Requests | the rigged car, the boat with Maria and Asuka; **the Staunton unlock** | R6, R12 (warp into the boat), R1 (Maria, Asuka), R10 (bridge, roads, tunnel) | **reqs** without R10 only the owner gets Staunton |
 
 ### El Burro (payphone)
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 40 | Turismo | race three cars, finish first | R1 (the racers), R15 (roads) | ✅ the owner has to win; helpers can ram the racers once R1 exists |
-| 41 | I Scream, You Scream | briefcase (detonator), ice cream van, jingle, detonate | R2 | ✅ owner drives the van. The script arms it, so the owner's copy has the bomb |
-| 42 | Trial By Fire | flamethrower, 25 Triads in a frenzy | R2, R13 | ✅ replaying `START_KILL_FRENZY` hands it to `rampage.md`'s machinery |
-| 43 | Big'N'Veiny | follow the van and pick up the magazines | R7 (power pills) | ⚠ only the owner's car collects |
+| 40 | Turismo | race three cars, finish first | R1 (the racers), R15 (roads) | **ok** the owner has to win; helpers can ram the racers once R1 exists |
+| 41 | I Scream, You Scream | briefcase (detonator), ice cream van, jingle, detonate | R2 | **ok** owner drives the van. The script arms it, so the owner's copy has the bomb |
+| 42 | Trial By Fire | flamethrower, 25 Triads in a frenzy | R2, R13 | **ok** replaying `START_KILL_FRENZY` hands it to `rampage.md`'s machinery |
+| 43 | Big'N'Veiny | follow the van and pick up the magazines | R7 (power pills) | **note** only the owner's car collects |
 
 ### Asuka
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 44 | Sayonara Salvatore | wait unseen, then kill Salvatore | R1 (Salvatore, the Mafia cars), R13 (13 spotted checks), R5 (his garage), R15 | 🟡 without R1 a helper can't make the kill; without R13 a helper can't be spotted |
-| 45 | Under Surveillance | kill the surveillance team | R1 (their van) | 🟡 |
-| 46 | Paparazzi Purge | chase the spy boat | R1 (the boat) | 🟡 |
-| 47 | Payday For Ray | payphone to payphone against the clock | nothing | ⚠ the phones are the owner's |
-| 48 | Two-Faced Tanner | kill Tanner | R1, R12 (wanted), R15 (max wanted) | 🟡 |
+| 44 | Sayonara Salvatore | wait unseen, then kill Salvatore | R1 (Salvatore, the Mafia cars), R13 (13 spotted checks), R5 (his garage), R15 | **reqs** without R1 a helper can't make the kill; without R13 a helper can't be spotted |
+| 45 | Under Surveillance | kill the surveillance team | R1 (their van) | **reqs** |
+| 46 | Paparazzi Purge | chase the spy boat | R1 (the boat) | **reqs** |
+| 47 | Payday For Ray | payphone to payphone against the clock | nothing | **note** the phones are the owner's |
+| 48 | Two-Faced Tanner | kill Tanner | R1, R12 (wanted), R15 (max wanted) | **reqs** |
 
 ### Kenji
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 49 | Kanbu Bust-Out | a cop car, the bomb shop, blow the cell wall, Kanbu to the dojo | R6, R4 (Kanbu), R8, R10 (wall), R12 (wanted) | 🟡 owner drives the cop car |
-| 50 | Grand Theft Auto | three cars, mint, into Kenji's lock-up | R5 | 🟡 anybody delivers each car (R5) |
-| 51 | Deal Steal | Yardie car, the contact, horn, kill the Colombians, the briefcase | R4, R14, R1, R2, R13 (the rendezvous) | 🟡 everybody arrives in a Yardie car |
-| 52 | Shima | the protection money, punish the gang | R2, R10 (store swap) | 🟡 |
-| 53 | Smack Down | kill at least 8 dealers | R1 (every dealer) | 🟡 without R1 only the owner can kill a dealer |
+| 49 | Kanbu Bust-Out | a cop car, the bomb shop, blow the cell wall, Kanbu to the dojo | R6, R4 (Kanbu), R8, R10 (wall), R12 (wanted) | **reqs** owner drives the cop car |
+| 50 | Grand Theft Auto | three cars, mint, into Kenji's lock-up | R5 | **reqs** anybody delivers each car (R5) |
+| 51 | Deal Steal | Yardie car, the contact, horn, kill the Colombians, the briefcase | R4, R14, R1, R2, R13 (the rendezvous) | **reqs** everybody arrives in a Yardie car |
+| 52 | Shima | the protection money, punish the gang | R2, R10 (store swap) | **reqs** |
+| 53 | Smack Down | kill at least 8 dealers | R1 (every dealer) | **reqs** without R1 only the owner can kill a dealer |
 
 ### Ray (payphone)
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 54 | Silence The Sneak | grenades, torch the house, kill McAffrey | R12 (grenades), R8, R5 | 🟡 the ammo checks are the owner's grenades |
-| 55 | Arms Shortage | Phil's weapons, defend the condo | R2 (Phil's weapons for everybody), R3 (gate), R1 (the attacking cars), R9 | 🟡 R1 is the whole point of a defend mission with helpers |
-| 56 | Evidence Dash | chase the prosecution, collect the evidence, torch the car | R3 (files riding in the car), R1 | 🟡 |
-| 57 | Gone Fishing | a police boat, kill Ray's partner at the lighthouse | R3, R8, R1, clock | 🟡 |
-| 58 | Plaster Blaster | smash the bodycast with a car or a blast | R3 (object damage), R1 (the ambulance), R12 (wanted), R13 (the decoy's 25 m) | 🟡 |
-| 59 | Marked Man | Ray to the airport, the stash | R4 (Ray), R1 (the CIA), R3 (doors), R2 (the stash for everybody), R5 | 🟡 everybody takes the whole stash |
+| 54 | Silence The Sneak | grenades, torch the house, kill McAffrey | R12 (grenades), R8, R5 | **reqs** the ammo checks are the owner's grenades |
+| 55 | Arms Shortage | Phil's weapons, defend the condo | R2 (Phil's weapons for everybody), R3 (gate), R1 (the attacking cars), R9 | **reqs** R1 is the whole point of a defend mission with helpers |
+| 56 | Evidence Dash | chase the prosecution, collect the evidence, torch the car | R3 (files riding in the car), R1 | **reqs** |
+| 57 | Gone Fishing | a police boat, kill Ray's partner at the lighthouse | R3, R8, R1, clock | **reqs** |
+| 58 | Plaster Blaster | smash the bodycast with a car or a blast | R3 (object damage), R1 (the ambulance), R12 (wanted), R13 (the decoy's 25 m) | **reqs** |
+| 59 | Marked Man | Ray to the airport, the stash | R4 (Ray), R1 (the CIA), R3 (doors), R2 (the stash for everybody), R5 | **reqs** everybody takes the whole stash |
 
 ### Donald Love
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 60 | Liberator | a Colombian car through the gate, rescue the gentleman | R5 (the gate and garages), R4 | 🟡 owner drives |
-| 61 | Waka-Gashira Wipeout! | Colombian car, kill Kenji, dump the car | R12 (wanted), R9 | ✅ |
-| 62 | A Drop In The Ocean | follow the Cessna by boat, 18 floating packages | R7 (Cessna), R2 (floating packages) | 🟡 anybody's boat collects a package for the mission (R2) |
-| 67 | Grand Theft Aero | the airport, the construction lift (a cutscene), the package | R13 (spotted), R12 (the teleport after the lift) | 🟡 |
-| 68 | Escort Service | protect the truck | R1 (the hitmen), R2, R5 | 🟡 |
-| 69 | Decoy | six stars, lead the cops away | R12 (everybody gets the stars), R15 (max wanted) | ✅ once R12 exists |
-| 70 | Love's Disappearance | cutscene | nothing | ✅ |
+| 60 | Liberator | a Colombian car through the gate, rescue the gentleman | R5 (the gate and garages), R4 | **reqs** owner drives |
+| 61 | Waka-Gashira Wipeout! | Colombian car, kill Kenji, dump the car | R12 (wanted), R9 | **ok** |
+| 62 | A Drop In The Ocean | follow the Cessna by boat, 18 floating packages | R7 (Cessna), R2 (floating packages) | **reqs** anybody's boat collects a package for the mission (R2) |
+| 67 | Grand Theft Aero | the airport, the construction lift (a cutscene), the package | R13 (spotted), R12 (the teleport after the lift) | **reqs** |
+| 68 | Escort Service | protect the truck | R1 (the hitmen), R2, R5 | **reqs** |
+| 69 | Decoy | six stars, lead the cops away | R12 (everybody gets the stars), R15 (max wanted) | **ok** once R12 exists |
+| 70 | Love's Disappearance | cutscene | nothing | **ok** |
 
 ### King Courtney (payphone)
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 63 | Bling-Bling Scramble | race | R15 (roads) | ✅ the owner has to win |
-| 64 | Uzi Rider | drive-bys with the Yardies in your car | R11, R12 (Uzi), R4, R1 | 🟡 everybody's kills count (R11) |
-| 65 | Gangcar Round-Up | three gang cars to the lock-up | R5 | 🟡 anybody delivers (R5) |
-| 66 | Kingdom Come | stop the SPANKed-up vans | R8 (the human bombs) | 🟡 |
+| 63 | Bling-Bling Scramble | race | R15 (roads) | **ok** the owner has to win |
+| 64 | Uzi Rider | drive-bys with the Yardies in your car | R11, R12 (Uzi), R4, R1 | **reqs** everybody's kills count (R11) |
+| 65 | Gangcar Round-Up | three gang cars to the lock-up | R5 | **reqs** anybody delivers (R5) |
+| 66 | Kingdom Come | stop the SPANKed-up vans | R8 (the human bombs) | **reqs** |
 
 ### Asuka, Staunton and Shoreside
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 71 | Bait | lure the Colombians into the ambush | R1, R11, R15 | 🟡 everybody's kills count (R11) |
-| 72 | Espresso-2-Go! | wreck 15 stalls on three islands | R3 (object damage), R8 | 🟡 without R3 the helpers' wrecking doesn't count |
-| 73 | S.A.M. | boat to the buoy, rocket the Cessna, the cargo | R2 (rocket), R3, R7 (Cessna) | 🟡 the cargo is the owner's to touch (C1) |
+| 71 | Bait | lure the Colombians into the ambush | R1, R11, R15 | **reqs** everybody's kills count (R11) |
+| 72 | Espresso-2-Go! | wreck 15 stalls on three islands | R3 (object damage), R8 | **reqs** without R3 the helpers' wrecking doesn't count |
+| 73 | S.A.M. | boat to the buoy, rocket the Cessna, the cargo | R2 (rocket), R3, R7 (Cessna) | **reqs** the cargo is the owner's to touch (C1) |
 
 ### D-Ice (payphone)
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 74 | Uzi Money | 20 Nines with Uzi drive-bys, a frenzy | frenzy replay | ✅ `rampage.md` carries it |
-| 75 | Toyminator | RC buggy against the armoured vans | R7 | ⚠ the vans only take the buggy's damage, and only the owner has one |
-| 76 | Rigged To Blow | the rigged car to the defusal garage, no damage | R5 | 🟡 owner drives |
-| 77 | Bullion Run | 30 pieces of bullion in a car, drop-offs | R7 (power pills), R5 | ⚠ only the owner's car collects |
-| 78 | Rumble | bat, the contact, the gang war | R1, R2, R13 | 🟡 |
+| 74 | Uzi Money | 20 Nines with Uzi drive-bys, a frenzy | frenzy replay | **ok** `rampage.md` carries it |
+| 75 | Toyminator | RC buggy against the armoured vans | R7 | **note** the vans only take the buggy's damage, and only the owner has one |
+| 76 | Rigged To Blow | the rigged car to the defusal garage, no damage | R5 | **reqs** owner drives |
+| 77 | Bullion Run | 30 pieces of bullion in a car, drop-offs | R7 (power pills), R5 | **note** only the owner's car collects |
+| 78 | Rumble | bat, the contact, the gang war | R1, R2, R13 | **reqs** |
 
 ### The finale
 
 | # | Mission | What it asks | Needs | Verdict |
 |---|---|---|---|---|
-| 79 | The Exchange | the weapons taken, the dam, the chopper, the credits | R12 (everybody disarmed), R7 (Catalina's helicopter), R2 (the rocket launcher, one), R15, clock, the credits replayed | 🟡 anybody who hits the chopper counts once R7 exists |
+| 79 | The Exchange | the weapons taken, the dam, the chopper, the credits | R12 (everybody disarmed), R7 (Catalina's helicopter), R2 (the rocket launcher, one), R15, clock, the credits replayed | **reqs** anybody who hits the chopper counts once R7 exists |
 
 ---
 
@@ -919,7 +920,7 @@ By how many missions each requirement opens up, and by what it costs:
 
 ---
 
-## 6. What the owner decided
+## 6. What was decided
 
 Decided on 2026-09-24:
 

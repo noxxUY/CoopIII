@@ -9,6 +9,9 @@
 #include "run.h"
 
 #include "config.h"
+#include "firewall.h"
+#include "options.h"
+#include "probe.h"
 #include "reach.h"
 #include "server.h"
 
@@ -27,6 +30,7 @@
 #include <cstdio>
 #include <ctime>
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -75,36 +79,29 @@ struct SlotView {
 struct State {
 	Server                server;
 	ServerConfig          config;
-	ServerConfig          editing;     // what the dialog is changing
 	std::deque<Line>      lines;
 	bool                  running    = false;
-	bool                  optionsOpen = false;
+	OptionsDialog         options;
 	int                   filter     = 0;   // 0 all, 1 players, 2 chat
 	size_t                lastCount  = 0;
-	std::string           address;
 	std::string           startError;
 	bool                  copied     = false;
 	float                 copiedAt   = 0.0f;
+	bool                  lanCopied  = false;
+	float                 lanCopiedAt = 0.0f;
+	float                 tipSince   = -1.0f;    // when the pointer came onto the address
 	float                 savedAt    = -10.0f;   // when the rules last changed
 	SlotView              slots[MAX_PLAYERS];
+
+	// This machine's addresses as they were when the server started, and
+	// what the probe (server/probe.h) has found out about the rest. Made in
+	// RunWindow rather than with the rest, so the console never starts its
+	// thread.
+	std::vector<LocalAddress>   local;
+	std::unique_ptr<ReachProbe> probe;
 };
 
 State g_state;
-
-// ---- the address to share -------------------------------------------------
-
-// The address a player on the same network types in, and the one the design's
-// header shows: a private one behind a gateway if there is one
-// (PreferredLanAddress), or failing that the first there is.
-std::string LanAddress() {
-	const std::vector<LocalAddress> all = LocalIPv4Addresses();
-	if (const uint32_t lan = PreferredLanAddress(all))
-		return FormatAddress(lan);
-	for (const LocalAddress &a : all)
-		if (KindOf(a.addr) != AddressKind::LinkLocal)
-			return FormatAddress(a.addr);
-	return "127.0.0.1";
-}
 
 std::string Clock(uint32_t ms) {
 	const uint32_t seconds = ms / 1000;
@@ -152,21 +149,72 @@ void StartServer() {
 		return;
 	}
 	g_state.running = true;
-	g_state.server.SetPassword(g_state.config.password);
-	g_state.server.SetMissionRules(g_state.config.missionFailOnDeath,
-	                               g_state.config.missionMarginCm, g_state.config.missionEnemies,
-	                               g_state.config.missionScale);
-	g_state.address = LanAddress();
-	for (const std::string &line : ReachLines(LocalIPv4Addresses(), g_state.config.port))
+	// Everything else in the ini: the password, the player limit, the mission
+	// rules and the votes. SaveOptions calls it again with whatever changed.
+	g_state.server.Configure(g_state.config);
+	g_state.local = LocalIPv4Addresses();
+	for (const std::string &line :
+	     ReachLines(g_state.local, g_state.config.port, g_state.config.lookUpPublicAddress))
 		Say(LogKind::Info, line.c_str());
+	g_state.probe->Begin(g_state.config.port, g_state.local, g_state.config.lookUpPublicAddress,
+	                     g_state.config.openRouterPort);
 }
 
 void StopServer() {
 	if (!g_state.running)
 		return;
 	g_state.server.Stop();
+	g_state.probe->End();
 	g_state.running = false;
 	Say(LogKind::Info, "stopped");
+}
+
+// The colour of the icon in front of a line under the address.
+ImU32 ToneColour(Tone tone, const Theme &theme) {
+	return tone == Tone::Warn ? theme.statusWarn : tone == Tone::Ok ? theme.statusOk
+	                                                                : theme.textTertiary;
+}
+
+// One of the lines under the address, right-aligned like the design's hint,
+// with an icon in front when it is good news or something to act on.
+void HintLine(ImDrawList *draw, float rightEdge, float y, const Advice &advice,
+              const Theme &theme) {
+	if (advice.text.empty())
+		return;
+	const float w = MeasureText(Type::Hint, advice.text.c_str()).x;
+	TextRight(rightEdge, y, Type::Hint,
+	          advice.tone == Tone::Info ? theme.textTertiary : theme.textSecondary,
+	          advice.text.c_str());
+	if (advice.tone != Tone::Info)
+		DrawIcon(draw, advice.tone == Tone::Ok ? Icon::CircleCheck : Icon::TriangleAlert,
+		         ImVec2(rightEdge - w - 18.0f, y + 1.5f), 13.0f, ToneColour(advice.tone, theme));
+}
+
+// The dialog's Save: the file first, then the running session, then a line
+// in the console for each setting that moved, so what changed and when is
+// there to read back.
+void SaveOptions(float now) {
+	const ServerConfig before = g_state.config;
+	g_state.config            = g_state.options.editing;
+	const std::string path    = ServerConfig::Path();
+	if (!g_state.config.Save(path))
+		Say(LogKind::Warn, ("could not write " + path + "; the options hold until the server "
+		                    "closes")
+		                       .c_str());
+	if (g_state.running)
+		g_state.server.Configure(g_state.config);
+	g_state.savedAt = now;
+
+	const std::vector<std::string> changes = DescribeChanges(before, g_state.config);
+	if (changes.empty()) {
+		Say(LogKind::Info, "options saved, nothing changed");
+		return;
+	}
+	Say(LogKind::Info, "options saved");
+	for (const std::string &line : changes)
+		Say(LogKind::Info, line.c_str());
+	if (g_state.config.port != before.port && g_state.running)
+		Say(LogKind::Warn, "the port changes when the server is stopped and started again");
 }
 
 } // namespace
@@ -199,15 +247,20 @@ int RunWindow(const Startup &startup) {
 	                                           .c_str());
 	if (startup.portFromArgs)
 		Say(LogKind::Detail, "port came from the command line, not the file");
+	g_state.probe = std::make_unique<ReachProbe>();
 	StartServer();
 
 	// Servicing the session is not part of drawing. A dedicated server spends
 	// its life minimised, or behind something, or being dragged across a
 	// screen - and App::Run skips the frame for all three. This runs every
-	// turn of the loop regardless. 0 so it never blocks.
+	// turn of the loop regardless. 0 so it never blocks. What the probe has
+	// found out goes into the console here too, so none of it waits for the
+	// window to be looked at.
 	const auto tick = [] {
 		if (g_state.running)
 			g_state.server.Tick(0);
+		for (const ProbeLine &line : g_state.probe->TakeLines())
+			Say(line.warn ? LogKind::Warn : LogKind::Info, line.text.c_str());
 	};
 
 	const int result = app.Run([&] {
@@ -256,24 +309,24 @@ int RunWindow(const Startup &startup) {
 		// While the options are up, the screen behind them is a picture. The
 		// scrim says as much and this makes it true. The title bar is outside
 		// it on purpose: a dialog should never be able to trap the window.
-		ImGui::BeginDisabled(g_state.optionsOpen);
+		ImGui::BeginDisabled(g_state.options.open);
 
 		const float titleY = bandY + kBandTop;
 		const float titleW = Text(ImVec2(kPadX, titleY), Type::WindowHeading, theme.textPrimary,
 		                          "Server");
-		if (g_state.running)
-			Pill(ImVec2(kPadX + titleW + 14.0f, titleY + 4.0f), "Running", theme.statusOk,
-			     theme.okPillBg, theme.okPillBorder, true);
-		else
-			Pill(ImVec2(kPadX + titleW + 14.0f, titleY + 4.0f), "Stopped", theme.textTertiary,
-			     theme.bgSubtle, theme.borderControl);
+		const float pillW =
+		    g_state.running
+		        ? Pill(ImVec2(kPadX + titleW + 14.0f, titleY + 4.0f), "Running", theme.statusOk,
+		               theme.okPillBg, theme.okPillBorder, true)
+		        : Pill(ImVec2(kPadX + titleW + 14.0f, titleY + 4.0f), "Stopped",
+		               theme.textTertiary, theme.bgSubtle, theme.borderControl);
 
 		char summary[256];
 		if (g_state.running)
 			std::snprintf(summary, sizeof(summary),
 			              "Listening on UDP port %u \xC2\xB7 %u slots \xC2\xB7 protocol v%u "
 			              "\xC2\xB7 up %s \xC2\xB7 in-game %02u:%02u",
-			              g_state.server.Port(), MAX_PLAYERS, PROTOCOL_VERSION,
+			              g_state.server.Port(), g_state.server.PlayerLimit(), PROTOCOL_VERSION,
 			              Clock(g_state.server.UptimeMs()).c_str(), session.Clock().Hour(),
 			              session.Clock().Minute());
 		else
@@ -281,8 +334,11 @@ int RunWindow(const Startup &startup) {
 			              g_state.startError.empty()
 			                  ? "Not listening. Press Start server to open the port again."
 			                  : g_state.startError.c_str());
-		Text(ImVec2(kPadX, titleY + 34.0f + 6.0f), Type::BodySmall,
-		     g_state.startError.empty() ? theme.textSecondary : theme.statusFail, summary);
+		const float summaryW =
+		    Text(ImVec2(kPadX, titleY + 34.0f + 6.0f), Type::BodySmall,
+		         g_state.startError.empty() ? theme.textSecondary : theme.statusFail, summary);
+		// Where the left of the band ends, which the address cards stay clear of.
+		const float leftEnd = ImMax(kPadX + titleW + 14.0f + pillW, kPadX + summaryW) + 20.0f;
 
 		// Right of the band: the address to share, then the stop button.
 		const float rightEdge = screen.x - kPadX;
@@ -298,29 +354,38 @@ int RunWindow(const Startup &startup) {
 				StartServer();
 		}
 
-		char address[64];
-		std::snprintf(address, sizeof(address), "%s:%u",
-		              g_state.address.empty() ? "127.0.0.1" : g_state.address.c_str(),
-		              g_state.server.Port());
-		const float addrTextW = MeasureText(Type::MonoLarge, address).x;
+		// The address to hand out: the public one once it is known, since that
+		// is the one a friend on the internet types, with the same network's
+		// in a smaller card beside it (reach.h, ShareFor). Until then, or with
+		// the lookup off or failed, this network's, as it always was.
+		const uint16_t  port     = g_state.server.Port();
+		const ShareView share    = ShareFor(g_state.local, g_state.probe->Status(), port);
+		const bool      asking   = share.address.empty();
+		const char     *addrText = asking ? "Looking up..." : share.address.c_str();
+
+		const float addrTextW = MeasureText(Type::MonoLarge, addrText).x;
 		const float addrW     = 14.0f + ImMax(addrTextW, 112.0f) + 16.0f + 36.0f + 8.0f;
 		const Rect  addrBox{ImVec2(stopBox.pos.x - 12.0f - addrW, titleY), ImVec2(addrW, 56.0f)};
 		Card(addrBox, theme, radius::kPrimary);
 		Text(Add(addrBox.pos, ImVec2(14.0f, 8.0f)), Type::MetaLabel, theme.textTertiary,
-		     "Address to share");
+		     share.label);
 		Text(Add(addrBox.pos, ImVec2(14.0f, 8.0f + 16.0f + 2.0f)), Type::MonoLarge,
-		     theme.textPrimary, address);
+		     asking ? theme.textTertiary : theme.textPrimary, addrText);
 		// The tick that says it went on the clipboard grows in and the copy
 		// icon fades under it, then they swap back a second and a half later.
 		const Rect  copyBox{ImVec2(addrBox.Max().x - 8.0f - 36.0f, addrBox.pos.y + 10.0f),
 		                    ImVec2(36.0f, 36.0f)};
 		const float done = Appear("##copied", g_state.copied, 18.0f);
+		ImGui::BeginDisabled(asking);
 		if (IconButton("##copy", copyBox, Icon::Copy, theme,
-		               WithAlpha(theme.textButton, 1.0f - done), 16.0f, true, theme.bgSubtle)) {
-			App::SetClipboard(address);
+		               WithAlpha(asking ? theme.textMuted : theme.textButton, 1.0f - done), 16.0f,
+		               true, theme.bgSubtle)) {
+			App::SetClipboard(share.address);
 			g_state.copied   = true;
 			g_state.copiedAt = app.Seconds();
 		}
+		ImGui::EndDisabled();
+		ImGui::SetItemTooltip("Copy");
 		if (done > 0.0f) {
 			const DrawGroup tick(draw);
 			DrawIcon(draw, Icon::Check, ImVec2(copyBox.pos.x + 10.0f, copyBox.pos.y + 10.0f),
@@ -331,11 +396,78 @@ int RunWindow(const Startup &startup) {
 		if (g_state.copied && app.Seconds() - g_state.copiedAt > 1.6f)
 			g_state.copied = false;
 
-		char forward[128];
-		std::snprintf(forward, sizeof(forward),
-		              "For friends outside your network, forward UDP port %u on your router.",
-		              g_state.server.Port());
-		TextRight(rightEdge, titleY + 56.0f + 8.0f, Type::Hint, theme.textTertiary, forward);
+		// Resting on the card says who the address is for. Tested rather
+		// than submitted, so the copy button keeps its clicks, and after a
+		// moment, so crossing the header does not flash it.
+		const bool overAddr =
+		    !g_state.options.open && ImGui::IsMouseHoveringRect(addrBox.pos, addrBox.Max()) &&
+		    !ImGui::IsMouseHoveringRect(copyBox.pos, copyBox.Max());
+		if (!overAddr)
+			g_state.tipSince = -1.0f;
+		else if (g_state.tipSince < 0.0f)
+			g_state.tipSince = app.Seconds();
+		else if (app.Seconds() - g_state.tipSince > 0.4f) {
+			const ReachStatus status = g_state.probe->Status();
+			if (share.isPublic)
+				ImGui::SetTooltip("What friends on the internet type to join.\nOn this PC, "
+				                  "connect with 127.0.0.1:%u instead: many routers do not loop\n"
+				                  "the public address back to your own network.",
+				                  static_cast<unsigned>(port));
+			else if (asking)
+				ImGui::SetTooltip("Asking a what-is-my-IP service for this network's public "
+				                  "address.");
+			else
+				ImGui::SetTooltip("What players on your own network type to join.%s",
+				                  status.lookup == LookupState::Off
+				                      ? "\nLooking up the public address is off in Options."
+				                  : status.lookup == LookupState::Failed
+				                      ? "\nThe public address could not be looked up."
+				                      : "");
+		}
+
+		// The same network's, when the main card is the public one and there
+		// is room beside the band's text. Clicking anywhere on it copies it.
+		if (!share.lan.empty()) {
+			const float lanTextW = MeasureText(Type::Mono, share.lan.c_str()).x;
+			const float lanW     = 14.0f + ImMax(lanTextW, 84.0f) + 16.0f;
+			const Rect  lanBox{ImVec2(addrBox.pos.x - 10.0f - lanW, titleY), ImVec2(lanW, 56.0f)};
+			if (lanBox.pos.x >= leftEnd) {
+				const Touched lanTouch = Hotspot("##lancard", lanBox);
+				if (lanTouch.clicked) {
+					App::SetClipboard(share.lan);
+					g_state.lanCopied   = true;
+					g_state.lanCopiedAt = app.Seconds();
+				}
+				if (lanTouch.hovered) {
+					ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+					ImGui::SetTooltip("What players on your own network type. Click to copy.");
+				}
+				if (g_state.lanCopied && app.Seconds() - g_state.lanCopiedAt > 1.6f)
+					g_state.lanCopied = false;
+				const float lanDone = Appear("##lancopied", g_state.lanCopied, 18.0f);
+				Card(lanBox, theme, radius::kPrimary, Lift(theme.bgCard, theme, lanTouch.t * 0.5f));
+				const ImVec2 labelAt = Add(lanBox.pos, ImVec2(14.0f, 8.0f));
+				{
+					const DrawGroup label(draw);
+					Text(labelAt, Type::MetaLabel, theme.textTertiary, "Same network");
+					label.Fade(1.0f - lanDone);
+				}
+				if (lanDone > 0.0f) {
+					const DrawGroup label(draw);
+					Text(labelAt, Type::MetaLabel, theme.statusOk, "Copied");
+					label.Fade(lanDone);
+				}
+				Text(Add(lanBox.pos, ImVec2(14.0f, 8.0f + 16.0f + 4.0f)), Type::Mono,
+				     theme.textSecondary, share.lan.c_str());
+			}
+		}
+
+		// Under them, the router and how the host connects - or, stopped,
+		// nothing, since none of it is true of a server that is not there.
+		if (g_state.running) {
+			HintLine(draw, rightEdge, titleY + 56.0f + 8.0f, share.port, theme);
+			HintLine(draw, rightEdge, titleY + 56.0f + 8.0f + 17.0f, share.note, theme);
+		}
 
 		// ---- the body ------------------------------------------------------
 		const float bodyY = bandY + bandH + kBodyTop;
@@ -349,7 +481,8 @@ int RunWindow(const Startup &startup) {
 		Text(ImVec2(kPadX + 16.0f, bodyY + (kHeaderH - 20.0f) * 0.5f), Type::SectionTitle,
 		     theme.textPrimary, "Players");
 		char count[16];
-		std::snprintf(count, sizeof(count), "%u / %u", session.Count(), MAX_PLAYERS);
+		std::snprintf(count, sizeof(count), "%u / %u", session.Count(), 
+		              g_state.server.PlayerLimit());
 		TextRight(playersBox.Max().x - 16.0f, bodyY + (kHeaderH - 20.0f) * 0.5f, Type::Mono,
 		          theme.textSecondary, count);
 
@@ -397,7 +530,11 @@ int RunWindow(const Startup &startup) {
 				              0, 1.0f);
 				TextMiddle(ImVec2(badgeBox.pos.x + (28.0f - bw) * 0.5f, badgeBox.pos.y), 28.0f,
 				           Type::Mono, theme.textTertiary, badge);
-				TextMiddle(ImVec2(nameX, rowY), kRowH, Type::Body, theme.textTertiary, "Open");
+				// Closed rather than open once the server's player limit is
+				// reached: nobody else can take it.
+				const bool closed = session.Count() >= g_state.server.PlayerLimit();
+				TextMiddle(ImVec2(nameX, rowY), kRowH, Type::Body,
+				           closed ? theme.textMuted : theme.textTertiary, closed ? "Closed" : "Open");
 				open.Fade(1.0f - filled);
 			}
 
@@ -444,7 +581,7 @@ int RunWindow(const Startup &startup) {
 		}
 
 		// Rules. The whole card opens the options, not just the button on the
-		// end of it: the three values are what somebody came here to change.
+		// end of it: the values are what somebody came here to change.
 		// Submitted before the Options button, so the button still wins where
 		// the two overlap.
 		const float   optionsW = 110.0f;
@@ -461,8 +598,7 @@ int RunWindow(const Startup &startup) {
 		                      ImVec2(optionsBox.pos.x - 10.0f - rulesBox.pos.x, rulesBox.size.y)};
 		const Touched rulesTouch = Hotspot("##rulescard", cardHit);
 		if (rulesTouch.clicked) {
-			g_state.editing     = g_state.config;
-			g_state.optionsOpen = true;
+			g_state.options.Open(g_state.config);
 		}
 		if (rulesTouch.hovered)
 			ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -475,18 +611,18 @@ int RunWindow(const Startup &startup) {
 		Text(ImVec2(rightX + 20.0f, bodyY + (kRulesH - 20.0f) * 0.5f), Type::SectionTitle,
 		     theme.textPrimary, "Rules");
 
-		struct Rule {
-			const char *label;
-			std::string value;
-		};
-		const Rule rules[] = {
-		    {"Friendly fire", g_state.config.friendlyFire ? "On" : "Off"},
-		    {"Wanted level", Label(g_state.config.wantedLevel)},
-		    {"Mission fails on death", g_state.config.missionFailOnDeath ? "On" : "Off"},
-		};
-
+		// As many of the rules as fit before the button, in the order people
+		// ask about them (options.cpp, SummariseRules). The rest are a click
+		// away, and the tooltip says how many.
+		const std::vector<RuleSummary> rules = SummariseRules(g_state.config);
 		float ruleX = rightX + 20.0f + 64.0f + 22.0f;
-		for (int i = 0; i < 3; ++i) {
+		size_t ruleCount = 0;
+		for (size_t i = 0; i < rules.size(); ++i) {
+			const float w = ImMax(MeasureText(Type::MetaLabel, rules[i].label).x,
+			                      MeasureText(Type::SectionTitle, rules[i].value.c_str()).x);
+			if (ruleX + w > optionsBox.pos.x - 16.0f)
+				break;
+			++ruleCount;
 			if (i > 0) {
 				draw->AddLine(ImVec2(ruleX - 11.0f, bodyY + 14.0f),
 				              ImVec2(ruleX - 11.0f, bodyY + kRulesH - 14.0f), theme.border, 1.0f);
@@ -494,18 +630,73 @@ int RunWindow(const Startup &startup) {
 			Text(ImVec2(ruleX, bodyY + 14.0f), Type::MetaLabel, theme.textTertiary, rules[i].label);
 			Text(ImVec2(ruleX, bodyY + 14.0f + 16.0f + 4.0f), Type::SectionTitle,
 			     theme.textPrimary, rules[i].value.c_str());
-			const float w = ImMax(MeasureText(Type::MetaLabel, rules[i].label).x,
-			                      MeasureText(Type::SectionTitle, rules[i].value.c_str()).x);
 			ruleX += w + 44.0f;
 		}
+		if (rulesTouch.hovered && ruleCount < SettingCount())
+			ImGui::SetTooltip("%zu more settings in Options", SettingCount() - ruleCount);
 
 		if (OutlineButton("##options", optionsBox, "Options", Icon::Gear, theme, true)) {
-			g_state.editing     = g_state.config;
-			g_state.optionsOpen = true;
+			g_state.options.Open(g_state.config);
+		}
+
+		// Windows Firewall, when it is keeping players out (firewall.h). Only
+		// then: a firewall that lets the server in is a line in the console,
+		// not something to look at all session. The console gives up the room.
+		float consoleY = bodyY + kRulesH + 16.0f;
+		{
+			const FirewallVerdict verdict = g_state.probe->Firewall();
+			const FirewallAdvice  advice  = AdviseFirewall(verdict, g_state.server.Port());
+			const bool            warn    = g_state.running && advice.tone == Tone::Warn;
+			const float           shown   = Appear("##firewall", warn, 12.0f);
+			if (shown > 0.0f) {
+				const bool  allowing = g_state.probe->Allowing();
+				const float buttonW  = advice.canFix ? 204.0f : 0.0f;
+				const float textX    = rightX + 16.0f + 18.0f + 12.0f;
+				const float textW =
+				    rightW - (textX - rightX) - 16.0f - (buttonW > 0.0f ? buttonW + 16.0f : 0.0f);
+				const float detailH = MeasureWrapped(Type::BodySmall, textW, advice.detail.c_str()).y;
+				const float bannerH = ImMax(68.0f, 11.0f + 20.0f + detailH + 12.0f);
+				const Rect  banner{ImVec2(rightX, consoleY), ImVec2(rightW, bannerH)};
+				{
+					const DrawGroup group(draw);
+					Card(banner, theme, radius::kCard, theme.bgCard,
+					     Mix(theme.border, theme.statusWarn, 0.55f));
+					DrawIcon(draw, Icon::TriangleAlert, ImVec2(rightX + 16.0f, consoleY + 13.0f),
+					         18.0f, theme.statusWarn);
+					Text(ImVec2(textX, consoleY + 11.0f), Type::SectionTitle, theme.textPrimary,
+					     advice.title.c_str());
+					TextWrapped(ImVec2(textX, consoleY + 11.0f + 20.0f), textW, Type::BodySmall,
+					            theme.textTertiary, advice.detail.c_str());
+					group.Fade(shown);
+					group.Move(ImVec2(0.0f, (1.0f - shown) * -6.0f * Travel()));
+				}
+				// The button is there to be pressed or it is not (see the kick
+				// button); it comes once the banner has.
+				if (advice.canFix && warn && shown > 0.9f) {
+					const Rect allowBox{ImVec2(banner.Max().x - 12.0f - buttonW,
+					                           consoleY + (bannerH - 44.0f) * 0.5f),
+					                    ImVec2(buttonW, 44.0f)};
+					ImGui::BeginDisabled(allowing);
+					if (OutlineButton("##fwallow", allowBox,
+					                  allowing ? "Waiting for Windows" : "Allow in firewall",
+					                  Icon::ShieldCheck, theme, false, Type::ButtonSmall,
+					                  theme.statusOk))
+						g_state.probe->AllowInFirewall(app.Hwnd());
+					ImGui::EndDisabled();
+					ImGui::SetItemTooltip(
+					    "Adds a Windows Firewall rule letting server.exe receive UDP, with netsh "
+					    "run as administrator.%s\nWindows asks for permission first; nothing "
+					    "changes if you say no.",
+					    verdict.state == FirewallState::Blocked
+					        ? "\nserver.exe's other inbound rules are deleted first, the one "
+					          "blocking it among them,\nsince a block beats any allow."
+					        : "");
+				}
+				consoleY += (bannerH + 16.0f) * EaseOut(shown);
+			}
 		}
 
 		// Console.
-		const float consoleY = bodyY + kRulesH + 16.0f;
 		const Rect  consoleBox{ImVec2(rightX, consoleY),
 		                       ImVec2(rightW, screen.y - kBodyBot - consoleY)};
 		Card(consoleBox, theme, radius::kCard, theme.bgConsole);
@@ -562,123 +753,11 @@ int RunWindow(const Startup &startup) {
 		ImGui::EndDisabled();
 
 		// ---- the options dialog --------------------------------------------
-		// It arrives and it leaves; while it is on its way out it is still
-		// drawn but nothing in it can be pressed.
-		const float dialogT = Appear("##options", g_state.optionsOpen, 17.0f);
-		if (dialogT > 0.0f) {
-			// The scrim starts under the title bar, as the design draws it.
-			const Dialog dialog(screen, ImVec2(560.0f, 398.0f), theme, dialogT, kTitleBar);
-			ImGui::BeginDisabled(!g_state.optionsOpen);
-
-			const Rect box = dialog.box;
-			Card(box, theme, radius::kDialog, theme.bgPanel, theme.borderControl);
-
-			const float dx = box.pos.x + 28.0f;
-			const float dw = box.size.x - 56.0f;
-			float       dy = box.pos.y + 24.0f;
-
-			DrawIcon(draw, Icon::Gear, ImVec2(dx, dy + 4.0f), 20.0f, theme.textSecondary);
-			Text(ImVec2(dx + 30.0f, dy), Type::DialogHeading, theme.textPrimary,
-			     "Server options");
-			if (IconButton("##optclose", {ImVec2(box.Max().x - 28.0f - 36.0f, dy - 4.0f),
-			                              ImVec2(36.0f, 36.0f)},
-			               Icon::Close, theme, theme.textSecondary, 18.0f, false))
-				g_state.optionsOpen = false;
-
-			dy += 28.0f + 8.0f;
-			Text(ImVec2(dx, dy), Type::Body, theme.textSecondary,
-			     "Synced to every player in the session. Defaults match single player.");
-			dy += 20.0f + 6.0f;
-
-			auto row = [&](const char *title, const char *detail, float height, bool divider) {
-				const float top = dy;
-				dy += 18.0f;
-				Text(ImVec2(dx, dy), Type::SectionTitle, theme.textPrimary, title);
-				TextWrapped(ImVec2(dx, dy + 24.0f), dw - 180.0f, Type::BodySmall,
-				            theme.textTertiary, detail);
-				dy = top + height;
-				if (divider)
-					draw->AddLine(ImVec2(dx, dy - 0.5f), ImVec2(dx + dw, dy - 0.5f), theme.border,
-					              1.0f);
-				return top;
-			};
-
-			float top = row("Friendly fire", "Players can hurt and kill each other.", 74.0f, true);
-			Switch("##optff", ImVec2(box.Max().x - 28.0f - 48.0f, top + 18.0f + 6.0f),
-			       &g_state.editing.friendlyFire, theme);
-
-			top = row("Wanted level",
-			          "Per player: everyone keeps their own stars, shared while riding in the "
-			          "same car.",
-			          92.0f, true);
-			static const char *const kWanted[] = {"Per player", "Shared", "Off"};
-			int                      wanted    = static_cast<int>(g_state.editing.wantedLevel);
-			const float              wantedW   = 208.0f;
-			if (Segmented("##optwanted",
-			              {ImVec2(box.Max().x - 28.0f - wantedW, top + 18.0f + 4.0f),
-			               ImVec2(wantedW, 38.0f)},
-			              kWanted, 3, &wanted, theme))
-				g_state.editing.wantedLevel = static_cast<WantedLevelRule>(wanted);
-
-			top = row("Mission fails on death",
-			          "If anyone dies during a mission, it fails for everyone.", 74.0f, false);
-			Switch("##optmission", ImVec2(box.Max().x - 28.0f - 48.0f, top + 18.0f + 6.0f),
-			       &g_state.editing.missionFailOnDeath, theme);
-
-			const float actionsY = box.Max().y - 24.0f - 44.0f;
-			if (LinkText("##optreset", ImVec2(dx, actionsY + 13.0f), Type::ButtonSmall,
-			             theme.textSecondary, "Reset to defaults"))
-				g_state.editing = ServerConfig{};
-
-			if (PrimaryButton("##optsave",
-			                  {ImVec2(box.Max().x - 28.0f - 92.0f, actionsY), ImVec2(92.0f, 44.0f)},
-			                  "Save", Icon::Check, true, theme, Type::ButtonSmall)) {
-				const bool portChanged = g_state.editing.port != g_state.config.port;
-				const bool ffChanged   = g_state.editing.friendlyFire != g_state.config.friendlyFire;
-				const bool wlChanged   = g_state.editing.wantedLevel != g_state.config.wantedLevel;
-				g_state.config = g_state.editing;
-				g_state.config.Save(ServerConfig::Path());
-				g_state.server.SessionRef().SetFriendlyFire(g_state.config.friendlyFire);
-				g_state.server.SessionRef().SetAmmoSync(g_state.config.ammoSync);
-				g_state.server.SessionRef().SetWantedRule(WireValue(g_state.config.wantedLevel));
-				g_state.server.SessionRef().SetRampageRule(WireValue(g_state.config.rampage));
-				// Not in the dialog, the same as the rampage rule: the ini is where
-				// it is set, and this keeps a save from quietly putting it back.
-				g_state.server.SessionRef().SetCheatRule(WireValue(g_state.config.cheats));
-				g_state.server.SessionRef().SetMoneyRule(WireValue(g_state.config.money));
-				g_state.server.SessionRef().SetPackageRule(
-				    WireValue(g_state.config.hiddenPackages));
-				g_state.savedAt = app.Seconds();
-				Say(LogKind::Info, "options saved");
-				if (wlChanged) {
-					char line[128];
-					std::snprintf(line, sizeof(line),
-					              "wanted level is now %s; players already in the "
-					              "session keep the old rule until they rejoin",
-					              Name(g_state.config.wantedLevel));
-					Say(LogKind::Info, line);
-				}
-				if (ffChanged)
-					Say(LogKind::Info, g_state.config.friendlyFire
-					                       ? "friendly fire is on; players already in the session "
-					                         "are told on their next join"
-					                       : "friendly fire is off");
-				if (portChanged)
-					Say(LogKind::Warn, "the port only changes when the server restarts");
-				g_state.optionsOpen = false;
-			}
-			if (OutlineButton("##optcancel",
-			                  {ImVec2(box.Max().x - 28.0f - 92.0f - 10.0f - 96.0f, actionsY),
-			                   ImVec2(96.0f, 44.0f)},
-			                  "Cancel", Icon::Close, theme, false, Type::ButtonSmall))
-				g_state.optionsOpen = false;
-
-			if (ImGui::IsKeyPressed(ImGuiKey_Escape))
-				g_state.optionsOpen = false;
-
-			ImGui::EndDisabled();
-			dialog.End();
-		}
+		// options.cpp. It arrives and it leaves; while it is on its way out it
+		// is still drawn but nothing in it can be pressed.
+		if (DrawOptions(g_state.options, g_state.config, app, screen, kTitleBar) ==
+		    OptionsResult::Save)
+			SaveOptions(app.Seconds());
 
 		ImGui::End();
 		ImGui::PopStyleColor();
@@ -686,6 +765,9 @@ int RunWindow(const Startup &startup) {
 	}, tick);
 
 	StopServer();
+	// Closes the port on the router, if it was opened, before the process
+	// goes. Bounded, so a router that has stopped answering cannot keep it.
+	g_state.probe->Finish();
 	return result;
 }
 

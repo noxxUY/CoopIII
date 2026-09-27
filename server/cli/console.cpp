@@ -5,6 +5,7 @@
 // server itself is server/core/server.h, the same class the window runs.
 #include "run.h"
 
+#include "probe.h"
 #include "reach.h"
 #include "server.h"
 
@@ -56,17 +57,33 @@ int RunConsole(const Startup &startup) {
 	                  WireValue(startup.config.money),
 	                  WireValue(startup.config.hiddenPackages)))
 		return 1;
-	server.SetPassword(startup.config.password);
-	server.SetMissionRules(startup.config.missionFailOnDeath, startup.config.missionMarginCm,
-	                       startup.config.missionEnemies, startup.config.missionScale);
-	for (const std::string &line : ReachLines(LocalIPv4Addresses(), startup.config.port))
+	// Everything else in the ini: the password, the player limit, the mission
+	// rules, the votes. The window calls the same again on every save.
+	server.Configure(startup.config);
+	const std::vector<LocalAddress> local = LocalIPv4Addresses();
+	for (const std::string &line :
+	     ReachLines(local, startup.config.port, startup.config.lookUpPublicAddress))
 		std::printf("[coopiii] %s\n", line.c_str());
 
-	while (g_running)
+	// The public address, the router and the firewall, found out on a thread
+	// of their own (server/probe.h); what it finds is printed between ticks.
+	ReachProbe probe;
+	probe.Begin(startup.config.port, local, startup.config.lookUpPublicAddress,
+	            startup.config.openRouterPort);
+	const auto say = [&probe] {
+		for (const ProbeLine &line : probe.TakeLines())
+			std::printf("[coopiii] %s\n", line.text.c_str());
+	};
+
+	while (g_running) {
 		server.Tick();
+		say();
+	}
 
 	std::printf("[coopiii] shutting down\n");
 	server.Stop();
+	probe.Finish();
+	say();
 	return 0;
 }
 
