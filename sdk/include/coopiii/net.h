@@ -31,6 +31,18 @@ struct Message {
 	}
 };
 
+// How long the server gives a player's connection that has stopped answering
+// before it drops it. ENet's own default is 5 s at the least and 30 s at the
+// most, and a game that crashed kept its player in the session for most of
+// the 30: a mission it owned froze everybody else in it for as long. A peer is
+// dropped once NET_PEER_TIMEOUT_MIN_MS has gone by with ENet's resends of an
+// unacknowledged packet used up, or once NET_PEER_TIMEOUT_MAX_MS has gone by
+// whatever; ENet pings every 500 ms, so there is always one to wait for. A
+// hitch shorter than the minimum never drops anybody.
+constexpr uint32_t NET_PEER_TIMEOUT_LIMIT  = 32;   // ENet's own, the resends
+constexpr uint32_t NET_PEER_TIMEOUT_MIN_MS = 5000;
+constexpr uint32_t NET_PEER_TIMEOUT_MAX_MS = 10000;
+
 // Global ENet init/deinit, refcounted. Safe to call from any number of
 // NetClient/servers in one process.
 bool NetInit();
@@ -61,10 +73,15 @@ public:
 	// and moves state on connect/disconnect/timeout.
 	void Service(std::vector<Message> &out);
 
+	// What the server gave as its reason the last time it hung up on us (its
+	// NetServer::Disconnect `reason`), 0 for a timeout or none yet.
+	uint32_t LastDisconnectReason() const { return m_lastReason; }
+
 private:
 	_ENetHost *m_host = nullptr;
 	_ENetPeer *m_peer = nullptr;
 	State      m_state = DISCONNECTED;
+	uint32_t   m_lastReason = 0;
 };
 
 // Server side. `peerId` is an ENet-level connection id, distinct from the
@@ -103,11 +120,25 @@ public:
 
 	void Disconnect(PeerId peer, uint8_t reason);
 
+	// Whether a peer is one of the session's players. Broadcast reaches those
+	// alone: a connection that never said hello, or is still waiting on its
+	// password, was sent every chat line and every snapshot.
+	void SetMember(PeerId peer, bool member);
+
+	// ENet's own estimate of the round trip to this peer, in ms. The server
+	// GUI shows it per player; nothing in the protocol depends on it.
+	uint32_t RoundTripMs(PeerId peer) const;
+
+	// The longest a connected peer that has gone silent is kept, in ms: what
+	// its connection was given (NET_PEER_TIMEOUT_MAX_MS), 0 for no such peer.
+	uint32_t PeerTimeoutMaxMs(PeerId peer) const;
+
 	// Blocks up to timeoutMs waiting for the first event, then drains the rest.
 	void Service(std::vector<ServerEvent> &out, uint32_t timeoutMs = 0);
 
 private:
-	_ENetHost *m_host = nullptr;
+	_ENetHost           *m_host = nullptr;
+	std::vector<uint8_t> m_members;
 };
 
 template <class T>

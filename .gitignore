@@ -17,3 +17,6 @@
 .vscode/
 *.user
 Thumbs.db
+
+# Dear ImGui writes this next to whatever ran last; nothing here wants it.
+imgui.ini

@@ -48,7 +48,14 @@ bool InterpBuffer::Sample(uint32_t renderTimeMs, Pose &out) const {
 
 	const Snapshot &newest = m_samples.back();
 
-	if (m_samples.size() == 1 || renderTimeMs >= newest.timeMs) {
+	// Only when the render instant really is past the newest sample. This
+	// used to also take a lone sample rendered *before* its own time, which
+	// is every stream's first frames (SampleDelayed starts DELAY_MS behind
+	// it): the unsigned subtraction wrapped and hit the cap, so a new remote
+	// was drawn 250 ms ahead of itself and pulled back once the second sample
+	// came in. Nobody saw it while the velocities were 50 times too small; at
+	// 25 m/s it's 6 m. A lone sample now falls through to the hold below.
+	if (renderTimeMs >= newest.timeMs) {
 		// Ahead of everything we have. Extrapolate along the last known
 		// velocity for a bounded window, then just hold position instead of
 		// letting it drift off forever.
@@ -92,6 +99,40 @@ bool InterpBuffer::Sample(uint32_t renderTimeMs, Pose &out) const {
 
 	out.pos     = newest.pos;
 	out.heading = newest.heading;
+	return true;
+}
+
+bool InterpBuffer::VelocityAt(uint32_t renderTimeMs, Vec3 &out) const {
+	if (m_samples.empty())
+		return false;
+
+	const Snapshot &newest = m_samples.back();
+	if (renderTimeMs >= newest.timeMs) {
+		// Held once the extrapolation window is spent, as Sample holds it.
+		out = renderTimeMs - newest.timeMs >= MAX_EXTRAPOLATE_MS ? Vec3{0.0f, 0.0f, 0.0f}
+		                                                         : newest.velocity;
+		return true;
+	}
+	const Snapshot &oldest = m_samples.front();
+	if (renderTimeMs <= oldest.timeMs) {
+		out = oldest.velocity;
+		return true;
+	}
+	for (size_t i = 0; i + 1 < m_samples.size(); ++i) {
+		const Snapshot &a = m_samples[i];
+		const Snapshot &b = m_samples[i + 1];
+		if (renderTimeMs < a.timeMs || renderTimeMs >= b.timeMs)
+			continue;
+		const uint32_t span = b.timeMs - a.timeMs;
+		if (span == 0 || DistanceSq(a.pos, b.pos) > SNAP_DISTANCE * SNAP_DISTANCE) {
+			out = {0.0f, 0.0f, 0.0f};
+			return true;
+		}
+		const float inv = 1000.0f / static_cast<float>(span);
+		out = {(b.pos.x - a.pos.x) * inv, (b.pos.y - a.pos.y) * inv, (b.pos.z - a.pos.z) * inv};
+		return true;
+	}
+	out = newest.velocity;
 	return true;
 }
 
@@ -156,7 +197,9 @@ bool VehicleInterpBuffer::Sample(uint32_t renderTimeMs, VehicleTransform &out) c
 
 	const Snapshot &newest = m_samples.back();
 
-	if (m_samples.size() == 1 || renderTimeMs >= newest.timeMs) {
+	// Same condition as the ped buffer's, for the same reason: a lone sample
+	// rendered before its own time is held, not thrown 250 ms forward.
+	if (renderTimeMs >= newest.timeMs) {
 		const uint32_t ahead = renderTimeMs - newest.timeMs;
 		const float    dt    = std::min(ahead, MAX_EXTRAPOLATE_MS) / 1000.0f;
 		out.pos = {newest.pos.x + newest.velocity.x * dt,
@@ -203,13 +246,40 @@ bool VehicleInterpBuffer::Sample(uint32_t renderTimeMs, VehicleTransform &out) c
 
 bool VehicleInterpBuffer::SampleDelayed(uint32_t localNowMs,
                                         VehicleTransform &out) {
+	return SampleOnClock(localNowMs, /*holdAtNewest=*/false, out);
+}
+
+bool VehicleInterpBuffer::SampleDelayedHeld(uint32_t localNowMs,
+                                            VehicleTransform &out) {
+	return SampleOnClock(localNowMs, /*holdAtNewest=*/true, out);
+}
+
+bool VehicleInterpBuffer::SampleOnClock(uint32_t localNowMs, bool holdAtNewest,
+                                        VehicleTransform &out) {
 	if (m_samples.empty()) {
 		m_clock.Stop();
 		return false;
 	}
 	const uint32_t newest = m_samples.back().timeMs;
 	const uint32_t target = newest > DELAY_MS ? newest - DELAY_MS : 0;
-	return Sample(m_clock.Advance(localNowMs, target), out);
+	uint32_t       at     = m_clock.Advance(localNowMs, target);
+	// Clamping the pose alone would leave the clock running on through a
+	// stall, and the first late row would then be sampled somewhere past it:
+	// a car stopped for a batch that jumps forward the moment the row lands.
+	// Held here, the clock is still standing on `newest` when that row
+	// arrives. After one late row that is about where the new target puts it
+	// anyway; after a longer gap CLOCK_EASE closes the rest, or past
+	// CLOCK_RESYNC_MS the clock resyncs. Either way the car moves on from
+	// where it stopped, forwards.
+	if (holdAtNewest)
+		at = m_clock.Clamp(newest);
+	return Sample(at, out);
+}
+
+uint32_t PlaybackClock::Clamp(uint32_t maxMs) {
+	if (m_running && static_cast<int32_t>(m_renderTimeMs - maxMs) > 0)
+		m_renderTimeMs = maxMs;
+	return m_renderTimeMs;
 }
 
 uint32_t PlaybackClock::Advance(uint32_t localNowMs, uint32_t targetMs) {

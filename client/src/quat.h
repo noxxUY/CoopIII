@@ -70,10 +70,11 @@ inline Quat QuatFromAxes(const Vec3 &right, const Vec3 &forward, const Vec3 &up)
 // one through here scales the basis, which the engine reads as a scaled car.
 inline void AxesFromQuat(const Quat &q, Vec3 &right, Vec3 &forward, Vec3 &up) {
 	const float len2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
-	if (!(len2 > 1e-12f)) {
-		// Degenerate case: hand back identity instead of NaNs. A car briefly
-		// at identity orientation is a bug you can spot; a car with a NaN
-		// matrix takes the renderer down with it.
+	if (!(len2 > 1e-12f) || !std::isfinite(len2)) {
+		// Degenerate case, or an infinite component (whose inverse length is
+		// 0, and 0 * inf a NaN): hand back identity instead of NaNs. A car
+		// briefly at identity orientation is a bug you can spot; a car with a
+		// NaN matrix takes the renderer down with it.
 		right   = Vec3{1.0f, 0.0f, 0.0f};
 		forward = Vec3{0.0f, 1.0f, 0.0f};
 		up      = Vec3{0.0f, 0.0f, 1.0f};

@@ -40,6 +40,11 @@ gta3.exe
                                      WindowedMode, FramerateVigilante, GInput
 ```
 
+CoopIII-Setup installs this stack from each project's own release (the same
+files, byte for byte, for SilentPatch, CLEO, Mod Loader, GInput and Framerate
+Vigilante), in the game root rather than under `modloader/_ESSENTIALS`; the
+Widescreen Fix goes to `scripts/`. `docs/installer.md` has the table.
+
 ## 2. Consequences for CoopIII
 
 ### 2.1 Ship a `.asi`, not a proxy DLL
@@ -129,6 +134,89 @@ players must not be counted as ambient population, or traffic and pedestrians
 will thin out as the session fills up. (v1 leaves NPCs/traffic unsynced
 entirely - see `protocol.md` §3 - so this is a v2 concern, recorded here
 because the numbers come from the same survey.)
+
+### 2.7 A San Andreas car camera (SACarCam)
+
+`github.com/erorcun/SACarCam` puts San Andreas' car camera into III (and VC).
+It is an optional mod the player installs on their own. CoopIII does not ship
+it, bundle it, patch it or contain any of its code, and must not: the repo
+has **no licence file and no licence text anywhere in it**, so all rights are
+reserved by its author. Reading it to check compatibility is fine; copying it,
+redistributing a build of it, or writing "our own" version with its source
+open beside us is not. CoopIII only makes sure the two run together.
+
+**It runs on our exe unmodified.** Its `DllMain` identifies III 1.0 by
+`*(DWORD*)0x005C1E70 == 0x53E58955` (and `0x005C1E75 == 0xB85548EC`); both
+hold on the pinned 1.0 image. Every address it uses is hardcoded with no
+pattern scanning, and it has no III 1.1 or Steam addresses at all: on those
+builds it patches nothing. The r6 release binary
+(`SACarCam.dll`, 56 832 bytes, SHA-256 `65D06692…FD320`) was disassembled and
+patches exactly what its source says. On III it writes, in `DllMain`:
+
+| Site | Retail | What it becomes |
+|---|---|---|
+| `0x00456F40` | `WellBufferMe` entry (`sub esp,8`) | `jmp` to its own copy, which also records the previous camera mode |
+| `0x00459A54` | `call CCam::Process_Cam_On_A_String` (MODE 18) | its SA car camera |
+| `0x00459B36` | `call CCam::Process_BehindBoat` (MODE 22) | the same camera for boats |
+| `0x005225D2` | FireTruckControl `call CPad::GetCarGunLeftRight` | 0 while the car camera is up |
+| `0x0052260E` | FireTruckControl `call CPad::GetCarGunUpDown` | 0 while the car camera is up |
+| `0x0053D628` | TankControl `call CPad::GetCarGunLeftRight` | 0 while the car camera is up |
+| `0x0048BFB0` | CGame::Initialise `call 0x004735A0` | its debug menu registration, then the original |
+
+Its camera then aims the tank's turret and the fire truck's cannon at where
+the camera looks (writing `CAutomobile` +0x580/+0x584 and playing the
+turret's motor, sound 26), in place of the stick.
+
+**No overlap with anything CoopIII hooks.** None of those seven sites is one
+of CoopIII's call-site redirects (the camera call `0x0048C9B5`, the two stunt
+shot calls, the passenger aim's four collision calls at `0x004605E5`,
+`0x00460691`, `0x00460923`, `0x00460B8E`, the gun gates' `FindPlayerVehicle`
+calls at `0x0052259A` and `0x0053D5E5`, or any other), and none is inside
+the first bytes of a function CoopIII detours; every hex constant in
+`client/src` was checked against them. `tools/clienttest` (carcam.cpp) pins the
+camera ones. Load order does not matter: SACarCam patches in `DllMain`,
+CoopIII on the first frame, and CoopIII's redirects all verify their target
+first.
+
+What works with it, by construction rather than by test:
+
+- **Drivers.** The SA camera follows the car; the turret and cannon it turns
+  are sampled by `SyncCarExtras` like any other, and the water cannon still
+  goes through `CWaterCannons::UpdateOne`.
+- **Passengers.** A rider's camera follows the car he rides in (FindPlayerVehicle
+  does not care which seat), so he gets the SA camera and can look round with
+  the mouse. `ridecam` still corrects that car before the camera looks.
+- **The passenger's free aim.** Holding the right button still hands the
+  rider `MODE_FOLLOWPED` through `TakeControl`; SACarCam never touches that
+  mode or its collision calls. Letting go restores the car camera, which
+  starts fresh behind the car.
+- **Cutscenes and the unique jump's shot** use other modes (FLYBY, FIXED).
+
+**The one thing CoopIII changes** (`client/src/game/carcam.*`): SACarCam turns
+the gun of whatever car the camera follows, and for a rider that is somebody
+else's tank. `CorrectCarExtras` wrote the driver's aim back after the frame,
+so it was drawn right, but the turret's motor played on the rider's machine
+every frame his camera and the driver's gun disagreed. When the car camera's
+call leads into another module, CoopIII now takes that call and chains to it,
+and for a tank or fire truck the local player is not driving it puts the gun
+back afterwards and sets the car's `m_audioEntityId` to -1 for the length of
+the call (cAudioManager::PlayOneShot ignores a negative entity). Against the
+retail camera nothing is taken. The gun gates (`client/src/game/cargun.*`)
+sit in front of SACarCam's three stick calls, so for a passenger those are
+never reached and only the camera's own write is left to put back. The log
+says which case it found:
+`carcam: the car camera call at 0x00459A54 leads into SACarCam.asi ...`.
+
+**Installing it** (the player's side): download `SACarCam.dll` from the
+project's r6 release, rename it `SACarCam.asi` and put it next to
+`CoopIII.asi`. Nothing in `CoopIII.ini` turns it on or off; remove the file to
+go back. GInput is optional for it (it falls back to a dummy pad). Its
+`LCSCarCam` build patches the same sites.
+
+**Not proved in a running game:** that the SA camera behaves for a rider in a
+car whose transform arrives over the wire (its history-based trailing might
+swing on a snap), that the mute leaves no other sound of the car silenced,
+and the whole thing under two clients.
 
 ## 3. Not yet verified
 

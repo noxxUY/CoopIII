@@ -23,6 +23,8 @@
 // same.
 #pragma once
 
+#include <coopiii/protocol.h>
+
 #include <cstddef>
 #include <cstdint>
 
@@ -95,6 +97,793 @@ constexpr uintptr_t CTimer__EndUserPause                     = 0x004AD4A0;
 constexpr uintptr_t CTimer__m_UserPause                      = 0x0095CD7C;
 constexpr uintptr_t CTimer__m_CodePause                      = 0x0095CDB1;
 
+// ---- time of day and weather ----------------------------------------------
+//
+// Verified 2026-09-21. Found the way the ped and vehicle paths were: by
+// walking the script opcodes that already do the thing, instead of hunting a
+// symbol by name. The dispatcher at 0x00439500 is a chain of
+// `cmp dx,<limit> / jge / movsx eax,dx / push eax / call <range handler>`,
+// and each range handler is `lea eax,[opcode - base] / cmp eax,<count> / ja
+// default / jmp [eax*4 + <table>]`.
+//
+//   SET_TIME_OF_DAY    192  ->  100..199 table 0x005EEA7C, entry 92
+//                               handler 0x0043D1EB
+//   FORCE_WEATHER      437  ->  400..499 table 0x005EEFC8, entry 37
+//   FORCE_WEATHER_NOW  438                              entry 38
+//   RELEASE_WEATHER    439                              entry 39
+//
+// The 400..499 range handler is 0x00440CB0 and its base opcode is a round
+// 400 (`lea edx,[eax + 0FFFFFE70h]`, i.e. eax - 0x190). The 100 table is the
+// one the ped spawn already uses, and entry 54 there is still CREATE_CHAR's
+// 0x0043BA03 - which is how this pass knew it had the right base before
+// trusting anything else it read out of it.
+//
+// Every rel32 below was resolved with tools/calltarget, not by hand.
+
+// Clock.cpp:74. __cdecl(uint8 h, uint8 m) - both arguments still take a
+// 4-byte stack slot; the callee reads the low byte of each.
+//
+//   0x004733C0  mov  eax, [0x00885B48]        CTimer::GetTimeInMilliseconds()
+//               mov  word [0x0095CC7C], 0     ms_nGameClockSeconds = 0
+//               mov  [0x009430E4], eax        ms_nLastClockTick
+//               mov  al, [esp+4]
+//               mov  [0x0095CDA6], al         ms_nGameClockHours
+//               mov  al, [esp+8]
+//               mov  [0x0095CDC8], al         ms_nGameClockMinutes
+//               ret
+//
+// 0x00885B48 is CTimer::m_snTimeInMilliseconds, recorded above from an
+// unrelated pass - the two agree, which is the kind of mutual confirmation
+// worth looking for.
+//
+// Prefer this over writing the two bytes directly. It also rebases
+// ms_nLastClockTick, so the engine's own CClock::Update measures the next
+// game minute from the correction rather than immediately ticking one off
+// whatever was left over.
+constexpr uintptr_t CClock__SetGameClock = 0x004733C0;
+
+// Three more witnesses for the same globals, each from a different function:
+//
+//   CClock::Initialise  0x00473370  `mov byte [0x0095CDA6], 0Ch` and
+//                                   `mov byte [0x0095CDC8], 0` - Clock.cpp:25's
+//                                   12:00, as a literal. CGame::Initialise
+//                                   calls it with `push 3E8h` at 0x0048C289
+//                                   (Game.cpp:596), so a game minute really
+//                                   is 1000 ms.
+//   CClock::Update      0x00473460  `inc byte [0x0095CDC8]`, then
+//                                   `cmp byte [0x0095CDC8], 3Ch` / `inc byte
+//                                   [0x0095CDA6]` / `cmp byte [0x0095CDA6],
+//                                   18h` - 60 and 24, i.e. Clock.cpp:53-66.
+//   CClock::StoreClock  0x00473540  reads hours, minutes and seconds in
+//                                   declaration order into three stored
+//                                   copies, and RestoreClock (0x00473570) is
+//                                   its mirror.
+//
+// GetGameClockMinutesUntil (0x004733F0, Clock.cpp:83) settles which of the
+// two bytes is which on its own: it does `imul edx, [0x0095CDA6], 3Ch` and
+// adds [0x0095CDC8], so the one multiplied by 60 is the hour.
+constexpr uintptr_t CClock__Initialise             = 0x00473370;
+constexpr uintptr_t CClock__Update                 = 0x00473460;
+constexpr uintptr_t CClock__ms_nGameClockHours     = 0x0095CDA6;   // uint8
+constexpr uintptr_t CClock__ms_nGameClockMinutes   = 0x0095CDC8;   // uint8
+constexpr uintptr_t CClock__ms_nGameClockSeconds   = 0x0095CC7C;   // uint16
+constexpr uintptr_t CClock__ms_nLastClockTick      = 0x009430E4;   // uint32
+constexpr uintptr_t CClock__ms_nMillisecondsPerGameMinute = 0x008F2C64;   // uint32
+
+// CWeather's three type globals and the blend position between them. All
+// four are pinned by CWeather::Init (0x00522BA0, Weather.cpp:105-118), which
+// happens to give each one a different literal:
+//
+//   mov word [0x0095CC70], 0        NewWeatherType    = WEATHER_SUNNY
+//   mov word [0x0095CCEC], 1        OldWeatherType    = WEATHER_CLOUDY
+//   mov dword [0x008F2520], 0       InterpolationValue = 0.0f
+//   or  word [0x0095CC80], 0FFFFh   ForcedWeatherType = WEATHER_RANDOM (-1)
+//
+// CWeather::Update confirms old and new a second time and in the other
+// direction: at 0x00522C4C it does `mov ax,[0x0095CC70] / mov
+// [0x0095CCEC],ax`, which is Weather.cpp:125's `OldWeatherType =
+// NewWeatherType` and can only be read that way round.
+//
+// The type numbering is confirmed against the retail data rather than re3's
+// header: WeatherTypesList at 0x005FFBC8 reads 0,0,...,1,1,2,2,1,0 at
+// entries 16..21, matching Weather.cpp's table exactly.
+constexpr uintptr_t CWeather__NewWeatherType     = 0x0095CC70;   // int16
+constexpr uintptr_t CWeather__OldWeatherType     = 0x0095CCEC;   // int16
+constexpr uintptr_t CWeather__ForcedWeatherType  = 0x0095CC80;   // int16
+constexpr uintptr_t CWeather__InterpolationValue = 0x008F2520;   // float
+
+enum eWeatherType {
+	WEATHER_SUNNY  = 0,
+	WEATHER_CLOUDY = 1,
+	WEATHER_RAINY  = 2,
+	WEATHER_FOGGY  = 3,
+	WEATHER_TOTAL  = 4,
+	WEATHER_RANDOM = -1,   // ForcedWeatherType only: "let the list decide"
+};
+
+// Weather.cpp:270-284. All three are two or three plain stores and nothing
+// else, which is why game/world.cpp writes the globals rather than calling
+// them - there is no registration hiding in here the way there is in the ped
+// and vehicle spawn paths. Recorded because they are the proof:
+//
+//   ForceWeather     0x00523170  mov eax,[esp+4] / mov [Forced],ax / ret
+//   ForceWeatherNow  0x00523180  mov ecx,[esp+4] / mov [Old],cx /
+//                                mov ax,[Old] / mov [New],ax /
+//                                mov [Forced],cx / ret
+//   ReleaseWeather   0x005231A0  or word [Forced],0FFFFh / ret
+constexpr uintptr_t CWeather__ForceWeather    = 0x00523170;
+constexpr uintptr_t CWeather__ForceWeatherNow = 0x00523180;
+constexpr uintptr_t CWeather__ReleaseWeather  = 0x005231A0;
+constexpr uintptr_t CWeather__Update          = 0x00522C10;
+
+// The one ordering fact the whole feature rests on. CGame::Process calls
+// these two back to back (Game.cpp:1031-1032):
+//
+//   0x0048C8EB  call 0x00473460    CClock::Update
+//   0x0048C8F0  call 0x00522C10    CWeather::Update
+//
+// and CWeather::Update opens with `mov al, [0x0095CDC8]` (the clock's
+// minutes) and ends by storing that minute over 60 into InterpolationValue.
+// So the blend between the old and new weather types is a function of the
+// clock and is recomputed every frame. Sync the clock and the blend follows;
+// there is no reason to put it on the wire.
+//
+// CoopIII's PreFrame runs before CGame::Process, so anything written to
+// either from there is what these two read this frame, not next frame.
+//
+// Verified 2026-09-24: how the hour turns over, which is the one thing about
+// the blend a follower has to get right by hand. CWeather::Update:
+//
+//   0x00522C10  mov  al,[0x0095CDC8]          the minutes
+//   0x00522C22  fild / fmul [0x005FFC48]       * 0x3C888889, 1/60 as a float
+//   0x00522C34  fcomp [0x008F2520]             against last frame's blend
+//   0x00522C3F  cmp ah,1 / jne 0x00522CAC      not below it: no new hour
+//   0x00522C44  cmp word [0x0095CC80],0        ForcedWeatherType
+//   0x00522C52  mov [0x0095CCEC],ax            old = new
+//   0x00522C58  jge 0x00522CA0                 forced >= 0: new = forced
+//   0x00522C5A  mov eax,[0x008F626C] / inc     else (index + 1) mod 64,
+//   0x00522C6D  mov [0x008F626C],eax           kept,
+//   0x00522C72  mov ax,[ebx*2+0x005FFBC8]      and new = WeatherTypesList[it]
+//   0x00522CB0  fstp [0x008F2520]              the blend = minutes/60
+//
+// So a follower whose clock is moved back, or into another hour, turns its
+// own weather over on the next frame unless the blend moves with the clock,
+// and at the top of the hour takes its next type from the pin.
+constexpr uintptr_t CWeather__WeatherTypeInList = 0x008F626C;   // int32, 0..63
+
+// What a picture is made of. CTimeCycle::Update is the call CGame::Process
+// makes after CGarages::Update (0x0048C993 -> 0x00421E40) and two more, and
+// right before TheCamera.Process (0x0048C9B5, ecx = 0x006FACF8):
+//
+//   0x0048C9A2  call 0x004ABF40               CTimeCycle::Update
+//   0x0048C9A7  call 0x00597680               then the camera, if the replay allows
+//
+// and its inputs are the clock and the weather and nothing else:
+//
+//   0x004ABF41  mov   al,[0x0095CDC8]          minutes, for the hour's blend
+//   0x004ABF46  movzx ebx,byte [0x0095CDA6]    hour, and hour+1 mod 24 beside it
+//   0x004ABF76  movsx ecx,word [0x0095CCEC]    OldWeatherType
+//   0x004ABF9D  fsub  [0x008F2520]             1 - InterpolationValue
+//   0x004ABFE4  fild  [edx*4+0x0087FB90]       table[hour*4 + weather], the
+//                                              four corners of hour x weather
+//   0x004ABFEB  movsx ebp,word [0x0095CC70]    NewWeatherType
+//
+// then TheCamera.m_BlurType (0x004ACA9D, [0x006FADA0]) for whether timecyc's
+// blur colour becomes the frame's colour filter. There is no extra-colour
+// state in III: SET_EXTRA_COLOURS and CTimeCycle's m_bExtraColourOn are Vice
+// City's, and no III opcode reaches this table any other way. Two machines
+// with the same hour, minute, pair and blend show the same colours; the
+// filter's type is the camera's own business - the sniper scope, a close
+// blast's shake, and SET_MOTION_BLUR (0374), which only the intro runs.
+constexpr uintptr_t CTimeCycle__Update = 0x004ABF40;
+
+// ---- trains ---------------------------------------------------------------
+//
+// Verified 2026-09-23 against the retail image. re3's Train.cpp was the map
+// and is right about the shape; everything below was read off the bytes.
+//
+// CTrain::UpdateTrains is called from exactly one place, CGame::Process, in
+// the block the pause flag gates (Game.cpp:1039):
+//
+//   0x0048C8FA  call 0x0040B3B0    CCollision::Update
+//   0x0048C8FF  call 0x0054F3A0    CTrain::UpdateTrains
+//   0x0048C904  call 0x0054BEC0    CPlane::UpdatePlanes
+//
+// resolved with tools/calltarget, and a scan of the whole image for E8/E9
+// rel32s finds no other call or jump to it. It is static, takes nothing and
+// returns nothing: `push ebx / push esi / mov esi,6FAD2Ch / ... / ret`, with
+// 0x006FAD2C being TheCamera + 0x34, the camera's position.
+//
+// **Where a train is, is a function of CTimer::m_snTimeInMilliseconds and of
+// nothing that accumulates.** The El half:
+//
+//   0x0054F426  mov  edx,[00885B48h]         t = CTimer::m_snTimeInMilliseconds
+//   0x0054F430  lea  eax,[edx+ebx]           ebx = 0, then += 10000h per train
+//   0x0054F43B  and  eax,1FFFFh
+//   0x0054F448  fild qword [esp]             the masked time
+//   0x0054F44B  fld  st(4) / fmul [006023B0h]  TotalDurationOfTrack * 1/131072
+//   0x0054F466  fcomp [esi+0070D850h]        walk aLineBits for the segment
+//   0x0054F490  jmp  [eax*4+006023F8h]       stand / constant / accelerate
+//   0x0054F4A0  fstp [eax*4+0064D008h]       EngineTrackPosition[i]
+//   0x0054F4E3  fstp [eax*4+00880848h]       EngineTrackSpeed[i]
+//   0x0054F546  cmp  cx,2                    two trains
+//
+// and the subway half is the same code over its own tables: `and eax,3FFFFh`
+// at 0x0054F59B, 1/262144 at 0x006023B4, EngineTrackPosition_S at
+// 0x0064D018, `cmp dx,4` at 0x0054F6A7. The segment search starts from j = 0
+// every call (`xor esi,esi` at 0x0054F453 and 0x0054F5B3). Nothing is read
+// that the previous frame wrote. The float constants were read from the
+// file: 200/1600/-1000/500 for the camera box the El half is gated on,
+// 1000.0, 7.6293945e-06 and 3.8146973e-06.
+//
+// Two oddities, both harmless to a caller. Each half ends by storing the time
+// it read straight back into the global (`mov [00885B48h],edx` at
+// 0x0054F55E, `mov [00885B48h],ebx` at 0x0054F6BF), so the call writes
+// CTimer's clock with whatever value it found there. And
+// ProcessTrainAnnouncements (0x0054F6D0), called at 0x0054F564, flips
+// bTrainArrivalAnnounced (0x006022A0) and calls PlayAnnouncement at
+// 0x0054F7F0, which in this build is a single `ret`.
+//
+// A byte scan of .text for the four arrays finds them referenced in these
+// three functions and nowhere else: UpdateTrains writes them, the
+// announcements read the El positions, and CTrain::ProcessControl reads one
+// of each through `mov edx,64D008h` / `mov [esp+1Ch],880848h` (El) or
+// 0x0064D018 / 0x0087C7C8 (subway), picked by m_nTrackId at +0x29C.
+//
+// ProcessControl (vtable slot 8, see below) turns that into a wagon: rear =
+// EngineTrackPosition[m_nWagonGroup +0x292] - m_fWagonPosition (+0x288),
+// wrapped by TotalLengthOfTrack; the node pair around it; the front 20 units
+// further on; the matrix from the two. Its only persistent input is
+// m_nCurTrackNode (+0x290), and that is a search cursor, not state: the loop
+// at 0x0054F901 advances it `(n + 1) % numTrackNodes` (`idiv` at 0x0054F90A)
+// until the segment contains the position, so it lands on the same segment
+// whatever it started from. What else it keeps - m_isFarAway (+0x28E,
+// `(m_nWagonId + m_FrameCounter) & 0Fh` at 0x0054F841, so a wagon 250 m from
+// the camera (62500.0 at 0x006023CC) is repositioned one frame in sixteen) and
+// the door state machine at +0x2A0/+0x2A4, the one place it reads CTimer
+// (0x0054FD9A) - follows the position and never feeds back into it.
+//
+// So two machines that feed UpdateTrains the same number have the same
+// trains. game/trains.cpp detours it and puts the session's clock in CTimer's
+// place for the length of the call.
+constexpr uintptr_t CTrain__UpdateTrains = 0x0054F3A0;
+
+// CTrain's constructor (0x0054E2A0, called from InitTrains at 0x0054F1D8 as
+// `push 4 / push 7Ch` - PERMANENT_VEHICLE, MI_TRAIN) stamps
+// `mov dword [eax],60241Ch` at 0x0054E2BA, and slot 8 of that table
+// (0x0060243C) holds 0x0054F800. That slot is the only reference to it in
+// the image.
+constexpr uintptr_t CTrain__vtable         = 0x0060241C;
+constexpr uintptr_t CTrain__ProcessControl = 0x0054F800;
+
+// A wagon's name, the same on every machine. CTrain::InitTrains builds the El
+// in a five-pass loop and the subway in an eight-pass one, and each pass
+// stamps its loop counter as m_nWagonId:
+//
+//   0x0054F151  mov word [edi+28Ch],si     El, si 0..4 (`cmp esi,5` at 0x0054F173)
+//   0x0054F232  mov word [esi+28Ch],di     subway, di 0..7 (`cmp edi,8` at 0x0054F25B)
+//   0x0054F24D  mov byte [esi+29Ch],1      m_nTrackId = TRACK_SUBWAY
+//   0x0054E3CF  mov byte [eax+29Ch],0      the constructor's TRACK_ELTRAIN
+//
+// CReplay's playback builds its own (0x0059541E) and those are not the
+// session's; outside a replay there are no others. docs/protocol.md 1.7.1.
+constexpr size_t  TRAIN_WAGON_ID = 0x28C;   // int16
+constexpr size_t  TRAIN_TRACK_ID = 0x29C;   // uint8
+constexpr uint8_t TRAIN_TRACKS   = 2;
+constexpr uint16_t TRAIN_WAGONS_ON_TRACK[TRAIN_TRACKS] = {5, 8};
+
+// ---- planes ---------------------------------------------------------------
+//
+// Verified 2026-09-23 against the retail image, the same way as the trains
+// and for the same reason. re3's Plane.cpp was the map; everything below was
+// read off the bytes.
+//
+// CPlane::UpdatePlanes is the call right after UpdateTrains in CGame::Process
+// (0x0048C904, see "trains" above). A byte scan of the whole file for E8/E9
+// rel32s and for the address as an absolute finds that call and nothing else,
+// with UpdateTrains' call at 0x0048C8FF turning up in the same scan as the
+// control. Static, no arguments, `push ebx / push esi / push ebp / sub esp,8`,
+// and it returns at once while `cmp byte [0095CD5Bh],1` (CReplay::IsPlayingBack)
+// holds. The linear listing runs the prologue into the padding before it;
+// 0x0054BEC0 is `53 56`.
+//
+// **Where a plane is, is a function of CTimer::m_snTimeInMilliseconds.** Three
+// airliners, one loop over flight.dat:
+//
+//   0x0054BEFC  mov  edx,[00885B48h]          t = CTimer, read once for the call
+//   0x0054BF02  lea  eax,[edx+ecx]            ecx = 0, then += 2AAAAh per plane
+//   0x0054BF0D  and  eax,7FFFFh
+//   0x0054BF1F  fmul [0060200Ch]              1/524288, TotalDurationOfFlightPath
+//                                             (0x0064CFB8) times the masked time
+//   0x0054BF36  fcomp [ebp+00734180h]         walk aPlaneLineBits (0x00734168,
+//                                             stride 14h) from j = 0 every call
+//   0x0054BF6B  jmp  [eax*4+006021C8h]        stand / constant / accelerate
+//   0x0054BF4A  fstp [ebx*4+008F5FBCh]        OldPlanePathPosition[i] = ...
+//   0x0054BF78  fstp [ebx*4+008F5FC8h]        PlanePathPosition[i]
+//   0x0054BFB8  fstp [ebx*4+00941538h]        PlanePathSpeed[i]
+//   0x0054C018  cmp  ebx,3
+//
+// and three Dodos on flight2.dat with no lookup at all: position =
+// 50.0 (0x00601F74) * ((t + k * 2AAAAh) & 7FFFFh) * TotalDurationOfFlightPath2
+// (0x0064CFC0) / 524288, into PlanePath2Position (0x0064CFC4, 3 floats), the
+// speed into 0x008F1A54. Both are periodic in 0x80000 ms, and 2^32 is a
+// multiple of that, so the clock's wrap is invisible.
+//
+// The same write-back the trains have: `mov [00885B48h],edx` at 0x0054C031
+// stores the value it read at 0x0054BEFC. edx is not touched in between.
+// Those are the only two references to the global in the function, and it
+// makes no calls at all, so a value swapped in around it is seen by the
+// planes and by nothing else.
+//
+// **Three things carry over from the previous call, and none of them moves a
+// plane.**
+//
+// 1. OldPlanePathPosition, copied from PlanePathPosition at the top of each
+//    airliner's iteration. Its only reader is CPlane::ProcessControl at
+//    0x0054CF24 (a byte scan finds exactly those two references), which
+//    compares it with LandingPoint (0x008F2C7C) to play the touchdown sound
+//    once. A jump of the clock can play that sound once or skip it once.
+//
+// 2. The two mission Cessnas, and this is the one a caller has to handle.
+//    `if (CesnaMissionStatus == 1)` (0x0064CFE8, at 0x0054C0A7) positions the
+//    drug-run Cessna from `t - CesnaMissionStartTime` (0x0064CFEC, `sub
+//    ebp,[0064CFECh]` at 0x0054C0FD) and lands it once that reaches 128072
+//    (`cmp ebp,1F448h`); the drop-off Cessna does the same from 0x0064CFF0 /
+//    0x0064CFF4 against 521288 (`cmp edx,7F448h`). Both start times are
+//    stamped from CTimer and nothing else: `mov eax,[00885B48h]` then
+//    `mov [0064CFECh],eax` at 0x0054E0DC in CreateIncomingCesna, and the same
+//    into 0x0064CFF4 at 0x0054E23C in CreateDropOffCesna. A byte scan finds
+//    no other writer of either. So a caller that hands UpdatePlanes a
+//    different clock must move both start times by the same amount for the
+//    call, or a Cessna in flight lands, or waits, on the wrong schedule.
+//
+// 3. CPlane::ProcessControl's own state: m_nCurPathNode (+0x28C, word), a
+//    search cursor exactly like the train's - `inc / cdq / idiv` over
+//    NumPathNodes at 0x0054CE6C, looping until the segment contains the
+//    position (0x0054CEB7-0x0054CED2), so it lands on the same segment from
+//    any start; and m_isFarAway (+0x28A), which puts a plane more than 300 m
+//    from the camera on one frame in eight (`(m_randomSeed + FrameCounter) &
+//    7` at 0x0054CCCC). Neither feeds the position. The matrix fields are
+//    written in that block and never read (every `[ebp+0Ch..3Ch]` there is an
+//    fstp), and bIsInSafePosition (+0x51 bit 6) is set on every path out at
+//    0x0054DD34, so CWorld::Process never integrates m_vecMoveSpeed into it.
+//
+// CPlane's constructor is 0x0054B170 (`mov dword [eax],6021DCh`); slot 8 of
+// that vtable is ProcessControl, 0x0054C1D0. InitPlanes (0x0054B820) makes
+// three MI_AIRTRAIN (8Ch) and three MI_DEADDODO (8Dh), PERMANENT_VEHICLE,
+// locked, m_nPlaneId at +0x288.
+//
+// game/planes.cpp detours UpdatePlanes the way game/trains.cpp detours
+// UpdateTrains, and shifts the two Cessna start times with the clock.
+constexpr uintptr_t CPlane__UpdatePlanes                 = 0x0054BEC0;
+constexpr uintptr_t CPlane__CesnaMissionStartTime        = 0x0064CFEC;   // int32
+constexpr uintptr_t CPlane__DropOffCesnaMissionStartTime = 0x0064CFF4;   // int32
+
+// ---- traffic lights -------------------------------------------------------
+//
+// Verified 2026-09-23 against the retail image. re3's TrafficLights.cpp was
+// the map; everything below was read off the bytes.
+//
+// **A light is a function of CTimer::m_snTimeInMilliseconds and of nothing
+// else.** The three functions are whole leaves - no call, no write, no other
+// read - and this is all of each (lighttime.h has the thresholds):
+//
+//   0x00455760  CTrafficLights::LightForCars1
+//     mov eax,[00885B48h] / and eax,3FFFh
+//     cmp eax,1388h / jae / xor al,al / ret          green  below 5000
+//     cmp eax,1770h / jae / mov al,1 / ret           amber  below 6000
+//     mov al,2 / ret                                 red    the rest
+//   0x00455790  CTrafficLights::LightForCars2
+//     same head; cmp 1770h -> al 2, cmp 2AF8h -> al 0, cmp 2EE0h -> al 1, else al 2
+//   0x004557D0  CTrafficLights::LightForPeds
+//     same head; cmp 2EE0h -> al 2 (don't walk), cmp 3C18h -> al 0 (walk),
+//     else al 1 (walk, blinking)
+//
+// The result is in al and the rest of eax is the masked clock; every caller
+// reads al alone. The linear listing runs each prologue into the zero padding
+// before it (`add byte ptr [ecx+00885B48h],ah` at 0x0045578F and 0x004557CF);
+// the functions start on the `A1`.
+//
+// A byte scan of the whole file for E8/E9 rel32s and for the three addresses
+// as absolutes finds ten calls and nothing else - no pointer to any of them:
+//
+//   CTrafficLights::ShouldCarStopForLight (0x00455350), once per path link it
+//   checks, Cars1 then Cars2 by the link's trafficLightType & 7Fh:
+//     0x004553BC / 0x004553E2   the next link
+//     0x004554F1 / 0x00455517   the current link
+//     0x00455633 / 0x00455659   the previous link
+//   each followed by `test al,al`, and every pair behind `test bl,bl / jne`
+//   on the alwaysStop argument, so a caller passing true never reads a light.
+//   Its three callers: 0x004186D4 pushes 1 (CCarCtrl::PossiblyRemoveVehicle,
+//   so the removal test doesn't depend on the light); 0x004191EB pushes 0
+//   (SlowCarOnRailsDownForTrafficAndLights at 0x004191E0, which then calls
+//   CCarAI::CarHasReasonToStop and makes 0 the car's target speed); 0x0041EA52
+//   pushes 0 from the driving-style switch at 0x0041EA48 (styles 0 and 1,
+//   stop and slow down for cars).
+//
+//   CTrafficLights::DisplayActualLight (0x00455800), the only caller being
+//   CEntity::ProcessLightsForEntity at 0x00474A89 for MI_TRAFFICLIGHTS:
+//     0x00455851 / 0x00455858   Cars1 or Cars2 by FindTrafficLightType
+//                               (0x004564A0) == 1, then `mov bl,al`
+//     0x00456105                LightForPeds, `cmp al,2`
+//   and the one thing about a light that is not a call: the blink of the walk
+//   sign is `mov eax,[00885B48h] / and eax,100h` at 0x004562A4, CTimer read
+//   directly. That stays on this machine's clock; it is 256 ms of flicker.
+//
+//   CPed::Wait, WAITSTATE_TRAFFIC_LIGHTS (entry 0 of the jump table at
+//   0x005F8AA4, i.e. state 1):
+//     0x004D5DE6  once CTimer passes m_nWaitTimer (+0x23C), LightForPeds; on
+//                 al == 0 it clears m_nWaitState (+0x238) and calls
+//                 SetMoveState(PEDMOVE_WALK) (0x004C5A30). That is the one
+//                 decision a light makes that outlasts the frame: a ped that
+//                 has set off crosses, whatever the light does next.
+//
+// Nothing keeps a light between frames. CarHasReasonToStop (0x00415B00) is
+// `mov eax,[00885B48h] / mov [ecx+14Ch],eax` - it stamps
+// AutoPilot.m_nAntiReverseTimer with this machine's clock, which only this
+// machine's driver logic reads - and the on-rails target speed ramps towards the
+// light's answer over a few frames, which is a car accelerating, not a stale
+// light.
+//
+// game/lights.cpp detours all three and answers from lighttime.h on the
+// session's clock, or calls the original when there is no session.
+constexpr uintptr_t CTrafficLights__LightForCars1 = 0x00455760;
+constexpr uintptr_t CTrafficLights__LightForCars2 = 0x00455790;
+constexpr uintptr_t CTrafficLights__LightForPeds  = 0x004557D0;
+
+// ---- lift bridge ----------------------------------------------------------
+//
+// Verified 2026-09-23 against the retail image. re3's Bridge.cpp was the map.
+//
+// CBridge::Update (0x00413AC0) has one caller, CGame::Process at 0x0048C9CD,
+// outside the replay gate. It returns at once unless pLiftPart (0x008E2C94)
+// and pWeight (0x008E28BC) were both found by CBridge::Init. Then:
+//
+//   0x00413AE7  OldState (0x008F2A20) = State (0x008F2A1C)
+//   0x00413AE0  CStats::CommercialPassed (0x008F4334) == 0 ->
+//               State = 0, lift 25.0, TimeOfBridgeBecomingOperational = 0
+//   0x00413B16  if TimeOfBridgeBecomingOperational (0x008F2BC0) == 0, stamp it
+//               with `mov eax,[00885B48h]`
+//   0x00413B29  mov edx,[00885B48h] / sub edx,[008F2BC0h] / and edx,0FFFFh
+//   then cmp 2710h / 9C40h / C350h / EA60h -> State 2 / 3 / 4 / 5, else 1,
+//   and the lift height from 25.0 (0x005EC68C) and 1/10000 (0x005EC690).
+//
+// The epoch is referenced by those four instructions and by nothing else in
+// the image (byte scan for 0x008F2BC0): not saved, not loaded, not reset by
+// Init. CommercialPassed is written by COMMAND_COMMERCIAL_PASSED's handler
+// (`mov dword [008F4334h],1` at 0x00449842, then the Shoreside radio
+// announcement), and loaded with the stats in a save.
+//
+// **The part that isn't cosmetic.** Update ends with two edges and nothing
+// else touches the path links:
+//
+//   State 4 after 3 -> SetLinksBridgeLights(-330, -230, -700, -588, true)
+//   State 3 after 2 -> SetLinksBridgeLights(-330, -230, -700, -588, false)
+//
+// on ThePaths (`mov ecx,8F6754h`), the four floats pushed from 0x005EC688,
+// 0x005EC684, 0x005EC680 and 0x005EC67C (-330, -230, -700, -588, read from
+// the file). CBridge::Init (0x00413A30) makes the same call with true and
+// writes OldLift (0x008F6254) = -1.0f (`mov [008F6254h],0BF800000h`), which
+// the next Update always overwrites with a height between 0 and 25.
+// CPathFind::SetLinksBridgeLights (0x0042E3B0) is __thiscall, five dwords,
+// `ret 14h`; it walks m_numCarPathLinks (+0x45BE8) links of 18h bytes from
+// +0x26840 and sets bit 0 of +15h in each whose position is inside the box.
+// That bit is what CTrafficLights::ShouldCarStopForBridge (0x00456460) reads
+// at 0x0091CFA9 = 0x008F6754 + 0x26840 + 15h: cars stop when the next link
+// has it and the current one doesn't. So a bridge that is up on one machine
+// and down on another sends traffic different ways, and a clock that jumps
+// over an edge leaves the links wrong until the cycle comes round again.
+//
+// game/liftbridge.cpp detours Update; liftbridgetime.h has the arithmetic.
+constexpr uintptr_t CBridge__Update                          = 0x00413AC0;
+constexpr uintptr_t CBridge__pLiftPart                       = 0x008E2C94;   // CEntity*
+constexpr uintptr_t CBridge__pWeight                         = 0x008E28BC;   // CEntity*
+constexpr uintptr_t CBridge__State                           = 0x008F2A1C;   // int32
+constexpr uintptr_t CBridge__OldState                        = 0x008F2A20;   // int32
+constexpr uintptr_t CBridge__OldLift                         = 0x008F6254;   // float
+constexpr uintptr_t CBridge__TimeOfBridgeBecomingOperational = 0x008F2BC0;   // uint32, CTimer ms
+constexpr uintptr_t CStats__CommercialPassed                 = 0x008F4334;   // int32
+constexpr uintptr_t ThePaths                                 = 0x008F6754;   // CPathFind
+constexpr uintptr_t CPathFind__SetLinksBridgeLights          = 0x0042E3B0;
+// The box, as the engine pushes it: the addresses of its own four floats.
+constexpr uintptr_t CBridge__LinksX1                         = 0x005EC688;   // float, -330
+constexpr uintptr_t CBridge__LinksX2                         = 0x005EC684;   // float, -230
+constexpr uintptr_t CBridge__LinksY1                         = 0x005EC680;   // float, -700
+constexpr uintptr_t CBridge__LinksY2                         = 0x005EC67C;   // float, -588
+
+// ---- the police helicopter ------------------------------------------------
+//
+// Verified 2026-09-23 against the retail image. re3's Heli.cpp was the map;
+// every address, offset and constant below was read off the bytes, and the
+// one place the two disagree is noted.
+//
+// **Who reads CHeli::pHelis.** A byte scan of the whole file for the four
+// slot addresses as absolutes (0x0072CF50/54/58/5C) finds them in 0x00549970
+// (InitHelis), UpdateHelis, GenerateHeli, the Catalina functions at
+// 0x0054A9B0..0x0054AA20, both collision tests and SpecialHeliPreRender - the
+// whole of Heli.cpp, from 0x0054999A to 0x0054AE16, and nothing outside it.
+// So a CHeli that is not in the array is invisible to every one of them,
+// which is what makes a replica possible (game/heli.cpp).
+//
+// **Who calls them.** An E8/E9 scan for each entry point:
+//   UpdateHelis           one call, 0x0048C909, in CGame::Process
+//   SpecialHeliPreRender  one call, 0x004A78A0, the tail of CRenderer::PreRender
+//   TestBulletCollision   0x0055D93F and 0x0055DB0F (CWeapon::FireInstantHit)
+//                         and 0x0056233D (the function after FireSniper, re3's
+//                         FireM16_1stPerson); every one `push 4` for damage
+//   TestRocketCollision   0x0055B8E2 and 0x0055B9BC, both in
+//                         CProjectileInfo::Update, both on a stack copy of the
+//                         projectile's position and only when [info] == 8
+//   CHeli::CHeli          0x0054A67C / 0x0054A6A1 (GenerateHeli) and 0x00595493
+//   ProcessControl        no direct call; slot 8 of the vtable (0x00601ED0)
+//
+// **The constructor** (0x00547220, __thiscall(int model, uint8 createdBy),
+// `ret 8`) calls CVehicle's (0x00550A60), stamps the vtable 0x00601EB0 at
+// 0x0054723B, writes m_vehType = 3 at +0x284, calls SetModelIndex through slot
+// 3, and then fills the members below in re3's order. mass and turn mass are
+// 1e8 (4CBEBC20h), the dust heights -50 (C2480000h), and m_nLastShotTime at
+// +0x304 is never written - re3's "BUG" comment is right about the retail
+// build. SetStatus writes `and al,7 / or al,40h`, STATUS_HELI (8).
+//
+// **GenerateHeli** (0x0054A640, cdecl(bool catalina)) is the registration
+// CoopIII copies for a replica: CVehicle::operator new(33Ch), the constructor
+// with 7Dh (MI_CHOPPER) and 4 (PERMANENT_VEHICLE), SetTranslate 250 m from
+// FindPlayerCoors at (rand & 0FFh) * 6.28/256 and 50 m up (0x006019D0), mirrored
+// to the other side when that leaves +-2000; SetStatus(4), ABANDONED;
+// `or dl,8` into +0x1F5, bIsLocked; the lowest m_nHeliId no slot holds; and
+// CWorld::Add. It does NOT set the col model - InitHelis does, once, for
+// both helicopter models (0x005499C7/0x005499D7, ms_colModelPed1 at 0x00726CB0),
+// which is re3's GTA3_PS2_160 branch rather than the one its #if picks for PC.
+//
+// **UpdateHelis** (0x005499F0, cdecl, no arguments):
+//   0x00549A18  FindPlayerPed()->m_pWanted->NumOfHelisRequired()   (0x004ADC00)
+//   0x00549A34  every 15 s (`add eax,3A98h` into 0x008F1A7C), while
+//               NumRandomHelis (int16 0x0095CCAA) is short, GenerateHeli into
+//               pHelis[0], else pHelis[1], m_heliType = 0
+//   0x00549B81  FLY_AWAY (2) and z > 150 (0x00601BC4): CWorld::Remove, the
+//               deleting destructor, slot nulled, NumRandomHelis-- for 0 and 1
+//   0x00549C4B  SHOT_DOWN (3) and `CTimer::GetTimeInMilliseconds() >
+//               m_nExplosionTimer` (unsigned, `jbe` skips): the explosion.
+//               AddExplosion(nil, nil, 5, pos, 0); SpawnFlyingComponent 6, 7
+//               and 2; CDarkel::RegisterCarBlownUpByPlayer at 0x0054A04F;
+//               CWorld::Remove and delete; then
+//                 0x0054A0C1  inc [008E2A64h]         CStats::HelisDestroyed
+//                 0x0054A0C7  add [008F1B7Ch],2       PeopleKilledByPlayer
+//                 0x0054A0CE  add [00880DD4h],2       PedsKilledOfThisType[COP]
+//                 0x0054A0DF  add [PlayerInFocus's m_nMoney],0FAh      $250
+//                 0x0054A134  m_pWanted->RegisterCrime_Immediately(0Ch, pos,
+//                             slot + 4D83h, 0)       CRIME_SHOOT_HELI
+//                 0x0054A13E  TestForNewRandomHelisTimer = now + 50000
+//   0x0054A17B  SHOT_DOWN and within 7 s of the timer: on the first frame of
+//               that window (previous time + 7000 < timer), components 3 and 4,
+//               m_fAngularSpeed *= -2.5, `or dl,10h` into +0x52
+//               (bRenderScorched), and AddExplosion(nil, nil, 5, pos - 2.5 *
+//               forward, 0); every other frame m_fAngularSpeed *= 1.03
+//   0x0054A39D  for pHelis[0] and [1] not flying away, each one past
+//               NumOfHelisRequired is set to FLY_AWAY
+//   0x0054A402  FindPlayerCoors().z < -2 (0x00601BC8): every one not shot
+//               down flies away
+// The PeopleKilledByPlayer and PedsKilledOfThisType addresses are the ones
+// CDarkel::RegisterKillByPlayer bumps (0x00421013, 0x0042103C with base
+// 0x00880DBC; +18h is index 6, PEDTYPE_COP), so those two are cross-checked.
+// HelisDestroyed is re3's name for the one before them and nothing else here
+// reads it.
+//
+// **NumOfHelisRequired** (0x004ADC00, __thiscall on CWanted): 0 when either of
+// the two bits at +0x16 is set (m_bIgnoredByCops, m_bIgnoredByEveryone), else
+// a jump table (0x005F781C) on `m_nWantedLevel - 3`: 3 and 4 give 1, 5 and 6
+// give 2, anything else 0.
+//
+// **ProcessControl** (0x00547CC0, __thiscall, plain `ret`) chases
+// FindPlayerCoors (first call at 0x00547D1D) and, for m_heliType 0, takes its
+// shooting interval from FindPlayerPed()->m_pWanted->m_nWantedLevel at
+// 0x00549269: a table at 0x00601E30 gives 999999 below 3 stars, then 10000,
+// 5000, 3500 and 2000 ms, halved in a no-police zone (0x00525CA0). It ends
+// with CPhysical::RemoveAndAdd, `or al,40h` into +0x51 (bIsInSafePosition),
+// CMatrix::UpdateRW and CEntity::UpdateRwFrame (0x00549829..0x00549842) - the
+// tail a replica's detour repeats.
+//
+// **TestBulletCollision** (0x0054AB30, cdecl(line0, line1, bulletPos, int
+// damage) -> bool). For each of the four slots: skip a null one and one with
+// bBulletProof (+0x53 bit 0); CCollision::DistToLine(line0, line1, &pos)
+// (0x0040DC70) < 5.0 (0x00601B74); bulletPos = line0 + (line1 - line0) *
+// max(1, dist - 5) / |line1 - line0|; m_nBulletDamage (+0x308) += damage;
+// past 400 (190h) for m_heliType 2, Catalina's, or past 700 (2BCh) for any
+// other: m_fAngularSpeed = (rand() < 3FFFh ? 1 : 0) * 0.1 - 0.05,
+// m_heliStatus = 3, m_nExplosionTimer = CTimer::m_snTimeInMilliseconds +
+// 10000. Every hit past the limit starts the ten seconds again.
+//
+// **TestRocketCollision** (0x0054AA30, cdecl(CVector *pos) -> bool). For each
+// slot: skip null and bExplosionProof (+0x52 bit 1); if the squared distance
+// is under 64.0 (0x00601E10), the same three writes. No damage count at all.
+//
+// **SpecialHeliPreRender** (0x0054AE10, cdecl) is `for 4 slots: if non-null,
+// call 0x005477F0`, CHeli::PreRenderAlways (__thiscall), which draws the
+// searchlight from +0x2AC/+0x2B0/+0x2C4 and the tail light.
+//
+// It can't take an inline detour: the loop's `jl` at 0x0054AE27 goes back to
+// 0x0054AE13, inside the five bytes a jmp would overwrite, so the second slot
+// runs the middle of the jmp (`push ds / popad / popfd`) and the game dies on
+// the first frame. Its one caller is CRenderer::PreRender, `call 0054AE10` at
+// 0x004A78A0, so that call is what gets redirected.
+//
+// **SpawnFlyingComponent** (0x0054AE50, __thiscall(int node) -> CObject*,
+// `ret 4`) clones the node's atomic from m_aHeliNodes (+0x288 + node * 4) into
+// a new CObject and CWorld::Adds it; a null node returns at once.
+constexpr uintptr_t CHeli__vtable               = 0x00601EB0;
+constexpr uintptr_t CHeli__CHeli                = 0x00547220;
+constexpr uintptr_t CHeli__ProcessControl       = 0x00547CC0;
+constexpr uintptr_t CHeli__PreRenderAlways      = 0x005477F0;
+constexpr uintptr_t CHeli__UpdateHelis          = 0x005499F0;
+constexpr uintptr_t CHeli__GenerateHeli         = 0x0054A640;
+constexpr uintptr_t CHeli__TestRocketCollision  = 0x0054AA30;
+constexpr uintptr_t CHeli__TestBulletCollision  = 0x0054AB30;
+constexpr uintptr_t CHeli__SpecialHeliPreRender = 0x0054AE10;
+constexpr uintptr_t CRenderer__PreRender_SpecialHeliCall = 0x004A78A0;
+constexpr uintptr_t CHeli__SpawnFlyingComponent = 0x0054AE50;
+constexpr uintptr_t CHeli__pHelis               = 0x0072CF50;   // CHeli *[4]
+constexpr uintptr_t CWanted__NumOfHelisRequired = 0x004ADC00;
+constexpr uintptr_t CWanted__RegisterCrime_Immediately = 0x004ADA10;   // thiscall, ret 10h
+constexpr uintptr_t CCollision__DistToLine      = 0x0040DC70;   // cdecl -> float
+constexpr uintptr_t CGeneral__GetRandomNumber   = 0x005A41D0;   // rand()
+constexpr uintptr_t CStats__HelisDestroyed      = 0x008E2A64;
+constexpr uintptr_t CStats__PeopleKilledByPlayer = 0x008F1B7C;
+constexpr uintptr_t CStats__CopsKilled          = 0x00880DD4;   // PedsKilledOfThisType[6]
+
+constexpr uint16_t MI_CHOPPER       = 125;
+constexpr int      HELI_SLOTS       = 4;
+constexpr size_t   SIZEOF_HELI      = 0x33C;
+constexpr uint8_t  HELI_TYPE_RANDOM   = 0;
+constexpr uint8_t  HELI_TYPE_CATALINA = 2;
+// The nodes UpdateHelis throws off: 3 and 4 in the first half, 6, 7 and 2 in
+// the second.
+constexpr int      HELI_NODE_TOPROTOR   = 2;
+constexpr int      HELI_NODE_BACKROTOR  = 3;
+constexpr int      HELI_NODE_TAIL       = 4;
+constexpr int      HELI_NODE_SKID_LEFT  = 6;
+constexpr int      HELI_NODE_SKID_RIGHT = 7;
+constexpr int      EXPLOSION_HELI       = 5;
+constexpr int      CRIME_SHOOT_HELI     = 12;
+constexpr uint32_t HELI_CRIME_ID_BASE   = 0x4D83;   // + slot
+constexpr int32_t  HELI_SHOOT_DOWN_MONEY = 250;
+constexpr uint32_t HELI_BULLET_LIMIT          = 700;
+constexpr uint32_t HELI_BULLET_LIMIT_CATALINA = 400;
+constexpr uint32_t HELI_EXPLODE_AFTER_MS      = 10000;
+constexpr float    HELI_BULLET_RADIUS         = 5.0f;
+constexpr float    HELI_ROCKET_RADIUS_SQ      = 64.0f;
+constexpr float    HELI_FIRST_BLAST_BACK      = 2.5f;
+constexpr float    HELI_MOVE_SPEED_TO_MPS     = 50.0f;   // CTimer, 0x004AD232
+
+namespace offs {
+constexpr size_t HELI_NODES              = 0x288;   // RwFrame *[8]
+constexpr size_t HELI_STATUS             = 0x2A8;   // int8
+constexpr size_t HELI_SEARCHLIGHT_X      = 0x2AC;
+constexpr size_t HELI_SEARCHLIGHT_Y      = 0x2B0;
+constexpr size_t HELI_EXPLOSION_TIMER    = 0x2B4;   // uint32, CTimer ms
+constexpr size_t HELI_ROTATION           = 0x2B8;
+constexpr size_t HELI_ANGULAR_SPEED      = 0x2BC;
+constexpr size_t HELI_SEARCHLIGHT_INTENSITY = 0x2C4;
+constexpr size_t HELI_ID                 = 0x2C8;   // int8
+constexpr size_t HELI_TYPE               = 0x2C9;   // int8
+constexpr size_t HELI_BULLET_DAMAGE      = 0x308;   // uint32
+} // namespace offs
+
+// ---- the police helicopter's gun -------------------------------------------
+//
+// Verified 2026-09-23 against the retail image with dumpbin /disasm. re3's
+// Heli.cpp:462-525 and Weapon.cpp:2061-2170 were the map; every number below
+// was read off the bytes.
+//
+// **When it fires.** Inside CHeli::ProcessControl (0x00547CC0), after the
+// searchlight is worked out:
+//   0x005491E4  m_fSearchLightIntensity < 0.9 (0x00601BB0), or the player
+//               more than 7 m from the light (sq distance vs 49.0 at
+//               0x00601BB4): m_nShootTimer (+0x300) = now, and nothing fires
+//   0x0054922D  otherwise, and past m_nPoliceShoutTimer (+0x330): the
+//               "found you" shout, PlayOneShot(m_audioEntityId, 6Bh, 0.0)
+//   0x00549260  m_heliType 0: the interval from FindPlayerPed()->m_pWanted's
+//               level (0x00549269), table 0x00601E30 = 999999 ms for 0..2
+//               stars, 10000, 5000, 3500, 2000 for 3..6; halved when
+//               CCullZones::NoPolice (0x00525CA0). Any other type: 1500
+//   0x005492DC  m_bIgnoredByCops / m_bIgnoredByEveryone (+0x16 of CWanted):
+//               m_nShootTimer = now, nothing fires
+//   0x005492F5  the frame the interval runs out: GetIsLineOfSightClear(pos,
+//               FindPlayerCoors, buildings only); blocked resets the timer
+//   0x00549370  now > m_nShootTimer + interval AND now > m_nLastShotTime
+//               (+0x304) + 200 (`add eax,0C8h` at 0x0054938A): one round
+//
+// So there is no burst object in the engine. Once the interval has run out
+// the helicopter fires one round each time 200 ms have passed, on the first
+// frame that notices, for as long as the light holds the player - roughly
+// five a second - and stops the moment the light slips.
+//
+// **One round** (0x0054939B..0x0054958C):
+//   target = FindPlayerCoors + ((rand & 0FFh) - 128) * 0.02 (0x00601BA4) in x
+//            and again in y, then + 3.0 (0x00601BAC) * dir
+//   dir    = Normalise(FindPlayerCoors - pos), CVector::Normalise 0x004BA560
+//   source = pos + 3.0 * dir, pos being [ebp+34h] (edi, 0x005490D7)
+//   FireOneInstantHitRound(&source, &target, 20)   `push 14h`, 0x00549569
+//   DMAudio.PlayOneShot(m_audioEntityId, 2Fh, 0.0)  0x00549582
+//   m_nLastShotTime = now                            0x0054958C
+// `source` is exactly three metres from the helicopter's own position, which
+// is how game/heligun.cpp tells which of the two police slots fired without
+// needing a detour on ProcessControl.
+//
+// **FireOneInstantHitRound** (0x00563B00, cdecl(CVector *source, CVector
+// *target, int damage), plain `ret`). Three callers in the image: the one
+// above, returning to 0x0054956E, and two at 0x005644F0 / 0x00564600 that
+// are not the helicopter's. In order:
+//   0x00563B56  CParticle::AddParticle(0Ch GUNFLASH, source, zero, nil, 0.0,
+//               0, 0, 0, 0)
+//   0x00563BBB  CPointLights::AddLight(0, source, zero, 5.0, 1.0, 0.8, 0.0,
+//               0, false)
+//   0x00563BDD  CWorld::ProcessLineOfSight(source, target, colPoint, victim,
+//               1, 1, 1, 1, 1, 1, 0)
+//   0x00563C43  CParticle::AddParticle(2Fh HELI_ATTACK, source, (target -
+//               source) * 0.15 (0x00603058), ...) - the tracer
+//   ped victim not dying: CAnimManager::AddAnimation for the hit reaction,
+//               CPed::InflictDamage(nil, 3 UZI, damage, piece, dir) at
+//               0x00563D0C, four blood particles when on screen
+//   vehicle:    CVehicle::InflictDamage(nil, 3, damage) at 0x00563E0D
+//   then a switch on the victim's type (table 0x00603238, type - 1):
+//     building  PlayOneShotScriptObject(6Ah, &point) + AddParticle(10h SMOKE,
+//               point, (0, 0, 0.01))
+//     vehicle   DMAudio.PlayOneShot(victim audio, 38h, 1.0)
+//     ped       DMAudio.PlayOneShot(victim audio, 37h, 1.0) + CPed::Say(65h)
+//     object    PlayOneShotScriptObject(6Bh, &point)
+//     dummy     PlayOneShotScriptObject(6Ch, &point)
+//   no victim:  CWaterLevel::GetWaterLevel(target.x, target.y, target.z + 10,
+//               &level, false); if water, AddParticle(26h BOAT_SPLASH, (x, y,
+//               level), (0, 0, 0.01)) and PlayOneShotScriptObject(6Dh) at that
+//               same splash position. re3 plays it at point.point; retail
+//               builds the vector at [esp+70h] and passes that.
+// It never calls CHeli::TestBulletCollision and never reaches
+// CObject::ObjectDamage: the helicopter's gun hurts peds and vehicles only.
+//
+// **What an observer calls instead.** Everything above except the two
+// InflictDamage calls, the hit animation, the blood and Say. The whole
+// transitive call graph of the six functions below was walked over the image
+// (every E8/E9 target, function bounds from the IDA export) and contains none
+// of CPed::InflictDamage, CVehicle::InflictDamage, CObject::ObjectDamage,
+// CExplosion::AddExplosion, CHeli::TestBulletCollision, CPed::SetDie,
+// CAutomobile::BlowUpCar, CWeapon::Fire or FireOneInstantHitRound. The only
+// indirect calls in it are OS imports (0x0061Dxxx), RwEngineInstance's
+// malloc/free (+0x130/+0x134 off 0x00661228) and the CRT. The same walk from
+// CParticle::Update (0x0050DCF0, called by CGame::Process right before
+// gFireManager.Update) finds nothing either, so a tracer particle cannot do
+// damage later. The walk from 0x00563B00 itself does find both InflictDamage
+// calls, which is the control that says the walk works.
+constexpr uintptr_t FireOneInstantHitRound        = 0x00563B00;
+constexpr uintptr_t HELI_SHOT_RETURN_ADDRESS      = 0x0054956E;
+constexpr uintptr_t CParticle__AddParticle        = 0x0050D140;   // cdecl, 9 args
+constexpr uintptr_t CPointLights__AddLight        = 0x00510790;   // cdecl, 13 dwords
+constexpr uintptr_t CAudioEngine__PlayOneShot     = 0x0057C840;   // thiscall on DMAudio, ret 0Ch
+constexpr uintptr_t PlayOneShotScriptObject       = 0x0057C5F0;   // cdecl(uint8, CVector *)
+constexpr uintptr_t CWaterLevel__GetWaterLevel    = 0x005552C0;   // cdecl, 5 args -> bool
+
+constexpr int32_t  PARTICLE_GUNFLASH    = 0x0C;
+constexpr int32_t  PARTICLE_SMOKE       = 0x10;
+constexpr int32_t  PARTICLE_BOAT_SPLASH = 0x26;
+constexpr int32_t  PARTICLE_HELI_ATTACK = 0x2F;
+constexpr uint16_t SOUND_WEAPON_SHOT_FIRED = 0x2F;
+constexpr uint16_t SOUND_WEAPON_HIT_PED    = 0x37;
+constexpr uint16_t SOUND_WEAPON_HIT_VEHICLE = 0x38;
+constexpr uint8_t  SCRIPT_SOUND_BULLET_HIT_GROUND_1 = 0x6A;
+constexpr uint8_t  SCRIPT_SOUND_BULLET_HIT_GROUND_2 = 0x6B;
+constexpr uint8_t  SCRIPT_SOUND_BULLET_HIT_GROUND_3 = 0x6C;
+constexpr uint8_t  SCRIPT_SOUND_BULLET_HIT_WATER    = 0x6D;
+constexpr float    HELI_SHOT_MUZZLE_OFFSET = 3.0f;    // 0x00601BAC
+constexpr float    HELI_TRACER_SPEED_SCALE = 0.15f;   // 0x00603058
+constexpr float    HELI_SHOT_LIGHT_RADIUS  = 5.0f;    // 0x006030DC
+constexpr float    HELI_SHOT_WATER_PROBE   = 10.0f;   // 0x00603068
+constexpr float    HELI_IMPACT_DRIFT_Z     = 0.01f;   // 3C23D70Ah
+
+namespace offs {
+constexpr size_t HELI_SHOOT_TIMER        = 0x300;   // uint32, CTimer ms
+constexpr size_t HELI_LAST_SHOT_TIME     = 0x304;   // uint32, CTimer ms
+constexpr size_t PHYSICAL_AUDIO_ENTITY   = 0x64;    // int32, CVehicle ctor 0x00550F45
+} // namespace offs
+
 // ---- startup state machine ------------------------------------------------
 //
 // gGameState, the variable WinMain (0x00582710) switches on. Verified by
@@ -115,10 +904,9 @@ constexpr uintptr_t CTimer__m_CodePause                      = 0x0095CDB1;
 // re3 makes with a literal. 3 and 5 are reached via `++gGameState` instead, so
 // they never show up as an immediate.
 //
-// agentpad/ uses this as its readiness signal, and it's worth knowing why
-// instead of just copying it: it's the only "the game is up" indicator that
-// doesn't go through CTimer, and CTimer is disputed (see the long note in
-// game/frame.cpp). WinMain sets gGameState itself, so reaching GS_FRONTEND
+// Worth knowing as a readiness signal: it's the only "the game is up"
+// indicator that doesn't go through CTimer, and CTimer is disputed (see the
+// long note in game/frame.cpp). WinMain sets gGameState itself, so GS_FRONTEND
 // means its loop is turning and every plugin's DllMain is long finished.
 constexpr uintptr_t gGameState = 0x008F5838;
 
@@ -136,8 +924,10 @@ enum eGameState {
 };
 
 // FrontendIdle - the frontend's per-frame function, only reached through
-// RsEventHandler(rsFRONTENDIDLE). Nothing hooks it yet; it's here because it
-// proves CPad::UpdatePads runs on the title screen.
+// RsEventHandler(rsFRONTENDIDLE). It proves CPad::UpdatePads runs on the
+// title screen. __cdecl, no arguments, plain `ret`. game/newgame.cpp detours
+// it: MinHook takes `sub esp,8 / call CTimer::Update` (8 bytes), and no
+// branch or pointer in the image lands inside them.
 constexpr uintptr_t FrontendIdle        = 0x0048E700;
 constexpr uintptr_t AppEventHandler     = 0x0048E800;   // main.cpp's RsEventHandler
 constexpr uintptr_t RsEventHandler      = 0x00584A20;   // skeleton's dispatcher
@@ -147,13 +937,27 @@ constexpr uintptr_t FrontEndMenuManager = 0x008F59D8;   // `mov ecx` before Proc
 // bool. Read by the GS_FRONTEND case to decide whether to start the game.
 constexpr uintptr_t CMenuManager__m_bMenuActive = 0x008F5AE9;
 
+// __thiscall void CMenuManager::DoSettingsBeforeStartingAGame(), on
+// FrontEndMenuManager: what the menu's New Game runs (re3 Frontend.cpp). It
+// shuts the menu, which is what the GS_FRONTEND case above waits for, and
+// flags the start. Read in the image: re3's body statement for statement,
+// m_bUseMouse3rdPerson, the vsync copy, DMAudio.Service, m_bWantToRestart
+// (`mov byte [008F5AECh],1`), ShutdownJustMenu (0x00488920, `mov byte
+// [ecx+111h],0` = m_bMenuActive), UnloadTextures, the two fades and
+// ResetTimers, then a plain `ret`. Its only two callers are in
+// ProcessButtonPresses: 0x004872B0, the first menu's New Game (target menu 10
+// and m_bGameNotLoaded, [ebp+116h]), and 0x00487998, MENUACTION_NEWGAME, each
+// `mov ecx,ebp / call`. Called once, for the lobby's new game
+// (game/newgame.cpp).
+constexpr uintptr_t CMenuManager__DoSettingsBeforeStartingAGame = 0x0048AB40;
+
 // ---- input ----------------------------------------------------------------
 //
 // The whole input surface, verified 2026-09-21 against the retail image
 // rather than trusted off re3's declarations - re3 said where to look, the
 // binary said whether it was true. Provenance is below for each fact, since
-// agentpad/ writes into these structures every frame and a wrong offset here
-// means a write into a neighbouring global.
+// anything writing into these structures does it every frame, and a wrong
+// offset here means a write into a neighbouring global.
 //
 // CPad::GetPad (0x00492F60) is sixteen bytes and gives two facts at once:
 //
@@ -407,6 +1211,10 @@ constexpr uint8_t  STREAMING_LOADED          = 1;      // STREAMSTATE_LOADED
 constexpr uint32_t STREAM_OFFSET_TXD         = 0x157C; // txd ids start here
 
 inline bool HasModelLoaded(uint32_t modelId) {
+	// A model id off the wire indexes the streaming array with nothing else
+	// in the way. Model ids end where txd ids begin (MODELINFO_SIZE below).
+	if (modelId >= STREAM_OFFSET_TXD)
+		return false;
 	const auto *state = reinterpret_cast<const uint8_t *>(
 	    CStreaming__ms_aInfoForModel + modelId * STREAMING_INFO_STRIDE +
 	    STREAMING_LOADSTATE_OFFS);
@@ -511,12 +1319,41 @@ constexpr uint8_t ENTITY_BULLET_PROOF         = 0x01;   // byte C
 constexpr uint8_t ENTITY_FIRE_PROOF           = 0x02;   // byte C
 constexpr uint8_t ENTITY_COLLISION_PROOF      = 0x04;   // byte C
 constexpr uint8_t ENTITY_MELEE_PROOF          = 0x08;   // byte C
+// bOnlyDamagedByPlayer: CVehicle::InflictDamage tests [esi+53h] bit 4 at
+// 0x00551972 and CAutomobile::VehicleDamage at 0x0052F653 (below), and it is
+// fifth in the list above.
+constexpr uint8_t ENTITY_ONLY_DAMAGED_BY_PLAYER = 0x10;   // byte C
 constexpr uint8_t ENTITY_ZONE_CULLED          = 0x40;   // byte C
 constexpr uint8_t ENTITY_DRAW_LAST            = 0x20;   // byte D
+
+// bRemoveFromWorld, byte D bit 0. The one flag in the engine that makes
+// CWorld::Process delete an entity in the middle of its own walk over the
+// moving list, so it is the one flag an owner of a ped cannot afford to
+// ignore. CPed::FlagToDestroyWhenNextProcessed (0x004D6570, vtable slot 16)
+// opens by writing exactly this bit: `mov al,[ebx+54h] / and al,0FEh /
+// or al,1 / mov [ebx+54h],al`, then goes on to the bInVehicle work at +0x314
+// and +0x310 that re3 Ped.cpp:7658-7678 describes.
+constexpr uint8_t ENTITY_REMOVE_FROM_WORLD    = 0x01;   // byte D
+
+// CPhysical::m_movingListNode, the CPtrNode this entity holds in
+// CWorld::ms_listMovingEntityPtrs, or null when it isn't in the list.
+//
+// Read straight off both halves of the pair: CPhysical::AddToMovingList
+// (0x004958F0) ends `mov [ebx+0E8h], eax` with eax the new node, and
+// CPhysical::RemoveFromMovingList (0x00495940) opens
+// `mov ecx,[ebx+0E8h] / test ecx,ecx / je`.
+constexpr size_t MOVING_LIST_NODE = 0xE8;
 
 // CPed::m_pCurrentPhysSurface. IsEntityCullZoneVisible's PED case reads it
 // and tests that entity's bZoneCulled2 - the only other way a ped gets culled
 // before SetupEntityVisibility ever sees it.
+//
+// Also the vehicle a standing ped is on: CPed::ProcessEntityCollision writes
+// it with the entity under its feet and registers the reference
+// (`mov [ebx+2FCh],esi / lea eax,[ebx+2FCh] / push eax / call 004A7480` at
+// 0x004CC033, beside m_vecOffsetFromPhysSurface at +0x2F0 and the boat test
+// `[esi+284h] == 1` that sets bOnBoat), and CPed::KillPedWithCar reads it back
+// at 0x004EC482 with an ENTITY_TYPE_VEHICLE test.
 constexpr size_t PED_CURRENT_PHYS_SURFACE = 0x2FC;
 
 // CPhysical::m_entryInfoList - the list of sector lists this entity is filed
@@ -839,7 +1676,11 @@ constexpr size_t VEH_HANDLING           = 0x128;   // tHandlingData*
 constexpr size_t VEH_AUTOPILOT          = 0x12C;   // CAutoPilot, 0x70 bytes
 constexpr size_t VEH_COLOUR1            = 0x19C;   // uint8
 constexpr size_t VEH_COLOUR2            = 0x19D;   // uint8
-constexpr size_t VEH_EXTRAS             = 0x19E;   // int8[2]
+// int8[2]. Written in exactly one place in the engine, CVehicle::SetModelIndex
+// at 0x00551185/0x00551190, from CVehicleModelInfo::ms_compsUsed. It is a
+// record of a choice already made and writing it changes nothing on screen -
+// see "a vehicle's extra components" below, which is why.
+constexpr size_t VEH_EXTRAS             = 0x19E;
 constexpr size_t VEH_ALARM_STATE        = 0x1A0;   // int16
 constexpr size_t VEH_DRIVER             = 0x1A4;   // CPed*
 constexpr size_t VEH_PASSENGERS         = 0x1A8;   // CPed*[8]
@@ -857,6 +1698,8 @@ constexpr size_t VEH_HEALTH             = 0x200;   // float, 1000 = full
 constexpr size_t VEH_CURRENT_GEAR       = 0x204;   // uint8
 constexpr size_t VEH_CHANGE_GEAR_TIME   = 0x208;   // float
 constexpr size_t VEH_DOOR_LOCK          = 0x224;   // eCarLock, 4 bytes
+constexpr size_t VEH_HORN_TIMER         = 0x22C;   // uint8, see "the horn" below
+constexpr size_t VEH_HORN_PATTERN       = 0x22D;   // uint8
 constexpr size_t VEH_SIREN_OR_ALARM     = 0x22E;   // bool
 constexpr size_t VEH_COLL_POLYS         = 0x230;   // CStoredCollPoly[2]
 constexpr size_t VEH_STEER_INPUT        = 0x280;   // float
@@ -943,6 +1786,71 @@ static_assert((VEH_ENGINE_ON & VEH_IS_LOCKED) == 0 &&
                   (VEH_ENGINE_ON | VEH_HANDBRAKE_ON) == 0x30,
               "bEngineOn is bit 4, between bIsLocked (3) and bIsHandbrakeOn (5)");
 
+// ---- the horn ---------------------------------------------------------------
+//
+// m_nCarHornTimer (+0x22C) and m_nCarHornPattern (+0x22D), the two bytes in
+// front of m_bSirenOrAlarm. Every byte-sized access to either offset in the
+// image was listed with a scan and read; there are twenty-seven and these are
+// all of them that matter:
+//
+//   CVehicle::CVehicle      0x00550EDA / 0x00550EE5   both = 0
+//   CAutomobile::ProcessControl, status switch on [+50h]>>3, table 0x00600A24:
+//     entries 4 (ABANDONED), 5 (WRECKED) and 11 (PLAYER_DISABLED) are
+//     0x00531B54 / 0x00531B7E / 0x00531B68, which set the brake to 0.2 / 0.05
+//     / 1.0 and all fall into `mov byte [ebp+22Ch],0` at 0x00531BAC.
+//   the horn block, 0x00533FF2: status 0 (PLAYER) only.
+//     Mr Whoopee (model 0x71) toggles the siren byte off the pad's
+//     bHornHistory (0x006F0439, index 0x006F043E) and leaves the timer alone.
+//     A siren car (call 0x00552200) writes 1 only after three frames of held
+//     key (0x00534169), otherwise 0, and toggles the siren on a tap.
+//     Anything else except the Yardie Lobo (0x87) and with bCheat3
+//     (0x0095CD66) clear writes 1 or 0 straight from CPad::GetHorn
+//     (0x00493350, ecx = Pads[0] 0x006F0360) at 0x0053419F / 0x005341A8.
+//     Every other status calls ReduceHornCounter (0x005308C0: `cmp byte
+//     [ecx+22Ch],0 / je / dec byte [ecx+22Ch] / ret`) at 0x005341B5.
+//   CAutomobile::PlayCarHorn 0x0053C450, CAutomobile vtable slot 34 (the only
+//     pointer to it in the image is 0x00600CA4 = 0x00600C1C + 0x88): does
+//     nothing if the timer is running, else draws rand() & 7 and sets 45
+//     (0x2D) on 0-1 (0x0053C46C) and on 2-3 (0x0053C48B, after the driver's
+//     Say), so four draws in eight. The driver logic's honk, from
+//     PlayHornIfNecessary (0x0053C4B0). CCarAI::UpdateCarAI (0x00413E50, called
+//     only from the SIMPLE and PHYSICS arms, 0x00531A68 / 0x00531B3E) also
+//     writes 45 for a siren car on a random byte match (0x0041584D) and 0 in
+//     three places.
+//   cAudioManager::ProcessVehicleHorn 0x0056C200, reached from
+//     ProcessVehicle at 0x00569C23 for any car in road-noise range, with no
+//     status test on the way. Skipped for Mr Whoopee and for a siren-switching
+//     car with its siren on. For status PLAYER any non-zero timer sounds; for
+//     every other status it clamps the timer to 44 (0x2C), re-picks the
+//     pattern when the timer reads exactly 44, and sounds only where
+//     `byte [0x00606AB8 + pattern*44 + (44 - timer)]` is set. That table is
+//     in game/horn.h, and it is why a replica cannot be given the player's 1.
+//   cAudioManager::ProcessVehicleSirenOrAlarm 0x0056C420: for a siren model
+//     (0x0056C3C0) it returns at 0x0056C4C7 when the status is 4, ABANDONED,
+//     before anything reads the timer or queues the siren. game/siren.h has
+//     the rest and the detour that gets a replica past it.
+//   CCarCtrl::SlowCarDownForPedsSectorList 0x00419300, called from
+//     ScanForPedDanger 0x00418F40, which CAutomobile::ProcessControl calls at
+//     0x00534B14 if !bWarnedPeds - AFTER the status switch and the horn block.
+//     The horn read at 0x0041974E sits behind `status == 0` (0x0041967E),
+//     `pedState != 9` and `CharCreatedBy == 1` (0x0041968F): a player's car,
+//     a random ped. It is what makes pedestrians flee (SetFlee 2000 ms, then
+//     run) when the player honks at them.
+//   CPed::SetEvasiveStep 0x004D30C0 reads it at 0x004D31CA, and
+//     CPed::SetEvasiveDive 0x004D33A0 at 0x004D33EC. Both only after their
+//     early returns, which for the scan's animType 0 include
+//     !bRespondsToThreats (byte [+156h] bit 1) in both.
+static_assert(VEH_HORN_PATTERN == VEH_HORN_TIMER + 1 &&
+                  VEH_SIREN_OR_ALARM == VEH_HORN_PATTERN + 1,
+              "m_nCarHornTimer, m_nCarHornPattern, m_bSirenOrAlarm are three "
+              "consecutive bytes (re3 Vehicle.h:188-190)");
+
+// cVehicleParams, the audio's per-vehicle argument, built on ProcessVehicle's
+// stack: `mov [esp+8],ebx` at 0x00569A5C with ebx the CVehicle, and
+// ProcessVehicleSirenOrAlarm reads it back with `mov ebp,[ebx+8]` at
+// 0x0056C443.
+constexpr size_t AUDIO_PARAMS_VEHICLE = 0x08;   // CVehicle *
+
 } // namespace offs
 
 // World.cpp - CWorld::Players[CWorld::PlayerInFocus].m_pPed. Confirmed by
@@ -961,7 +1869,8 @@ constexpr uintptr_t FindPlayerPed     = 0x004A1150;
 constexpr uintptr_t FindPlayerVehicle = 0x004A10C0;
 
 constexpr uintptr_t CPed__SetStoredState = 0x004C5DB0;
-constexpr uintptr_t CPed__SetDie         = 0x004D37D0;
+// CPed::SetDie has moved to the damage/death block at the end of the combat
+// section, where it is called from and where its proof is written out.
 
 // ---- ped lifecycle --------------------------------------------------------
 //
@@ -969,7 +1878,7 @@ constexpr uintptr_t CPed__SetDie         = 0x004D37D0;
 // a pool allocator - guessing is what corrupts a pool silently:
 //
 //   CRunningScript::ProcessCommands (0x00439500) dispatches `cmp dx,200 /
-//   call` into ProcessCommands100To199 (0x0043AEA4), whose jump table at
+//   call` into ProcessCommands100To199 (0x0043AEA0), whose jump table at
 //   0x005EEA7C is indexed by opcode-100. COMMAND_CREATE_CHAR is opcode 154
 //   (re3 ScriptCommands.h), so entry 54 -> 0x0043BA03.
 //
@@ -1077,6 +1986,39 @@ constexpr int CHAR_CREATED_BY_UNKNOWN = 0;
 constexpr int CHAR_CREATED_BY_RANDOM  = 1;
 constexpr int CHAR_CREATED_BY_MISSION = 2;
 
+// **Measured 2026-09-22, and it is what makes docs/wanted.md §4.2 true: a
+// police ped is RANDOM_CHAR, so game/population.cpp already replicates it.**
+//
+// Taken from the image rather than from re3's CPopulation::AddPed, because
+// "AddPed does not touch CharCreatedBy" is an absence and re3 has been wrong
+// about a retail fact six times on this project. An absence is checkable by
+// scanning for the instruction that would contradict it, which is what this
+// is: every `mov`/`alu byte [reg+160h], imm8` and `mov byte [reg+160h], r8`
+// with a disp32 in the whole of .text, 77 of them.
+//
+// The only *write* CPopulation or CCarCtrl could reach is the constructor's:
+//
+//   004C42EB  mov byte [eax+160h], 1     inside CPed::CPed (0x004C41C0),
+//                                        re3 Ped.cpp:79, and the next field
+//                                        it writes is [eax+180h] = 0
+//
+// Everything else at this offset in those two modules is a *read*:
+//
+//   004F347B  cmp byte [ecx+160h], 1     CPopulation, "is this ambient?"
+//   0041968F  cmp byte [ebx+160h], 1     CCarCtrl, the same question
+//
+// and every other immediate write in the image is a script opcode handler
+// stamping MISSION_CHAR, one of the two handlers that hand a mission ped back
+// to the city as RANDOM_CHAR, or the replay system at 0x0058xxxx. There is no
+// write anywhere in CPopulation's whole address range.
+//
+// So a CCopPed leaves CPopulation::AddPed carrying exactly the value an
+// ambient civilian leaves it carrying, and nothing between there and
+// CWorld::Add distinguishes the two. The live measurement in
+// docs/population.md §1.3.1 that says ambient pedestrians replicate therefore
+// covers police as well, without a second measurement and without a line of
+// code.
+
 // ePedType. COP == 6 is read straight out of the CREATE_CHAR handler's
 // `cmp dword [ScriptParams[0]], 6`, which fixes the rest of the enum.
 constexpr int PEDTYPE_CIVMALE   = 4;
@@ -1086,36 +2028,131 @@ constexpr int PEDTYPE_COP       = 6;
 // MI_PLAYER - Claude. Model index 0 (re3 ModelIndices.h), and what a remote
 // player wears by default.
 //
-// Slot 0 is a special model: its geometry loads by name rather than by index.
-// Worth writing down that it never changes in GTA III, since the opposite
-// looks like the obvious guess. Three things establish it:
+// Slot 0 is a special model: its geometry loads by name rather than by index,
+// and the name is how Claude changes clothes. The index never changes; what
+// it holds does.
 //
-//   - COMMAND_CREATE_PLAYER is the only place that fills it, with the literal
-//     name "player" and STREAMFLAGS_DONT_REMOVE (re3 Script.cpp:2722).
-//   - The save loader stores a model name beside the player, and re3's comment
-//     on it reads: it could be avoided by just using "player" because in
-//     practice it is always true (Pools.cpp:514).
-//   - No script command changes a ped's model index at all. LOAD_SPECIAL_MODEL
-//     fills the *special character* slots (MI_SPECIAL01..21, 8-Ball, Misty),
-//     never slot 0.
+// Corrected 2026-09-24. This comment used to say GTA III has no outfits.
+// It has two, and the script swaps them by renaming slot 0:
 //
-// So there are no outfits in GTA III - a Claude who looks different in a
-// mission is a CCutsceneObject out of cuts.img standing in front of the real
-// ped, not the ped wearing something else. CoopIII still doesn't hardcode
-// this (the model travels on the wire and a change re-skins the ped), because
-// it's a fact about the stock game and not the engine, and a mod might not
-// share it.
+//   00_intro.sc   0352: set_actor $PLAYER_ACTOR skin_to 'PLAYERP'   prison
+//   19_8ball.sc   0352: set_actor $PLAYER_ACTOR skin_to 'PLAYER'    normal
 //
-// DONT_REMOVE is also why this model needs no streaming request, and must not
-// be given one - it's pinned for the life of the game, and adding our own
-// SCRIPTOWNED claim on top would just be one more reason for
-// CStreaming::RemoveModel to refuse, if something ever did want to replace it.
+// 0352 is COMMAND_UNDRESS_CHAR, 800-range table 0x005EF77C entry 50, handler
+// 0x0044AAFC:
+//
+//   0044AB67  movsx ebx,word [ebp+5Ch]     mi = ped->m_modelIndex
+//   0044AB6D  call  [esi+18h]              ped->DeleteRwObject()
+//   0044AB72  call  004D48E0               CPed::IsPlayer
+//   0044AB7B  xor   ebx,ebx                  ... then mi = 0
+//   0044AB88  call  0040A890               RequestSpecialModel(mi, name, 6)
+//   0044AB99  call  004AE9D0               CWorld::Remove(ped)
+//
+// and 0353 COMMAND_DRESS_CHAR (entry 51, 0x0044ABBA) puts the ped back:
+// `or word [esi+5Ch],-1` then SetModelIndex(mi) through vtable +0x0C, then
+// CWorld::Add. So the local player is rebuilt around a renamed model 0, and
+// "which clothes" is CBaseModelInfo::m_name of model 0 and nothing else
+// (MODELINFO_NAME below). Both names live in gta3.img's extra-objects
+// directory, not in any IDE.
+//
+// The other two ways slot 0 is filled use the same function:
+// COMMAND_CREATE_PLAYER (0x0043A78C, "player", flags 5, only when it isn't
+// loaded yet) and CPools::LoadPedPool (0x004A2C2E, the name from the save).
+//
+// DONT_REMOVE is why this model needs no streaming request, and must not be
+// given one - it's pinned for the life of the game, and our own SCRIPTOWNED
+// claim on top would just be one more reason for CStreaming::RemoveModel to
+// refuse.
 constexpr uint16_t MI_PLAYER = 0;
 
 // The fallback for when the player model somehow isn't there - MI_MALE01, an
 // ordinary civilian always in the stream. A remote player wearing the wrong
 // shirt is a cosmetic bug. A remote player who's invisible is not.
 constexpr uint16_t MI_MALE01 = 7;
+
+// ---- special models: Claude's clothes and the mission characters ----------
+//
+// CStreaming::RequestSpecialModel(int32 modelId, const char *name, int32
+// flags), __cdecl. Every caller cleans up with `add esp,0Ch`. Matches re3
+// Streaming.cpp:866-904 statement for statement:
+//
+//   0040A89B  mov ebx,[ebp*4+0083D408h]   mi = ms_modelInfoPtrs[modelId]
+//   0040A8B0  cmp al,[esi]  (esi=ebx+4)   inlined strcmp against m_name
+//   0040A8DB  call 00407EA0               same name: RequestModel and return
+//   0040A905  call 005A0920               strcpy(mi->m_name, name)
+//   0040A969  call 00408830               RemoveModel(modelId)   <- see below
+//   0040A997  call 004736E0               ms_pExtraObjectsDir->FindItem
+//   0040A99E  call 004F6B70               ClearTexDictionary ([ecx+28h] = -1)
+//   0040A9BB  call 004F6B40               SetTexDictionary(name or "generic")
+//   0040A9DB  call 00406410               ms_aInfoForModel[id].SetCdPosnAndSize
+//   0040A9E5  call 00407EA0               RequestModel(modelId, flags)
+//
+// Prologue `53 56 57 55 83 EC 28`, seven bytes of whole instructions, and no
+// branch anywhere in the function (or into it from outside) lands inside
+// them: every internal jump targets 0x0040A8B0 or later. Safe to detour.
+//
+// A rename runs RemoveModel on a model other peds may still be built from.
+// Their clumps are clones and survive, but the model's own clump goes until
+// the new name streams in, and a clone's txd reference was taken on the old
+// name (AddRef -> AddTexDictionaryRef, [mi+28h]) while its eventual release
+// lands on the new one.
+// The engine gets away with it because UNDRESS_CHAR takes the only ped of
+// that model out of the world first. A remote Claude is a second ped of that
+// model, so CoopIII has to do the same (ped.cpp, HookedRequestSpecialModel).
+//
+// Five callers: COMMAND_CREATE_PLAYER 0x0043A78C, LOAD_SPECIAL_MODEL (the
+// cutscene props, 0x004474C4), UNDRESS_CHAR 0x0044AB88, CPools::LoadPedPool
+// 0x004A2C2E, and RequestSpecialChar below.
+constexpr uintptr_t CStreaming__RequestSpecialModel = 0x0040A890;
+
+// CStreaming::RequestSpecialChar(charId, name, flags) at 0x0040ADA0 is
+// `add eax,1Ah` and a call to the above, which is what pins MI_SPECIAL01 at
+// 26. Its only caller is COMMAND_LOAD_SPECIAL_CHARACTER (0x23C, 500-range
+// table 0x005EF298 entry 72, handler 0x00444274), which passes `param - 1`
+// and flags 6. HasSpecialCharLoaded (0x0040ADC0) is
+// `cmp byte [id*20 + 006C7298h],1`, i.e. m_loadState of 26 + id.
+constexpr uintptr_t CStreaming__RequestSpecialChar = 0x0040ADA0;
+constexpr uint16_t  MI_SPECIAL01      = 26;
+constexpr uint16_t  NUM_SPECIAL_CHARS = 4;   // special01..04 in default.ide
+
+// CStreaming::SetMissionDoesntRequireModel(int32 id), __cdecl, 0x0040A820.
+// `and byte [id*20 + 006C7091h],0FDh` - clears SCRIPTOWNED - then hands a
+// loaded model back to the streamer's list, or cancels a request that
+// hadn't loaded. UNLOAD_SPECIAL_CHARACTER (0x296, handler 0x00444CD1) reaches
+// it through 0x0040ADE0, which is `add eax,1Ah` again.
+constexpr uintptr_t CStreaming__SetMissionDoesntRequireModel = 0x0040A820;
+
+// CStreaming::ms_pExtraObjectsDir, a CDirectory*, and CDirectory::FindItem
+// (const char *name, uint32 &offset, uint32 &size), __thiscall, `ret 0Ch`,
+// returning bool in al. Case-insensitive compare over 32-byte entries whose
+// name is at +8. RequestSpecialModel calls it as
+// `mov ecx,[0095CB90h] / call 004736E0` and ignores the answer, leaving two
+// uninitialised locals as the model's CD position when the name isn't there.
+// So a name off the wire gets looked up here first.
+constexpr uintptr_t CStreaming__ms_pExtraObjectsDir = 0x0095CB90;
+constexpr uintptr_t CDirectory__FindItem            = 0x004736E0;
+
+namespace offs {
+// CBaseModelInfo::m_name, char[24]. RequestSpecialModel compares and copies
+// at [mi+4]; m_colModel follows at +0x1C (MODELINFO_COLMODEL).
+constexpr size_t MODELINFO_NAME     = 0x04;
+constexpr size_t MODELINFO_NAME_LEN = 24;
+// CBaseModelInfo::m_refCount, uint16: AddRef (0x004F6BA0) is
+// `inc word [ecx+26h]`, RemoveRef (0x004F6BB0) `dec word [ecx+26h]`, and
+// CEntity::CreateRwObject / DeleteRwObject call them (0x00473F07,
+// 0x00473F74). So it counts the entities built from the model.
+constexpr size_t MODELINFO_REFCOUNT = 0x26;
+} // namespace offs
+static_assert(offs::MODELINFO_NAME_LEN == PLAYER_LOOK_LEN,
+              "a look is exactly one model name");
+
+// CStreamingInfo::m_flags, the byte after m_loadState. RequestModel
+// (0x00407EA0) ORs the caller's flags into [id*20 + 006C7091h].
+constexpr size_t  STREAMING_FLAGS_OFFS    = 0x09;
+constexpr uint8_t STREAMFLAGS_DONT_REMOVE = 0x01;
+constexpr uint8_t STREAMFLAGS_SCRIPTOWNED = 0x02;   // SetMissionDoesntRequire clears it
+constexpr uint8_t STREAMFLAGS_PRIORITY    = 0x08;   // RequestModel's `and eax,8` arm
+constexpr uint8_t STREAMING_NOTLOADED     = 0;
 
 // ---- vehicle lifecycle ----------------------------------------------------
 //
@@ -1130,7 +2167,8 @@ constexpr uint16_t MI_MALE01 = 7;
 //
 //   CollectParameters(&m_nIp, 4)
 //   if (CModelInfo::IsBoatModel(model))                  ; call 0x0050BB90
-//        ... the CBoat branch, `push 484h` then the same shape ...
+//        ... the CBoat branch. NOT the same shape as the car's, see "boats"
+//        below for the whole of it (re-read 2026-09-23) ...
 //   if (!IsBikeModel(model))     ; inlined: ms_modelInfoPtrs[model]->+0x58 != 5
 //        car = new CAutomobile(model, MISSION_VEHICLE)   ; push 5A8h / new / ctor
 //   pos.z += car->GetDistanceFromCentreOfMassToBaseOfModel()   ; 0x004755C0
@@ -1199,7 +2237,7 @@ constexpr uintptr_t CVehicle__operator_new = 0x00551120;
 // vtable, then constructs CDamageManager at this+0x288 - which is the proof
 // of offs::SIZEOF_VEHICLE.
 constexpr uintptr_t CAutomobile__ctor = 0x0052C6B0;
-constexpr uintptr_t CBoat__ctor       = 0x0053E3E0;   // same signature
+constexpr uintptr_t CBoat__ctor       = 0x0053E3E0;   // same signature, see "boats"
 constexpr uintptr_t CVehicle__ctor    = 0x00550A60;   // (uint8 createdBy)
 
 // CVehicle::SetModelIndex(uint32). Calls CEntity::SetModelIndex, copies
@@ -1211,6 +2249,252 @@ constexpr uintptr_t CVehicle__SetModelIndex = 0x00551170;
 
 constexpr uintptr_t CVehicle__CanBeDeleted = 0x005511B0;
 
+// ---- boats ----------------------------------------------------------------
+//
+// Read out of the retail image on 2026-09-23 for docs/roadmap.md M2, "Boats".
+// A synced boat used to be built as a CAutomobile wearing a boat's model.
+// Everything below is what it takes to build the real thing and what the
+// real thing does differently once it exists.
+//
+// **How the engine tells a boat from a car: by the model info, before there
+// is an object, and by m_vehType after.** CModelInfo::IsBoatModel is nine
+// instructions and has no null check (the listing desyncs on the padding in
+// front of it, so this was decoded from the bytes):
+//
+//   0050BB90  mov ecx,[esp+4]                    model id
+//   0050BB94  mov edx,[ecx*4+0083D408h]          ms_modelInfoPtrs[id]
+//   0050BB9D  cmp byte [eax+2Ah],5 / jne false   m_type == MITYPE_VEHICLE
+//   0050BBA3  cmp dword [edx+58h],1 / jne false  m_vehicleType == BOAT
+//   0050BBA9  mov al,1 / ret
+//
+// CREATE_CAR's bike test reads the same dword (`mov esi,[eax+58h] / cmp
+// esi,5` at 0x0043C5ED), and CCarGenerator::DoInternalProcessing calls
+// IsBoatModel too (0x00542739), so it is the engine's one rule, not a script
+// quirk. Once built, CBoat::CBoat writes `mov dword [eax+284h],1` at 0x0053E42A
+// and CAutomobile::CAutomobile writes 0 there at 0x0052C766, which is what
+// every runtime IsBoat() in the engine tests (0x004D8519, 0x004D7F43,
+// 0x004E0C3B, 0x004E022B below).
+constexpr uintptr_t CModelInfo__IsBoatModel = 0x0050BB90;   // recorded, not called
+constexpr uint8_t   MITYPE_VEHICLE          = 5;
+// CStreaming::RequestModelStream tests both in a row on the same model info
+// (re3 Streaming.cpp:1760-1780): `cmp byte [eax+2Ah],6 / jne` at 0x0040A284,
+// then `cmp byte [ebx+2Ah],5` at 0x0040A28F.
+constexpr uint8_t   MITYPE_PED              = 6;
+namespace offs {
+constexpr size_t MODELINFO_VEHICLE_TYPE = 0x58;   // int32 eVehicleType
+} // namespace offs
+
+// CBoat::CBoat(int32 modelId, uint8 createdBy), __thiscall, `ret 8` at
+// 0x0053E78D. `mov eax,[esp+1Ch] / push eax / call 0x00550A60` passes
+// createdBy on to CVehicle::CVehicle and keeps the model in ebp for the
+// SetModelIndex through vtable slot 3 at 0x0053E481. The vtable it stamps at
+// 0x0053E3FC is 0x00600EA4; slot 29 of it is CBoat::BlowUpCar and slot 0 is
+// the deleting destructor 0x005425E0, which runs ~CBoat (0x0053E790) and then
+// `call 0x00551150` - CVehicle::operator delete, i.e. `mov ecx,[009430DCh] /
+// call 0x00554CA0`, the vehicle pool's Delete. So DELETE_CAR's teardown
+// through slot 0 frees a boat into the same pool a car goes back to.
+constexpr uintptr_t CBoat__vtable = 0x00600EA4;
+
+// **The pool holds either.** CVehicle::operator new (0x00551120) ignores its
+// size - `mov ecx,[009430DCh] / call 0x00554CF0 / ret`, decoded from the
+// bytes - and CPool::New at 0x00554CF0 hands back `index * 5A8h + base`
+// (0x00554D4E). Every slot is sizeof(CAutomobile), and a 0x484-byte CBoat
+// sits in one with 0x124 bytes to spare. CREATE_CAR still pushes 484h for a
+// boat and CoopIII does the same.
+//
+// CREATE_CAR's boat branch, 0x0043C497-0x0043C5DB, which is shorter than the
+// car branch in ways that matter:
+//
+//   push 484h / call CVehicle::operator new
+//   push 2 / push model / call CBoat::CBoat              ; MISSION_VEHICLE
+//   pos.z += GetDistanceFromCentreOfMassToBaseOfModel()  ; 0x004755C0
+//   SetPosition, ClearSpaceForMissionEntity              ; 0x00454060
+//   [+50h] and 7 / or 20h                                ; STATUS_ABANDONED
+//   [+1F5h] and 0F7h / or 8                              ; bIsLocked
+//   [+15Ah] = 0, [+15Bh] = 0                             ; mission, temp action
+//   [+160h] = 41A00000h (20.0f), [+164h] = 20            ; max and cruise speed
+//   CWorld::Add
+//
+// No CCarCtrl::JoinCarWithRoadSystem (a boat has no road to join), no
+// driving style or lanes, no bEngineOn write, no m_nZoneLevel and no
+// bHasBeenOwnedByPlayer. The two gates are the car's two gates.
+constexpr float BOAT_SPAWN_CRUISE_SPEED = 20.0f;
+
+// Every `call 0x0053E3E0` in the image, which is also the list of ways a boat
+// can come to exist:
+//
+//   0043C4B2  CREATE_CAR, createdBy 2
+//   004A1C13  the save loader, `push 484h` then placement new (0x00551130)
+//             and createdBy 1, then `dec [00943118h]` (NumRandomCars) - the
+//             real createdBy is copied in from the save afterwards
+//   00542760  CCarGenerator::DoInternalProcessing, after IsBoatModel,
+//             createdBy 3 (PARKED_VEHICLE), then bIsStatic and bEngineOn off
+//   00595460  the replay, which picks the class by model id: 0x78, 0x8E,
+//             0x8F, 0x96 (Predator, Speeder, Reefer, Ghost)
+//
+// None of them is CCarCtrl, so GTA III has no boat traffic, and a boat in
+// the street is a parked one from a car generator the script switched on.
+
+// **What a CBoat does with its status, and why a replica's controls are not
+// its own.** CBoat::ProcessControl (vtable slot 8, 0x0053EF10) switches on
+// the status through the six-entry table at 0x00600E84:
+//
+//   0 PLAYER     0x0053F2F0  ProcessControlInputs(0) through slot 18
+//   2 SIMPLE     0x0053F323  CPhysical::ProcessControl only, then return
+//   3 PHYSICS    0x0053F376  CCarCtrl::SteerAIBoatWithPhysics (0x0041E250)
+//   4,5 ABANDONED, WRECKED   0x0053F393  steer = 0, bIsHandbrakeOn = 0,
+//                            brake = 0.5f, gas = 0; and if the player is more
+//                            than 150 units away (0x00600D10), both velocity
+//                            vectors zeroed and return
+//
+// ProcessControlInputs (0x0053EC70) keeps its own accelerate, brake and steer
+// at +0x2D8, +0x2DC and +0x2E0 and ends by publishing the two that mean
+// anything to the rest of the engine: `fstp [ebp+1E8h]` (m_fSteerAngle) and
+// `fstp [ebp+1ECh]` (m_fGasPedal = accelerate) at 0x0053EEF2 / 0x0053EEFE.
+// A boat has no gear and no handbrake of its own, and C_VehicleState's steer
+// and gas already carry the two fields it publishes.
+//
+// **A boat has its own fire timer, and nothing but the constructor resets
+// it.** The damage block the status switch falls into opens at
+// `m_fHealth <= 600.0f` (0x0053F627, constant 0x00600D28) and the fire at
+// `m_fHealth < 150.0f` (0x0053F917). Then:
+//
+//   0053FB04  fadd [ebp+2CCh] / fstp [ebp+2CCh]      timer += step in ms
+//   0053FB10  fld [ebp+2CCh] / fcomp [00600D60h]     5000.0f
+//   0053FB23  mov eax,[ebp+2D0h] / push eax          m_pSetOnFireEntity
+//   0053FB2E  call dword [esi+74h]                   BlowUpCar
+//
+// The only other writes to [+2CCh] in the image are the constructor's zero
+// at 0x0053E6C7 and code outside CBoat. The car's block at 0x00534510 resets
+// its timer for a healthy car; this one never does. So "every destruction
+// goes through BlowUpCar" further down still holds, but the list of callers
+// there is one short, and so is its "exactly ONE place" that turns a raw
+// m_fHealth into a wreck. CAutomobile's AUTO_FIRE_BLOWUP_TIMER at +0x530 lies
+// past the end of a 0x484-byte boat - inside the pool slot, outside the
+// object, and not the boat's timer. A write meant to hold a boat's timer has
+// to go to +0x2CC.
+namespace offs {
+constexpr size_t BOAT_FIRE_BLOWUP_TIMER  = 0x2CC;   // float, ms
+constexpr size_t BOAT_SET_ON_FIRE_ENTITY = 0x2D0;   // CEntity*
+} // namespace offs
+constexpr float BOAT_FIRE_HEALTH = 150.0f;
+
+static_assert(offs::BOAT_FIRE_BLOWUP_TIMER >= offs::SIZEOF_VEHICLE &&
+                  offs::BOAT_SET_ON_FIRE_ENTITY + 4 <= offs::SIZEOF_BOAT,
+              "both are CBoat's own members");
+
+// **A boat's culprit is the one m_pSetOnFireEntity nothing registers.** The
+// car's copy is registered every place it is written (0x0052FFCE then
+// 0x0052FFE5, 0x00551BF3 then 0x00551C08). The boat's is a plain copy of that
+// frame's m_pDamageEntity, in the damage block:
+//
+//   0053F60B  mov dword [ebp+200h],3F800000h     m_fHealth = 1.0f
+//   0053F615  mov eax,[ebp+110h]                 m_pDamageEntity
+//   0053F61B  mov [ebp+2D0h],eax                 m_pSetOnFireEntity, no call
+//
+// and five seconds of fire later the timer above hands it to BlowUpCar
+// (0x0053FB25 / 0x0053FB2E, vtable +74h = 0x00541CB0), which passes it on as
+// the culprit of CExplosion::AddExplosion (0x00541DAB), which registers a
+// reference on it (0x005592C5) and keeps it as the blast's creator. So a boat
+// that a remote player's car or a replica rammed, and that CoopIII then took
+// away, blows up blaming a freed pool slot. CoopIII nils it before the entity
+// goes (game/teardown.h) - what a registered pointer would have become.
+constexpr uintptr_t BOAT_SET_ON_FIRE_STORE   = 0x0053F61B;
+constexpr uintptr_t BOAT_FIRE_TIMER_CULPRIT  = 0x0053FB25;
+constexpr uintptr_t CBoat__BlowUpCar_Explode = 0x00541DAB;   // E8 AddExplosion(this, culprit, 3, ...)
+
+// **The seat, which is the part that breaks first.** CPed::SetObjective's arm
+// for OBJECTIVE_ENTER_CAR_AS_PASSENGER and _AS_DRIVER (14 and 15, both
+// 0x004D8507 in the table at 0x005F8EFC) writes m_objective at 0x004D84EC and
+// then does this before anything else:
+//
+//   004D8519  cmp dword [ebp+284h],1 / jne 004D8540   the car is a boat
+//   004D8524  call CPed::IsPlayer / jne 004D8540       and we are not the player
+//   004D852F  call 0x004D9460                          RestorePreviousObjective
+//             ret 8
+//
+// 0x004D9460 is `m_objective = m_prevObjective, m_prevObjective = 0` (with
+// the LEAVE_CAR special case), so for any ped that is not the player the
+// objective is undone on the spot and m_carInObjective is never written. The
+// engine never puts a pedestrian in a boat by objective. CPed::WarpPedIntoCar
+// reads m_objective (0x004D7D94) to pick the seat, so the warp that follows
+// takes its no-seat arm. For a replica that is every boat, every time.
+//
+// WarpPedIntoCar itself handles a boat fine once it gets that far: it writes
+// m_pMyVehicle and m_carInObjective with their references, and after the
+// seat `cmp [ebx+284h],1` at 0x004D7F43 picks boat animation 0x7A where a car
+// gets 0x6F/0x70. SetEnterCar_AllClear has the same boat arm at 0x004E0C3B,
+// but it is reached through the objective the same way.
+
+// **Why a boat stops where its driver leaves it.** CPed::ProcessObjective's
+// LEAVE_VEHICLE arm tests only for a train (`[edx+284h] == 2` at 0x004DA132,
+// then CPed::SetExitTrain at 0x004E3640) and sends everything else, boats
+// included, to CPed::SetExitCar at 0x004DA157 - whose first act is
+// CanPedExitCar, and CanPedExitCar (0x005523C0) has no m_vehType test in it.
+// So a player can only step off a boat that is already inside
+// VEH_EXIT_MAX_SPEED_SQ and VEH_EXIT_MAX_TURN.
+//
+// And a vehicle never gets bIsStatic from CPhysical::ProcessControl. The
+// quiet-frame counter "when the engine itself stops believing a thing is
+// moving" transcribes is behind a type test at 0x00495F9A: `and al,7 / cmp
+// al,4 / je` (an object) or `cmp al,3` plus a flag (a ped), and anything else
+// jumps to 0x00496179 past it. CBoat's own code writes neither bIsStatic nor
+// m_nStaticFrames. So for a boat, VehicleAtRest is VehicleAtRestNumbers and
+// nothing else.
+
+// ---- why a session car can become impossible to get into -------------------
+//
+// Recorded because it is the whole of the "press F on a car another player
+// drove and you walk toward it forever" bug, and because nothing about the
+// symptom points at it. CoopIII does not call either of these; what it has to
+// do is stop making the first one return false.
+//
+// __thiscall bool CVehicle::CanPedEnterCar(void), disassembled 2026-09-22:
+//
+//   005522F0  mov edx,ecx / lea eax,[edx+24h] / three movs        GetUp()
+//   00552303  fld [esp+0Ch]                                       up.z
+//   00552307  fcom [0060258Ch]   = +0.1f    ; not greater ->
+//   0055231C  fcom [00602590h]   = -0.1f    ; not less    -> return false
+//   00552333  lea eax,[edx+78h]  MagnitudeSqr(m_vecMoveSpeed)
+//   00552354  fcomp [00602594h]  = 0.04f    ; greater     -> return false
+//   00552370  add edx,84h        MagnitudeSqr(m_vecTurnSpeed)
+//   00552394  fcomp [00602594h]  = 0.04f    ; greater     -> return false
+//                                           ; otherwise   -> return true
+//
+// The three constants were read out of the file, not derived: 0x3DCCCCCD,
+// 0xBDCCCCCD and 0x3D23D70B at 0x0060258C. So the speed gate is sq(0.2f), the
+// value re3 Vehicle.cpp:1009 has, and it is on BOTH velocities. It confirms
+// MOVE_SPEED 0x78 and TURN_SPEED 0x84 a second time, from a function that
+// reads them rather than writes them.
+constexpr uintptr_t CVehicle__CanPedEnterCar = 0x005522F0;   // () -> bool
+constexpr float     VEH_ENTER_MAX_SPEED_SQ   = 0.04f;
+
+// And what the refusal costs, from CPed::SeekCar's arrival block:
+//
+//   004D44C0  movzx edx,byte [ebp+1CCh]     m_nNumMaxPassengers
+//   004D44C7  movzx eax,byte [ebp+1C9h]     m_nNumGettingIn
+//   004D44CF  cmp eax,edx / jge out         (after inc edx)
+//   004D44D9  mov ecx,ebp / call 005522F0   CanPedEnterCar
+//   004D44E0  test al,al / je 004D4617
+//   004D4617  mov ecx,ebx / call 004C5E30   CPed::RestorePreviousState
+//
+// RestorePreviousState, and nothing else. m_objective is left at
+// OBJECTIVE_ENTER_CAR_AS_DRIVER, so the next frame runs SeekCar again and the
+// ped walks back to the same door. There is no timeout and no give-up: a car
+// that fails CanPedEnterCar forever is a car the player can never enter, and
+// the only sign of it is a character walking on the spot.
+//
+// The same block re-confirms PED_VEH_DOOR 0x2E8 as a *word*
+// (`cmp word [ebx+2E8h],0Fh` at 004D452A) and CAR_DOOR_LF == 15 against
+// VEH_DRIVER 0x1A4 - the two constants branch `entercar` found independently.
+// 0x004D3F90 is where the function starts - 1720 bytes, ending at 0x004D4648,
+// with the block above at its tail. Taken from the IDA function list beside
+// the binary rather than by scanning backwards, and cross-checked by the one
+// either side of it: 0x004D3E70/118 bytes is CPed::Teleport, which this file
+// already records from an independent reading.
+constexpr uintptr_t CPed__SeekCar              = 0x004D3F90;   // ()
+constexpr uintptr_t CPed__RestorePreviousState = 0x004C5E30;   // ()
+
 // __thiscall CEntity::GetDistanceFromCentreOfMassToBaseOfModel() -> float.
 // CREATE_CAR adds it to the spawn z so the car sits on its wheels rather than
 // with its centre of mass on the road surface.
@@ -1220,6 +2504,480 @@ constexpr uintptr_t CVehicle__GetDistanceFromCentreOfMassToBaseOfModel = 0x00475
 // AutoPilot.m_nNextRouteNode (+0x130) and m_nCurrentRouteNode (+0x12C), which
 // is both re3's first statement and another confirmation of VEH_AUTOPILOT.
 constexpr uintptr_t CCarCtrl__JoinCarWithRoadSystem = 0x0041F820;
+
+// ---- traffic generation ---------------------------------------------------
+//
+// What docs/population.md needs to tell the engine how crowded the street
+// really is. Verified 2026-09-22, by the route that has worked every time
+// here: walk the script opcode that already does the thing.
+//
+// SET_CAR_DENSITY_MULTIPLIER is opcode 491, so entry 91 of the 400..499 table
+// at 0x005EEFC8 (base opcode a round 400, see the note at the top of this
+// file). The handler is 0x004426FA and it is four instructions:
+//
+//   004426FA  lea  eax, [ebp+10h]              &ScriptParams
+//             mov  ecx, ebp                    the running script
+//             push 1 / push eax
+//             call 004382E0                    CollectParameters(&m_nIp, 1)
+//   00442707  fld  dword [006ED460]            ScriptParams[0]
+//   00442715  fstp dword [005EC8B4]            CarDensityMultiplier
+//
+// That names three things at once, and then the multiplier names the
+// generator: of the six instructions in the image that touch 0x005EC8B4,
+// three are `mov imm32` resets, one is the store above, and the two `fmul`s
+// are the readers. The one at 0x004166E3 is inside CCarCtrl code.
+constexpr uintptr_t CTheScripts__CollectParameters = 0x004382E0;
+constexpr uintptr_t CTheScripts__ScriptParams      = 0x006ED460;
+
+// CCarCtrl::GenerateOneRandomCar(void). __cdecl, no arguments.
+//
+// Confirmed twice over. It is the function containing the density read, and
+// its prologue carries re3's `static int32 unk = 0` as the MSVC pair an
+// initialised function-local static compiles to - a guard byte and the
+// storage:
+//
+//   004165F0  push ebx/esi/edi/ebp / sub esp,188h
+//   004165FA  cmp  byte [0062356C], 0          the init guard
+//   00416603  mov  byte [0062356C], 1
+//   0041660A  mov  dword [00623568], 0         the static itself
+//
+// Then its first two gates are re3's first two statements, in order:
+//
+//   004166E3  fmul dword [005EC8B4]            * CarDensityMultiplier
+//   004166E9  fmul dword [006182F8]            * CIniFile::CarNumberMultiplier
+//   004166EF  fild dword [00943118]            NumRandomCars
+//             fcompp / jne                     >= means return
+//
+//   00416710  mov  eax, [00943118]             NumRandomCars
+//             add  eax, [008F1B38]             + five more counters
+//             add  eax, [008F1B54]
+//             add  eax, [008F29E0]
+//             add  eax, [00885BB0]
+//             add  eax, [009411F0]
+//   00416733  cmp  eax, [005EC8B8]             MaxNumberOfCarsInUse
+//             jl                               under it means carry on
+//
+// These two gates are the whole point: rewrite what they read and the engine
+// counts everybody's cars before deciding to make another. population.md 1.3.
+constexpr uintptr_t CCarCtrl__GenerateOneRandomCar = 0x004165F0;
+constexpr uintptr_t CCarCtrl__CarDensityMultiplier = 0x005EC8B4;
+constexpr uintptr_t CCarCtrl__MaxNumberOfCarsInUse = 0x005EC8B8;
+constexpr uintptr_t CIniFile__CarNumberMultiplier  = 0x006182F8;
+
+// The gate counter. Read twice in the two gates above, which is its own
+// confirmation.
+constexpr uintptr_t CCarCtrl__NumRandomCars = 0x00943118;
+
+// The second term of that sum, and named independently a few instructions
+// later by the wanted-level branch - re3's `NumLawEnforcerCars <
+// pWanted->m_MaximumLawEnforcerVehicles`:
+//
+//   00416767  movzx eax, byte [edi+12h]        m_MaximumLawEnforcerVehicles
+//   0041676B  cmp  dword [008F1B38], eax
+//   00416771  jge                              at the cap, no cop car
+constexpr uintptr_t CCarCtrl__NumLawEnforcerCars = 0x008F1B38;
+
+// ---- who maintains those counters, and it is the constructor --------------
+//
+// Verified 2026-09-22, and this is the fact docs/population.md §3 step 4 had
+// to establish before deciding whether traffic needs the counter rewriting.
+//
+// CCarCtrl::UpdateCarCount(CVehicle*, bool remove). __cdecl, two stack args:
+//
+//   004202E0  cmp   byte [esp+8], 0          the `remove` argument
+//   004202E5  mov   ecx, [esp+4]             the vehicle
+//   004202E9  jne   00420330                 -> the decrement half
+//   004202EB  movzx eax, byte [ecx+1F4h]     VehicleCreatedBy  (offs 0x1F4)
+//   004202F2  dec   eax / cmp eax,3 / ja out
+//   004202F8  jmp   [eax*4 + 5ECC94h]        four-entry table, createdBy-1
+//
+// Both jump tables read out of the image, and between them they NAME three of
+// the counters that the generator's sum left ambiguous - the table index is
+// VehicleCreatedBy - 1, and that enum is fixed by the constructor argument
+// CREATE_CAR passes:
+//
+//   0x005ECC94 (increment) = 4202FF, 420317, 42031F, 420327
+//   0x005ECC84 (decrement) = 420344, 42035C, 420364, 42036C
+//
+//   index 0  RANDOM_VEHICLE     004202FF  test bIsLawEnforcer -> inc 008F1B38
+//                                         then inc 00943118   (NumRandomCars)
+//   index 1  MISSION_VEHICLE    00420317  inc 008F1B54
+//   index 2  PARKED_VEHICLE     0042031F  inc 008F29E0
+//   index 3  PERMANENT_VEHICLE  00420327  inc 008F29F0
+//
+// So 0x008F1B54 is NumMissionCars and 0x008F29E0 is NumParkedCars, which is
+// the second independent witness those two needed - the first was only their
+// presence in the generator's reassociated sum, which does not say which is
+// which. 0x008F29F0 is NumPermanentCars and is NOT in that sum, which agrees:
+// re3's sum does not include it either. By elimination the two still unnamed,
+// 0x00885BB0 and 0x009411F0, are NumFiretrucksOnDuty and NumAmbulancesOnDuty
+// in some order, and nothing here says which - they stay in
+// docs/addresses-unverified.md.
+//
+// **And the callers are the constructor and the destructor**, which is the
+// whole point. A whole-image scan for `call 0x004202E0` finds exactly three:
+//
+//   00550C89  push 0 / push eax / call 4202E0   inside CVehicle::CVehicle
+//                                               (which starts at 0x00550A60)
+//   005510CA  push 1 / push ebx / call 4202E0   inside ~CVehicle
+//   00596DC4                                    the replay system
+//
+// This is the vehicle equivalent of CPed::CPed calling
+// CPopulation::UpdatePedCount, and it is why population.md §1.3.1's ped
+// result had a fair chance of repeating for cars. It is not the same, though,
+// and the difference is the whole measurement: **which** counter a vehicle
+// lands in is decided by the byte at +0x1F4, so a replica created as
+// MISSION_VEHICLE is counted in NumMissionCars and is invisible to the
+// generator's *first* gate, which reads NumRandomCars alone. A replica
+// created as RANDOM_VEHICLE lands in the same counter its original did on the
+// machine that made it, and both gates see it.
+constexpr uintptr_t CCarCtrl__UpdateCarCount = 0x004202E0;
+constexpr uintptr_t CCarCtrl__NumMissionCars = 0x008F1B54;
+constexpr uintptr_t CCarCtrl__NumParkedCars  = 0x008F29E0;
+
+// The other two terms of the sum are 0x00885BB0 and 0x009411F0. They are
+// NumFiretrucksOnDuty and NumAmbulancesOnDuty in some order, and neither the
+// sum nor UpdateCarCount says which - deliberately not guessed at, and listed
+// in docs/addresses-unverified.md instead.
+
+// ---- what a session car's copy costs the traffic budget --------------------
+//
+// Verified 2026-09-23 for game/carlife.h. A copy is built MISSION_VEHICLE, so
+// UpdateCarCount's second arm puts it in NumMissionCars, and NumMissionCars is
+// one of the six terms above. Every copy alive on this machine is one car
+// fewer the engine will generate.
+//
+// The same six-term sum is compared against MaxNumberOfCarsInUse in exactly
+// three places, found by scanning the whole image for [005EC8B8]:
+//
+//   00416733  cmp eax,[005EC8B8] / jl carry on    GenerateOneRandomCar
+//   0041FC93  cmp eax,[005EC8B8] / jle carry on   the function at 0x0041FC50
+//                                                 (called from 0x004165E7),
+//                                                 re3's GenerateEmergencyServicesCar
+//   004F4B05  cmp eax,[005EC8B8] / jl             CPopulation::AddToPopulation,
+//                                                 the cop-car-for-a-cop branch
+//
+// and written in exactly one, CIniFile::LoadIniFile's `12.0f *
+// CarNumberMultiplier` at 0x0059BF9E, whose only caller (0x0048BEED) is
+// startup. NumMissionCars is read nowhere else: its 17 references are those
+// three sums, two resets (0x0041D2BC, 0x0041D3DD) and incs and decs. So
+// raising MaxNumberOfCarsInUse by what the copies add to the sum is the same
+// thing, at all three gates, as the copies not being counted.
+//
+// PERMANENT_VEHICLE's counter, 0x008F29F0 (UpdateCarCount's fourth arm,
+// 0x00420327), is not in the sum.
+constexpr uintptr_t CCarCtrl__NumPermanentCars = 0x008F29F0;
+
+// CPools::SaveVehiclePool(uint8 *buf, uint32 *size). __cdecl: GenericSave's
+// only call to it, 0x0058FDD2, pushes &size and buf and pops both itself.
+//
+// It walks the vehicle pool (0x009430DC) twice, once to count and once to
+// write, and both walks use the same test (0x004A20E0-0x004A212B, then
+// 0x004A21E2-0x004A2223):
+//
+//   cmp [v+1A8h+i*4],0 for i < 8     any passenger -> skip
+//   cmp [v+1A4h],0                   a driver      -> skip
+//   cmp [v+284h],0 / cmp [v+1F4h],2  a car and MISSION_VEHICLE -> written
+//   cmp [v+284h],1 / cmp [v+1F4h],2  a boat and MISSION_VEHICLE -> written
+//
+// and the write is a memcpy of the whole object (0x5A8 for a car, 0x484 for a
+// boat) through 0x005B3BB0. So any empty mission car in the pool goes into the
+// single-player save, and a parked session copy is exactly that. Nothing else
+// in the function reads VehicleCreatedBy, so a copy that reads anything but 2
+// for the length of the call is simply not written.
+constexpr uintptr_t CPools__SaveVehiclePool = 0x004A2080;
+
+// GenericSave(int file), the whole save, which calls the one above at
+// 0x0058FDD2. bool __cdecl: its only caller, C_PcSave::SaveSlot, does
+// `push ebp / call 0058F8D0 / test al,al / pop ecx` at 0x00591F15. Opens
+// `push ebx / push esi / push edi / push ebp / sub esp,150h`, ten bytes.
+//
+// Before any pool it copies the simple variables into the buffer, and three
+// of them are the weather (re3 GenericGameStorage.cpp, the same order):
+//
+//   0058FB13  mov esi,95CCECh / movsw   OldWeatherType    -> [ebp+88h]
+//   0058FB20  mov esi,95CC70h / movsw   NewWeatherType    -> [ebp+8Ch]
+//   0058FB2D  mov esi,95CC80h / movsw   ForcedWeatherType -> [ebp+90h]
+//
+// and GenericLoad reads ForcedWeatherType straight back (`mov edi,95CC80h /
+// movsw` at 0x00590CCB). So whatever pins the weather when a save is made
+// pins it in every game that loads it.
+constexpr uintptr_t GenericSave = 0x0058F8D0;
+
+// CPlayerInfo::SavePlayerInfo(uint8 *buf, uint32 *size), GenericSave's player
+// block and its only caller: 0x00590675 `add ecx,9412F0h` over PlayerInFocus
+// * 13Ch, then `call 004A0960` at 0x0059067B (re3 GenericGameStorage.cpp, the
+// block after cAudioScriptObject's). It opens `push esi / push edi`, writes
+// *size = 13Ch, and copies field by field off Players[PlayerInFocus], each
+// time re-reading PlayerInFocus:
+//
+//   004A098E  add ecx,0ACh / movs dword    m_nMoney        -> buf+0
+//   004A0A2A  add edx,0B0h / movs dword    m_nVisibleMoney -> buf+0Fh
+//
+// Those two are the save's only copy of the player's cash.
+constexpr uintptr_t CPlayerInfo__SavePlayerInfo      = 0x004A0960;
+constexpr uintptr_t GenericSave_SavePlayerInfoCall   = 0x0059067B;
+
+// The save's name. GenericSave opens with
+//
+//   0058F8DA  mov ecx,941520h     TheText
+//   0058F8DF  push 70D828h        CStats::LastMissionPassedName, char[8]
+//   0058F9AC  call 0052C5A0       CText::Get
+//   0058F9B6  je 0058FA2E         only a null skips the name
+//
+// and copies what comes back, cut at 22 characters with "...'" after, into
+// the 24 characters the load menu lists. CText::Get (`mov eax,[esp+4] / push
+// eax / call 0052BFB0 / ret 4`, __thiscall) never gives a null:
+// CKeyArray::Search sprintfs "%s missing" (the format at 0x00600200) and,
+// when its binary search finds nothing, widens that into WideErrorString and
+// returns it (`mov eax,95CCB6h` at 0x0052C04C). An empty key finds nothing
+// either. The key is written by REGISTER_MISSION_PASSED (`push 70D828h` at
+// 0x00447FD0, a strncpy of the script's eight bytes), zeroed by CStats::Init
+// (0x004AAF11) and copied by CStats::SaveStats (0x004AB3E0, its copy at
+// 0x004AB65F), which GenericSave calls at 0x00590722, long after the name,
+// and by LoadStats (0x004AB8DA). So the key a save holds is the one its name
+// was made from.
+constexpr uintptr_t CStats__LastMissionPassedName = 0x0070D828;
+constexpr uintptr_t TheText                       = 0x00941520;
+constexpr uintptr_t CText__Get                    = 0x0052C5A0;
+constexpr uintptr_t CText__WideErrorString        = 0x0095CCB6;
+
+// ---- pedestrian generation -------------------------------------------------
+//
+// The other half of what docs/population.md §1.3 needs. Verified 2026-09-22 by
+// the same route as the traffic block above, and it landed on a correction
+// worth reading before the addresses: **population.md §4 names the wrong
+// function.** CPopulation::ManagePopulation does not decide whether to add a
+// pedestrian - it is the *reaper*, and the gate that decides whether to make
+// one lives in CPopulation::AddToPopulation. Both are named below.
+//
+// SET_PED_DENSITY_MULTIPLIER is opcode 990. That range is not laid out like
+// the 400 one, so the table was found rather than assumed: the dispatcher's
+// tenth arm is `cmp dx,3E8h / jge / movsx eax,dx / push eax / call 0044CB80`
+// (0x00439608), and that handler opens
+//
+//   0044CB95  lea  eax, [ebx - 384h]           base opcode 900, not a round
+//   0044CB9B  cmp  eax, 63h                    number pulled off the 400 case
+//   0044CBA4  jmp  dword [eax*4 + 005EFA14]    100 entries
+//
+// Entry 90 of 0x005EFA14 is 0x0044F730, and it is the same four instructions
+// the car one was, which is how this pass knew the base was right before
+// trusting anything read out of the table:
+//
+//   0044F730  lea/mov eax,ecx = [esp+4] + 10h  &ScriptParams, the script
+//             push 1 / push eax
+//             call 004382E0                    CollectParameters(&m_nIp, 1)
+//   0044F743  fld  dword [006ED460]            ScriptParams[0]
+//   0044F751  fstp dword [005FA56C]            PedDensityMultiplier
+//
+// Same CollectParameters and same ScriptParams as opcode 491 - a third
+// independent witness for both.
+constexpr uintptr_t CPopulation__PedDensityMultiplier = 0x005FA56C;
+
+// And the multiplier names the generator. Of the four instructions in the
+// image that touch 0x005FA56C, two are `mov dword [005FA56C],3F800000h`
+// resets back to 1.0f (0x00437C1C in CTheScripts, 0x004F3796 in
+// CPopulation::Initialise), one is the store above, and exactly one is a
+// reader:
+//
+//   004F4B55  fmul dword [005FA56C]
+//
+// which sits inside 0x004F4A00.
+//
+// __cdecl CPopulation::AddToPopulation(float minDist, float maxDist,
+//                                      float minDistOffScreen,
+//                                      float maxDistOffScreen).
+//
+// Identified three ways over, not one. It matches re3 Population.cpp:571-605
+// statement for statement:
+//
+//   004F4A2B  movzx ebx,byte [0095CD61]        CWorld::PlayerInFocus
+//             imul  ebx,ebx,13Ch               sizeof(CPlayerInfo)
+//             add   ebx,009412F0               CWorld::Players
+//   004F4A46  call  004A1170                   FindPlayerCentreOfWorld
+//   004F4A6A  call  004B6FB0                   GetZoneInfoForTimeOfDay
+//   004F4A71  call  004A1150 / mov eax,[eax+53Ch] / mov edx,[eax+18h]
+//             cmp   edx,2 / jle                GetWantedLevel() > 2
+//   004F4A90  movzx eax,byte [esi+11h]         m_MaxCops
+//             cmp   dword [00885AFC],eax / jge   ms_nNumCop < m_MaxCops
+//   004F4AA0  cmp   byte [ecx+314h],0 / jne    !bInVehicle
+//   004F4AAD  movzx eax,byte [esi+12h]         m_MaximumLawEnforcerVehicles
+//             cmp   dword [008F1B38],eax / jge
+//   004F4AB9  mov   ax,[ebx+0FCh]              m_nTrafficMultiplier, a word
+//             fild / fmul [005EC8B4] / fild [00943118] / fcompp
+//   004F4AE2  the same six-term car sum, against [005EC8B8]
+//
+// - which is the entire `addCop` block, and on the way through re-confirms
+// every address in the traffic block above from a second function. Then the
+// gate this is all here for:
+//
+//   004F4B36  movzx esi,[esp+6Ch] / movzx eax,[esp+8Eh]
+//             add   esi,eax                    pedDensity + carDensity
+//   004F4B4B  fild  [esp+40h]
+//   004F4B4F  fmul  dword [ebx+100h]           playerInfo->m_fRoadDensity
+//   004F4B55  fmul  dword [005FA56C]           PedDensityMultiplier
+//   004F4B5B  fmul  dword [006182F4]           CIniFile::PedNumberMultiplier
+//   004F4B63  fild  dword [005FA574]           MaxNumberOfPedsInUse
+//             fcomp / jne / fild again         Min(..., MaxNumberOfPedsInUse)
+//   004F4BA0  cmp   dword [0095CB50],eax       ms_nTotalPeds < that
+//             jl    carry on
+//   004F4BA8  cmp   byte [esp+18h],0 / je out  ... || addCop
+//
+// This is the pedestrian equivalent of GenerateOneRandomCar's two gates, and
+// it is the thing population.md §1.3 rewrites. Note what it actually reads:
+// **ms_nTotalPeds**, not ms_nNumCivMale and ms_nNumCivFemale. Those two are
+// inputs to it (see UpdatePedCount below) but the comparison is against the
+// total, so that is the counter the replica count has to be written into.
+constexpr uintptr_t CPopulation__AddToPopulation = 0x004F4A00;
+
+// CIniFile::PedNumberMultiplier, four bytes below CarNumberMultiplier - which
+// is how the pair are declared in re3 IniFile.cpp and a free cross-check on
+// the one this project already had.
+constexpr uintptr_t CIniFile__PedNumberMultiplier = 0x006182F4;
+
+// CPopulation::MaxNumberOfPedsInUse, an int32 and not a float - the gate above
+// reads it with `fild`, not `fld`. Two independent witnesses, and the second
+// one is exact: CIniFile::LoadIniFile (0x0059BE20) ends with the ped line and
+// the car line side by side,
+//
+//   0059BF3F  fld  dword [0061831C]            25.0f
+//             fmul dword [006182F4]            * PedNumberMultiplier
+//             fistp / mov [005FA574], eax
+//   0059BF68  fld  dword [00618320]            12.0f
+//             fmul dword [006182F8]            * CarNumberMultiplier
+//             fistp / mov [005EC8B8], eax
+//
+// which is re3's `MaxNumberOfPedsInUse = 25.0f * PedNumberMultiplier` and
+// `MaxNumberOfCarsInUse = 12.0f * CarNumberMultiplier` verbatim. The two
+// constants really are 25.0f and 12.0f in the image, and the initialised data
+// at the two destinations reads 25 and 12 as int32 - so the already-verified
+// MaxNumberOfCarsInUse is what vouches for this one.
+//
+// This refutes the guess of 0x008F5F74 in docs/addresses-unverified.md.
+constexpr uintptr_t CPopulation__MaxNumberOfPedsInUse = 0x005FA574;
+
+// ---- the population counters ----------------------------------------------
+//
+// Not walked outwards from ms_nTotalMissionPeds - that walk is refuted, and
+// its candidate for ms_nNumCivMale (0x008F5F78, 116 references) is nowhere
+// near the truth. These came out of the function that maintains them.
+//
+// __cdecl CPopulation::UpdatePedCount(ePedType, bool decrease) at 0x004F5A60
+// is two 23-entry jump tables over ePedType - 0x005FAACC to increment,
+// 0x005FAA70 to decrement - and every arm is a single `inc`/`dec dword`. So
+// the enum indexes the counters directly and nothing is inferred from
+// declaration order:
+//
+//   type                       inc site   counter
+//   PLAYER1..PLAYER4 (0..3)    -          falls through to the ret
+//   CIVMALE     (4)            004F5A81   008F2548
+//   CIVFEMALE   (5)            004F5A8C   008F5F44
+//   COP         (6)            004F5A97   00885AFC
+//   GANG1..GANG9 (7..15)       004F5AAD.. 008F1B1C 008F1B14 008F1B18 008F1B2C
+//                                         008F1B30 008F1B20 008F1B28 008F1B0C
+//                                         008F1B10
+//   EMERGENCY/FIREMAN (16,17)  004F5AA2   0094071C   (both arms, one counter)
+//   CRIMINAL    (18)           004F5B10   008F2548   (CivMale again)
+//   UNUSED1     (19)           -          ret
+//   PROSTITUTE  (20)           004F5B1B   008F5F44   (CivFemale again)
+//   SPECIAL     (21)           -          ret
+//   UNUSED2     (22)           004F5B26   008F1A98
+//
+// The decrement table is the same 23 arms pointing at the same 15 globals.
+// That whole shape - six types that count nothing, two pairs of types sharing
+// one counter, CRIMINAL landing on CivMale and PROSTITUTE on CivFemale - is
+// re3's UpdatePedCount exactly, and no other assignment of names to those
+// globals reproduces it. This is the proof; everything below just uses it.
+constexpr uintptr_t CPopulation__UpdatePedCount = 0x004F5A60;
+
+constexpr uintptr_t CPopulation__ms_nNumCivMale   = 0x008F2548;
+constexpr uintptr_t CPopulation__ms_nNumCivFemale = 0x008F5F44;
+constexpr uintptr_t CPopulation__ms_nNumCop       = 0x00885AFC;
+constexpr uintptr_t CPopulation__ms_nNumEmergency = 0x0094071C;
+constexpr uintptr_t CPopulation__ms_nNumDummy     = 0x008F1A98;
+
+// The three totals. These are not maintained by UpdatePedCount at all - they
+// are recomputed from the per-type counters in two places, and both compute
+// the identical three lines, which is what names them:
+//
+//   004F39E0 (CPopulation::Update)  and  004F3AD6 (GeneratePedsAtStartOfGame)
+//
+//     mov  eax,[008F2548] / add eax,[008F5F44] / mov [008F2C3C],eax
+//                                          ms_nTotalCivPeds = male + female
+//     mov  eax,[008F1B1C] / add the other eight gangs / mov [00885AF0],eax
+//                                          ms_nTotalGangPeds
+//     mov  eax,[008F2C3C] / add [00885AF0] / add [00885AFC]
+//                         / add [0094071C] / add [008F1A98]
+//                         / mov [0095CB50],eax
+//                                          ms_nTotalPeds
+//
+// re3 Population.cpp:430-435 and :451-456, term for term. Every one of these
+// globals also gets a `mov dword [..],0` from CPopulation::Initialise
+// (0x004F3770), which is the second witness each of them gets.
+constexpr uintptr_t CPopulation__ms_nTotalCivPeds  = 0x008F2C3C;
+constexpr uintptr_t CPopulation__ms_nTotalGangPeds = 0x00885AF0;
+
+// The one the generator's gate actually compares. Read at 0x004F4BA0, written
+// at 0x004F3A4E and 0x004F3B3D, zeroed at 0x004F37E0, and nowhere else in the
+// image - four references, which is what a total recomputed once a frame and
+// read once a frame should have.
+constexpr uintptr_t CPopulation__ms_nTotalPeds = 0x0095CB50;
+
+// The rest of CPopulation, named for free by CPopulation::Update's call order.
+// Update is 0x004F39A0: `cmp byte [0095CD5B],1 / jne` is CReplay::IsPlayingBack,
+// then the first two calls are ManagePopulation and
+// MoveCarsAndPedsOutOfAbandonedZones, then the m_CountDownToPedsAtStart
+// countdown that runs GeneratePedsAtStartOfGame - re3 Population.cpp:420-444
+// in order.
+constexpr uintptr_t CPopulation__Update = 0x004F39A0;
+
+// CPopulation::ManagePopulation(void). The reaper, not the generator: its body
+// opens with `mov bp,word [009412EC]` (CTimer::m_FrameCounter, already
+// verified above) `and ebp,1Fh`, then sweeps a 1/32 slice of the *object* pool
+// at stride 0x19C before it ever reaches a ped - which is re3's
+// ManagePopulation opening the object sweep, and is nothing like a function
+// that adds pedestrians.
+constexpr uintptr_t CPopulation__ManagePopulation = 0x004F3B90;
+
+constexpr uintptr_t CPopulation__MoveCarsAndPedsOutOfAbandonedZones = 0x004F5BE0;
+constexpr uintptr_t CPopulation__GeneratePedsAtStartOfGame          = 0x004F3AD0;
+constexpr uintptr_t CPopulation__Initialise                         = 0x004F3770;
+
+// float CPopulation::PedCreationDistMultiplier(). Called from all four of
+// Update, ManagePopulation, GeneratePedsAtStartOfGame and AddToPopulation,
+// always immediately before an `fmul` against a creation-distance constant.
+constexpr uintptr_t CPopulation__PedCreationDistMultiplier = 0x004F6410;
+
+// int8, and the reason a fresh game makes a crowd: Update counts it down and
+// runs GeneratePedsAtStartOfGame (fifty AddToPopulation calls, `cmp bx,32h`)
+// when it hits zero. `cmp byte [0095CD4F],0` / `dec byte [0095CD4F]` at
+// 0x004F39BA.
+constexpr uintptr_t CPopulation__m_CountDownToPedsAtStart = 0x0095CD4F;
+
+namespace offs {
+
+// CPed::m_nPedType, a dword. Read off the two call sites of UpdatePedCount
+// that matter: CPed::CPed pushes `(m_nPedType, false)`
+//
+//   004C5082  mov eax,[ecx+32Ch] / push 0 / push eax / call 004F5A60
+//
+// and CPed::~CPed pushes `(m_nPedType, true)`
+//
+//   004C51DE  mov eax,[ebx+32Ch] / push 1 / push eax / call 004F5A60
+//
+// so the field that decides which counter a ped belongs to is +0x32C. The
+// values are the PEDTYPE_* constants already in this file - COP == 6 out of
+// CREATE_CHAR - and the jump tables above independently confirm the enum runs
+// 0..22 with no gaps.
+constexpr size_t PED_TYPE = 0x32C;
+
+} // namespace offs
+
+// CPed::m_nCreatedBy is offs::PED_CHAR_CREATED_BY, already verified further up
+// this file out of COMMAND_CREATE_CHAR's `mov byte [ebx+0x160],2`. It is
+// listed in population.md §4 as still to find; it isn't. CHAR_CREATED_BY_RANDOM
+// is what the ped generator leaves behind, and it is what tells an ambient ped
+// from a mission one.
 
 // CTheScripts::ClearSpaceForMissionEntity(const CVector&, CEntity*). CREATE_CAR
 // calls it between SetPosition and SetStatus; it shoves whatever is standing in
@@ -1270,6 +3028,1509 @@ constexpr int CARLOCK_LOCKED   = 2;
 constexpr uint8_t ENTITY_STATUS_SHIFT     = 3;
 constexpr uint8_t ENTITY_STATUS_ABANDONED = 4;
 constexpr uint8_t ENTITY_TYPE_VEHICLE     = 2;
+
+// STATUS_WRECKED == 5 because CAutomobile::BlowUpCar writes `or al,0x28`
+// (5 << 3) into the same bits, and CCarCtrl::PossiblyRemoveVehicle reads them
+// back with `shr dl,3 / cmp eax,5`. Both are transcribed below.
+constexpr uint8_t ENTITY_STATUS_WRECKED = 5;
+
+// STATUS_PHYSICS == 3: the emergency-vehicle spawn at 0x00420212 writes
+// `and al,7 / or al,18h` (3 << 3) and CAutomobile::ProcessControl's status
+// switch (0x0053191E, table 0x00600A24) sends 3 to the arm that calls
+// CCarAI::UpdateCarAI and SteerAICarWithPhysics (0x00531B3D).
+//
+// This used to say only the siren detour writes it. The engine writes it on
+// every car CoopIII seats a replica in: CPed::WarpPedIntoCar does
+// `and al,7 / or al,18h` at 0x004D7E9B for any ped IsPlayer says no to, and
+// CPed::PedSetInCarCB does the same at 0x004CF4C2 at the end of an animated
+// entry into the driver's seat. game/carstatus.h has what that means.
+constexpr uint8_t ENTITY_STATUS_PHYSICS = 3;
+
+// STATUS_PLAYER == 0: the same two functions write `and al,7` with no `or`
+// for a ped IsPlayer says yes to (0x004D7E83; 0x004CF45D, which like the 3
+// at 0x004CF4C2 is behind an m_objective == 15 test). There are five
+// such stores in the image and nothing writes one back every frame, so a car
+// that loses it keeps whatever it was given until the player gets out and in.
+constexpr uint8_t ENTITY_STATUS_PLAYER = 0;
+
+// ---- the driver logic a status runs ------------------------------------------
+//
+// CAutomobile::ProcessControl's switch, table 0x00600A24, read out of the image:
+//
+//   0 PLAYER      0x005319F0  ProcessControlInputs (vtable +48h) only if the
+//                             driver's ped type is 0; DoDriveByShootings
+//                             (0x00564000) at 0x00531A5D. The horn block after
+//                             the switch reads CPad::GetHorn for status 0
+//                             only (0x00533FFB, 0x00534191).
+//   1, 6-9        0x00531BB3  straight to the physics, controls untouched
+//   2 SIMPLE      0x00531A67  UpdateCarAI, then the rails (0x00418880)
+//   3 PHYSICS     0x00531B3D  UpdateCarAI, SteerAICarWithPhysics,
+//                             PlayHornIfNecessary (0x0053C4B0)
+//   4 ABANDONED   0x00531B54  brake 0.2, handbrake off, steer 0, gas 0,
+//                             horn timer 0 (0x00531BAC)
+//   5 WRECKED     0x00531B7E  brake 0.05, handbrake on, same zeroes
+//   10 REMOTE     0x00531925  the RC car, which reads pad 0 first thing
+//   11 DISABLED   0x00531B68  brake 1.0, handbrake on, same zeroes
+//
+// __cdecl void CCarAI::UpdateCarAI(CVehicle *). `push ebx / push esi /
+// sub esp,230h / mov ebx,[esp+23Ch]`, called only from the SIMPLE and
+// PHYSICS arms (0x00531A68, 0x00531B3E), each `push ebp / call / pop ecx`.
+// Mission bookkeeping: police missions for a law enforcer, the anti-reverse
+// timer, and at the end a siren car that draws (randomSeed ^ rand()) == 0xAD
+// gets a horn timer of 45.
+//
+// __cdecl void CCarCtrl::SteerAICarWithPhysics(CVehicle *). `push ebx /
+// sub esp,10h / mov ebx,[esp+18h]`, one caller, 0x00531B45. Switches on
+// m_nTempAction (`movsx eax,byte [ebx+15Bh] / dec eax`, table 0x005ECBC0) and
+// otherwise on m_nCarMission (0x0041DD90, table 0x005ECBE8), then writes all
+// four controls whatever it decided (0x0041DD4D-0x0041DD7E): steer to +1E8h,
+// the handbrake to bit 5 of +1F5h, gas to +1ECh, brake to +1F0h. For
+// MISSION_NONE (entry 0, 0x0041E1AD) that is steer 0, gas 0, handbrake on and
+// brake 0.5 (3F000000h).
+//
+// A boat's PHYSICS arm (0x0053F376) calls neither. It calls
+// __cdecl void CCarCtrl::SteerAIBoatWithPhysics(CVehicle *), `push ebx /
+// mov ebx,[esp+8]`, one caller, 0x0053F388. MISSION_NONE (0x0041E267) zeroes
+// the boat's own +2E0h/+2D8h/+2DCh, and 0x0041E2B1-0x0041E2DD publishes them
+// whatever the mission was: steer to +1E8h, handbrake off, brake to +1F0h, gas
+// to +1ECh, which CBoat::ProcessControl reads back at 0x0053FDEA.
+constexpr uintptr_t CCarAI__UpdateCarAI              = 0x00413E50;
+constexpr uintptr_t CCarCtrl__SteerAICarWithPhysics  = 0x0041DA60;
+constexpr uintptr_t CCarCtrl__SteerAIBoatWithPhysics = 0x0041E250;
+
+// __thiscall bool cAudioManager::ProcessVehicleSirenOrAlarm(cVehicleParams *),
+// `ret 4` at all three exits (0x0056C4D1, 0x0056C5DB, 0x0056C5EA). Called
+// once in the image, from the automobile arm of ProcessVehicle at 0x00569C2E.
+// Opens `push ebx / push esi / push ebp / mov esi,ecx / sub esp,8` after the
+// previous function's `ret 4` at 0x0056C417 and its padding. The gate it holds
+// against a status-4 siren car is at 0x0056C4C4 (game/siren.h).
+constexpr uintptr_t cAudioManager__ProcessVehicleSirenOrAlarm = 0x0056C420;
+
+// ---- the siren's light bar -------------------------------------------------
+//
+// __thiscall void CAutomobile::PreRender(), CAutomobile's vtable slot 12
+// (0x00600C1C + 0x30 = 0x00600C4C reads 0x00535B40). Opens `push ebx / push
+// esi / push edi / push ebp / mov ebp,ecx / sub esp,6F8h`. The light bar is a
+// switch on the model near the end:
+//
+//   005373D7  movsx eax,word [ebp+5Ch] / lea edx,[eax-61h] / cmp edx,33h
+//   005373E3  ja 00537F82                      past the switch
+//   005373E9  jmp [edx*4 + 00600AD0h]
+//
+// whose table sends 97 (fire truck), 106 (ambulance), 116 (police) and 117
+// (Enforcer) to `cmp byte [ebp+22Eh],0 / je 00537F82` at 0x005373F0, 107 (FBI
+// car) to the same test at 0x00537E4F, 110 (taxi) to 0x00537D1F and 113 (Mr
+// Whoopee) straight to 0x00537F82. No status test on the way skips it: the
+// only two before it in the function (0x00535DC0, 0x00536048) choose what the
+// wheels do, and the status-4/5 arm, `jne 00539DB7` at 0x00536062, lands on
+// 0x0053655E and falls through to the switch. So m_bSirenOrAlarm alone lights
+// the bar, on any status.
+//
+// CAutomobile::ProcessControl (slot 8, 0x00600C3C reads 0x00531470) reads the
+// same byte at 0x005347ED: with it set, the frame counter (0x009412EC) & 7 == 5,
+// CVehicle::UsesSiren (0x00552200) and not Mr Whoopee (0x71), it calls
+// 0x00416280, which re3 calls CCarAI::MakeWayForCarWithSiren - this machine's
+// traffic pulls over for it.
+constexpr uintptr_t CAutomobile__PreRender          = 0x00535B40;
+constexpr uintptr_t CAutomobile__ProcessControl     = 0x00531470;
+constexpr uintptr_t CAutomobile__PreRender_SirenBar = 0x005373F0;
+constexpr uintptr_t CAutomobile__PreRender_FbiLight = 0x00537E4F;
+
+// ---- a car's destruction ---------------------------------------------------
+//
+// Verified 2026-09-21 against the retail image, re-verified instruction by
+// instruction 2026-09-22 (every transcription below was re-disassembled from
+// the file, and two of the notes in this block were wrong - see the
+// corrections marked "Corrected 2026-09-22"). Found from
+// CExplosion::AddExplosion (0x005591C0, already here from M3): the only call
+// site in the whole exe that chooses between EXPLOSION_CAR and
+// EXPLOSION_CAR_QUICK is the one inside CAutomobile::BlowUpCar, which is
+// re3 Automobile.cpp:3913-3915. From that call the function start falls out of
+// the vtable, and everything BlowUpCar writes on the way is a field.
+//
+// ############################################################################
+// # THE POINT OF THIS BLOCK: m_fHealth is a number, destruction is an event. #
+// #                                                                          #
+// # Writing m_fHealth does not destroy a car. The engine's own damage path   #
+// # proves it in three instructions: CVehicle::InflictDamage writes          #
+// # `mov dword [esi+200h],0` at 0x00551C10 and then, separately, calls       #
+// # `call dword [ebx+74h]` at 0x00551C55. The zero and the destruction are   #
+// # two acts, and only the second one blows anything up.                     #
+// #                                                                          #
+// # Every destruction goes through CAutomobile::BlowUpCar (a CBoat has its   #
+// # own, below), and the callers are:                                        #
+// #                                                                          #
+// #   CVehicle::InflictDamage        a damage *transition* - the write above #
+// #   CVehicle::ProcessDelayedExplosion   a bomb timer                       #
+// #   CAutomobile::ProcessControl    the five-second fire timer below        #
+// #   COMMAND_EXPLODE_CAR            the script (0x00442E08)                 #
+// #                                                                          #
+// # There is exactly ONE place in the engine that reads a raw m_fHealth and  #
+// # can end up destroying a car, and that is the fire timer below - it needs #
+// # health < 250 and then five seconds of ProcessControl. Nothing anywhere   #
+// # tests m_fHealth for zero.                                                #
+// #                                                                          #
+// # So an observer that writes a health of 0 straight into a remote car's    #
+// # m_fHealth gets a car with no health that is not destroyed. That is why   #
+// # a synced car blew up on its driver's screen and nowhere else, and it is  #
+// # why the fix is an event on the wire rather than another field.           #
+// #                                                                          #
+// # BlowUpCar is never called directly: a scan of .text for an E8/E9 rel32   #
+// # to 0x0053BC60 or to CBoat's 0x00541CB0 finds nothing at all. Every one   #
+// # of the callers above goes through vtable slot 29, which is why a detour  #
+// # on the function catches all of them and a detour on a call site would    #
+// # catch one.                                                               #
+// ############################################################################
+//
+// __thiscall void CAutomobile::BlowUpCar(CEntity *culprit).  ret 4.
+//
+//   0x0053BC60  push ebx/esi/edi/ebp ; mov ebx,ecx      this
+//   0x0053BC69  mov al,[ebx+1F7h] / shr al,6 / and al,1 / jne
+//                                                       if (!bCanBeDamaged) return
+//   0x0053BC80  fld [ebx+80h] / fadd [0x6007F8] / fstp  m_vecMoveSpeed.z += 0.13f
+//   0x0053BC92  mov al,[ebx+50h] / and al,7 / or al,28h SetStatus(STATUS_WRECKED)
+//   0x0053BC9C  mov al,[ebx+52h] / and al,0EFh / or al,10h   bRenderScorched = true
+//   0x0053BCA6  mov eax,[0x885B48] / mov [ebx+210h],eax m_nTimeOfDeath = time
+//   0x0053BCB1  lea ecx,[ebx+288h] / call 0x00545B70    Damage.FuckCarCompletely()
+//   0x0053BCBC  cmp word [ebx+5Ch],83h                  GetModelIndex() != MI_RCBANDIT
+//   ... bumper/door damage, the flying wheel, the dead occupants ...
+//   0x0053BF20  push 0 / push esi / push 3 / push [esp+28h] / push ebx
+//   0x0053BF2A  call 0x005591C0 / add esp,14h
+//                                    AddExplosion(this, culprit, EXPLOSION_CAR, pos, 0)
+//
+//     Corrected 2026-09-22: this line used to show three pushes and no
+//     `add esp`. It is five arguments, the same five M3 recorded for
+//     COMMAND_ADD_EXPLOSION. The arm at 0x0053BF15 pushes 4 instead of 3,
+//     which is what fixes EXPLOSION_CAR == 3 and EXPLOSION_CAR_QUICK == 4.
+//
+// re3 Automobile.cpp:3837-3925, statement for statement. Two offsets fall out
+// of it for free and both are new: m_nTimeOfDeath at +0x210 and
+// CDamageManager at +0x288, which is SIZEOF_VEHICLE, i.e. CAutomobile's first
+// member.
+constexpr uintptr_t CAutomobile__BlowUpCar = 0x0053BC60;
+
+// CBoat::BlowUpCar. A genuinely different function - its own prologue, its own
+// stack frame (`sub esp,28h` against CAutomobile's `sub esp,8`) - opening on
+// the same `mov al,[ebp+1F7h] / shr al,6 / and al,1` bCanBeDamaged test. It is
+// slot 29 of CBoat's vtable, which is how it was found: the constant
+// 0x00541CB0 appears exactly once in the whole file, at 0x00600F18 in .data,
+// i.e. 0x74 into the vtable at 0x00600EA4.
+//
+// It is hooked as well as CAutomobile's, because a detour on one function
+// catches only that function. Without it the local player's own boat exploding
+// says nothing to the session, and since 2026-09-23 SpawnRemoteVehicle builds
+// a real CBoat for a boat model, so an observed boat's destruction comes
+// through here too (see "boats" above).
+constexpr uintptr_t CBoat__BlowUpCar = 0x00541CB0;
+
+// It is virtual, and going through the vtable is what makes a replay right for
+// whichever of the two the object actually is. Slot 29 in CAutomobile's vtable
+// (0x00600C1C + 0x74 == 0x0053BC60), in CBoat's (0x00600EA4 + 0x74 ==
+// 0x00541CB0) and in CVehicle's (0x006028A8 + 0x74 == 0x00444B10), where it is
+// the do-nothing base: four instructions, `mov [esp+4],ecx / ret 4`. The
+// engine calls it exactly this way - see the fire timer below, which ends on
+// `call dword [ebx+74h]`.
+constexpr size_t VTABLE_BLOW_UP_CAR = 29;
+
+// __thiscall void CVehicle::ProcessDelayedExplosion(void). The bomb timer, and
+// the second of BlowUpCar's callers. `mov ecx,ebp / call 0x00551C90` at
+// 0x005347E6, two instructions after the fire block below, which is re3
+// Automobile.cpp:1111 calling Vehicle.cpp:846. Its own tail is the third
+// `call dword [ebx+74h]` in the vehicle modules, at 0x00551D7C.
+constexpr uintptr_t CVehicle__ProcessDelayedExplosion = 0x00551C90;
+
+// ---- a wreck without its blast (game/wreck.h) ------------------------------
+//
+// Verified 2026-09-25 against the retail image. A late joiner is handed the
+// session's wrecks, and running BlowUpCar on the copy it builds would set off
+// an explosion, a fire and a flying wheel next to it a minute after everybody
+// else saw them. So the copy is given the state BlowUpCar leaves on a car and
+// none of the effects. Every write, in BlowUpCar's own order:
+//
+// CAutomobile::BlowUpCar (0x0053BC60), ebx = this:
+//   0x0053BC80  moveSpeed.z += 0.13f                       skipped: at rest
+//   0x0053BC92  mov al,[ebx+50h] / and al,7 / or al,28h    STATUS_WRECKED
+//   0x0053BC9C  mov al,[ebx+52h] / and al,0EFh / or al,10h bRenderScorched
+//   0x0053BCA6  mov eax,[0x00885B48] / mov [ebx+210h],eax  m_nTimeOfDeath
+//   0x0053BCB1  lea ecx,[ebx+288h] / call 0x00545B70       FuckCarCompletely
+//   0x0053BCBC  cmp word [ebx+5Ch],83h / je 0x0053BD6B     not MI_RCBANDIT:
+//   0x0053BCCA  push 0 / push 5 / push 7 / call 0x00530120    SetBumperDamage x2
+//   0x0053BCE4  push 0 / push 0 / push 11h / call 0x00530200  SetDoorDamage x6
+//   0x0053BD30  push 1 / push 4 / call 0x00530300          the flying wheel: skipped
+//   0x0053BD48  mov eax,[ebx+38Ch]                         m_aCarNodes[CAR_WHEEL_LF]
+//   0x0053BD4E  push 0x0052C690 / push eax / call 0x005A2340  its first atomic
+//   0x0053BD67  mov byte [eax+2],0                         ...hidden
+//   0x0053BD6B  mov dword [ebx+200h],0                     m_fHealth = 0
+//   0x0053BD75  mov word [ebx+216h],0                      m_nBombTimer = 0
+//   0x0053BD7E  mov al,[ebx+4D9h] / and al,0F8h            m_bombType = NONE
+//   0x0053BD94  CamShake                                   skipped
+//   0x0053BDA7  the driver and passengers                  none on a copy
+//   0x0053BE71  and [ebx+1F5h],0EFh                        bEngineOn = false
+//   0x0053BE7F  and [ebx+1F5h],0BFh                        bLightsOn = false
+//   0x0053BE8D  mov byte [ebx+22Eh],0                      m_bSirenOrAlarm
+//   0x0053BE94  and [ebx+4D9h],0F7h                        bTaxiLight = false
+//   0x0053BEA2  bIsAmbulanceOnDuty / bIsFireTruckOnDuty    never set on a copy
+//   0x0053BEE5  push 0 / call 0x00552820                   ChangeLawEnforcerState
+//   0x0053BEFE  call 0x00479590                            StartFire: skipped
+//   0x0053BF04  call 0x00421070                            CDarkel: skipped
+//   0x0053BF2A  call 0x005591C0                            AddExplosion: skipped
+//
+// The damage calls pass noFlyingComponents = 0 (the first push); the copy's
+// pass 1, so a missing door is hidden rather than thrown at the joiner. The
+// component and part pairs are the ones in eDoors/ePanels above.
+//
+// CBoat::BlowUpCar (0x00541CB0), ebp = this, is shorter and writes no time of
+// death and no damage model:
+//   0x00541CE7  and al,7 / or al,28h                       STATUS_WRECKED
+//   0x00541CF1  and al,0EFh / or al,10h                    bRenderScorched
+//   0x00541CFB  mov dword [ebp+200h],0                     m_fHealth = 0
+//   0x00541D05  mov word [ebp+216h],0                      m_nBombTimer = 0
+//   0x00541D80  and al,0EFh into [ebp+1F5h]                bEngineOn = false
+//   0x00541D8E  and al,0BFh into [ebp+1F5h]                bLightsOn = false
+//   0x00541D90  push 0 / call 0x00552820                   ChangeLawEnforcerState
+//   0x00541DAB  call 0x005591C0                            AddExplosion: skipped
+constexpr uintptr_t BLOWUP_CAR_STATUS      = 0x0053BC92;
+constexpr uintptr_t BLOWUP_CAR_SCORCHED    = 0x0053BC9C;
+constexpr uintptr_t BLOWUP_CAR_DEATH_TIME  = 0x0053BCA6;
+constexpr uintptr_t BLOWUP_CAR_FUCK_CALL   = 0x0053BCB7;
+constexpr uintptr_t BLOWUP_CAR_RCBANDIT    = 0x0053BCBC;
+constexpr uintptr_t BLOWUP_CAR_BUMPER_CALLS[2] = {0x0053BCD0, 0x0053BCDD};
+constexpr uintptr_t BLOWUP_CAR_DOOR_CALLS[6]   = {0x0053BCEA, 0x0053BCF7, 0x0053BD04,
+                                                  0x0053BD11, 0x0053BD1E, 0x0053BD2B};
+constexpr uintptr_t BLOWUP_CAR_WHEEL_NODE  = 0x0053BD48;
+constexpr uintptr_t BLOWUP_CAR_WHEEL_WALK  = 0x0053BD54;
+constexpr uintptr_t BLOWUP_CAR_WHEEL_HIDE  = 0x0053BD67;
+constexpr uintptr_t BLOWUP_CAR_HEALTH      = 0x0053BD6B;
+constexpr uintptr_t BLOWUP_CAR_BOMB_TIMER  = 0x0053BD75;
+constexpr uintptr_t BLOWUP_CAR_BOMB_TYPE   = 0x0053BD89;
+constexpr uintptr_t BLOWUP_CAR_ENGINE      = 0x0053BE77;
+constexpr uintptr_t BLOWUP_CAR_LIGHTS      = 0x0053BE85;
+constexpr uintptr_t BLOWUP_CAR_SIREN       = 0x0053BE8D;
+constexpr uintptr_t BLOWUP_CAR_TAXI        = 0x0053BE9A;
+constexpr uintptr_t BLOWUP_CAR_LAW_CALL    = 0x0053BEE7;
+constexpr uintptr_t BLOWUP_BOAT_STATUS     = 0x00541CE7;
+constexpr uintptr_t BLOWUP_BOAT_SCORCHED   = 0x00541CF1;
+constexpr uintptr_t BLOWUP_BOAT_HEALTH     = 0x00541CFB;
+constexpr uintptr_t BLOWUP_BOAT_BOMB_TIMER = 0x00541D05;
+constexpr uintptr_t BLOWUP_BOAT_ENGINE     = 0x00541D80;
+constexpr uintptr_t BLOWUP_BOAT_LIGHTS     = 0x00541D8E;
+constexpr uintptr_t BLOWUP_BOAT_LAW_CALL   = 0x00541D98;
+
+// __cdecl RwFrame *RwFrameForAllObjects(RwFrame *, RwObject *(*)(RwObject *,
+// void *), void *). Three pushes and `add esp,0Ch` at both of the calls read
+// here, SetComponentVisibility's (0x00530107) and BlowUpCar's (0x0053BD54).
+constexpr uintptr_t RwFrameForAllObjects = 0x005A2340;
+
+// __cdecl RwObject *GetFirstObjectCallback(RwObject *, void *out). The
+// whole function:
+//   0x0052C690  mov ecx,[esp+4] / movzx eax,byte [ecx+2] / and eax,4 / je
+//   0x0052C69D  mov eax,[esp+8] / mov [eax],ecx        *out = atomic
+//   0x0052C6A3  mov eax,ecx / ret                      and go on walking
+// so *out ends up holding the last atomic of the frame with rpATOMICRENDER
+// (4) in its flags byte (RWOBJECT_FLAGS, +2, below), which BlowUpCar then
+// zeroes.
+constexpr uintptr_t GetFirstObjectCallback = 0x0052C690;
+constexpr uint8_t   RPATOMIC_RENDER        = 0x04;
+
+// __thiscall void CVehicle::ChangeLawEnforcerState(bool). ret 4. Sets or
+// clears bIsLawEnforcer, bit 0 of +0x1F5, and moves
+// CCarCtrl::NumLawEnforcerCars (0x008F1B38) with it - but only when the bit
+// actually changes (0x0055282F and 0x00552858 test it first), so calling it
+// on a car that never was one does nothing.
+constexpr uintptr_t CVehicle__ChangeLawEnforcerState = 0x00552820;
+
+// BlowUpCar's `cmp word [ebx+5Ch],83h`: the RC Bandit keeps its doors.
+constexpr uint16_t MI_RCBANDIT = 0x83;
+
+namespace offs {
+// Bit 3 of the flags byte at +0x4D9, beside the bomb type: BlowUpCar's
+// `and al,0F7h` at 0x0053BE9A (re3's bTaxiLight).
+constexpr uint8_t AUTOMOBILE_TAXI_LIGHT = 0x08;
+} // namespace offs
+
+// Whose blast it is (game/wreck.h, BlastAsksForCar). The damage an explosion
+// does to a car names the explosion's creator as the culprit:
+//
+//   0x004B1340  push ebx/esi/edi/ebp / sub esp,0B0h   a 0xC0 frame, so the
+//                                                     arguments start at +0xC4
+//   0x004B18C4  push 12h                              WEAPONTYPE_EXPLOSION
+//   0x004B18C6  push dword [esp+0DCh]                 two pushes in, the fifth
+//                                                     argument: the creator
+//   0x004B18CD  call 0x00551950                       CVehicle::InflictDamage
+//
+// (re3's CWorld::TriggerExplosionSectorList, by its six arguments and the
+// vehicle arm; its three callers are 0x004B12C4, 0x004B12E3 and 0x004B1302,
+// one sector list each. CoopIII calls none of it; the start is recorded for
+// the frame size that turns [esp+0DCh] into an argument.) And a thrown
+// or fired projectile's explosion is created by whoever threw or fired it,
+// CProjectileInfo::RemoveProjectile's m_pSource:
+//
+//   0x0055B73D  mov eax,[esi+4] / push eax / push 0
+//   0x0055B743  call 0x005591C0                       AddExplosion(nil, source, ...)
+constexpr uintptr_t EXPLOSION_SECTOR_LIST     = 0x004B1340;
+constexpr uintptr_t EXPLOSION_VEHICLE_CAUSE   = 0x004B18C4;
+constexpr uintptr_t EXPLOSION_VEHICLE_CULPRIT = 0x004B18C6;
+constexpr uintptr_t EXPLOSION_VEHICLE_DAMAGE  = 0x004B18CD;
+constexpr uintptr_t PROJECTILE_BLAST_CULPRIT  = 0x0055B73D;
+constexpr uintptr_t PROJECTILE_BLAST_CALL     = 0x0055B743;
+
+// The fire timer's own BlowUpCar, whose culprit a custodian passes when it
+// blows up a car that burned past its custody (client.h, BurnOutlastedCustody):
+//
+//   0x005347A2  mov eax,[ebp+574h] / mov ebx,[ecx] / push eax   m_pSetOnFireEntity
+//   0x005347AB  call dword [ebx+74h]                            BlowUpCar
+constexpr uintptr_t FIRE_TIMER_CULPRIT = 0x005347A2;
+constexpr uintptr_t FIRE_TIMER_BLOW_UP = 0x005347AB;
+
+// CVehicle::InflictDamage is BlowUpCar's first caller and the one that settles
+// what this whole block is about. Its entry point is NOT recorded here: the
+// instructions below were read at their own addresses and nothing CoopIII does
+// needs to call the function, so recording a start address would be recording
+// something unproven next to things that are proved. Two arms, both reached
+// from the same 250.0f compare against the constant at 0x0060256C:
+//
+//   0x00551BA5  fld [esp+4] / fcomp [0x0060256C]      damage vs 250.0f
+//   0x00551BBA  fld [esi+200h] / fcomp [0x0060256C]   m_fHealth vs 250.0f
+//   0x00551BE1  lea ecx,[esi+288h] / push 0E1h / call 0x00545940
+//                                                     the "set on fire" arm
+//   0x00551BF3  mov [esi+574h],ebp                    m_pSetOnFireEntity
+//   ---- the fatal arm ----
+//   0x00551C10  mov dword [esi+200h],0                m_fHealth = 0
+//   0x00551C55  mov ecx,esi / push ebp / mov ebx,[ecx]
+//   0x00551C5A  call dword [ebx+74h]                  BlowUpCar(culprit)
+//
+// The write and the call are 69 bytes apart and neither implies the other.
+// That is the whole reason a health of zero on the wire produced an
+// intact-looking car with no health on the observer's screen.
+
+// ---- the five-second fire timer, and why an observer must not run it -------
+//
+// This is the only place in the engine that reads a raw m_fHealth and
+// destroys a car for it, which makes it the one path a health value copied
+// off the wire can reach. Inside CAutomobile::ProcessControl:
+//
+//   0x00534761  fild qword [esp+0D0h]                CTimer::GetTimeStepInMs()
+//   0x00534768  fadd  dword [ebp+530h]
+//   0x0053476E  fstp  dword [ebp+530h]               m_fFireBlowUpTimer += step
+//   0x00534774  fld   dword [ebp+530h]
+//   0x0053477A  fcomp dword [0x00600730]             5000.0f
+//   0x00534780  fnstsw ax / test ah,45h
+//   0x00534785  jne   0x005347BA                     not past 5000 yet
+//   0x00534787  movzx ecx,byte [0x0095CD61]          CWorld::PlayerInFocus
+//   0x0053478F  imul  ecx,ecx,13Ch / add ecx,9412F0h CWorld::Players[..]
+//   0x0053479B  call  0x004A15F0                     AwardMoneyForExplosion(this)
+//   0x005347A2  mov   eax,[ebp+574h]                 m_pSetOnFireEntity
+//   0x005347A8  mov   ebx,[ecx] / push eax
+//   0x005347AB  call  dword [ebx+74h]                BlowUpCar(m_pSetOnFireEntity)
+//   0x005347AE  jmp   0x005347BA
+//   0x005347B0  mov   dword [ebp+530h],0             the ELSE arm, see below
+//
+// And the entry test, 0x2A0 bytes earlier, which is what the timer hangs off:
+//
+//   0x00534510  fld [ebp+200h] / fcomp [0x006005C0]  m_fHealth vs 250.0f
+//   0x0053451E  and ah,5 / cmp ah,1
+//   0x00534524  jne 0x005347B0                       not damaged -> reset timer
+//   0x0053452A  mov cl,[ebp+50h] / shr cl,3
+//   0x00534533  cmp eax,5
+//   0x00534536  je  0x005347B0                       already wrecked -> reset
+//
+//     Corrected 2026-09-22: the old note called 0x005347B0 the "else" of the
+//     5000.0f compare. It is not - 0x005347AE jumps straight over it. It is
+//     the else of the *entry* test above, which is why holding the timer at
+//     zero from CoopIII works at all: the engine only resets it for a car
+//     that is healthy or already wrecked.
+//
+// re3 Automobile.cpp:1098-1106. m_fHealth at +0x200 is re-confirmed nine
+// instructions after the timer by the engine-damage arm (`fld [ebp+200h] /
+// fcomp [0x006005C0]` at 0x005347C1 against the same 250.0f), as is
+// m_bSirenOrAlarm at +0x22E two instructions after that (0x005347ED).
+//
+// Note what is NOT in the entry condition: any flag, any damage event, any
+// culprit. An observer that copies a health below 250 arms this timer, and
+// five seconds later its own engine decides that somebody else's car is
+// destroyed - at a moment its owner did not choose, at whatever position
+// local physics had it in, crediting a null culprit, and paying the observer
+// AwardMoneyForExplosion for it once per frame until it succeeds.
+//
+// vehicle.cpp holds this at zero for any car another player is driving or
+// settling, which leaves the flames (those are drawn off m_fHealth, not off
+// the timer) and takes away the decision. The BlowUpCar detour is the backstop for the other
+// two callers.
+namespace offs {
+constexpr size_t AUTO_FIRE_BLOWUP_TIMER  = 0x530;   // float
+constexpr size_t AUTO_SET_ON_FIRE_ENTITY = 0x574;   // CEntity*
+constexpr size_t AUTO_DAMAGE_MANAGER     = 0x288;   // CDamageManager, == SIZEOF_VEHICLE
+constexpr size_t VEH_TIME_OF_DEATH       = 0x210;   // uint32, ms
+} // namespace offs
+
+static_assert(offs::AUTO_DAMAGE_MANAGER == offs::SIZEOF_VEHICLE,
+              "CDamageManager is CAutomobile's first member, so BlowUpCar's "
+              "`lea ecx,[ebx+288h]` re-states sizeof(CVehicle)");
+static_assert(offs::AUTO_FIRE_BLOWUP_TIMER < offs::SIZEOF_AUTOMOBILE &&
+                  offs::AUTO_SET_ON_FIRE_ENTITY < offs::SIZEOF_AUTOMOBILE,
+              "both live inside the object the pool actually strides for");
+static_assert(offs::VEH_TIME_OF_DEATH > offs::VEH_CHANGE_GEAR_TIME &&
+                  offs::VEH_TIME_OF_DEATH < offs::VEH_DOOR_LOCK,
+              "m_nTimeOfDeath sits between two offsets Area E already proved");
+
+constexpr float VEH_FIRE_HEALTH    = 250.0f;
+constexpr float VEH_FIRE_BLOWUP_MS = 5000.0f;
+
+// ---- what "burning" means for a custodian (boat.h, VehicleOnFire) ----------
+//
+// Verified 2026-09-23 against the retail image. A custodian keeps a burning
+// car until it goes up, so it has to ask its own engine the same question the
+// two fire blocks ask, and one more:
+//
+//   0x00534510  fld [ebp+200h] / fcomp [0x006005C0]    car: health < 250.0f
+//   0x00534533  cmp eax,5 / je 0x005347B0              ...and not WRECKED
+//   0x0053F917  fld [ebp+200h] / fcomp [0x00600D10]    boat: health < 150.0f
+//   0x0053F653  cmp eax,5 / je 0x00541880              ...inside the <= 600
+//                                                      block, not WRECKED
+//
+// And a CFire on the car, which is burning before the health gets there.
+// CFire::ProcessFire's vehicle arm:
+//
+//   0x004799CA  cmp [esi+1E4h],ebx / je                m_pCarFire == this,
+//                                                      else Extinguish
+//   0x004799E0  cmp byte [ebx+1],0 / jne               not a script fire
+//   0x004799E6  fld [0x005F1AC8] / fmul [0x008E2CB4]   1.2f * timestep
+//   0x004799FB  push 9 / push [ebx+14h]
+//   0x004799FE  call 0x00551950                        InflictDamage(src, 9, ..)
+//
+// and CFireManager::StartFire gives a car's fire 4000 ms plus up to 1000 more
+// (0x0047978E rand, 0x004797A0 * 1/32768 * 1000, 0x004797CE add eax,0FA0h).
+// So a lit car loses about 270 health to its own CFire and then, if that took
+// it under 250, burns for the five seconds above.
+
+// bRenderScorched is byte B (+0x52) bit 4, from BlowUpCar's
+// `and al,0EFh / or al,10h`. It shares that byte with bExplosionProof (bit 1),
+// which M3 found the same way and for the same reason - byte B is where the
+// flags that did not fit in byte A ended up, and guessing which byte a
+// CEntity flag lives in has cost this project two rounds.
+namespace offs {
+constexpr uint8_t ENTITY_RENDER_SCORCHED = 0x10;   // byte B
+} // namespace offs
+
+static_assert((offs::ENTITY_RENDER_SCORCHED & offs::ENTITY_EXPLOSION_PROOF) == 0,
+              "two different bits of byte B, whatever else they share");
+
+// ---- the reaping site that deletes a car BECAUSE it is locked --------------
+//
+// CCarCtrl::PossiblyRemoveVehicle's wreck branch, which begins at 0x00418726:
+//
+//   0x00418726  mov dl,[ebx+50h] / shr dl,3 / cmp eax,5 / jne out
+//                                             GetStatus() != STATUS_WRECKED
+//   0x00418738  mov eax,[ebx+210h] / test eax,eax / je out
+//                                             m_nTimeOfDeath == 0
+//   0x00418746  add eax,0EA60h                 + 60000 ms
+//   0x0041874B  cmp [0x885B48],eax / jbe out   CTimer::GetTimeInMilliseconds()
+//   0x00418757  call 0x00474CC0                GetIsOnScreen()
+//   0x00418763  call 0x004AAA00                IsEntityCullZoneVisible()
+//   0x004187B2  fcomp [0x005EC978]             distance from the player
+//   0x004187DC  call 0x00428260                IsPointWithinHideOutGarage()
+//   0x004187E7  call 0x004AE9D0                CWorld::Remove
+//               ... then the deleting destructor
+//
+// ############################################################################
+// # Corrected 2026-09-22. This block used to say, in bold, "there is no      #
+// # bIsLocked test and no CanBeDeleted call anywhere in it". That is wrong.  #
+// # Both are there, immediately above, and they are what JUMPS INTO the      #
+// # branch:                                                                  #
+// #                                                                          #
+// #   0x004186BF  shr al,3 / and al,1 / jne 0x00418726   bIsLocked -> wreck  #
+// #   0x004186C6  mov ecx,ebx / call 0x005511B0          CanBeDeleted()      #
+// #   0x004186CF  test al,al / je 0x00418726             !deletable -> wreck #
+// #   0x004186D4  call 0x00455350 / jne 0x00418726       in a mission -> ""  #
+// #                                                                          #
+// # So 0x00418726 is the ELSE of the two gates, not code that forgot them.   #
+// # The engine's reasoning is "this car cannot be recycled as traffic; is it #
+// # at least a minute-old wreck?" - and a minute-old wreck goes, gates and   #
+// # all. The conclusion CoopIII depends on is unchanged and now rests on     #
+// # the right reading: passing !bIsLocked && CanBeDeleted() does NOT keep a  #
+// # wrecked mission car in the pool, it is precisely what routes it here.    #
+// #                                                                          #
+// # The practical consequence, which is what matters: a destroyed synced car #
+// # leaves the pool about 60 seconds later, by itself, and CoopIII must not  #
+// # read that empty slot as "respawn it".                                    #
+// ############################################################################
+//
+// (re3 marks an added bIsLocked check as a FIX_BUGS at the top of the same
+// function, CarCtrl.cpp:719-722. That is a *different* test in a different
+// place, and reading it as this one is how the note above came to be wrong.
+// Four times now a re3 reading has had to be corrected against the binary.)
+constexpr uint32_t VEH_WRECK_REMOVAL_MS = 60000;
+
+// ---- an explosion damages every car in its radius, on EVERY machine --------
+//
+// Verified 2026-09-22, and it is the measurement the unowned-car work
+// (docs/roadmap.md §5.8) rests on, because it decides how much of the problem
+// was a problem at all.
+//
+// CExplosion::AddExplosion ends on CWorld::TriggerExplosion, which walks the
+// vehicle, ped and object lists of every sector the blast radius touches.
+// The vehicle arm of CWorld::TriggerExplosionSectorList, in full:
+//
+//   0x004B1891  cmp al,2 / jne                  GetType() != ENTITY_TYPE_VEHICLE
+//   0x004B1895  lea ecx,[ebp+50h]
+//   0x004B1898  mov dl,[ecx] / shr dl,3 / cmp eax,2 / jne
+//                                                GetStatus() == STATUS_SIMPLE
+//   0x004B18A5  and al,7 / or al,18h            SetStatus(STATUS_PHYSICS == 3)
+//   0x004B18AE  call 0x0041F7F0                 SwitchVehicleToRealPhysics
+//   0x004B18B4  fld dword [0x005F79B0]          1100.0f
+//   0x004B18BA  fmul dword [esp+14h]            * fDamageMultiplier
+//   0x004B18C4  push 12h                        WEAPONTYPE_EXPLOSION
+//   0x004B18C6  push [esp+0DCh]                 pCreator
+//   0x004B18CD  call 0x00551950                 CVehicle::InflictDamage
+//   0x004B18E0  cmp word [ebp+216h],0 / div si  m_nBombTimer /= 10
+//
+// re3 World.cpp:2105-2119, statement for statement, and 1100.0f appears
+// exactly once in the whole image.
+//
+// ############################################################################
+// # WHAT THIS MEANS FOR SYNC, and it is not small. fDamageMultiplier is      #
+// # (radius - distance) * 2 / radius, clamped to 1 - a function of the       #
+// # blast position and the car's position and nothing else. No random        #
+// # number, no frame timing, no local NPC logic.                             #
+// #                                                                          #
+// # CoopIII already replays every player's explosion on every machine at a   #
+// # fixed world position everyone agrees on (protocol.md §1.9.3). A parked   #
+// # car is placed from the same map data on every machine. So a parked car   #
+// # inside a replayed blast takes the SAME damage on every machine, through  #
+// # the SAME function - the one that calls BlowUpCar through the vtable when #
+// # the damage is fatal.                                                     #
+// #                                                                          #
+// # An unowned car blown up by an explosion is therefore already destroyed   #
+// # everywhere, for free, by the same route §5.7 found for pavement fires.   #
+// # What is NOT free is a car that got there by accumulated damage - gunfire #
+// # spread and accuracy are rolled per machine, and a collision with a       #
+// # replica is a collision with something whose transform is corrected       #
+// # rather than simulated. Those diverge, and the fire timer above turns a   #
+// # divergence in health into a divergence in whether the car ever blows up  #
+// # at all. That is what the destruction event is a backstop for.            #
+// ############################################################################
+//
+// __thiscall void CVehicle::InflictDamage(CEntity *culprit, eWeaponType,
+//                                         float damage).
+//
+// Its entry point used to be deliberately absent from this file, on the
+// grounds that the instructions recorded in the destruction block above were
+// read at their own addresses and a start address would have been unproven.
+// It is proven now and the reason is gone: 0x00551950 is the target of the
+// `call` at 0x004B18CD above, it is a clean function entry (preceded by
+// alignment padding, opening `push ebx / push esi / mov esi,ecx`), and that
+// `mov esi,ecx` is what makes the `mov dword [esi+200h],0` at 0x00551C10
+// - already recorded above - a write to m_fHealth. Seven call sites in the
+// image: 0x004799FE (CFire::ProcessFire), 0x004B18CD (the explosion above)
+// and five inside the weapon modules.
+//
+// ---- and now CoopIII does call it. Re-verified 2026-09-23, in full --------
+//
+// The block above recorded this address on the strength of one `call` and a
+// three-instruction look at the prologue, and said plainly that nothing here
+// called it. Both halves changed: game/vehicle.cpp now detours it and
+// ApplyRemoteVehicleHit calls it, so the address, the convention and every
+// argument had to be proved rather than inherited. One address in this project
+// was found to be three bytes off in the same week, which is the reason this
+// was re-read from the file instead of trusted.
+//
+// **It is a function start.** 0x00551944..0x0055194F is twelve bytes of 0x00
+// alignment fill, after the previous function's `jmp` at 0x00551942. The entry
+// is:
+//
+//   0x00551950  push ebx / push esi / mov esi,ecx / push ebp / sub esp,10h
+//
+// `mov esi,ecx` is what makes every `[esi+...]` below a member of `this`, and
+// it is __thiscall for exactly that reason.
+//
+// **It takes three arguments and it closes `ret 0Ch`.** Every one of the seven
+// exits is `add esp,10h / pop ebp / pop esi / pop ebx / ret 0Ch`, the last at
+// 0x00551C83. Twelve bytes is three dwords and there is no fourth. With the
+// prologue's 0x1C of pushes and locals, the callee reads them as:
+//
+//   [esp+20h] -> ebp     arg1  CEntity *culprit
+//   [esp+24h] -> edx     arg2  eWeaponType, a full dword
+//   [esp+28h]            arg3  float damage
+//
+// and the explosion call site writes the same three in the same order, which
+// is the independent witness:
+//
+//   0x004B18BE  push eax                     reserve the float's slot
+//   0x004B18BF  mov ecx,ebp                  this = the car
+//   0x004B18C1  fstp dword [esp]             arg3 = 1100.0f * fDamageMultiplier
+//   0x004B18C4  push 12h                     arg2 = WEAPONTYPE_EXPLOSION
+//   0x004B18C6  push [esp+0DCh]              arg1 = pCreator
+//   0x004B18CD  call 0x00551950
+//
+// (The transcription in the block above shows the `fld`/`fmul` and the two
+// pushes but not the `push eax / fstp dword [esp]` pair between them, which is
+// where the float actually lands. The conclusion was right and the listing was
+// short by two instructions.)
+//
+// **It returns nothing.** No exit sets eax on purpose; the last one leaves it
+// holding a model index off `movsx eax,word [esi+5Ch]` from the Yardie check
+// at 0x00551C5D. Anything reading a bool out of this is reading a leftover.
+//
+// **Two gates in front of the damage, and the second one bites us.**
+//
+//   0x00551958  [esi+1F7h] bit 6 clear -> ret 0Ch     !bCanBeDamaged
+//   0x00551972  [esi+53h]  bit 4 set   -> culprit must be FindPlayerPed()
+//               (0x004A1150) or FindPlayerVehicle() (0x004A10C0), else ret
+//                                                     bOnlyDamagedByPlayer
+//
+// On the owner's machine the culprit CoopIII passes is a replica of the
+// *shooter's* ped, which is neither of those, so a car carrying
+// bOnlyDamagedByPlayer takes nothing off the wire. That is a residual and it
+// is left standing: the only way round it is to name the local player as the
+// culprit, which is a lie about who fired, and the flag exists precisely to
+// stop anybody but the player hurting that car.
+//
+// **The proof flags sit inside a switch, and the switch leaks.** This is the
+// same shape as CPed::InflictDamage (docs/protocol.md §1.10.2) and it is why
+// setting flags on a replica was never going to be the mechanism:
+//
+//   0x0055199F  cmp eax,13h / ja 0x00551A10        anything above 19: no check
+//   0x005519A4  jmp [eax*4 + 0x006026CC]           twenty entries
+//
+// Resolved out of the file, the table is:
+//
+//   0, 1              -> 0x005519AB  [esi+53h] bit 3   bMeleeProof
+//   2..7, 13, 19      -> 0x005519BE  [esi+53h] bit 0   bBulletProof
+//   8, 10, 11, 18     -> 0x005519E6  [esi+52h] bit 1   bExplosionProof
+//   9                 -> 0x005519D4  [esi+53h] bit 1   bFireProof
+//   16                -> 0x005519FC  [esi+53h] bit 2   bCollisionProof
+//   12, 14, 15, 17    -> 0x00551A10  nothing is checked at all
+//
+// So DETONATOR, TOTALWEAPONS, ARMOUR, RUNOVERBYCAR and every cause from 20
+// up - DROWNING, FALL, UNIDENTIFIED - reach the health with no flag consulted.
+// CoopIII sets exactly one of those five bits on an observed car
+// (bCollisionProof, game/vehicle.cpp SetVehicleObserved) and must not set the
+// rest: bExplosionProof would stop a replayed blast reaching a car it is
+// supposed to reach identically on every machine. The detour is the positive
+// statement; the flag stays as the half that still works if the detour fails.
+//
+// **Then the health.** `m_fHealth <= 0.0f` (0x00551A10, against the 0.0f at
+// 0x00602534) leaves straight for the exit, so a call against a car that is
+// already finished is harmless rather than merely wasteful. Otherwise:
+//
+//   0x00551AB1  mov [esi+228h],al                m_nLastWeaponDamage = weapon
+//   0x00551AC5  health <= damage ? -> 0x00551C10 m_fHealth = 0, then BlowUpCar
+//   0x00551ADE  m_fHealth -= damage
+//   0x00551BA5  old health >= 250 and new < 250  the "set it on fire" arm
+//
+// The 250.0f is the constant at 0x0060256C. Note that 0x00551BA5 reads the
+// *pre-hit* health out of the scratch slot written at 0x00551ABD, not the
+// damage - the pair at 0x00551BA5 and 0x00551BBA is a transition test across
+// 250, which is why a car catches fire once rather than every frame.
+//
+// CoopIII calls it in one place only, ApplyRemoteVehicleHit, and only on a car
+// this machine's own player is driving.
+//
+// It is here because it is the function that turns damage into destruction,
+// and every argument about who may destroy what ends up pointing at it.
+// (WEAPONTYPE_EXPLOSION == 18 is already below, under the damage block, and
+// the `push 12h` above is one more witness for it. CWorld::TriggerExplosion
+// and CWorld::TriggerExplosionSectorList have no entry point recorded here on
+// purpose: the instructions above were read at their own addresses, CoopIII
+// calls neither, and an unproven start address next to proved ones is exactly
+// what this file exists to prevent.)
+constexpr uintptr_t CVehicle__InflictDamage   = 0x00551950;
+constexpr float     VEH_EXPLOSION_BASE_DAMAGE = 1100.0f;
+
+// The weapon switch's own ceiling: `cmp eax,13h / ja 0x00551A10` at
+// 0x0055199F, so causes 0..19 are looked up in the table at 0x006026CC and
+// everything from 20 up skips the proof flags entirely.
+constexpr uint32_t VEH_INFLICT_WEAPON_TABLE_LEN = 20;
+
+namespace offs {
+// m_nLastWeaponDamage, written verbatim from the second argument's low byte at
+// 0x00551AB1, before any health arithmetic and whatever the outcome.
+constexpr size_t VEH_LAST_WEAPON_DAMAGE = 0x228;   // uint8
+} // namespace offs
+
+static_assert(offs::VEH_LAST_WEAPON_DAMAGE < offs::SIZEOF_VEHICLE,
+              "m_nLastWeaponDamage is a CVehicle member, not a CAutomobile one");
+
+// ---- CDamageManager: what a dented car actually stores ---------------------
+//
+// Verified 2026-09-22 for docs/cardamage.md. The whole class, its eleven
+// accessors, everything in the image that writes it, and the four functions
+// that turn a status byte into something you can see.
+//
+// The block above already proved WHERE it is - BlowUpCar's
+// `lea ecx,[ebx+288h] / call 0x00545B70` and InflictDamage's
+// `lea ecx,[esi+288h] / call 0x00545940`, two independent witnesses that
+// CDamageManager is CAutomobile's first member. What follows is what is in it.
+//
+// Nothing here is arithmetic on a re3 declaration. Every field is named by an
+// instruction that touches it:
+//
+//   0x005458B0  lea eax,[eax*4] / mov eax,0Fh / and [edx+14h],eax
+//                                        SetPanelStatus: +0x14, four bits each
+//   0x005458E0  mov eax,[edx+14h] / shr / and eax,0Fh      GetPanelStatus
+//   0x00545860  add eax,eax / mov eax,3 / and [edx+10h],eax
+//                                        SetLightStatus: +0x10, two bits each
+//   0x00545890  mov eax,[edx+10h] / shr / and eax,3        GetLightStatus
+//   0x00545900  mov [ecx+edx+5],al       SetWheelStatus: +0x05, uint8[4]
+//   0x00545910  movzx eax,[ecx+eax+5]    GetWheelStatus
+//   0x00545920  mov [ecx+edx+9],al       SetDoorStatus:  +0x09, uint8[6]
+//   0x00545930  movzx eax,[ecx+eax+9]    GetDoorStatus
+//   0x00545940  cmp eax,0FAh / mov [ecx+4],al
+//                                        SetEngineStatus: +0x04, clamped to 250
+//   0x00545960  movzx eax,[ecx+4]        GetEngineStatus
+//
+// sizeof is 0x1C and it is proved twice, neither time from a header:
+//
+//   0x00545850  xor eax,eax / push edi / mov edi,ecx / stosd x7 / pop edi / ret
+//                                        ResetDamageStatus: 7 dwords = 28 bytes
+//   0x0052C6EF  mov dword [edx+288h],3F400000h    m_fWheelDamageEffect = 0.75f
+//   0x0052C6FD  mov byte  [eax+2A0h],1            field_18 = 1   (0x288 + 0x18)
+//   0x0052C708  add eax,2A4h                      the NEXT member (0x288 + 0x1C)
+//   0x0052C70D  push 6 / push 24h / push 0 / push 0052D150h / push eax
+//   0x0052C719  call 0059CD10                     vector ctor iterator
+//
+// Six objects of stride 0x24 starting at 0x2A4 are CAutomobile::Doors[6], so
+// there is nothing between field_18 and them. The 0.75f and the 1 are the
+// inlined CDamageManager constructor, which is the only writer of either
+// field: m_fWheelDamageEffect is read only as a traction multiplier for a
+// WHEEL_STATUS_BURST wheel, and nothing in this build ever bursts one (see
+// CAutomobile__BurstTyre below). Treat both as constants.
+namespace offs {
+// All relative to AUTO_DAMAGE_MANAGER, not to the vehicle.
+constexpr size_t DMG_WHEEL_DAMAGE_EFFECT = 0x00;   // float, 0.75f, effectively const
+constexpr size_t DMG_ENGINE_STATUS       = 0x04;   // uint8, 0..250
+constexpr size_t DMG_WHEEL_STATUS        = 0x05;   // uint8[4]
+constexpr size_t DMG_DOOR_STATUS         = 0x09;   // uint8[6]
+constexpr size_t DMG_LIGHT_STATUS        = 0x10;   // uint32, 2 bits per light
+constexpr size_t DMG_PANEL_STATUS        = 0x14;   // uint32, 4 bits per panel
+constexpr size_t DMG_FIELD_18            = 0x18;   // uint8, written once, read nowhere
+constexpr size_t SIZEOF_DAMAGEMANAGER    = 0x1C;
+
+// CAutomobile::Doors[6], the member immediately after it, and the array of
+// RwFrame* every applier subscripts.
+constexpr size_t AUTO_DOORS      = 0x2A4;   // CDoor[6], stride SIZEOF_DOOR
+constexpr size_t SIZEOF_DOOR     = 0x24;
+constexpr size_t AUTO_CAR_NODES  = 0x37C;   // RwFrame *m_aCarNodes[]
+
+// CVehicle::bIsDamaged, byte +0x1F7 bit 1. From SetComponentVisibility's
+// `mov al,[ebx+1F7h] / and al,0FDh / or al,2` at 0x005300E8 - the same byte
+// VEH_FLAGS_C already names, and a third bit of it after bIsLocked and
+// bHasBeenOwnedByPlayer.
+constexpr uint8_t VEH_IS_DAMAGED = 0x02;   // byte +0x1F7
+} // namespace offs
+
+static_assert(offs::DMG_DOOR_STATUS + 6 <= offs::DMG_LIGHT_STATUS,
+              "six door bytes fit between the wheels and the light word");
+static_assert(offs::DMG_WHEEL_STATUS + 4 == offs::DMG_DOOR_STATUS,
+              "the door array starts where the wheel array ends");
+static_assert(offs::AUTO_DAMAGE_MANAGER + offs::SIZEOF_DAMAGEMANAGER ==
+                  offs::AUTO_DOORS,
+              "CAutomobile::Doors[6] begins exactly where CDamageManager ends "
+              "- the constructor's `add eax,2A4h`");
+static_assert(offs::AUTO_DOORS + 6 * offs::SIZEOF_DOOR <= offs::AUTO_CAR_NODES,
+              "and the six doors fit before m_aCarNodes");
+static_assert(offs::AUTO_CAR_NODES + 20 * 4 < offs::SIZEOF_AUTOMOBILE,
+              "twenty car nodes stay inside the object the pool strides for");
+
+// The eleven accessors. Trivial, non-virtual, __thiscall, and worth having by
+// address rather than reimplemented: SetPanelStatus and SetLightStatus are
+// bitfield surgery on a shared dword and a hand-rolled copy that got the shift
+// wrong would be a silent wrong panel.
+constexpr uintptr_t CDamageManager__ResetDamageStatus   = 0x00545850;
+constexpr uintptr_t CDamageManager__GetComponentGroup   = 0x00545790;
+constexpr uintptr_t CDamageManager__SetLightStatus      = 0x00545860;
+constexpr uintptr_t CDamageManager__GetLightStatus      = 0x00545890;
+constexpr uintptr_t CDamageManager__SetPanelStatus      = 0x005458B0;
+constexpr uintptr_t CDamageManager__GetPanelStatus      = 0x005458E0;
+constexpr uintptr_t CDamageManager__SetWheelStatus      = 0x00545900;
+constexpr uintptr_t CDamageManager__GetWheelStatus      = 0x00545910;
+constexpr uintptr_t CDamageManager__SetDoorStatus       = 0x00545920;
+constexpr uintptr_t CDamageManager__GetDoorStatus       = 0x00545930;
+constexpr uintptr_t CDamageManager__SetEngineStatus     = 0x00545940;
+constexpr uintptr_t CDamageManager__GetEngineStatus     = 0x00545960;
+
+// The four that move a status one step, and the one that decides by how much.
+// ProgressDoorDamage refuses at 3, ProgressPanelDamage at 3, ProgressWheelDamage
+// at 2 - so every ladder climbs and none of them descends. That is what makes
+// the wire word a monotone join (docs/cardamage.md §4).
+//
+//   0x0054597C  call GetDoorStatus  / cmp eax,3 / jne / inc eax / SetDoorStatus
+//   0x00545A0C  call GetPanelStatus / cmp al,3  / jne / ...
+//   0x00545A4C  call GetWheelStatus / cmp al,2  / jne / ...
+//   0x005459B4  call GetEngineStatus / call CGeneral::GetRandomNumber
+//               lea edx,[ebp+20h] / and eax,1Fh / add eax,edx
+//               cmp bp,0E1h / jae ; cmp ax,0E0h / jbe ; mov eax,0E0h
+//                                   status + 32 + (rand & 0x1F), capped at 224
+//                                   below ENGINE_STATUS_ON_FIRE (225)
+constexpr uintptr_t CDamageManager__ProgressDoorDamage   = 0x00545970;
+constexpr uintptr_t CDamageManager__ProgressEngineDamage = 0x005459B0;
+constexpr uintptr_t CDamageManager__ProgressPanelDamage  = 0x00545A00;
+constexpr uintptr_t CDamageManager__ProgressWheelDamage  = 0x00545A40;
+
+// __thiscall bool CDamageManager::ApplyDamage(tComponent, float damage,
+//                                             float collisionMultiplier).
+// ret 0Ch. The one decision in the whole system:
+//
+//   0x00545AA3  fmul dword [eax*4 + 006012B0h]   G_aComponentDamage[group]
+//   0x00545AB2  fcomp dword [006012CCh]          > 150.0f ?
+//   0x00545AD2  jmp dword [eax*4 + 006012D4h]    six arms, one per group
+//   0x00545AEB  fcomp dword [006012D0h]          > 220.0f -> ProgressEngineDamage
+//
+//   006012B0  G_aComponentDamage[7] = 2.5, 1.25, 3.2, 1.4, 2.5, 2.8, 0.5
+//             (bumper, wheel, door, bonnet, boot, panel, default)
+//
+// Deterministic. Scanning its caller CAutomobile::VehicleDamage end to end
+// (0x0052F390-0x005300B5) for a rel32 to CGeneral::GetRandomNumber
+// (0x005A41D0) finds none, so the only randomness anywhere in the damage
+// model is ProgressEngineDamage above - and docs/cardamage.md §2.3 shows that
+// one decides the density of the smoke and nothing else.
+constexpr uintptr_t CDamageManager__ApplyDamage = 0x00545A80;
+
+// __thiscall void CDamageManager::FuckCarCompletely(void). BlowUpCar's damage,
+// and it takes no input of any kind:
+//
+//   0x00545B73  mov byte [ebx+5],2              m_wheelStatus[0] = MISSING
+//   0x00545B7A  mov byte [ebx+9..0Eh],3         all six doors = MISSING
+//   0x00545B92  ProgressPanelDamage(10h) / (11h)   x3   - see below
+//   0x00545BAD  mov dword [ebx+10h],0           m_lightStatus = 0
+//   0x00545BB9  mov dword [ebx+14h],0           m_panelStatus = 0
+//   0x00545BC0  call SetEngineStatus(250)
+//
+// So a wrecked car's damage model is identical on every machine by
+// construction, and protocol.md §1.11 already makes every machine run
+// BlowUpCar. Nothing about a wreck needs to travel that does not travel now.
+//
+// The two ProgressPanelDamage calls pass 16 and 17, which are tComponent
+// values where a ePanels index belongs - retail's own bug, the one re3 guards
+// with FIX_BUGS. SetPanelStatus computes `panel*4` and `shl` masks the count
+// to five bits, so 16 aliases panel 0 and 17 aliases panel 1; both are then
+// overwritten by the `mov dword [ebx+14h],0` two instructions later. It is
+// deterministic and it changes nothing. Do not "fix" it into a divergence.
+constexpr uintptr_t CDamageManager__FuckCarCompletely = 0x00545B70;
+
+// ---- the one door a dent comes through -------------------------------------
+//
+// __thiscall void CAutomobile::VehicleDamage(float impulse, uint16 piece).
+// ret 8. It has exactly ONE caller in the image - 0x00531FE3, inside
+// CAutomobile::ProcessControl, passing (0.0f, 0) - and all thirteen of
+// ApplyDamage's call sites are inside it. There is no other path in the engine
+// from anything to a dent, a smashed panel or a door on the pavement.
+//
+//   0x0052F390  fld dword [006004FCh]           0.2f, for an explicit call
+//   0x0052F3BF  fld dword [ebp+10Ch]            m_fDamageImpulse
+//   0x0052F3CF  mov di,word [ebp+120h]          m_nDamagePieceType
+//   0x0052F3F8  [ebp+1F7h] bit 6                bCanBeDamaged
+//   0x0052F47C  fcomp dword [006005B0h]         impulse > 25.0f
+//   0x0052F653  [ebp+53h]  bit 4                bOnlyDamagedByPlayer
+//   0x0052F685  [ebp+53h]  bit 2 -> ret 8       bCollisionProof
+//   0x0052F6F9  GetLightStatus x4               oldLightStatus[], for the sound
+//   0x0052F7C1  the first of thirteen ApplyDamage calls
+//
+// The bCollisionProof test at 0x0052F685 is one comparison and an unconditional
+// return, before the first ApplyDamage. That is what makes the flag a complete
+// switch here, and it is worth contrasting with protocol.md §1.10.2: on
+// CPed::InflictDamage the proof flags sit inside a switch on the damage cause
+// and two arms of that switch test nothing at all. On a car there is no switch
+// in front of it.
+//
+// One thing is NOT behind that gate, and it is above it: the upside-down
+// health drain at 0x0052F413 (`GetUp().z < 0.0f` -> m_fHealth -= 4.0f * step,
+// the 4.0f at 0x006005A4). It is the whole of how a car left on its roof
+// catches fire, so it is not closed with the proofs; its own gate is taken
+// instead, and only the machine that decides the car's health runs it. See
+// "a car left on its roof", below.
+constexpr uintptr_t CAutomobile__VehicleDamage = 0x0052F390;
+
+constexpr float VEH_DAMAGE_IMPULSE_GATE  = 25.0f;    // 0x006005B0
+constexpr float VEH_DAMAGE_THRESHOLD     = 150.0f;   // 0x006012CC
+constexpr float VEH_DAMAGE_ENGINE_THRESH = 220.0f;   // 0x006012D0
+
+namespace offs {
+constexpr size_t VEH_DAMAGE_IMPULSE    = 0x10C;   // float,  m_fDamageImpulse
+constexpr size_t VEH_DAMAGE_PIECE_TYPE = 0x120;   // uint16, m_nDamagePieceType
+} // namespace offs
+
+static_assert(offs::VEH_DAMAGE_IMPULSE < offs::VEH_DAMAGE_PIECE_TYPE &&
+                  offs::VEH_DAMAGE_PIECE_TYPE < offs::SIZEOF_VEHICLE,
+              "both are CPhysical members, so both are inside CVehicle");
+
+// ---- a car left on its roof -------------------------------------------------
+//
+// Verified 2026-09-26 against the retail image. There are two ways a car on
+// its roof catches fire in GTA III, and both end in the same five-second
+// timer (0x00534510 .. 0x005347AB, "the five-second fire timer" above).
+//
+// 1. Any car but the one the local player sits in: VehicleDamage's drain.
+//
+//   0x0052F3F2  mov al,[ebp+1F7h] / shr al,6 / and al,1   bCanBeDamaged, else ret
+//   0x0052F410  lea esi,[ebp+24h]                         the up row
+//   0x0052F413  fld [esi+8] / fcomp [006004F8h]           GetUp().z < 0.0f
+//   0x0052F424  jne 0052F478                              no: on to the impulse
+//   0x0052F426  call FindPlayerVehicle
+//   0x0052F42B  cmp ebp,eax / je 0052F478                 the player's car: no drain
+//   0x0052F42F  [ebp+4DAh] bit 0 -> ret 8                 bNotDamagedUpsideDown
+//   0x0052F439  [ebp+50h] >> 3 == 0Ah -> ret 8            STATUS_PLAYER_REMOTE
+//   0x0052F447  [ebp+122h] bit 3 -> ret 8                 bIsInWater
+//   0x0052F460  fld [006005A4h] / fmul [008E2CB4h]        4.0f * CTimer::ms_fTimeStep
+//   0x0052F46C  fsubr [ebp+200h] / fstp [ebp+200h]        m_fHealth -= it
+//
+// Every frame ProcessControl reaches its one VehicleDamage call (0x00531FE3),
+// which a car on its roof always does. Two hundred health a second at any
+// frame rate, so a car at 1000 is under 250 in 3.75 s; the tail of the same
+// function then sets the engine on fire (0x0052FF7E) and the timer takes it
+// five seconds later. The three early returns leave the whole function, dents
+// and all, exactly as re3's `return` does (Automobile.cpp:3233-3237).
+//
+// 2. The local player's own car: CPlayerInfo::Process, once every 32 frames
+//    (0x004A06E7, CTimer::m_FrameCounter & 1Fh).
+//
+//   0x004A0702  [m_pPed+314h] != 0                        bInVehicle
+//   0x004A0716  FindPlayerVehicle up.z < [005F6A7Ch] 0.0f
+//   0x004A075F  |m_vecMoveSpeed| < [005F6A80h] 0.05f
+//   0x004A077A  [car+284h] == 0 / [car+122h] bit 3 clear  a car, not in water
+//   0x004A079E  up.z < [005F6A84h] -0.5f: += 2, else += 1  [info+0F4h], the counter
+//   0x004A07C0  anything else: counter = 0
+//   0x004A07CA  counter > 6 and [car+1F7h] bit 6          bCanBeDamaged
+//   0x004A0804  m_fHealth = min(249.0f [005F6A88h], m_fHealth)
+//   0x004A083D  push 0E1h / SetEngineStatus               225, on fire
+//   0x004A0858  [car+574h] = 0                            m_pSetOnFireEntity
+//
+// So for the car the local player is in, the drain is skipped at 0x0052F42B
+// and this takes over. CoopIII leaves that one alone: it is only ever the
+// local player's machine deciding about the car that player is in, and that
+// car's health is his to report (or, as a passenger, is overwritten by the
+// driver's snapshot the next frame).
+//
+// What CoopIII takes is the call at 0x0052F426. It answers with the car
+// itself - "this is the player's car", which skips the drain and nothing else
+// - for a car whose health another machine decides (vehicle.h,
+// RoofDrainMayRun): a car somebody else drives or settles, a replica of
+// somebody else's traffic, a session car nobody holds. Every other car drains
+// as it always did. ebp is the car at that call (0x0052F3B5 `mov ebp,ecx`,
+// and nothing between there and the call writes it).
+constexpr uintptr_t ROOF_DRAIN_PLAYER_CAR_CALL = 0x0052F426;
+constexpr uintptr_t ROOF_DRAIN_SKIP            = 0x0052F478;
+constexpr uintptr_t ROOF_DRAIN_WRITE           = 0x0052F460;
+constexpr uintptr_t VEHICLE_DAMAGE_CALL        = 0x00531FE3;
+constexpr uintptr_t PLAYERINFO_ROOF_BLOCK      = 0x004A06E7;
+constexpr uintptr_t PLAYERINFO_ROOF_HEALTH     = 0x004A0804;
+constexpr uintptr_t PLAYERINFO_ROOF_ENGINE     = 0x004A083D;
+constexpr uintptr_t ROOF_DRAIN_PER_STEP_AT     = 0x006005A4;   // 4.0f
+constexpr uintptr_t PLAYER_CAR_ROOF_HEALTH_AT  = 0x005F6A88;   // 249.0f
+
+constexpr float ROOF_DRAIN_PER_STEP    = 4.0f;
+constexpr float PLAYER_CAR_ROOF_HEALTH = 249.0f;
+
+// STATUS_PLAYER_REMOTE, the RC car's status: `cmp eax,0Ah` at 0x0052F442.
+// Named so the drain's test can be transcribed; never written (protocol.md
+// §1.4).
+constexpr uint8_t ENTITY_STATUS_PLAYER_REMOTE = 10;
+
+namespace offs {
+// Byte 0x4DA of CAutomobile, bit 0: bNotDamagedUpsideDown. Cleared by the
+// constructor (0x0052CD94 `and al,0FEh`), set or cleared by
+// SET_UPSIDEDOWN_CAR_NOT_DAMAGED (0x0058857D `and cl,0FEh / or cl,1`,
+// 0x00588591 `and dl,0FEh`), read by the drain at 0x0052F42F.
+constexpr size_t  AUTO_ROOF_FLAGS              = 0x4DA;
+constexpr uint8_t AUTO_NOT_DAMAGED_UPSIDE_DOWN = 0x01;
+// CPhysical's flag byte (bIsHeavy 0, bAffectedByGravity 1, bInfiniteMass 2,
+// "the CPhysical flag byte" below), bit 3: bIsInWater. Read as
+// `shr al,3 / and al,1` by the drain (0x0052F447) and by CPlayerInfo::Process
+// (0x004A0789).
+constexpr size_t  PHYSICAL_FLAGS    = 0x122;
+constexpr uint8_t PHYSICAL_IN_WATER = 0x08;
+} // namespace offs
+
+// bCanBeDamaged: bit 6 of VEH_FLAGS_C, `shr al,6 / and al,1` on [+1F7h] at
+// 0x0052F3F2 (the drain), 0x004A07DC (CPlayerInfo) and 0x00551958
+// (InflictDamage).
+constexpr uint8_t VEH_CAN_BE_DAMAGED = 0x40;
+
+static_assert(offs::AUTO_ROOF_FLAGS < offs::SIZEOF_AUTOMOBILE &&
+                  offs::AUTO_ROOF_FLAGS > offs::SIZEOF_VEHICLE,
+              "a CAutomobile member, past CVehicle");
+static_assert(offs::PHYSICAL_FLAGS == offs::VEH_DAMAGE_PIECE_TYPE + 2,
+              "the flag byte follows the uint16 m_nDamagePieceType");
+
+// ---- making a status byte visible ------------------------------------------
+//
+// Writing m_panelStatus changes the record and nothing on screen, for the same
+// reason writing m_fHealth destroys nothing (the block above) and writing
+// m_aExtras fits nothing (protocol.md §1.12). What you see is an RpAtomic that
+// was swapped or hidden when the status changed, and these are the functions
+// that do the swapping.
+//
+// Each one re-reads the status out of the car's own CDamageManager - there is
+// no variant that takes a value - so the sequence is always "write the status,
+// then call the applier for that component":
+//
+//   0x005301A0  mov eax,[esp+8] / lea ecx,[ebx+288h] / call GetPanelStatus
+//   0x005301B8  mov edx,[ebx+ebp*4+37Ch]    m_aCarNodes[component]
+//   0x005301BF  test edx,edx / jne          no node -> return, silently
+//   0x005301C8  cmp al,1                    PANEL_STATUS_SMASHED1 -> show damaged
+//   0x005301D3  cmp al,3                    PANEL_STATUS_MISSING  -> spawn + hide
+//
+// void SetPanelDamage (int32 component, ePanels panel, bool noFlyingComponents)
+// void SetBumperDamage(int32 component, ePanels panel, bool noFlyingComponents)
+// void SetDoorDamage  (int32 component, eDoors  door,  bool noFlyingComponents)
+// all __thiscall, all ret 0Ch.
+constexpr uintptr_t CAutomobile__SetBumperDamage       = 0x00530120;
+constexpr uintptr_t CAutomobile__SetPanelDamage        = 0x005301A0;
+constexpr uintptr_t CAutomobile__SetDoorDamage         = 0x00530200;
+constexpr uintptr_t CAutomobile__SpawnFlyingComponent  = 0x00530300;
+constexpr uintptr_t CAutomobile__SetComponentVisibility = 0x005300E0;
+
+// The all-at-once version, and the reason CoopIII does not use it.
+//
+// __thiscall void CAutomobile::SetupDamageAfterLoad(void). Twelve guarded
+// calls - two bumpers, six doors, four wings, no windscreen - each
+// `if(m_aCarNodes[c]) Set*Damage(c, panel)`. It is the engine's own answer to
+// "the CDamageManager bytes are already right, make the model match", and it
+// has exactly ONE caller in the whole image: 0x004A1D27, inside
+// CPools::LoadVehiclePool - the same function Area E cites as proof of the
+// CVehicle layout. A save writes the raw bytes into a fresh CAutomobile and
+// then calls this.
+//
+// It passes noFlyingComponents = FALSE:
+//
+//   0x0053C31C  push 0 / push 5 / push 7 / call SetBumperDamage
+//
+// so every already-missing part is SpawnFlyingComponent'ed - a real CObject,
+// out of the object pool, dropped at the car's feet. Tolerable once at a load
+// screen; not tolerable for a late joiner handed eight damaged cars.
+// docs/cardamage.md §5.2. Recorded because it is the proof of the recipe, not
+// because CoopIII calls it.
+//
+// The twelve calls also pin the component indices and m_aCarNodes at +0x37C
+// at the same time, e.g. `cmp dword [ebx+398h],0` is node 7 (0x37C + 7*4) and
+// `cmp dword [ebx+3C0h],0` is node 17.
+constexpr uintptr_t CAutomobile__SetupDamageAfterLoad = 0x0053C310;
+
+// __thiscall void CAutomobile::Fix(void). The only thing in the engine that
+// LOWERS a damage status - a Pay 'n' Spray, the script's FIX_CAR.
+//
+//   0x0053C247  lea ecx,[ebx+288h] / call 00545850   Damage.ResetDamageStatus()
+//   0x0053C263  SetDoorStatus(2..5, MISSING) when pHandling->Flags & 0x10
+//   0x0053C2A5  mov al,[ebx+1F7h] / and al,0FDh      bIsDamaged = false
+//   0x0053C2C0  mov ebp,7 / walk m_aCarNodes[7..] putting the atomics back
+//
+// It is an event, not a number, exactly like BlowUpCar. It was out of scope
+// while garages were unsynced at all (roadmap.md §4), and it is not any more:
+// the garage work replays it on every observer, and the owner follows the
+// respray with a VEH_DAMAGE_RESET so the record goes with the dents. See
+// docs/cardamage.md §6.2 and the spray-shop arm below.
+constexpr uintptr_t CAutomobile__Fix = 0x0053C240;
+
+// __thiscall void CAutomobile::BurstTyre(uint8 piece). Present, correct, and
+// UNREACHABLE in this build - which is why docs/cardamage.md §2.4 strikes
+// wheels from the wire entirely.
+//
+//   0x0053C0EF  sub eax,0Dh / cmp eax,3 / ja      CAR_PIECE_WHEEL_LF..RR
+//   0x0053C116  call GetWheelStatus / test eax,eax / jne    only an OK tyre
+//   0x0053C12C  call SetWheelStatus(wheel, WHEEL_STATUS_BURST)
+//
+// Three independent readings say nothing reaches it:
+//   - no E8/E9 rel32 to 0x0053C0E0 anywhere in .text;
+//   - the constant 0x0053C0E0 appears exactly once in the whole file, at
+//     0x00600C98, which is CAutomobile's vtable (0x00600C1C) + 0x7C, slot 31;
+//   - scanning .text for every `call dword ptr [reg+7Ch]` returns exactly
+//     three sites - 0x00582350, 0x005993C2, 0x0059A082 - and all three
+//     disassemble as COM interface calls in the movie and networking code.
+//
+// The other route to a wheel status is ProgressWheelDamage, reached only from
+// ApplyDamage's COMPGROUP_WHEEL arm, and VehicleDamage's four CAR_PIECE_WHEEL_*
+// cases are a bare `break` - so nothing ever passes it a wheel either.
+//
+// Net: m_wheelStatus is only ever non-zero because FuckCarCompletely set wheel
+// 0 to MISSING, inside a BlowUpCar every machine already runs. If a later
+// build, a mod or a Vice City port ever dispatches slot 31, this paragraph is
+// wrong and the wire needs a wheel nibble.
+constexpr uintptr_t CAutomobile__BurstTyre = 0x0053C0E0;
+constexpr size_t    VTABLE_BURST_TYRE      = 31;
+
+static_assert(VTABLE_BURST_TYRE > VTABLE_BLOW_UP_CAR,
+              "slot 31 sits after BlowUpCar's 29 in the same vtable, which is "
+              "how both were found");
+
+// ---- the small enums the appliers are indexed by ---------------------------
+//
+// Every value below is read off a `push` in BlowUpCar, SetupDamageAfterLoad or
+// CReplay::ProcessCarUpdate rather than out of re3's header.
+//
+// eDoors, from BlowUpCar's six SetDoorDamage calls at 0x0053BCEA..0x0053BD2B:
+// (component, door) = (11h,0) (12h,1) (0Fh,2) (0Bh,3) (10h,4) (0Ch,5).
+enum eDoors : uint8_t {
+	DOOR_BONNET = 0, DOOR_BOOT, DOOR_FRONT_LEFT, DOOR_FRONT_RIGHT,
+	DOOR_REAR_LEFT, DOOR_REAR_RIGHT, NUM_DOORS
+};
+
+// ePanels, from SetupDamageAfterLoad's (0Dh,0) (09h,1) (0Eh,2) (0Ah,3) and
+// BlowUpCar's two SetBumperDamage calls (07h,5) (08h,6). The windscreen is 4,
+// from VehicleDamage's CAR_PIECE_WINDSCREEN arm - and note that
+// SetupDamageAfterLoad does not apply it.
+enum ePanels : uint8_t {
+	VEHPANEL_FRONT_LEFT = 0, VEHPANEL_FRONT_RIGHT, VEHPANEL_REAR_LEFT,
+	VEHPANEL_REAR_RIGHT, VEHPANEL_WINDSCREEN, VEHBUMPER_FRONT, VEHBUMPER_REAR,
+	NUM_PANELS
+};
+
+// eCarNodes, the subscript into m_aCarNodes that every applier takes. Only the
+// ones the damage path uses are listed; each is witnessed by a `push` above
+// and cross-checked against the `cmp dword [ebx+<0x37C + n*4>],0` beside it.
+enum eCarNodes : uint8_t {
+	CAR_WHEEL_LF   = 4,    // BlowUpCar's SpawnFlyingComponent(4, COMPGROUP_WHEEL)
+	CAR_BUMP_FRONT = 7,    // [ebx+398h]
+	CAR_BUMP_REAR  = 8,    // [ebx+39Ch]
+	CAR_WING_RF    = 9,    // [ebx+3A0h]
+	CAR_WING_RR    = 10,   // [ebx+3A4h]
+	CAR_DOOR_RF    = 11,
+	CAR_DOOR_RR    = 12,
+	CAR_WING_LF    = 13,
+	CAR_WING_LR    = 14,   // [ebx+3B4h]
+	CAR_DOOR_LF    = 15,
+	CAR_DOOR_LR    = 16,
+	CAR_BONNET     = 17,   // [ebx+3C0h]
+	CAR_BOOT       = 18,
+	CAR_WINDSCREEN = 19,
+};
+
+// eDoorStatus / ePanelStatus, from the `cmp eax,3` in ProgressDoorDamage and
+// ProgressPanelDamage and from SetDoorDamage's own switch.
+enum eDoorStatus : uint8_t {
+	DOOR_STATUS_OK = 0, DOOR_STATUS_SMASHED, DOOR_STATUS_SWINGING,
+	DOOR_STATUS_MISSING
+};
+enum ePanelStatus : uint8_t {
+	PANEL_STATUS_OK = 0, PANEL_STATUS_SMASHED1, PANEL_STATUS_SMASHED2,
+	PANEL_STATUS_MISSING
+};
+
+// ENGINE_STATUS_ON_FIRE, the 0E1h InflictDamage pushes at 0x00551BE7 and the
+// value ProgressEngineDamage caps itself one below.
+constexpr uint8_t ENGINE_STATUS_ON_FIRE = 225;
+constexpr uint8_t ENGINE_STATUS_MAX     = 250;
+
+// ---- parked cars, and the name the map already gives them ------------------
+//
+// Verified 2026-09-22 for the unowned-car destruction work. The problem this
+// solves is naming: a parked car exists on every machine and nobody created
+// it, so there is nothing to allocate a netId against and no creator to
+// announce it. docs/population.md §1.2 says identity has to be handed out
+// rather than chosen - and for a parked car the MAP hands it out, which is
+// cheaper than the server doing it.
+//
+// Every PARKED_VEHICLE in GTA III comes out of a car generator, and the
+// generators live in one fixed array filled from the IPLs in file order. The
+// same files in the same order on every machine means the same index for the
+// same generator, with no round trip and no allocation.
+//
+// Found from the one debug string that survived into the retail image,
+// "CCarGenerator::DoInternalProcessing - can't find ground z for new car
+// x = %f y = %f \n" at 0x00600F68, referenced exactly once, at 0x00542B77.
+//
+// CTheCarGenerators::Process (0x00542F40) is what pins the array, and it
+// pins the stride twice over:
+//
+//   0x00542F57  inc byte [0x0095CDAF] / cmp ..,4    ProcessCounter, 0..3
+//   0x00542F6D  movzx ebx,byte [0x0095CDAF]
+//   0x00542F74  cmp ebx,[0x008E2C1C]                NumOfCarGenerators
+//   0x00542F7C  imul ebp,ebx,48h / add ebp,87CB18h  CarGeneratorArray[i]
+//   0x00542F89  call 0x00542BB0                     CCarGenerator::Process
+//   0x00542F8E  add ebx,4 / add ebp,120h            i += 4, ptr += 4 * 0x48
+//   0x00542F9F  cmp byte [0x0095CDC6],0 / dec       GenerateEvenIfPlayerIs..
+//
+// re3 CarGen.cpp:210-222. Note that the engine itself only ever walks the
+// array up to NumOfCarGenerators - that is the bound, read off the binary,
+// and nothing here indexes past it.
+// ############################################################################
+// # Confirmed in a running gta3.exe, 2026-09-22, read-only over              #
+// # ReadProcessMemory at GS_PLAYING_GAME with a save loaded:                 #
+// #                                                                          #
+// #   NumOfCarGenerators = 149     (re3 NUM_CARGENS is 160; 149 fits)        #
+// #   CurrentActiveCount = 133                                               #
+// #   [0]  model 106  pos (1140.7 -630.2 -100.0)  ang   0.0  col -1/-1       #
+// #   [1]  model 116  pos (1139.0 -646.0 -100.0)  ang  90.0  col -1/-1       #
+// #   [3]  model  91  pos (1284.3 -620.5   11.7)  ang   0.0  col -1/-1       #
+// #                                                                          #
+// # Every field lands where the disassembly says: vehicle model indices,     #
+// # Liberty City coordinates, angles of exactly 0/90/180/270 (degrees, as    #
+// # DoInternalProcessing's DEGTORAD says), colours of -1 (the "roll one"     #
+// # sentinel) and m_nUsesRemaining of 0xFFFF with one exhausted entry at 0.  #
+// #                                                                          #
+// # And the two counters are LIVE: writing 255 into                          #
+// # GenerateEvenIfPlayerIsCloseCounter had the engine decrement it at ~62/s  #
+// # (255 -> 235 -> 217 -> 198 -> 178 -> 160 over 1.5 s) while ProcessCounter #
+// # cycled 3, 1, 0, 0, 2 - which is this function running once a frame, at   #
+// # this address, over these globals.                                        #
+// #                                                                          #
+// # NOT confirmed in-game: a handle resolving to a live CVehicle. The test   #
+// # save spawns in a walled courtyard where the only generator inside 120 m  #
+// # is 52 m away, and CheckIfWithinRangeOfAnyPlayer also refuses anything    #
+// # closer than farclip - 20 (re3 CarGen.cpp:200) - so nothing generates     #
+// # there, forced counter or not. Every generator read -1 for the whole      #
+// # session, which is the documented "no car" value rather than a bad read.  #
+// ############################################################################
+constexpr uintptr_t CTheCarGenerators__Process            = 0x00542F40;
+constexpr uintptr_t CTheCarGenerators__CarGeneratorArray  = 0x0087CB18;
+constexpr uintptr_t CTheCarGenerators__NumOfCarGenerators = 0x008E2C1C;  // int32
+constexpr uintptr_t CTheCarGenerators__ProcessCounter     = 0x0095CDAF;  // uint8
+constexpr uintptr_t CTheCarGenerators__CurrentActiveCount = 0x008F2C5C;  // int32
+constexpr uintptr_t CTheCarGenerators__GenerateEvenIfPlayerIsCloseCounter =
+    0x0095CDC6;   // uint8
+
+constexpr uintptr_t CCarGenerator__Process             = 0x00542BB0;
+constexpr uintptr_t CCarGenerator__DoInternalProcessing = 0x005426E0;
+constexpr uintptr_t CCarGenerator__CalcNextGen         = 0x005426C0;
+constexpr uintptr_t CCarGenerator__CheckIfWithinRange  = 0x00542E50;
+
+// The CCarGenerator layout, all of it out of DoInternalProcessing's tail and
+// Process's head, matched against re3 CarGen.h field for field:
+//
+//   0x00542B36  mov ax,[ebp+14h] / cmp ax,-1        m_nColor1
+//   0x00542B40  cmp word [ebp+16h],-1               m_nColor2
+//   0x00542AAA  movzx ecx,byte [ebp+19h]            m_nAlarm
+//   0x00542AF4  movzx edx,byte [ebp+1Ah]            m_nDoorlock
+//   0x00542B56  mov ecx,[0x009430DC] / push ebx
+//   0x00542B5D  call 0x00429050                     GetVehiclePool()->GetIndex
+//   0x00542B62  mov [ebp+24h],eax                   m_nVehicleHandle
+//   0x00542B69  fld dword [ebp+8] ... [ebp+4]       m_vecPos.y, .x
+//   0x00542B84  movzx eax,word [ebp+28h]            m_nUsesRemaining
+//   0x00542B93  call 0x005426C0 / mov [ebp+20h],eax m_nTimer = CalcNextGen()
+//   0x00542BB3  cmp dword [ebx+24h],-1              m_nVehicleHandle == -1
+//   0x00542C18  mov byte [ebx+2Ah],1                m_bIsBlocking = true
+//
+namespace offs {
+constexpr size_t CARGEN_MODEL_INDEX    = 0x00;   // int32
+constexpr size_t CARGEN_POS            = 0x04;   // CVector
+constexpr size_t CARGEN_ANGLE          = 0x10;   // float, degrees
+constexpr size_t CARGEN_COLOUR1        = 0x14;   // int16, -1 == "roll one"
+constexpr size_t CARGEN_COLOUR2        = 0x16;   // int16
+constexpr size_t CARGEN_FORCE_SPAWN    = 0x18;   // uint8
+constexpr size_t CARGEN_ALARM          = 0x19;   // uint8, percent
+constexpr size_t CARGEN_DOORLOCK       = 0x1A;   // uint8, percent
+constexpr size_t CARGEN_MIN_DELAY      = 0x1C;   // int16
+constexpr size_t CARGEN_MAX_DELAY      = 0x1E;   // int16
+constexpr size_t CARGEN_TIMER          = 0x20;   // uint32, ms
+constexpr size_t CARGEN_VEHICLE_HANDLE = 0x24;   // int32, a POOL REF - see below
+constexpr size_t CARGEN_USES_REMAINING = 0x28;   // uint16
+constexpr size_t CARGEN_IS_BLOCKING    = 0x2A;   // bool
+constexpr size_t SIZEOF_CARGENERATOR   = 0x48;
+} // namespace offs
+
+static_assert(offs::CARGEN_VEHICLE_HANDLE < offs::SIZEOF_CARGENERATOR &&
+                  offs::CARGEN_IS_BLOCKING < offs::SIZEOF_CARGENERATOR,
+              "every field read lives inside the stride Process strides by");
+
+// ############################################################################
+// # m_nVehicleHandle is a pool REF in exactly the encoding CPools::          #
+// # GetVehicleRef produces, which is the whole reason this is usable.        #
+// #                                                                          #
+// # CPools::GetVehicleRef (0x004A1AC0) is four instructions:                 #
+// #   mov eax,[esp+4] / mov ecx,[0x009430DC] / push eax / call 0x00429050    #
+// # and 0x00429050 is the same call DoInternalProcessing makes at            #
+// # 0x00542B5D with the same pool in ecx. One function, one encoding:        #
+// #   0x00429071  shl eax,8 / add eax,ecx     (slot << 8) | flags byte       #
+// #                                                                          #
+// # So `CPools::GetVehicleRef(v) == gen->m_nVehicleHandle` is a valid test,  #
+// # and CPools::GetVehicle (0x004A1AE0 -> GetAt 0x0043EAF0) resolves a       #
+// # generator's handle with the free-slot check intact - a generator whose   #
+// # car has been reaped resolves to null rather than to whatever took the    #
+// # slot. GetAt's `imul eax,eax,5A8h` re-confirms SIZEOF_AUTOMOBILE.         #
+// ############################################################################
+//
+// ############################################################################
+// # WHAT THE INDEX IS NOT GOOD FOR. The map's generators are loaded first    #
+// # and are identical everywhere. The SCRIPT can create more at runtime      #
+// # (COMMAND_CREATE_CAR_GENERATOR), appended to the same array, and only     #
+// # the host runs the script (docs/campaign.md) - so from the first script   #
+// # generator onwards the two machines' arrays stop agreeing. CoopIII        #
+// # therefore snapshots NumOfCarGenerators once, when the world has finished #
+// # loading, and refuses to put any index at or above that on the wire.      #
+// # Below it, the index is map data and means the same thing everywhere.     #
+// ############################################################################
+
+// ---- a vehicle's extra components ------------------------------------------
+//
+// Verified 2026-09-22. The second half of the same family of bug as the paint
+// job: GTA III picks a car's extras at spawn, per machine, so two machines
+// independently roll different ones and each player sees a car the other does
+// not.
+//
+// ############################################################################
+// # Extras are NOT like the colours, and copying the colour fix would do     #
+// # nothing at all. m_currentColour1/2 are read by the renderer every frame, #
+// # so writing them after construction changes the car. m_aExtras is a       #
+// # *record* of a decision already taken: the components are RwAtomics that  #
+// # were cloned into the clump during construction, and writing the bytes    #
+// # afterwards changes the record and not one thing on screen.               #
+// #                                                                          #
+// # So an extra has to be forced BEFORE the constructor runs, through the    #
+// # engine's own override, and the engine has one because the garages need   #
+// # exactly this (re3 Garages.cpp:1905, CStoredCar::RestoreCar).             #
+// ############################################################################
+//
+// CVehicleModelInfo::ms_compsToUse - int8[2], the override. Both bytes are
+// 0xFE (-2) in the file at 0x005FF2EC, which is re3's initialiser
+// `{ -2, -2 }` (VehicleModelInfo.cpp:24). -2 means "choose at random".
+//
+// It is ONE-SHOT, and that is the whole mechanism. CVehicleModelInfo::
+// ChooseComponent (0x00520AB0) opens:
+//
+//   0x00520AB8  cmp byte [0x005FF2EC],0FEh
+//   0x00520AC1  je  0x00520AD7                  -2: fall through to the roll
+//   0x00520AC3  movsx eax,byte [0x005FF2EC]     otherwise: use it
+//   0x00520ACD  mov byte [0x005FF2EC],0FEh      and put it back to -2
+//   0x00520AD6  ret
+//
+// ChooseSecondComponent (0x00520BE0) is the same nine instructions against
+// 0x005FF2ED. Note `movsx`: the value is signed, so -1 ("no component")
+// survives the round trip and is what the engine itself passes for a car with
+// no extra fitted.
+constexpr uintptr_t CVehicleModelInfo__ms_compsToUse = 0x005FF2EC;
+
+// CVehicleModelInfo::ms_compsUsed - int8[2], what was actually chosen. Read
+// straight out of CVehicle::SetModelIndex (0x00551170), which is already in
+// this file and whose whole body is six instructions:
+//
+//   0x00551179  call 0x00473E70                 CEntity::SetModelIndex
+//   0x0055117E  mov dl,[0x0095CCB2]
+//   0x00551185  mov [ebp+19Eh],dl               m_aExtras[0] = ms_compsUsed[0]
+//   0x0055118B  mov al,[0x0095CCB3]
+//   0x00551190  mov [ebp+19Fh],al               m_aExtras[1] = ms_compsUsed[1]
+//   0x00551196  call 0x005219D0                 max passengers from door count
+//
+// which is re3 Vehicle.cpp:157-158 and the sixth independent confirmation of
+// offs::VEH_EXTRAS at 0x19E.
+constexpr uintptr_t CVehicleModelInfo__ms_compsUsed = 0x0095CCB2;
+
+constexpr int8_t VEHICLE_COMPS_RANDOM = -2;   // ms_compsToUse: roll for it
+constexpr int8_t VEHICLE_EXTRA_NONE   = -1;   // m_aExtras: nothing fitted
+
+// ---- why the write has to happen before the constructor --------------------
+//
+// CEntity::SetModelIndex (0x00473E70) is four instructions:
+//
+//   0x00473E70  mov eax,[esp+4]
+//   0x00473E75  mov [ecx+5Ch],ax                m_modelIndex
+//   0x00473E79  mov ebx,[ecx] / call dword [ebx+14h]   CreateRwObject(), slot 5
+//   0x00473E7F  ret 4
+//
+// and CVehicle::SetModelIndex is called from CAutomobile's constructor. So the
+// clump - and therefore CVehicleModelInfo::CreateInstance, which is what does
+// the choosing - is built INSIDE the constructor call. ms_compsToUse has to be
+// set before CoopIII calls the constructor, exactly as the garage does.
+constexpr uintptr_t CEntity__SetModelIndex = 0x00473E70;
+
+// ---- and why it has to be put back afterwards ------------------------------
+//
+// CVehicleModelInfo::CreateInstance, 0x0051FCB0. Found by scanning .text for
+// the two writes to ms_compsUsed (three sites each; the other one is
+// SetModelIndex above). It is re3 VehicleModelInfo.cpp:181-222 statement for
+// statement:
+//
+//   0x0051FCB9  call 0x004F8920                 CClumpModelInfo::CreateInstance
+//   0x0051FCC1  cmp dword [ebp+1F4h],0
+//   0x0051FCC8  je  0x0051FDA3                  if (m_numComps == 0) ...
+//   0x0051FCD9  call 0x00520AB0                 comp1 = ChooseComponent()
+//   0x0051FCE0  cmp ebx,-1 / je                 -1 means fit nothing
+//   0x0051FCE5  mov eax,[ebp+ebx*4+1DCh]        m_comps[comp1]   <-- UNCHECKED
+//   0x0051FD38  mov byte [0x0095CCB2],bl        ms_compsUsed[0] = comp1
+//   0x0051FD3E  call 0x00520BE0                 comp2 = ChooseSecondComponent()
+//   0x0051FD9B  mov byte [0x0095CCB3],bl        ms_compsUsed[1] = comp2
+//   0x0051FDA3  mov byte [0x0095CCB2],0FFh      the m_numComps == 0 arm:
+//   0x0051FDAA  mov byte [0x0095CCB3],0FFh      both used = -1 and RETURN
+//
+// ############################################################################
+// # Two traps, both in that listing.                                         #
+// #                                                                          #
+// # 1. `mov eax,[ebp+ebx*4+1DCh]` is the ONLY thing done with the chosen     #
+// #    index, and the only guard on it is `cmp ebx,-1`. There is no upper    #
+// #    bound. A component index off the wire goes straight into that         #
+// #    subscript and out of it into RpAtomicClone. m_comps is six pointers   #
+// #    (+0x1DC to +0x1F3, with m_numComps at +0x1F4 immediately after), so   #
+// #    anything at or above m_numComps reads another model's fields and      #
+// #    calls RenderWare on them. Bound it, in CoopIII, against m_numComps -  #
+// #    this is the same class of bug as the four-entry animation group and   #
+// #    the twelve-slot node array, which is three for three now.             #
+// #                                                                          #
+// # 2. The m_numComps == 0 arm at 0x0051FDA3 sets ms_compsUsed and NEVER     #
+// #    TOUCHES ms_compsToUse. So an override written for a model that has no #
+// #    components is not consumed, and the next car created on that machine  #
+// #    - traffic, a parked car, anything - picks it up instead. Put it back  #
+// #    to { -2, -2 } after the constructor returns, unconditionally.         #
+// ############################################################################
+namespace offs {
+constexpr size_t MODELINFO_COMPS      = 0x1DC;   // RpAtomic *[6]
+constexpr size_t MODELINFO_NUM_COMPS  = 0x1F4;   // int32
+constexpr size_t MODELINFO_COMP_RULES = 0x0EC;   // uint32
+} // namespace offs
+
+// Six, from the layout rather than from re3's declaration: m_comps starts at
+// +0x1DC and m_numComps, read by CreateInstance's own `cmp dword [ebp+1F4h]`,
+// sits at +0x1F4. (0x1F4 - 0x1DC) / 4 == 6. re3 agrees
+// (VehicleModelInfo.h:107) but it is not the source here.
+constexpr int MAX_VEHICLE_COMPS = 6;
+static_assert((offs::MODELINFO_NUM_COMPS - offs::MODELINFO_COMPS) /
+                      sizeof(void *) ==
+                  MAX_VEHICLE_COMPS,
+              "m_comps runs from +0x1DC up to m_numComps at +0x1F4");
+
+// MODELINFOSIZE. ms_modelInfoPtrs is 5500 pointers, which is proved twice over
+// by two separate walks of the array that both end on `cmp reg,157Ch / jl`:
+// 0x00401121 and 0x00406919. It is also, independently, the value already in
+// this file as STREAM_OFFSET_TXD - the streaming array puts txd ids straight
+// after the last model id, so the two numbers are the same number.
+constexpr uint32_t MODELINFO_SIZE = 0x157C;
+static_assert(MODELINFO_SIZE == STREAM_OFFSET_TXD,
+              "txd ids begin where model ids end");
+
+// ms_modelInfoPtrs[id], bounded. Null for a model that has never been loaded,
+// which every caller has to handle anyway.
+inline void *VehicleModelInfo(uint32_t modelId) {
+	if (modelId >= MODELINFO_SIZE)
+		return nullptr;
+	return reinterpret_cast<void **>(CModelInfo__ms_modelInfoPtrs)[modelId];
+}
+
+// A model a pedestrian may be built from. CPed::SetModelIndex reads its
+// CPedModelInfo's anim group and ped stats as they are, so a car's or an
+// object's model id that happens to be loaded would be read as one.
+inline bool IsPedModel(uint32_t modelId) {
+	const void *const info = VehicleModelInfo(modelId);
+	return info != nullptr &&
+	       *reinterpret_cast<const uint8_t *>(reinterpret_cast<uintptr_t>(info) + offs::MODELINFO_TYPE) ==
+	           MITYPE_PED;
+}
+
+// How many extra components this model actually has, or 0 when the model is
+// not loaded - in which case nothing may be forced, because CreateInstance
+// would subscript m_comps on a model info that is not there.
+inline int VehicleModelCompCount(uint32_t modelId) {
+	void *const info = VehicleModelInfo(modelId);
+	if (!info)
+		return 0;
+	const int32_t n = *reinterpret_cast<const int32_t *>(
+	    reinterpret_cast<uint8_t *>(info) + offs::MODELINFO_NUM_COMPS);
+	if (n <= 0)
+		return 0;
+	return n > MAX_VEHICLE_COMPS ? MAX_VEHICLE_COMPS : static_cast<int>(n);
+}
+
+// The one gate between a byte off the wire and CreateInstance's unchecked
+// subscript. Pure arithmetic, so tools/clienttest covers it without the game.
+//
+// Anything that is not a component this model has becomes -1, "fit nothing".
+// -1 is the engine's own value for that and the `cmp ebx,-1` above is the one
+// bound CreateInstance does check, so it is the safe answer as well as the
+// honest one: better a car missing an extra than a call into RenderWare with
+// somebody else's pointer.
+inline int8_t ClampVehicleExtra(int8_t wire, int compCount) {
+	if (wire < 0 || compCount <= 0)
+		return VEHICLE_EXTRA_NONE;
+	if (wire >= compCount || wire >= MAX_VEHICLE_COMPS)
+		return VEHICLE_EXTRA_NONE;
+	return wire;
+}
 
 // ---- animation ------------------------------------------------------------
 //
@@ -1372,6 +4633,24 @@ constexpr size_t ANIM_ID           = 0x2C;
 constexpr size_t ANIM_FLAGS        = 0x30;
 constexpr size_t SIZEOF_ANIM_ASSOC = 0x40;
 
+// CAnimBlendHierarchy::totalLength, the length of one play-through in
+// seconds. The hierarchy has no vtable, so re3's layout holds (name[24],
+// sequences, numSequences, compressed, totalLength). Witnessed twice:
+//
+//   UpdateTime (0x00403214)  mov eax,[ebx+14h] / fmul dword ptr [eax+20h]
+//                            relSpeed * hierarchy->totalLength
+//   RpAnimBlendClumpUpdateAnimations (0x00402536)
+//                            mov eax,[ebp+14h] / fld dword ptr [eax+20h] /
+//                            fdiv dword ptr [ebp+24h]
+//                            totalLength / speed, summed by blendAmount over
+//                            every ASSOC_MOVEMENT association
+//
+// The second is why a movement animation's `speed` does set its rate: every
+// one of them advances at blendSum / sum(length / speed * blend) strides a
+// second, the same for all of them, which keeps a walk and a run on one
+// normalised phase however they are weighted.
+constexpr size_t ANIMHIER_TOTAL_LENGTH = 0x20;
+
 // CAnimBlendAssociation::FromLink is `link - offsetof(assoc, link)`, and the
 // offset is 4 because of that vtable. Proved by BlendAnimation's own loop,
 // which does `lea ecx,[esi-4]` on every node.
@@ -1405,18 +4684,82 @@ constexpr uint16_t ANIM_STD_WALK    = 0;
 constexpr uint16_t ANIM_STD_RUN     = 1;
 constexpr uint16_t ANIM_STD_RUNFAST = 2;
 constexpr uint16_t ANIM_STD_IDLE    = 3;
+// The fifth, which the player's walking styles and the six strafe groups
+// have and a pedestrian's four-entry style does not ("walk_start",
+// "walk_start_left", ...; ReApplyMoveAnims names it with the other four).
+// Always bounded by the group's numAssociations before use.
+constexpr uint16_t ANIM_STD_STARTWALK = 4;
 
 // eMoveState (re3 Ped.h:290), and the reason the four ids above are the ones
 // every group has: CPed::SetMoveAnim switches on this and blends exactly
-// IDLE / WALK / RUN / RUNFAST out of the ped's own m_animGroup. Writing
-// m_nMoveState is how a remote player walks instead of sliding - the engine
-// picks the animation, we only say which gait.
+// IDLE / WALK / RUN / RUNFAST out of the ped's own m_animGroup. It is not how
+// a remote player walks: CPed::Idle overwrites it on a CCivilianPed before
+// SetMoveAnim reads it (docs/protocol.md 1.13.4), and the legs are the
+// sender's weights, written by ped.cpp's ApplyLegs (1.8.4).
 constexpr uint32_t PEDMOVE_NONE   = 0;
 constexpr uint32_t PEDMOVE_STILL  = 1;
 constexpr uint32_t PEDMOVE_WALK   = 2;
 constexpr uint32_t PEDMOVE_RUN    = 3;
 constexpr uint32_t PEDMOVE_SPRINT = 4;
 constexpr uint32_t PEDMOVE_LAST   = PEDMOVE_SPRINT;
+
+// ---- a cutscene's animations, and the models they are laid over -----------
+//
+// CCutsceneMgr::LoadCutsceneData(const char *name), __cdecl, 0x00404650.
+// Its only caller is LOAD_CUTSCENE's handler (02E4: 700-range table
+// 0x005EF4D0 entry 40, handler 0x00446D52), which strncpy's the script's
+// eight bytes and calls it at 0x00446D79. It empties
+// CCutsceneMgr::ms_pCutsceneDir (0x008F5F88, `mov [eax+8],0`) and reads
+// "ANIM\CUTS.DIR" (0x005EBE7C) into it, opens "ANIM\CUTS.IMG" (0x005EBE94),
+// finds "%s.IFP" (0x005EBEA4) with CDirectory::FindItem, seeks to
+// offset << 11, hands the file to CAnimManager::LoadAnimFile (0x00403A40),
+// and then:
+//
+//   00404729  mov  ecx,709C58h           ms_cutsceneAssociations
+//   0040472E  push edi                   the scene's name
+//   0040472F  call 00401130              CAnimBlendAssocGroup::CreateAssociations
+//
+// which, for each animation of the block of that name, builds a clump of
+// the model named like it to lay the animation over:
+//
+//   0040119B  add  ebp,[eax+18h]         block->firstIndex + i
+//   0040119E  imul ebp,ebp,28h           * sizeof(CAnimBlendHierarchy)
+//   004011A1  add  ebp,70F430h           + ms_aAnimations: its name, at +0
+//   004011A8  call 004010D0              GetModelFromName(name)
+//   004011BF  mov  ecx,edi
+//   004011C4  mov  esi,[ecx]             mi->CreateInstance, through the vtable
+//
+// with nothing between the call and the read. GetModelFromName (cdecl, one
+// argument, `pop ecx` after it) walks all 5500 model infos
+// (`mov esi,[ebp*4+0083D408h]` ... `cmp ebp,157Ch` at 0x00401121) for the
+// first that has an RwObject (vtable +14h), whose RwObject is a clump
+// (`cmp byte [eax],2`) and whose m_name (+4) is the animation's name with
+// case and digits aside (0x00401020). Anything else and it returns 0, and
+// 0x004011C4 reads address 0: the crash of 2026-09-24, animation 'eight2' of
+// l1_lg.ifp on a machine with no model called that loaded.
+//
+// Nothing is let go of to make room first: the RemoveUnusedModelsInLoadedList
+// (0x004089A0) and DrasticTidyUpMemory (0x0048CA10) it calls on the way in
+// are a bare `ret` each in this build.
+//
+// LoadAnimFile numbers a file's animations in file order from
+// ms_numAnimations (0x008E2DD4) and names its block at 0x006F01A0 + n*20h,
+// which is how the fault's own registers read: [esp+4] 0x006F01C0 is block
+// 1, its firstIndex 236 is ebp's 0x00711910, and i ([esp+0Ch]) is 0.
+constexpr uintptr_t CCutsceneMgr__LoadCutsceneData           = 0x00404650;   // recorded
+constexpr uintptr_t CAnimBlendAssocGroup__CreateAssociations = 0x00401130;   // recorded
+constexpr uintptr_t CCutsceneMgr__ms_cutsceneAssociations    = 0x00709C58;   // recorded
+constexpr uintptr_t CAnimManager__ms_aAnimations             = 0x0070F430;   // recorded
+constexpr uintptr_t AnimBlend__GetModelFromName             = 0x004010D0;
+// The call inside CreateAssociations, and the read after it.
+constexpr uintptr_t CREATE_ASSOCIATIONS_MODEL_CALL = 0x004011A8;
+constexpr uintptr_t CREATE_ASSOCIATIONS_FAULT      = 0x004011C4;
+
+// LOAD_ALL_MODELS_NOW's handler (038B: 900-range table 0x005EFA14 entry 7,
+// 0x0044D328) is `call CTimer::Stop / push 0 / call
+// CStreaming::LoadAllRequestedModels / pop ecx / call CTimer::Update`, and
+// that is all of it. CoopIII loads what the scene needs the same way.
+constexpr uintptr_t LOAD_ALL_MODELS_NOW_HANDLER = 0x0044D328;   // recorded
 
 // ---- weapons --------------------------------------------------------------
 //
@@ -1452,6 +4795,40 @@ constexpr size_t WEAPONINFO_ANIM_TO_PLAY = 0x34;
 constexpr size_t WEAPONINFO_MODEL_ID     = 0x4C;
 constexpr size_t WEAPONINFO_FLAGS        = 0x50;
 
+// The animation block in the middle of CWeaponInfo, and the reason a remote
+// player's gun looked like it was being drawn over and over instead of fired.
+//
+// A weapon has one animation, not three. The draw, the aim pose, the shot and
+// the recovery are all frames of it, and which part you see is decided by
+// where the association is parked and whether it is running:
+//
+//   m_fAnimLoopStart   CPed::PointGunAt parks it here and clears
+//                      ASSOC_RUNNING. That frozen frame is the "gun up,
+//                      ready" pose, and it is what a player holding an aim
+//                      without firing is showing.
+//   m_fAnimFrameFire   CPed::FireGun discharges the weapon when the playhead
+//                      crosses this.
+//   m_fAnimLoopEnd     and wraps back to m_fAnimLoopStart while the trigger
+//                      is held, which is the automatic-fire loop. It never
+//                      plays past here until the player stops.
+//
+// All four read out of CPed::FireGun in re3's own order (PedFight.cpp:
+// 525-770), which also re-confirms m_AnimToPlay and m_Flags:
+//
+//   0x004E6BC4  mov esi,[eax+34h]     weaponAnim = m_AnimToPlay
+//   0x004E6C0A  fld dword [eax+44h]   delayBetweenAnimAndFire = m_fAnimFrameFire
+//   0x004E6CBF  mov ebp,[eax+38h]     m_Anim2ToPlay
+//   0x004E6CE3  mov eax,[eax+50h]     IsFlagSet(WEAPONFLAG_THROW)
+//   0x004E6D16  fld dword [eax+3Ch]   animStart = m_fAnimLoopStart
+//   0x004E71B9  fld dword [eax+40h]   animLoopEnd = m_fAnimLoopEnd
+//
+// and the class is bracketed at both ends by offsets this file already had:
+// m_AnimToPlay at 0x34, m_nModelId at 0x4C, m_Flags at 0x50, total 0x54.
+constexpr size_t WEAPONINFO_ANIM2_TO_PLAY   = 0x38;
+constexpr size_t WEAPONINFO_ANIM_LOOP_START = 0x3C;
+constexpr size_t WEAPONINFO_ANIM_LOOP_END   = 0x40;
+constexpr size_t WEAPONINFO_ANIM_FRAME_FIRE = 0x44;
+
 constexpr uint32_t WEAPONFLAG_CANAIM          = 0x040;
 constexpr uint32_t WEAPONFLAG_CANAIM_WITHARM  = 0x080;
 
@@ -1486,6 +4863,12 @@ constexpr uintptr_t CPed__ClearAimFlag = 0x004C6A50;
 // CPed::IsPlayer(), called at the tail of ClearAimFlag. Recorded because it's
 // the cheap way to tell a remote player's CCivilianPed from the local
 // CPlayerPed, and that call site is the proof of it.
+//
+// The body was read on 2026-09-22 and agrees: `mov edx,[ecx+32Ch]` - which is
+// the `m_nPedType` this file already had - then 0, 1..2 and 3 in turn, i.e.
+// re3's four PEDTYPE_PLAYER values. It is a test on the ped *type* and not on
+// being FindPlayerPed(), which matters: CFireManager::StartFire decides the
+// NPC arm on the latter and the extinguish time on this.
 constexpr uintptr_t CPed__IsPlayer = 0x004D48E0;
 
 // ---- rendering ------------------------------------------------------------
@@ -1570,7 +4953,9 @@ constexpr uintptr_t CWorld__ms_nCurrentScanCode = 0x0095CC64;
 // reads `mov ebp,[edi] / mov edi,[edi+8]`.
 constexpr uintptr_t CWorld__ms_listMovingEntityPtrs = 0x008F433C;
 constexpr size_t    PTRNODE_ITEM = 0x00;
+constexpr size_t    PTRNODE_PREV = 0x04;
 constexpr size_t    PTRNODE_NEXT = 0x08;
+constexpr size_t    SIZEOF_PTRNODE = 0x0C;   // the `push 0Ch` every allocator uses
 
 // CWorld::Process. Its animation loop is re3 World.cpp:1865-1876 exactly:
 //     mov eax,[ebp+4Ch] / test / cmp byte [eax],2        rpCLUMP
@@ -1591,6 +4976,128 @@ constexpr uintptr_t CWorld__Process = 0x004B1A60;
 // moving list and CPed::SetModelIndex left an idle association on it.
 constexpr uintptr_t RpAnimBlendClumpGetFirstAssociation = 0x004031B0;
 constexpr uintptr_t RpAnimBlendClumpUpdateAnimations    = 0x004024B0;
+
+// How many animations may be on a clump at once before the engine starts
+// writing over its own stack.
+//
+// RpAnimBlendClumpUpdateAnimations builds an array of the nodes it is about
+// to blend, in a local, and neither fills it nor terminates it with a bound:
+//
+//   0x004024B4  sub  esp, 40h                     the whole frame
+//   0x004024F0  xor  esi, esi                     i = 0
+//   0x00402527  mov  [esp+esi*4+10h], eax         nodes[i++] = assoc->GetNode(0)
+//   0x0040256E  mov  dword [esp+esi*4+10h], 0     nodes[i] = nil
+//
+// The array starts at esp+0x10 and the frame ends at esp+0x40, so there is
+// room for twelve. What follows it is the function's own saved state.
+//
+// **The order of those saved registers was written down backwards here, and
+// it is the half of this note that decides which count is fatal.** The
+// prologue is five instructions and its bytes are
+// `53 56 57 55 83 EC 40` at 0x004024B0:
+//
+//   004024B0  53           push ebx
+//   004024B1  56           push esi
+//   004024B2  57           push edi
+//   004024B3  55           push ebp
+//   004024B4  83 EC 40     sub  esp,40h
+//
+// ebp is pushed last, so ebp is the one nearest esp, not ebx:
+//
+//   [esp+40h] saved ebp   <- nodes[12]
+//   [esp+44h] saved edi   <- nodes[13]
+//   [esp+48h] saved esi   <- nodes[14]
+//   [esp+4Ch] saved ebx   <- nodes[15]
+//   [esp+50h] return address                      <- nodes[16]
+//   [esp+54h] the clump argument                  <- nodes[17]
+//   [esp+58h] timeDelta                           <- nodes[18]
+//
+// `mov eax,[esp+54h]` at 0x004024B7 reads the clump argument, which is what
+// pins the whole table: the argument really is at +0x54, so the four saved
+// registers really are at +0x40..+0x4C in push order.
+//
+// A thirteenth animation corrupts the caller's registers, a seventeenth the
+// return address, and an eighteenth the clump. The last of those is what the
+// 2026-09-21 crash dump caught: ESI was 0x11, the terminator wrote null over
+// the clump argument, and two hundred bytes later the function's own tail
+// read it back and faulted at 0x004025D2 on `mov eax,[eax+4]`, address 4.
+//
+// Worth knowing that saved edi and esi are in that window, because
+// CWorld::Process's walk over the moving list keeps the node cursor in **edi**
+// and the entity in ebp across this very call:
+//
+//   - 12 associations: saved ebp is replaced. Harmless - the walk's very next
+//     instruction is `mov ebp,[edi]`, which overwrites it anyway.
+//   - 13: saved edi is nil'd. The walk's `test edi,edi` then ends walk 1
+//     early. A dropped frame of animation, no crash.
+//   - **14: saved esi is nil'd and saved edi comes back holding
+//     nodes[13] - a CAnimBlendNode\*.** The walk resumes on it, reads
+//     `[node+0]` as node->item into ebp and `[node+8]` as node->next into
+//     edi, and dereferences ebp+0x4C. CAnimBlendNode is
+//     `{ float theta; float invSin; int32 frameA; ... }` (re3
+//     AnimBlendNode.h), so a node sitting at the start of its sequence -
+//     theta 0.0f from CalcDeltas on two identical key frames, frameA 0 -
+//     puts **exactly zero** in both, and the fault is a read of 0x0000004C.
+//   - 15: saved ebx is nil'd.
+//   - 16: the return address.
+//   - 17: the clump argument.
+//
+// Fourteen is therefore the only count that reproduces a fault at
+// 0x004B1B25 *and* leaves ebx untouched, which is why AnimNodeArrayOverflow
+// below is written out per index rather than as "past twelve is bad".
+//
+// **re3 declares this array as sixteen** (`CAnimBlendNode *nodes[16]`,
+// src/animation/RpAnimBlend.h:8-12). The retail build has twelve. Anyone
+// sizing a cap from re3 would be four over and would not find out until the
+// game corrupted its own stack.
+//
+// The terminator is written at nodes[count], so eleven associations is the
+// last count that stays inside the frame.
+constexpr int ANIM_UPDATE_NODE_SLOTS  = 12;
+constexpr int MAX_CLUMP_ANIM_ASSOCS   = ANIM_UPDATE_NODE_SLOTS - 1;   // 11
+
+// RwObject::type for a clump. Walk 1 tests it with `cmp byte ptr [eax],2` at
+// 0x004B1B2C before it will look at an entity's animations, and so does
+// anything that mirrors walk 1.
+constexpr uint8_t RW_TYPE_CLUMP = 2;
+
+// What the terminator write `nodes[count] = nil` lands on, for a clump that
+// has `count` associations surviving UpdateBlend.
+//
+// Pure arithmetic over the stack map above, so tools/clienttest can pin it
+// without a game. It exists because "twelve is the limit" is true and is not
+// enough: the register a given count destroys is what decides whether the
+// symptom is a dropped frame or a crash at 0x004B1B25, and that mapping was
+// recorded backwards in this file until 2026-09-22.
+enum class AnimNodeArrayOverflow {
+	None,            // count <= 11: the terminator stays inside the frame
+	SavedEbp,        // 12
+	SavedEdi,        // 13
+	SavedEsi,        // 14  <- the one that crashes CWorld::Process's walk 1
+	SavedEbx,        // 15
+	ReturnAddress,   // 16
+	ClumpArgument,   // 17 and past it
+};
+
+inline AnimNodeArrayOverflow AnimNodeArrayTarget(int count) {
+	switch (count) {
+	case ANIM_UPDATE_NODE_SLOTS + 0: return AnimNodeArrayOverflow::SavedEbp;
+	case ANIM_UPDATE_NODE_SLOTS + 1: return AnimNodeArrayOverflow::SavedEdi;
+	case ANIM_UPDATE_NODE_SLOTS + 2: return AnimNodeArrayOverflow::SavedEsi;
+	case ANIM_UPDATE_NODE_SLOTS + 3: return AnimNodeArrayOverflow::SavedEbx;
+	case ANIM_UPDATE_NODE_SLOTS + 4: return AnimNodeArrayOverflow::ReturnAddress;
+	default: break;
+	}
+	if (count <= MAX_CLUMP_ANIM_ASSOCS)
+		return AnimNodeArrayOverflow::None;
+	return AnimNodeArrayOverflow::ClumpArgument;
+}
+
+// Does a clump with this many associations write outside the node array at
+// all? The question every sweep over somebody else's clump asks.
+inline bool AnimNodeArrayOverflows(int count) {
+	return count > MAX_CLUMP_ANIM_ASSOCS;
+}
 
 // CMatrix::UpdateRW(), __thiscall on the CMatrix (i.e. entity + offs::MATRIX).
 // Copies right/up/at/pos into the attached RwMatrix and calls RwMatrixUpdate.
@@ -1687,6 +5194,413 @@ constexpr uintptr_t CCollision__ms_collisionInMemory = 0x008F6250;
 constexpr uintptr_t CPed__ProcessControl          = 0x004C8910;
 constexpr uintptr_t CCivilianPed__ProcessControl  = 0x004BFFE0;
 
+// ---- what CPed::ProcessControl actually does, in its own order ------------
+//
+// Verified 2026-09-22, walking 0x004C8910 end to end against re3
+// Ped.cpp:1693-2364. This block exists because docs/protocol.md §6 asked for
+// two years whether a remote ped should be parked in a state "past
+// PED_STATES_NO_AI" or have ProcessControl skipped, and the answer to both is
+// no. §1.13 is the argument; these are the instructions it rests on.
+//
+// The function is one straight line with two early returns. In order:
+//
+//   004C891E  m_nZoneLevel vs ms_collisionInMemory          -> return
+//   004C8948  call 00528F70   GetClumpAlpha
+//   004C894D  [+0x15A] bit 7  bFadeOut ? alpha-8 : alpha+16, clamped 0..255
+//   004C8981  call 00528F50   SetClumpAlpha      <- the ONLY alpha raise
+//             bIsShooting = false; BuildPedLists(); bIsInWater = false;
+//             ProcessBuoyancy()
+//             the PED_DEAD arm (bloody footprints, blood pool) -> return
+//             the bWasPostponed arm -> return
+//             m_panicCounter; `m_fHealth <= 1.0f && m_nPedState <= 22h
+//             && !bIsInTheAir && !bIsLanding -> SetDie(KO_FRONT)`
+//             the whole collision-damage block (RAMMEDBYCAR, knockdowns)
+//   004CAF61  call 00495F10   CPhysical::ProcessControl
+//   004CAF66  cmp state,30h   PED_DIE  -> else arm is SetDead (004D3970)
+//   004CAFD0  cmp state,31h   PED_DEAD -> skips the next two
+//   004CAFD7  call 004C73F0   CalculateNewVelocity
+//   004CAFDE  call 004C7EA0   CalculateNewOrientation
+//   004CAFE5  call 004C7A00   UpdatePosition
+//   004CAFEC  call 004CC6C0   PlayFootSteps
+//   004CAFF3  call 004CE6C0   IsPedInControl -> CheckIfInTheAir/SetInTheAir
+//   004CB023  call 004D94E0   ProcessObjective
+//   004CB037  call 004C6AA0   AimGun          (bIsAimingGun, [+0x154] bit 7)
+//   004CB04C  call 004C6BB0   RestoreGunPosition
+//   004CB060  call 004C65B0   MoveHeadToLook  / 004C6930 RestoreHeadPosition
+//   004CB08A  call 004D0D10   InTheAir        (bIsInTheAir)
+//   004CB09C  bUpdateAnimHeading, skipped for state 24h/25h (FALL/GETUP)
+//   004CB0F1  call 004D5D80   Wait            (m_nWaitState at +0x238)
+//   004CB0F6  cmp state,1     if (!PED_IDLE) condemn ANIM_STD_IDLE_BIGGUN
+//   004CB11B  the state switch (below)
+//   004CB788  call [vtable+48h]  SetMoveAnim
+//             bPedIsBleeding, ServiceTalking, `bInVehicle && !m_pMyVehicle`
+//
+// Two entries in that list are the ones CoopIII cannot do without. The
+// SetClumpAlpha at 004C8981 is the only thing in the whole engine that raises
+// a ped's clump alpha, so a ped that never runs ProcessControl is never drawn
+// (the render block above says the same thing from the other end). And
+// CPhysical::ProcessControl is what makes a remote ped fall to the ground and
+// stand on it between snapshots.
+// Each of the names below is pinned twice: by its position in the call
+// sequence above, which matches re3 statement for statement, and by its own
+// first few instructions. CalculateNewVelocity opens `call IsPedInControl`;
+// CalculateNewOrientation and UpdatePosition both open
+// `cmp byte [0095CD5Bh],1` (CReplay::IsPlayingBack); AimGun opens by reading
+// m_pPointGunAt at +0x30C and switching on its entity type; SetDead opens by
+// clearing bUsesCollision and zeroing m_fHealth at +0x2C0; Wait opens with
+// DyingOrDead and `mov ebx,0ADh` (ANIM_STD_NUM). PlayFootSteps and InTheAir
+// are pinned by position alone and by taking only `this`.
+constexpr uintptr_t CPhysical__ProcessControl = 0x00495F10;
+constexpr uintptr_t CPed__CalculateNewVelocity    = 0x004C73F0;
+constexpr uintptr_t CPed__CalculateNewOrientation = 0x004C7EA0;
+constexpr uintptr_t CPed__UpdatePosition          = 0x004C7A00;
+constexpr uintptr_t CPed__PlayFootSteps           = 0x004CC6C0;
+constexpr uintptr_t CPed__CheckIfInTheAir         = 0x004D0BE0;
+constexpr uintptr_t CPed__SetInTheAir             = 0x004D0CA0;
+constexpr uintptr_t CPed__InTheAir                = 0x004D0D10;
+constexpr uintptr_t CPed__ProcessObjective        = 0x004D94E0;
+constexpr uintptr_t CPed__AimGun                  = 0x004C6AA0;
+constexpr uintptr_t CPed__RestoreGunPosition      = 0x004C6BB0;
+constexpr uintptr_t CPed__Wait                    = 0x004D5D80;
+constexpr uintptr_t CPed__SetDead                 = 0x004D3970;
+constexpr size_t    PED_VTABLE_SETMOVEANIM        = 0x48;
+
+// ---- a car hitting a ped (game/runover.h) ---------------------------------
+//
+// Read 2026-09-24 out of the collision-damage block above. The switch on
+// m_pDamageEntity's type is `jmp [eax*4+005F8854h]` at 004C8EC8 with
+// eax = type-1, and the table's second entry is 004C8ECF, the vehicle arm.
+// It is re3 Ped.cpp's non-VC_PED_PORTS branch, in order:
+//
+//   004C8E6A  mov eax,[ebx+110h]            collidingEnt = m_pDamageEntity
+//   004C8ECF  [ebp+78h] squared             collidingVeh->m_vecMoveSpeed
+//   004C8F0D  fcomp [005F8520h]             <= 0.05f squared: bumped, not hit
+//   004C8F3F  call 004D48E0 / je 004C9430   victim IsPlayer()? if not,
+//             004C9439 KillPedWithCar(veh, m_fDamageImpulse)
+//   ...       the player arm works out the closing speed into [esp+1Ch]; a
+//             car coming at our side may SetEvasiveStep us first (004C9288,
+//             004C9335, both back to 004C933C)
+//   004C933C  fcomp [005F8470h]             closing <= 0.1f: a look, no hit
+//   004C939B  call 004D09B0                 SetFall(1000, dir + 19h, false)
+//   004C93A0  mov ecx,[ebp+1A4h] / je       collidingVeh->pDriver
+//   004C93AA  call 004D48E0                 pDriver->IsPlayer()
+//   004C93B3  fld [esp+1Ch] / fmul [005F8528h]       yes: closing * 1000.0f
+//   004C93C0  cmp [ebp+5Ch],7Ch / fld [005F842Ch]    no, MI_TRAIN: 50.0f
+//   004C93D1  fld [005F8424h]                        no: 20.0f
+//   004C93ED  call 004EA420                 InflictDamage(veh, 10h, damage,
+//                                           0, dir)  RAMMEDBYCAR, TORSO
+//
+// IsPlayer is a ped *type* test (0..3), so a remote player's CCivilianPed at
+// the wheel reads as nobody, and a teammate's car costs the flat 20 - 6.6
+// health after InflictDamage's 0.33 for a player (004EA505, 005F9C80). The
+// closing-speed arm is the engine's own rule for a car another player drives;
+// single player just never reaches it.
+constexpr uintptr_t CPed__ProcessControl_CarDriverIsPlayer = 0x004C93AA;   // call CPed::IsPlayer
+constexpr uintptr_t CPed__ProcessControl_CarHitDamage      = 0x004C93ED;   // call CPed::InflictDamage
+constexpr float     CAR_HIT_MIN_SPEED_SQ    = 0.05f * 0.05f;   // 0x005F8520, 3B23D70Bh, one ulp over 0.0025f
+constexpr float     CAR_HIT_MIN_CLOSING     = 0.1f;       // 0x005F8470
+constexpr float     CAR_HIT_PER_CLOSING     = 1000.0f;    // 0x005F8528
+constexpr float     CAR_HIT_TRAIN_DAMAGE    = 50.0f;      // 0x005F842C
+constexpr float     CAR_HIT_FLAT_DAMAGE     = 20.0f;      // 0x005F8424
+constexpr float     PLAYER_DAMAGE_SCALE     = 0.33f;      // 0x005F9C80
+constexpr int16_t   MI_TRAIN                = 0x7C;
+
+// __thiscall void CPed::KillPedWithCar(CVehicle *car, float impulse), ret 8.
+// Three callers: 004C9439 above, and CPhysical's collision at 0049D760
+// (a ped that is not a player, or one pinned against a wall - `[+54h] bit 1`,
+// bHasHitWall) and 0049D7AF (the train). re3 PedFight.cpp:3005 in order:
+//
+//   004EC439  state 24h / 30h (FALL, DIE): note the car, return
+//   004EC473  state 31h (DEAD): return
+//   004EC482  standing on a boat, or on any car as a player: return
+//   004EC510  impulse > 12.0f (005F9C84) or MI_TRAIN, and not IsPlayer():
+//             the kill arm. The only reads of who drives are FindPlayerVehicle
+//             at 004EC558 (the pad shake) and pDriver at 004ECCAD (the
+//             hit-and-run event); the damage does not ask
+//   004ECD24  call 004EA420   InflictDamage(car, RAMMED/RUNOVER, 1000.0f)
+//   004ECDC0  else normal.z < -0.8f and impulse > 3, or impulse > 6 (> 10
+//             for a player): the knock arm
+//   004ECE91  call 004EA420   InflictDamage(car, 10h, IsPlayer && train ?
+//                             150.0f : 30.0f, 0, dir)
+//   004ECEA7  call 004D09B0   SetFall(1000, dir + 19h, true)
+//
+// So a pedestrian's run-over is the impulse and nothing else, on whichever
+// machine runs his ProcessControl.
+constexpr uintptr_t CPed__KillPedWithCar           = 0x004EC430;
+constexpr uintptr_t CPed__KillPedWithCar_KillDamage = 0x004ECD24;   // call CPed::InflictDamage
+constexpr uintptr_t CPed__KillPedWithCar_KnockDamage = 0x004ECE91;  // call CPed::InflictDamage
+
+// Two of its three callers, both `call 004EC430` with `this` in ecx:
+//
+//   0049D752  mov ecx,[esp+14h]         B, the ped
+//   0049D756  push [esp+0E0h]           maxImpulseB
+//   0049D75D  push ebx                  A, the car processing its collision
+//   0049D760  call 004EC430             CPhysical::ProcessCollisionSectorList
+//   004C9430  mov ecx,ebx
+//   004C9432  push [ebx+10Ch]           m_fDamageImpulse
+//   004C9438  push ebp                  the colliding car
+//   004C9439  call 004EC430             CPed::ProcessControl, non-player arm
+//
+// The third, 0049D7AF, is the train. The knock arm ends in
+// SetFall(1000, dir + 19h, true) at 004ECEA7 (`add [esp],19h / push 1 /
+// push [esp+4] / push 3E8h`); the kill arm has no SetFall of its own, the
+// death InflictDamage picks being its fall.
+constexpr uintptr_t CPhysical__Collision_KillPedWithCar = 0x0049D760;
+constexpr uintptr_t CPed__ProcessControl_KillPedWithCar = 0x004C9439;
+constexpr uint16_t  ANIM_STD_HIGHIMPACT_FRONT           = 0x19;
+constexpr int32_t   KILL_PED_WITH_CAR_FALL_MS           = 1000;
+
+// ---- AimGun, and where a ped's aim pitch comes from -----------------------
+//
+// CPed::AimGun (0x004C6AA0) has three arms, and only its one caller -
+// 004CB037 in ProcessControl, per a byte scan for E8 rel32 - ever reaches it:
+//
+//   004C6AA6  mov ecx,[ebx+30Ch] / test / je 004C6B30     m_pSeekTarget?
+//   004C6AFC  call 004ED920                               PointGunAtPosition
+//   004C6B32  call 004D48E0 / test al,al / je 004C6B70    IsPlayer()?
+//   004C6B41  push dword [ebx+5ECh]                       m_fFPSMoveHeading
+//   004C6B47  push dword [ebx+4BCh]                       m_fLookDirection
+//   004C6B4D  call 004ED9B0                               PointGunInDirection
+//   004C6B76  push dword [005F8438h]                      0.0f, for everyone else
+//   004C6B7C  push dword [ebx+4BCh]
+//   004C6B82  call 004ED9B0
+//
+// IsPlayer (0x004D48E0) is `mov edx,[ecx+32Ch]` and true for m_nPedType 0..3,
+// so a remote player - a CCivilianPed made as PEDTYPE_CIVMALE - takes the
+// third arm and gets a level aim whatever its owner is doing.
+//
+// PointGunInDirection is __thiscall on the CPedIK, (float yaw, float pitch),
+// `ret 8`, and returns bCanPointGunAtTarget in al. It is the whole aim, with
+// the arm/torso split inside it: `and eax,4` on m_flags picks
+// PointGunInDirectionUsingArm (0x004EDB20) for AIMS_WITH_ARM, whose MoveLimb
+// takes ms_upperArmInfo at 0x5F9FA4 = {20,-100,20, 70,-70,10} degrees and the
+// pitch minus the parent frame's world pitch; otherwise it is MoveLimb on
+// m_torsoOrient with ms_torsoInfo at 0x5F9F8C = {50,-50,15, 45,-45,7}. Both
+// end in RotateTorso (0x004EDDB0), which is RwMatrixRotate (0x005A2BF0) on the
+// PED_MID frame's modelling matrix with rwCOMBINEPOSTCONCAT, then puts the
+// frame's position back. No RpHAnim - III's peds are a plain frame hierarchy.
+// Three callers in the image: AimGun's two arms and PointGunAtPosition at
+// 004ED9A1. Nothing else bends a ped's arms toward a pitch.
+//
+// The player's pitch is CPlayerPed::m_fFPSMoveHeading at +0x5EC. Written in
+// four places: CPed::SetAttack's `call 0046B850 / fstp [ebp+5ECh]` at
+// 004E6570 (TheCamera.Find3rdPersonQuickAimPitch, only when the attacker is
+// FindPlayerPed() and Cams[0] is the 3rd-person mouse camera), and zeroed by
+// ClearAimFlag (004C6A90), RestoreGunPosition (004C6C01) and the run of
+// CPlayerPed member zeroes at 004EF968. Find3rdPersonQuickAimPitch ends on
+// `fchs`, so the convention is positive = down. CREATE_CHAR allocates 0x53C
+// for a ped, so on a remote player this offset is past the end of the object.
+constexpr uintptr_t CPedIK__PointGunInDirection = 0x004ED9B0;
+
+// ---- the diagonal walk's legs (remoteloco.h, LegTwistFor) ------------------
+//
+// The tail of CPed::CalculateNewVelocity, re3 Ped.cpp:1349-1405, read off
+// 0x004C764A-0x004C78C2:
+//
+//   004C7680  call 004A1150 / cmp ebx,eax / jne   FindPlayerPed() == this
+//   004C768F  call 004CE7D0                       CanStrafeOrMouseControl
+//   004C77D4  call 004055C0 (push 3)              the ANIM_STD_IDLE assoc,
+//   004C77F0  fcomp [005F84B0h]                   blendAmount < 0.5f
+//   004C77E3  call 004055C0 (push 42h)            no ANIM_STD_FIGHT_IDLE
+//   004C781D  LimitRadianAngle(walkAngle - m_fRotationCur)
+//   004C782A  > 005F84B4 (100 deg): -= pi; < 005F84B8 (-100 deg): += pi
+//   004C786A  > 005F84A8 (-50 deg) and < 005F84AC (50 deg), else nothing
+//   004C788F  LimbOrientation{yaw, 0.0f} on the stack
+//   004C78A7  RotateTorso(m_pFrames[7] ([ebx+1C0h]), &limb, false)
+//   004C78C2  RotateTorso(m_pFrames[8] ([ebx+1C4h]), &limb, false)
+//
+// RotateTorso is __thiscall on the CPedIK at +0x1F0, three arguments,
+// `ret 0Ch` (0x004EE2B3); it reads the frame out of the AnimBlendFrameData at
+// +0x10 (0x004EDDC1). CalculateNewVelocity has exactly one caller, the
+// ProcessControl call below, which runs after CWorld::Process's animation
+// walk, so what RotateTorso does there is what gets drawn.
+constexpr uintptr_t CPedIK__RotateTorso               = 0x004EDDB0;
+constexpr uintptr_t CPed__ProcessControl_NewVelocity  = 0x004CAFD7;   // call CalculateNewVelocity
+constexpr uint32_t  PED_NODE_UPPERLEGL                = 7;
+constexpr uint32_t  PED_NODE_UPPERLEGR                = 8;
+constexpr uint16_t  ANIM_STD_FIGHT_IDLE_ID            = 0x42;
+constexpr float     LEG_TWIST_IDLE_MAX_BLEND          = 0.5f;          // 0x005F84B0
+constexpr size_t    PEDIK_PED                   = 0x00;    // CPed *m_ped
+constexpr size_t    PLAYERPED_FPS_MOVE_HEADING  = 0x5EC;   // float, CPlayerPed only
+
+// ---- the per-state switch, and the whole ePedState enum with it -----------
+//
+//   004CB11B  mov eax,[ebx+224h]          m_nPedState
+//   004CB127  dec eax
+//   004CB128  cmp eax,36h
+//   004CB12D  ja  004CB9F0                the default arm
+//   004CB133  jmp [eax*4 + 005F8778h]
+//
+// So the table covers states 1..55 and everything else - 0, and anything
+// from 56 up - takes the default. The default arm at 004CB9F0 is two
+// instructions, `fstp st(0) / jmp 004CB784`, and 004CB784 is the
+// `call [vtable+48h]` above. **Taking the default does not skip anything
+// except the per-state function.**
+//
+// Twenty of the fifty-five table entries already point at that same default,
+// which is what dates the whole "park the state past PED_STATES_NO_AI" idea:
+// PED_STATES_NO_AI is 34, its own table entry is the default arm, and the
+// name means "states above this one are not the ped's own decision", not
+// "the NPC logic stops running here". re3 only ever uses it as the bound in
+// IsPedInControl, CanPedReturnToState and the health<=1 auto-SetDie.
+//
+// Reading the table off the image also confirms re3's enum against retail,
+// which is worth having written down after ANIM_STD_NUM came out one short:
+constexpr uintptr_t g_PedStateSwitchTable = 0x005F8778;   // indexed state-1
+constexpr uint32_t  PEDSTATE_TABLE_MAX    = 55;           // `cmp eax,36h`
+constexpr uint32_t PEDSTATE_LOOK_ENTITY    = 2;    // 004CB6B6, shared with 3
+constexpr uint32_t PEDSTATE_WANDER_RANGE   = 4;    // 004CB5AF
+constexpr uint32_t PEDSTATE_WANDER_PATH    = 5;    // 004CB6E0
+constexpr uint32_t PEDSTATE_ATTACK         = 16;   // 004CB639
+constexpr uint32_t PEDSTATE_FIGHT          = 17;   // 004CB647
+constexpr uint32_t PEDSTATE_AIM_GUN        = 22;   // 004CB655
+constexpr uint32_t PEDSTATE_STATES_NO_AI   = 34;   // default arm; the bound
+                                                   // IsPedInControl uses
+constexpr uint32_t PEDSTATE_FALL           = 36;   // 004CB6C4, and the 24h in
+                                                   // the bUpdateAnimHeading
+                                                   // test above
+constexpr uint32_t PEDSTATE_GETUP          = 37;   // 004CB1BC -> 004D0F20
+constexpr uint32_t PEDSTATE_STATES_NO_ST   = 40;   // IsPedShootable's bound
+constexpr uint32_t PEDSTATE_HANDS_UP       = 55;   // 004CB13A, the last entry
+// PEDSTATE_ON_FIRE (32, 004CB707), PEDSTATE_DRIVING (44, 004CB1D8),
+// PEDSTATE_DIE (48, 004CB62B) and PEDSTATE_DEAD (49, default) are declared
+// with the features that write them, above and below.
+
+// CPed::IsPedShootable has no address here on purpose: the retail build has
+// no out-of-line copy of it - `cmp dword [ecx+224h],28h` appears nowhere in
+// the image - so it is inlined at each of its three call sites. Recorded
+// only to say what it is NOT. All three sites are NPC target selection
+// (BuildPedLists, the KILL_CHAR objective, CPlayerPed's lock-on), and
+// nothing in the damage path calls it, so a ped parked above 40 would stop
+// being *aimed at* by the engine's own peds and would still take every
+// bullet. It is not a damage gate and must not be used as one.
+
+// __thiscall void CPed::Idle() - the switch's PED_IDLE arm, and therefore
+// the only NPC logic a remote player's ped runs today. Two things in it
+// matter, and both were measured rather than assumed:
+//
+//   004D077E  cmp  dword [ebx+22Ch], 1      m_nMoveState == PEDMOVE_STILL
+//   004D0789  je   004D07C1                 -> the ANIM_STD_IDLE_BIGGUN arm
+//   004D078F  [ebp+1Ch] = 0C1000000h        armedIdle->blendDelta = -8.0f
+//   004D0796  [ebp+30h] |= 4                ASSOC_DELETEFADEDOUT
+//   004D07A6  call 004D48E0                 CPed::IsPlayer()
+//   004D07AD  jne  004D0949                 ...and a player is left alone
+//   004D07B5  push 1 / call 004C5A30        SetMoveState(PEDMOVE_STILL)
+//
+// 1. It is the same `if (!IsPlayer())` shape as CFireManager::StartFire's
+//    burning-ped block: GTA III's own way of saying "somebody else decides
+//    where this one goes". There are more of these than the fire one.
+// 2. Because it runs *before* SetMoveAnim in the same frame, the move state
+//    CoopIII writes from PreFrame never survives to be read. Writing
+//    m_nMoveState and letting SetMoveAnim pick the walk has therefore never
+//    once worked on a remote ped; remote players walk because ApplyAnimation
+//    blends the wire's animId directly. docs/protocol.md §1.13.
+//
+// The STILL arm is also one of the two engine sources of animations on a
+// remote ped's clump: it adds ANIM_STD_IDLE_BIGGUN (id 0Ah) on a 3000..8500ms
+// random timer. The other is CPed::SetInTheAir, which blends
+// ANIM_STD_FALL_GLIDE (id 98h) the moment CheckIfInTheAir finds no ground
+// under a ped whose position came off the wire.
+constexpr uintptr_t CPed__Idle = 0x004D0690;
+
+// ---- landing and getting up: the partial wipe -----------------------------
+//
+// Read off the retail image 2026-09-24. Why a remote player's overlay (the
+// weapon held up, idle_armed) went missing on an observer after a jump and
+// never came back.
+//
+// __cdecl void RpAnimBlendClumpSetBlendDeltas(RpClump*, uint32 mask, float)
+// at 0x00405520 is a walk over the clump that does `fst [assoc+1Ch]` on every
+// association whose flags meet the mask, and nothing else. It never sets
+// ASSOC_DELETEFADEDOUT. A byte scan finds exactly three E8s to it:
+//
+//   004D0E75  CPed::SetLanding     (clump, 10h, [005F84E0h] = -1000.0f)
+//   004CE82F  CPed::PedGetupCB     the same, only while m_nPedState is 25h
+//   004C831B  CPed::ProcessBuoyancy, the dry-land arm, only if bIsInTheAir
+//
+// Then CAnimBlendAssociation::UpdateBlend (0x004032B0, one caller, 0x0040250B
+// inside RpAnimBlendClumpUpdateAnimations): blendAmount += delta * dt; at or
+// below zero with a negative delta it writes 0 into both +18h and +1Ch
+// (0x004032EC, 0x00403306), and only then tests `[+30h] and 4` (0x0040330D)
+// before deleting. So a partial without DELETEFADEDOUT is left on the clump at
+// weight 0 with a delta of 0, and nothing in the engine revives it. The weapon
+// anims (31h..3Ah), idle_armed (0Ah) and the FPS set are all partials without
+// that flag in the definition table at 0x005EAC10; the drive-by pair (77h/78h)
+// has it, which is why the -1000 DoDriveByShootings writes deletes them.
+//
+// CPed::SetLanding (0x004D0E40; callers 0x004CA573 in ProcessControl and
+// 0x004D0E2D in InTheAir):
+//   004D0E4A  state 30h/31h -> return            DyingOrDead
+//   004D0E60  RpAnimBlendClumpGetAssociation(clump, 97h)   FALL_fall there?
+//   004D0E75  SetBlendDeltas(clump, ASSOC_PARTIAL, -1000.0f)
+//   004D0E8C  AddAnimation(clump, 0, 9Ah) if it was, 004D0ECD 99h if not
+//   004D0EF5  SetFinishCallback(PedLandCB 0x004CE8A0, this)
+//   004D0F00  [+155h] &= ~8, |= 10h              bIsInTheAir off, bIsLanding on
+//
+// CPed::PedLandCB (0x004CE8A0): assoc +1Ch = -1000.0f, [+155h] &= ~10h, and
+// RestorePreviousState (0x004C5E30) when the state is 23h (PED_JUMP).
+//
+// CPed::SetGetUp (0x004D0F20) blends 93h if a FRONTAL (800h) association is on
+// the clump (004D118C), 90h otherwise (004D11A9), with PedGetupCB (0x004CE810)
+// as the finish callback (004D11BC). PedGetupCB wipes the partials as above,
+// clears bFallenDown ([+15Ch] bit 4), -1000 on its own anim, then
+// RestorePreviousState, SetMoveState and SetMoveAnim (vtable +48h) - a
+// non-partial blend of its own, which condemns whatever base CoopIII put on.
+//
+// The rest of the family, by who starts them: CPed::SetJump's arm at 0x004D7458
+// blends 94h (state 23h, FinishLaunchCB 0x004D7490), which adds 95h and sets
+// bIsInTheAir (004D77C0); CPlayerPed::RunningLand adds 96h at 0x004F3272
+// (FinishJumpCB 0x004D7A50); InTheAir blends 97h (0x004D0E02); SetInTheAir 98h.
+// Their names out of 0x005EA95C: Getup x3, Getup_front, JUMP_launch,
+// JUMP_glide, JUMP_land, FALL_fall, FALL_glide, FALL_land, FALL_collapse.
+// 91h/92h are in the family by position and name only; nothing in the image
+// was found blending them.
+constexpr uintptr_t RpAnimBlendClumpSetBlendDeltas     = 0x00405520;   // for the record
+constexpr uintptr_t CAnimBlendAssociation__UpdateBlend = 0x004032B0;   // for the record
+constexpr uintptr_t CPed__SetLanding                   = 0x004D0E40;   // for the record
+constexpr uintptr_t CPed__PedLandCB                    = 0x004CE8A0;   // for the record
+constexpr uintptr_t CPed__SetGetUp                     = 0x004D0F20;   // for the record
+constexpr uintptr_t CPed__PedGetupCB                   = 0x004CE810;   // for the record
+constexpr uintptr_t CPed__FinishLaunchCB               = 0x004D7490;   // for the record
+constexpr uintptr_t CPed__FinishJumpCB                 = 0x004D7A50;   // for the record
+constexpr uintptr_t CAnimManager__aStdAnimDescs        = 0x005EAC10;   // {int32 id, int32 flags}
+constexpr uintptr_t CAnimManager__aStdAnimNames        = 0x005EA95C;   // const char *[id]
+constexpr float     LANDING_PARTIAL_DELTA              = -1000.0f;     // 0x005F84E0
+
+constexpr uint16_t ANIM_STD_GET_UP        = 0x90;
+constexpr uint16_t ANIM_STD_GET_UP_FRONT  = 0x93;
+constexpr uint16_t ANIM_STD_JUMP_LAUNCH   = 0x94;
+constexpr uint16_t ANIM_STD_JUMP_GLIDE    = 0x95;
+constexpr uint16_t ANIM_STD_JUMP_LAND     = 0x96;
+constexpr uint16_t ANIM_STD_FALL          = 0x97;
+constexpr uint16_t ANIM_STD_FALL_GLIDE    = 0x98;
+constexpr uint16_t ANIM_STD_FALL_LAND     = 0x99;
+constexpr uint16_t ANIM_STD_FALL_COLLAPSE = 0x9A;
+
+constexpr uint32_t PEDSTATE_JUMP = 35;   // `mov [ebx+224h],23h` at 0x004D7445
+
+namespace offs {
+constexpr uint8_t PED_IS_IN_THE_AIR = 0x08;   // PED_FLAGS_B bit 3, SetInTheAir 0x004D0CB8
+constexpr uint8_t PED_IS_LANDING    = 0x10;   // PED_FLAGS_B bit 4, SetLanding 0x004D0F10
+} // namespace offs
+
+// __thiscall void CPed::ProcessObjective() - the other half of the NPC logic,
+// and the half that made a remote ped walk back to a car it had been taken
+// out of. Its guard is the reason clearing the objective was enough:
+//
+//   004D94EC  [+0x15Bh] bit 3               bClearObjective
+//   004D94F9  call 004CE6C0 / cmp state,2Ch IsPedInControl() || PED_DRIVING
+//   004D950D  call 004D8DF0                 ClearObjective
+//   004D9522  call 004D8F30                 UpdateFromLeader
+//   004D9527  cmp dword [ebx+164h], 0       m_objective != OBJECTIVE_NONE
+//   004D952E  je  004D9544                  ...or the whole body is skipped
+//
+// So a ped holding OBJECTIVE_NONE decides nothing here, whatever its state
+// is and whether or not ProcessControl runs. That is the off switch, and it
+// costs one dword.
+constexpr uintptr_t CPed__ClearObjective   = 0x004D8DF0;
+constexpr uintptr_t CPed__UpdateFromLeader = 0x004D8F30;
+
 // ---- putting a ped in a vehicle -------------------------------------------
 //
 // Verified 2026-09-21 (M2). There's no single engine export for "seat this
@@ -1737,11 +5651,54 @@ constexpr uintptr_t CPed__WarpPedIntoCar = 0x004D7D20;   // (CVehicle*)
 // arm and because M2's next piece needs the handoff directly.
 constexpr uintptr_t CVehicle__SetDriver = 0x00551F20;   // (CPed*)
 
-// CEntity::RegisterReference(CEntity**). Not called by CoopIII - it's here
-// because it's the reason despawning a seated ped is safe: WarpPedIntoCar
-// registers &pDriver, so CWorld::RemoveReferencesToDeletedObject (which the
-// despawn already calls) nils the car's pointer to the ped on its way out.
+// __thiscall void CEntity::RegisterReference(CEntity **ref)  [ret 4]
+//
+// An entity keeps a list of the pointers other objects hold to it and nils
+// every one of them when it is destroyed, which is the engine's own answer
+// to the crash class that has bitten this project twice. It is why
+// despawning a seated ped is safe: WarpPedIntoCar registers &pDriver, so
+// CWorld::RemoveReferencesToDeletedObject (which the despawn already calls)
+// nils the car's pointer to the ped on its way out.
+//
+//   004A7480  [ecx+50h] & 7 == 1 -> return            buildings never move
+//   004A7494  walk [ecx+60h], comparing node->ref     already registered?
+//   004A74B6  take a node from [0x008F1AF8] and link it
+//
+// CoopIII calls it directly in one place: the fire seam registers a fire's
+// &m_pEntity and &m_pSource the way CFireManager::StartFire does, so a
+// burning remote ped that gets deleted leaves the fire pointing at nothing
+// rather than at a freed pool slot (see the phase-three block below).
 constexpr uintptr_t CEntity__RegisterReference = 0x004A7480;
+
+// __thiscall void CEntity::ResolveReferences()   0x004A74E0
+// __thiscall void CEntity::PruneReferences()     0x004A7530
+//
+// The two walks over the same list (+0x60, nodes {next, CEntity **ref} from
+// the free list at 0x008F1AF8 that RegisterReference takes from):
+//
+//   004A74E7  mov edx,[eax+4] / cmp [edx],ecx / jne    Resolve: nil *ref, but
+//   004A74EE  mov dword [edx],0                         only where it is still
+//                                                       this entity
+//   004A7540  mov eax,[edx+4] / cmp [eax],ecx / je      Prune: unlink and free
+//   004A7549  mov [esi],eax ... mov [8F1AF8h],edx       every node whose *ref
+//                                                       is no longer this entity
+//
+// Prune is what the engine runs to drop a reference it has stopped needing:
+// every frame on every car (CAutomobile::ProcessControl, 0x00531A38), and over
+// the ped, vehicle and object pools in turn at 0x004A75A0 (strides 5F0h, 5A8h
+// and 19Ch, the three pools' own). So a pointer the
+// engine registered, moved somewhere else and re-registered there is left in
+// exactly the state the engine leaves its own in (game/ped.cpp,
+// PutPassengerInSlot): the old node matches nothing and goes at the next
+// prune, and Resolve would have skipped it anyway.
+//
+// WarpPedIntoCar's passenger arm (0x004D7DC9..0x004D7E3D) is the reason that
+// is needed: it looks at pPassengers[0..3] only, takes the first nil one,
+// writes it and registers a reference on the slot. It does not touch
+// m_nNumPassengers and never names a slot, so a seat past the first free one
+// cannot be asked for.
+constexpr uintptr_t CEntity__ResolveReferences = 0x004A74E0;
+constexpr uintptr_t CEntity__PruneReferences   = 0x004A7530;
 
 // eObjective. Only these three, because only these three are named by the
 // retail image itself: 0Fh from the `push 0Fh` in the handler above, 0Eh
@@ -1807,6 +5764,823 @@ constexpr uintptr_t CPed__RemoveInCarAnims = 0x004E4E20;
 // the bit pattern 0B727C5ACh, which is this value exactly.
 constexpr float VEH_EXIT_SETTLE_SPEED_Z = -0.00001f;
 
+// ---- getting in with the door open ----------------------------------------
+//
+// The two above put a ped in a seat in one instruction. These four are the
+// engine's real thing: a ped walks to a door, opens it, climbs in, and a
+// chain of animation-finish callbacks ends with the seat being assigned.
+// The whole point of them is that they take the best part of a second, so
+// nothing here is a call you make and then read the answer to.
+//
+// None of these are exported and none are reachable from a script opcode, so
+// each one was found by the state it writes. CPed::m_nPedState is at 0x224
+// (already recorded above) and the three states involved appear as an
+// immediate exactly once each in the whole image:
+//
+//   mov dword [reg+224h], 32h   -> 0x004E04AD   PED_CARJACK   (50)
+//   mov dword [reg+224h], 34h   -> 0x004E0B35   PED_ENTER_CAR (52)
+//   mov dword [reg+224h], 36h   -> 0x004E14B3   PED_EXIT_CAR  (54)
+//
+// Each sits inside a function that then matches re3 statement for statement;
+// the function starts below are the `53 56 57 55` prologues above them.
+//
+// __thiscall void CPed::SetEnterCar(CVehicle *car, uint32 unused)   [ret 8]
+//
+//   004E0920  push ebx/esi/edi/ebp                      function start
+//   004E092E  call 00545190   CCranes::IsThisCarBeingCarriedByAnyCrane
+//   004E0950  movzx eax, word [ebx+2E8h]                m_vehDoor
+//   004E095F  jmp [eax*4 + 5F93B0h]                     the door switch
+//   004E09A6  call 004CE6C0   CPed::IsPedInControl      (already verified)
+//   004E09AF  fld [ebx+2C0h] / fcomp 0                  m_fHealth > 0
+//   004E09C2  [ebp+1CAh] & doorFlag                     m_nGettingInFlags
+//   004E09CD  [ebp+1CBh] & doorFlag                     m_nGettingOutFlags
+//   004E09D8  [ebp+1F7h] bit 4                          bIsBeingCarJacked
+//   004E0A07  [ebx+1D8h] != 0                           m_pVehicleAnim
+//   004E0A1C  call 004E0A40                             SetEnterCar_AllClear
+//   004E0A25  call 004C5A30 (push 1)                    SetMoveState(STILL)
+//
+// It refuses far more often than it accepts, and every refusal is silent -
+// the ped just stops walking. That is the whole reason the seating loop
+// treats this as an attempt with a deadline rather than as a command.
+constexpr uintptr_t CPed__SetEnterCar = 0x004E0920;   // (CVehicle*, uint32)
+
+// __thiscall void CPed::SetCarJack(CVehicle *car)   [ret 4]
+//
+//   004E0220  push ebx/esi/edi/ebp                      function start
+//   004E022B  [ebx+284h] == 1 -> return                 car->IsBoat()
+//   004E0255  jmp [eax*4 + 5F9380h]                     the same door switch,
+//                                                       also picking the ped
+//                                                       in the seat being taken
+//   004E0312  call 004D48E0 (ecx = esi)                 CPed::IsPlayer
+//   004E0319  test al,al / jne 004E0347                 a player SKIPS the
+//                                                       three gates below
+//   004E031B  [esi+164h] == 8 or == 7 -> 004E0347        m_objective
+//   004E032B  [ebx+1F4h] == 2 -> return                 VehicleCreatedBy ==
+//                                                       MISSION_VEHICLE
+//   004E0334  [ebx+5Ch] != 7Eh -> 004E0347               m_nModelIndex
+//
+// **The MISSION_VEHICLE bail is behind the IsPlayer test, not in front of
+// it.** An earlier note here said SetCarJack "returns without doing anything"
+// on a MISSION_VEHICLE full stop, and used that to explain why CoopIII does
+// not play the jack animation. Half of that is wrong and the wrong half is
+// the one somebody would act on: `jne` at 004E0319 jumps over the whole guard
+// block for anything IsPlayer() says yes to, so the local player pressing F
+// on a session car is not affected by it at all. What the bail does block is
+// a *remote* ped - every one CoopIII builds is a CCivilianPed - from jacking
+// an occupied session car, which is the case the seating loop cares about.
+//
+// Read out of the retail image rather than from re3: the three `jne`/`je`
+// targets above all land on 004E0347, and 004D48E0 is the CPed::IsPlayer this
+// file already carries.
+//
+// Not called: the gate above stops it for a replica on a session car. A replica
+// jack goes straight to SetCarJack_AllClear below, with the other gates asked
+// by ped.cpp's BeginPedJackCar first.
+constexpr uintptr_t CPed__SetCarJack = 0x004E0220;   // (CVehicle*)
+
+// ---- a jack, played on a replica --------------------------------------------
+//
+// Everything past SetCarJack's gates, read out of the retail image on
+// 2026-09-24. The chain, in the order it runs:
+//
+// __thiscall void CPed::SetCarJack_AllClear(CVehicle*, uint32 doorNode,
+//                                           uint32 doorFlag)   [ret 0Ch]
+//
+//   004E03F0  push ebx / push ebp / sub esp,10h          function start
+//   004E03F5  mov ebx,[esp+1Ch]                          the car
+//   004E0480  call 004CF980                              weapon model off the
+//                                                        hand (the non-player arm)
+//   004E0495  m_pSeekTarget = car, RegisterReference
+//   004E04AD  mov dword [ebp+224h],32h                   PED_CARJACK
+//   004E04B7  [ebx+1F7h] and 0EFh / or 10h               bIsBeingCarJacked
+//   004E04CD  m_pMyVehicle = car, RegisterReference
+//   004E04EB  inc byte [eax+1C9h]                        m_nNumGettingIn++
+//   004E0517  call 004E1A30                              GetPositionToOpenCarDoor
+//   004E053D  or [ebx+1CAh],al                           m_nGettingInFlags |= flag
+//   004E05A4  [ebp+51h] and 0FEh                         bUsesCollision = false
+//   004E05B0  door 0Fh/10h: anim 54h/55h, else 63h/64h   the align animation
+//   004E0627  push 4DE130h / call 00401820               finish -> PedAnimAlignCB
+//
+// Its only caller is SetCarJack (004E03CC), which pushes the door flag, then
+// m_vehDoor, then the car - the order above.
+constexpr uintptr_t CPed__SetCarJack_AllClear = 0x004E03F0;
+
+// SetCarJack's four door arms (jump table 0x005F9380, indexed door - 0Bh),
+// each writing the flag into edi, the eDoors value into [esp+4] and the ped
+// in the seat into ebp:
+//
+//   004E025C  flag 1, door 2, [ebx+1A4h]   front left  - pDriver
+//   004E0271  flag 4, door 3, [ebx+1A8h]   front right - pPassengers[0]
+//   004E02A1  flag 2, door 4, [ebx+1ACh]   rear left   - pPassengers[1]
+//   004E02B6  flag 8, door 5, [ebx+1B0h]   rear right  - pPassengers[2]
+//
+// The eDoors value is what the door tests below take. The right-front arm
+// falls back to the driver only for PEDTYPE_COP (`cmp [esi+32Ch],6`), which a
+// replica never is.
+constexpr uint32_t CarDoorEnumFor(uint16_t doorNode) {
+	switch (doorNode) {
+	case 15: return 2;   // CAR_DOOR_LF
+	case 11: return 3;   // CAR_DOOR_RF
+	case 16: return 4;   // CAR_DOOR_LR
+	case 12: return 5;   // CAR_DOOR_RR
+	default: return 0;
+	}
+}
+
+// The door is asked about twice before AllClear, both through the car's
+// vtable with that eDoors value: `call [ebp+60h]` at 004E03A1 and, if it said
+// no, `call [ebp+64h]` at 004E03B0. Either yes lets the jack through.
+// PedAnimAlignCB asks 64h again (004DE250) next to 6Ch, IsDoorMissing.
+constexpr size_t VEH_VT_IS_DOOR_READY      = 0x60;
+constexpr size_t VEH_VT_IS_DOOR_FULLY_OPEN = 0x64;
+
+// The drive-by test SetCarJack runs on the ped in the seat, `mov ecx,ebp /
+// call 00564BB0` at 004E0347. The body is `cmp ebx, FindPlayerPed()` first, so
+// it is only ever true of the local player holding the uzi (weapon type 3) out
+// of the window.
+constexpr uintptr_t CPed__IsPedDoingDriveByShooting = 0x00564BB0;
+
+// And then the chain the engine drives by itself, one finish callback into the
+// next. None of these are called by CoopIII; they are what happens after
+// AllClear and they are what the pollers watch.
+//
+// CPed::PedAnimAlignCB (0x004DE130, above). Door open already -> straight to
+// the door-open callback with a null association (004DE447). Otherwise, for a
+// left door with m_objective == 15, a driver in PED_DRIVING, not a low car and
+// the driver NOT a MISSION_CHAR (`cmp byte [edx+160h],2` at 004DE2BE), the
+// quick jack: anim 52h on the jacker with PedAnimGetInCB, and
+// SetBeingDraggedFromCar(car, door, 1) on the driver (004DE308). Anything
+// else opens the door (anim 56h or 65h) and hangs PedAnimDoorOpenCB.
+//
+// So which of the two a machine plays depends on who is in the seat there: a
+// replica is always a MISSION_CHAR and gets pulled out the long way, the
+// local player and a traffic driver its own engine made get the quick one.
+//
+// CPed::PedAnimDoorOpenCB. Past the 0.2 m/s check and the door swing
+// (ProcessOpenDoor with 56h at 004DE7B6), `cmp [ebp+224h],32h` at 004DE7D1 is
+// the jack arm. The ped in the door's seat is dragged only if it is in
+// PED_DRIVING (2Ch) and its bDontDragMeOutCar is clear ([+159h] bit 2,
+// 004DE864); the jacker plays 58h/59h (left) or 67h/68h (right) with
+// PedAnimPullPedOutCB, and SetBeingDraggedFromCar(car, door, 0) goes to the
+// victim at 004DE9EC.
+constexpr uintptr_t CPed__PedAnimDoorOpenCB = 0x004DE500;
+
+// CPed::PedAnimPullPedOutCB. `cmp dword [ebx+164h],0Fh` at 004DEC03: the
+// jacker climbs in (5Ah/5Bh or 69h/6Ah, PedAnimGetInCB) only with
+// OBJECTIVE_ENTER_CAR_AS_DRIVER. Any other objective is QuitEnteringCar.
+constexpr uintptr_t CPed__PedAnimPullPedOutCB = 0x004DEAF0;
+constexpr uintptr_t CPed__PedAnimGetInCB      = 0x004DEC80;
+
+// __thiscall void CPed::SetBeingDraggedFromCar(CVehicle*, uint32 doorNode,
+//                                              bool quick)   [ret 0Ch]
+//
+//   004E0640  push ebx / push esi / mov ebx,ecx          function start
+//   004E0649  m_nPedState == 33h -> return
+//   004E065D  bUsesCollision = false, move speed zeroed, SetMoveState(STILL)
+//   004E06A7  m_vehDoor = doorNode (a word)
+//   004E06AE  door 0Fh: car status PLAYER_DISABLED (58h) for a player driver,
+//             ABANDONED (20h) otherwise
+//   004E06E0  call 004E4E20                              RemoveInCarAnims
+//   004E06F2  call 004DF940 (push 0)                     LineUpPedWithCar
+//   004E06F7  m_pVehicleAnim = nil
+//   004E0701  mov dword [ebx+224h],33h                   PED_DRAG_FROM_CAR
+//   004E0725  [ebx+159h] bit 4 = quick                   bWillBeQuickJacked
+//   004E07B9  or [ebp+1CBh],cl                           m_nGettingOutFlags |= flag
+//
+// Its two callers are the two arms above. Note it leaves bInVehicle set: the
+// ped is still in the seat as far as the car is concerned until the callback
+// below runs.
+constexpr uintptr_t CPed__SetBeingDraggedFromCar = 0x004E0640;
+
+// CPed::BeingDraggedFromCar, the per-frame half, from CWorld::Process's ped
+// walk: 004B1ED4 is the 33h arm of its `sub eax,32h` switch, 004B1ECB the
+// PED_ARRESTED arm when m_nLastPedState is 33h (a cop's drag). One more caller,
+// 004F0116, is the same arrested-after-a-drag test in a state switch of its
+// own. With no m_pVehicleAnim it drops the sitting
+// animation and adds the drag: 53h if bWillBeQuickJacked, else 50h/51h for a
+// left door or 4Eh/4Fh for a right one, finish callback 0x004CF000 (the push
+// at 004E0900). Then LineUpPedWithCar, which carries the ped out of the door.
+constexpr uintptr_t CPed__BeingDraggedFromCar = 0x004E07D0;
+
+// CPed::PedSetDraggedOutCarCB, the end of the drag:
+//
+//   004CF000  push ebx / push esi                        function start
+//   004CF011  RpAnimBlendClumpGetAssociation(clump, 53h)  quick or not
+//   004CF039  drag anim blendDelta = -1000 (not for PED_ARRESTED)
+//   004CF090  and [ecx+1CBh],dl                          m_nGettingOutFlags &= ~flag
+//   004CF0AC  call 005520A0                              RemoveDriver, or the
+//             passenger loop at 004CF0F5
+//   004CF129  mov byte [esi+314h],0                      bInVehicle = false
+//   004CF14A  delete callback 4E2480 for the quick jack, 4E2920 otherwise
+//             (004CF159): these run when the drag animation is deleted, a
+//             frame later, and are what put the ped down beside the car
+//   004CF17F  BlendAnimation(clump, 0, 90h, ...)         ANIM_STD_GET_UP
+//
+// The only thing that gives the door back after a drag. A ped taken out of the
+// seat by anything else while in 33h has to have it given back by hand -
+// GettingOutFlagsAfterUnseat below.
+constexpr uintptr_t CPed__PedSetDraggedOutCarCB = 0x004CF000;
+
+// The jack's animations, in the "ped" block (ped.ifp): the definition at
+// 0x005EB734 is {block "ped", model 1, 0ADh anims, names 0x005EA95C, descs
+// 0x005EAC10}, and the names table is indexed by the anim id - 0x005EA95C
+// holds "walk_civi", 0x005EAAA4 (id 52h) holds "CAR_Qjack".
+//
+//   4Eh car_jackedRHS    4Fh car_LjackedRHS   50h car_jackedLHS
+//   51h car_LjackedLHS   52h CAR_Qjack        53h CAR_Qjacked
+//   58h CAR_pullout_LHS  59h CAR_pulloutL_LHS 67h CAR_pullout_RHS
+//   68h CAR_pulloutL_RHS
+//
+// Their lengths, off the game's own anim\ped.ifp (the last key frame of each):
+// CAR_pullout_LHS 1.63 s, car_jackedLHS 3.80, CAR_Qjack 2.80, CAR_Qjacked 4.03.
+// So the jacker's whole chain is 0.03 + 0.93 + 1.63 + 0.63 + 0.47 = 3.69 s, and
+// he is in the seat about a second before the ped he pulled out is on its feet.
+//
+// Only the quick jack's id is read by CoopIII: the local player's jack through
+// SetEnterCar is still a jack when that is the animation on him.
+constexpr uint16_t ANIM_STD_CAR_QJACK = 0x52;
+
+namespace offs {
+// The sixth CPed bitfield byte. bDontDragMeOutCar is bit 2 (the victim test at
+// 004DE864), bWillBeQuickJacked bit 4 (written at 004E0725).
+constexpr size_t  PED_FLAGS_F             = 0x159;
+constexpr uint8_t PED_DONT_DRAG_ME_OUT    = 0x04;
+} // namespace offs
+
+// __thiscall void CPed::QuitEnteringCar(void)   [ret]
+//
+//   004E0E00  push ebx / mov ebx,ecx                    function start
+//   004E0E14  m_pVehicleAnim->blendDelta = -1000.0f
+//   004E0E1D  call 004C5D80                             RestartNonPartialAnims
+//   004E0E28  call 004055C0 (push 3)                    get ANIM_STD_IDLE
+//   004E0E46  call 00403710                             blend it if missing
+//   004E0E5B  m_nPedState == 32h -> car->bIsBeingCarJacked = false
+//   004E0E7B  dec [ebp+1C9h]                            m_nNumGettingIn--
+//   004E0E90  jmp [eax*4 + 5F93C8h]                     m_nGettingInFlags &= ~flag
+//   004E0EBE  [ebx+51h] |= 1                            bUsesCollision = true
+//   004E0F78  m_pVehicleAnim = nil
+//
+// This is the undo, and it is not optional. A ped that is dropped out of an
+// entry without it leaves the car's m_nGettingInFlags holding that door and
+// m_nNumGettingIn counting somebody who is not coming: the door is then
+// refused to everybody, for the rest of the car's life, because that flag is
+// the first thing SetEnterCar tests.
+constexpr uintptr_t CPed__QuitEnteringCar = 0x004E0E00;
+
+// __thiscall void CPed::EnterCar(void)   [ret]
+//
+// The per-frame half of an entry, and the answer to "who moves the door".
+// Recorded because the seat sync hinges on it: **a car's door is swung by the
+// entering ped's own animation, on whichever machine is running that ped, and
+// nothing about an open door exists anywhere else.**
+//
+//   004E0D30  push ebx/esi / mov ebx,ecx / push ebp     function start
+//   004E0D38  mov eax,[ebx+310h]                        m_pMyVehicle
+//   004E0D48  [eax+50h] >> 3 == 5 -> bail               STATUS_WRECKED
+//   004E0D56  fld [ebx+2C0h] / fcomp 0                  m_fHealth > 0
+//   004E0D71  call 004E0E00 / call 004D37D0             QuitEnteringCar, SetDie
+//   004E0D40  mov esi,[ebx+30Ch]                        m_pSeekTarget = the car
+//   004E0D94  movzx from word [ebx+2E8h]                m_vehDoor (a word again)
+//   004E0DA5  call 004E1A30                             GetPositionToOpenCarDoor
+//   004E0DB0  mov ecx,esi / push ebx / call 005522A0    car->CanPedOpenLocks(this)
+//   004E0DC5  mov eax,[ebx+1D8h] / test -> skip          m_pVehicleAnim
+//   004E0DCF  mov edx,[eax+2Ch] / push [eax+20h]        anim->animId, currentTime
+//   004E0DDE  call dword ptr [ebp+5Ch]                  CVehicle::ProcessOpenDoor
+//   004E0DE1  [ebx+155h] &= ~8                          bIsInTheAir = false
+//   004E0DF3  call 004DF940 (push 0)                    LineUpPedWithCar(START)
+//
+// Two things follow, and both were needed to explain a door that opened on
+// one screen and not the other:
+//
+//  - the door is written by a virtual call on the *car*, made out of the
+//    *ped's* animation, every frame, from CWorld::Process's walk over the
+//    moving list. So a replica ped that is genuinely animating into a car
+//    does move that car's real door on the machine that owns the car. There
+//    is nothing to send and nothing to hook; the entry has to start, and it
+//    has to start while there is still an entry left to play.
+//  - QuitEnteringCar makes no call on the car at all (there is no
+//    `call [reg+5Ch]` anywhere in 004E0E00..004E0F96). It clears
+//    m_nGettingInFlags and leaves the door wherever the animation had got it
+//    to. An entry abandoned after the door-opening animation has run
+//    therefore leaves that door standing open with nobody in it, and only
+//    somebody else's get-in or get-out will ever shut it again.
+//
+// It also independently re-confirms three offsets this file already had:
+// PED_SEEK_TARGET 0x30C, ANIM_ID 0x2C and ANIM_CURRENT_TIME 0x20.
+constexpr uintptr_t CPed__EnterCar               = 0x004E0D30;
+constexpr uintptr_t CVehicle__CanPedOpenLocks    = 0x005522A0;   // (CPed*) -> bool
+constexpr uintptr_t CPed__GetPositionToOpenCarDoor = 0x004E1A30;
+
+// CPed::PedAnimAlignCB, the finish callback SetEnterCar_AllClear hangs on the
+// align animation (`push 4DE130h / call 00401820` at 004E0D17). It is what
+// blends the door-opening animation and hands it its own callback, so the
+// chain from SetEnterCar to an open door is: align -> this -> open-door
+// animation -> the per-frame EnterCar above.
+constexpr uintptr_t CPed__PedAnimAlignCB = 0x004DE130;
+
+// CVehicle::ProcessOpenDoor's slot in the vehicle vtable, as EnterCar calls
+// it. A byte offset, not an index: `call dword ptr [ebp+5Ch]`.
+constexpr size_t VEH_VT_PROCESS_OPEN_DOOR = 0x5C;
+
+// ---- the animation id that SHUTS a door -----------------------------------
+//
+// Wanted for one thing: an entry that is abandoned after the door-opening
+// animation has run leaves that door standing open with nobody in it, because
+// QuitEnteringCar makes no call on the car (the note above). One
+// ProcessOpenDoor with a closing animation and a time past its end puts it
+// back, and this is that animation. It was not guessed; here is the whole
+// chain, read out of the retail image on 2026-09-23.
+//
+// **The engine's own closing call.** CPed::PedAnimDoorCloseCB, the finish
+// callback of the shut-the-door animation, at 0x004DF234:
+//
+//   004DF234  [ebp+1F6h] bit 1                          veh->bIsBus
+//   004DF240  movzx eax, word [ebx+2E8h]                m_vehDoor
+//   004DF24B  push [005F8CB8h]                          1.0f (read: 0x3F800000)
+//   004DF251  push 5Ch                                  the animation id
+//   004DF254  call dword [esi+5Ch]                      ProcessOpenDoor
+//   004DF257  switch on m_vehDoor - 0Bh                 the door it names
+//
+// so the engine passes **0x5C** and a time of 1.0f to close a door, whichever
+// door it is - the side comes from the component, not from the id. The open
+// half of the same chain is one instruction shorter and sits at 0x004DE7B1
+// with `push 56h`, which is the matching ANIM_STD_CAR_OPEN_DOOR_LHS.
+//
+// **And what 0x5C does when it gets there.** CAutomobile::ProcessOpenDoor is
+// CAutomobile's vtable slot 0x5C (0x00600C1C + 0x5C reads 0x0052E910). It
+// switches on `anim - 52h` through a 92-entry table at 0x00600820:
+//
+//   entries 0x52, 0x56, 0x65       -> 0x0052EA50   open,  0.66f .. 0.8f
+//   entries 0x5C, 0x5D, 0x6B, 0x6C -> 0x0052EB6D   close, 0.2f  .. 0.63f
+//
+// Four ids share the closing arm, which is exactly the set re3 groups as
+// {CLOSE_DOOR_LHS, CLOSE_DOOR_LO_LHS, CLOSE_DOOR_RHS, CLOSE_DOOR_LO_RHS}, and
+// three share the opening one, exactly {QUICKJACK, OPEN_DOOR_LHS,
+// OPEN_DOOR_RHS}. The two constants read 0.2f at 0x006004FC and 0.63f at
+// 0x0060056C. Past the second of those the arm at 0x0052EBE0 does:
+//
+//   0052EBE4  fcomp [0060056Ch]                          time > 0.63f
+//   0052EBF7  push [006004F8h]                           0.0f
+//   0052EC01  call dword [ebp+58h]                       OpenDoor(comp, door, 0)
+//
+// so ProcessOpenDoor(door, 0x5C, 1.0f) is "shut that door, now", by the same
+// call the engine makes at the end of every get-in. It is also safe on a door
+// that is already shut: OpenDoor is handed a ratio of 0 either way.
+constexpr uint16_t ANIM_STD_CAR_OPEN_DOOR_LHS  = 0x56;   // 86
+constexpr uint16_t ANIM_STD_CAR_CLOSE_DOOR_LHS = 0x5C;   // 92
+
+// ---- which door a driver's entry actually uses ----------------------------
+//
+// __thiscall void CPed::GetNearestDoor(CVehicle *veh, CVector *out)
+//
+// Recorded because it refutes the thing everybody assumes about the enter
+// key: **a driver does not walk round the car.** CPed::SeekCar's non-passenger
+// arm, at 0x004D40F5:
+//
+//   004D40F5  cmp word [ebx+2E8h], 0                    m_vehDoor == 0, or
+//   004D4103  cmp eax, 0Fh / je 004D4181                m_objective == 15
+//                                                       (ENTER_CAR_AS_DRIVER)
+//   004D4189  call 004E1CF0                             -> GetNearestDoor
+//   004D410A  call 004E4D90 ... 004D4121 call 004E1A30  the jack arm instead
+//
+// and GetNearestDoor compares the four door positions by squared distance and
+// writes the winner straight into m_vehDoor (`mov word [esi+2E8h],10h` at
+// 0x004E2199 for the rear-left, `0Ch` at 0x004E21E6 for the rear-right, and
+// the front pair above them). So pressing the enter key on the passenger side
+// opens the *near* door; CPed::PedAnimDoorCloseCB's third arm then blends
+// ANIM_STD_CAR_SHUFFLE_RHS and the ped slides across to the wheel inside the
+// car. There is no walk-around to replicate, and the seat does not name the
+// door - which is why docs/protocol.md §1.14.7 puts the door on the wire.
+//
+// CoopIII does not call this. It is here because the entry seam is otherwise
+// impossible to reason about, and because the first guess about it was wrong.
+constexpr uintptr_t CPed__GetNearestDoor = 0x004E1CF0;   // (CVehicle*, CVector*)
+
+// ---- and how fast a car may be moving, for real ---------------------------
+//
+// CVehicle::CanPedEnterCar above gates on sq(0.2f) before the walk. The
+// door-opening callback gates again, on the same number, *after* it - and
+// this second one is the expensive one, because failing it does not refuse
+// the entry, it knocks the ped over. At 0x004DE752, immediately before the
+// ProcessOpenDoor quoted above:
+//
+//   004DE74C  fsqrt                                     |m_vecMoveSpeed|
+//   004DE758  fcomp [005F8D50h]                         = 0.2f  (0x3E4CCCCD)
+//   004DE763  jne 004DE7A0                              under: carry on
+//   004DE769  call 004E0E00                             QuitEnteringCar
+//   004DE78D  push 3E8h / call 004D09B0                 SetFall(1000, ...)
+//
+// 0.2 m/s, on the magnitude rather than on its square. So a pre-check looser
+// than sq(0.2f) buys nothing: a car creeping at 0.3 m/s passes it, the ped
+// walks up, and the engine drops him in the road a second later.
+constexpr float PED_ENTER_MAX_SPEED_SQ = 0.04f;   // = sq(0.2f), and VEH_ENTER_MAX_SPEED_SQ
+
+// __thiscall void CPed::SetExitCar(CVehicle *veh, uint32 wantedDoorNode) [ret 8]
+//
+//   004E1010  push ebx/esi/edi/ebp / sub esp,88h        function start
+//   004E1059  call 005523C0                             veh->CanPedExitCar()
+//   004E1090  m_nPedState 36h or 33h -> return          already leaving
+//   004E10AA  zeroes [ebp+78h..8Ch]                     move and turn speed
+//   004E10F7  pDriver     == this -> door 0Fh
+//   004E1106  pPassengers[0] == this -> door 0Bh
+//   004E1115  pPassengers[1] == this -> door 10h
+//   004E1124  pPassengers[2] == this -> door 0Ch
+//
+// Pass 0 for the door and it works out which one from the seat the ped is
+// actually in, which is why nothing on the exit path has to know about doors.
+constexpr uintptr_t CPed__SetExitCar = 0x004E1010;   // (CVehicle*, uint32)
+
+// ---- the door a passenger gets out by (game/passexit.h) -------------------
+//
+// Having picked the seat's door, SetExitCar asks the car whether there is
+// room to stand at it, through the vtable, and acts on a no by going round to
+// the other side of the car:
+//
+//   004E1251  mov edi,[ecx] / push 0 / push ebx
+//   004E1256  call [edi+80h]              IsRoomForPedToLeaveCar(door, nil)
+//   004E1262  call 00552260               IsOnItsSide: teleport, no animation
+//   004E1275  room -> 004E13E0            the exit, by that door
+//   004E1285  sub eax,0Bh / jmp [eax*4+5F943Ch]   no room:
+//     RF  004E12EB  pDriver, or somebody getting in at LF?  else door := LF
+//     RR  004E1313  pPassengers[1], or LR getting in?       else door := LR
+//   004E1340  that ped null -> return; IsPlayer or MISSION_CHAR -> swap
+//             through 5F9424h: RF -> LF, RR -> LR, LF -> RF, LR -> RR
+//   004E13AB  call [edi+80h]              the other side; no room there,
+//                                         and a player is teleported
+//
+// So a passenger whose own door the room test turns down leaves by the far
+// side of the car, the front passenger by the DRIVER'S door, and a player
+// does that whether the wheel is empty or not. Retail's own choice, and
+// single player never shows it, because there the player is never anybody's
+// passenger.
+//
+// IsRoomForPedToLeaveCar is CAutomobile's at 0x0053C5B0 (vtable 0x00600C1C
+// + 0x80), the re3 Automobile.cpp:3975 line of sight and 0.6 m sphere.
+// PedSetOutCarCB asks it again at the end of the exit, at its own call, and
+// calls PositionPedOutOfCollision on a no; neither of the two above is that
+// one.
+constexpr uintptr_t LEAVE_CAR_SET_EXIT_CAR_CALL = 0x004DA157;   // call CPed::SetExitCar
+constexpr uintptr_t SET_EXIT_CAR_ROOM_CALL      = 0x004E1256;   // FF 97 80 00 00 00
+constexpr uintptr_t SET_EXIT_CAR_SIDE_ROOM_CALL = 0x004E13AB;   // FF 97 80 00 00 00
+constexpr size_t    SET_EXIT_CAR_ROOM_CALL_LEN  = 6;
+constexpr size_t    VEH_VT_IS_ROOM_FOR_PED_TO_LEAVE_CAR = 0x80;
+constexpr uintptr_t CAutomobile__IsRoomForPedToLeaveCar = 0x0053C5B0;   // (door, CVector*) -> bool
+
+// ---- a new driver clears the car of its passengers ------------------------
+//
+// CPed::PedSetInCarCB, the end of every animated entry, for a ped who got in
+// as the driver (re3 Ped.cpp:4485-4495):
+//
+//   004CF4C7  mov eax,[ebx+164h] / cmp eax,0Fh / jne   ENTER_CAR_AS_DRIVER only
+//   004CF4D2  xor esi,esi                              i = 0 .. m_nNumMaxPassengers
+//   004CF4D6  mov ecx,[ebp+esi*4+1A8h] / test / je      pPassengers[i]
+//   004CF4E1  cmp byte [ecx+160h],1 / jne              CharCreatedBy == RANDOM_CHAR
+//   004CF4EA  push ebp / push 0Dh
+//   004CF4ED  call 004D83E0                            SetObjective(LEAVE_CAR, car)
+//
+// Meant for the hitchhiker a stolen car still has in it. The player ped is
+// RANDOM_CHAR too - nothing ever changes the byte the CPed constructor wrote -
+// so a remote player's copy climbing in at the wheel here tells our player,
+// sitting beside it, to get out. Esi and ebp carry the loop across the call.
+constexpr uintptr_t NEW_DRIVER_PASSENGER_LEAVE_CALL = 0x004CF4ED;   // E8 -> CPed::SetObjective
+
+// ---- why a player can become unable to get OUT of a car -------------------
+//
+// The mirror of CanPedEnterCar above, and it matters more, because a car you
+// cannot get into is a car you walk away from and a car you cannot get out of
+// is the rest of the session.
+//
+// **There is exactly one call site of CPed::SetExitCar in the whole image**
+// (0x004DA157, in CPed::ProcessObjective's OBJECTIVE_LEAVE_CAR arm), it is not
+// virtual, and it is where every exit in the game goes - the player's included,
+// since the exit key sets that objective. And its first act is:
+//
+//   004E1057  mov ecx,esi / call 005523C0        veh->CanPedExitCar()
+//   004E105E  test al,al / jne 004E1090          true -> get on with the exit
+//   004E1062  mov ecx,[esi+1A4h] / test / je     false -> pDriver...
+//   004E106C  call 004D48E0                              ...->IsPlayer()?
+//   004E1075  mov byte [esi+164h],0                      AutoPilot cruise = 0
+//   004E107C  mov byte [esi+15Ah],0
+//   004E1083  add esp,88h / pop / ret 8                  and RETURN
+//
+// So a false answer is not "exit differently". It is "no exit", silently, with
+// the ped left sitting exactly where it was, and the only thing the function
+// does on that arm is stop an NPC *driver* (the IsPlayer test at 004E106C is on
+// the car's driver, and it skips the write when the driver is the player).
+// There is no timeout and nothing retries: the player presses the key, nothing
+// happens, and nothing ever will until the car's own numbers change.
+//
+// __thiscall bool CVehicle::CanPedExitCar(void), disassembled 2026-09-23:
+//
+//   005523C0  mov edx,ecx / lea eax,[edx+24h] / three movs   GetUp()
+//   005523D3  fld [esp+0Ch]                                  up.z
+//   005523D7  fcom [0060258Ch]  = +0.1f    ; greater -> 005524D0
+//   005523F4  fcom [00602590h]  = -0.1f    ; less    -> 005524D0
+//                            ; so the fallthrough is |up.z| <= 0.1, the car
+//                            ; on its side, and 005524D0 is every other pose
+//   00552405  lea eax,[edx+78h]  MagnitudeSqr(m_vecMoveSpeed)
+//   00552426  fcomp [00602550h] = 0.005f   ; greater -> return false
+//   0055243A  [edx+84h] fabs / fcom [00602548h] = 0.01f  ; greater -> false
+//   00552464  [edx+88h] the same
+//   0055248E  [edx+8Ch] the same
+//   005524B8  mov al,1 / ret                             ; otherwise true
+//   005524D0  the same four tests again, same two constants, same answers
+//
+// Both arms end up asking for the same thing, so the orientation branch buys
+// nothing here and the rule is simply: **a car may be got out of only when
+// |m_vecMoveSpeed|^2 <= 0.005f and every component of m_vecTurnSpeed is within
+// 0.01f of zero.** The two arms differ on nothing but the boundary - the
+// |up.z| <= 0.1 one tests `and ah,5 / cmp ah,1` and so wants strictly less,
+// the other tests `test ah,45h` and lets equality through - which is a
+// distinction no float coming out of a physics step will ever land on.
+//
+// The constants were read out of the file at the addresses
+// above (0x3BA3D70A and 0x3C23D70A), not derived, and the up.z pair is the same
+// +-0.1f CanPedEnterCar uses.
+//
+// **The number to remember is that 0.005 is eight times tighter than the 0.04
+// on the way in.** game/vehicle.cpp's RestRemoteVehicle exists because a car
+// held at a departed driver's velocity fails CanPedEnterCar forever; a car held
+// at a *fraction* of that velocity still passes the entry gate and fails this
+// one. So anything in CoopIII that writes m_vecMoveSpeed or m_vecTurnSpeed onto
+// a car the local player is sitting in does not merely make it drive oddly - it
+// takes the exit key away, and the player has no way to tell those two apart.
+constexpr uintptr_t CVehicle__CanPedExitCar = 0x005523C0;   // () -> bool
+constexpr float     VEH_EXIT_MAX_SPEED_SQ   = 0.005f;
+constexpr float     VEH_EXIT_MAX_TURN       = 0.01f;
+
+static_assert(VEH_EXIT_MAX_SPEED_SQ < VEH_ENTER_MAX_SPEED_SQ,
+              "getting out of a car is stricter about its speed than getting "
+              "in - 0.005f against sq(0.2f)");
+
+// ---- when the engine itself stops believing a thing is moving --------------
+//
+// The other half of the two gates above, and the one that decides when a car
+// nobody is driving may be handed back to the pinned world
+// (protocol.h, S_VehicleCustody). A custodian that calls rest too early leaves
+// a car pinned mid-fall, which is the bug it exists to fix arrived at from the
+// other side; one that never calls it streams a parked car for ever.
+//
+// The answer is not CoopIII's to invent, because GTA III already answers it on
+// the same machine about the same object. Inside CPhysical::ProcessControl
+// (0x00495F10), disassembled 2026-09-23:
+//
+//   00496085  avg move speed squared  fcompp against (0.006f * CTimer step)^2
+//   00496095  jne 00496172                        ; moving  -> reset
+//   004960B3  avg turn  speed squared  fcompp against the same
+//   004960D1  jne 00496172                        ; turning -> reset
+//   004960D7  inc byte [ebx+0EDh]                 m_nStaticFrames
+//   004960DD  cmp byte [ebx+0EDh],0Ah             ten
+//   004960E4  jbe 00496179                        ; <= 10, carry on moving it
+//   004960EA  mov byte [ebx+0EDh],0Ah             clamp
+//   004960F1  [ebx+51h] and 0FBh / or 4           bIsStatic = true
+//   004960FB  m_vecMoveSpeed = 0,0,0              (+0x78, +0x7C, +0x80)
+//   00496130  m_vecTurnSpeed = 0,0,0              (+0x84, +0x88, +0x8C)
+//   00496170  ret                                 WITHOUT ApplyMoveSpeed
+//   00496172  mov byte [ebx+0EDh],0               any moving frame resets it
+//
+// Three facts worth having separately:
+//
+//  1. **Rest is a run, not an instant.** Eleven consecutive quiet frames, and
+//     a single moving one puts the counter back to zero. A car at the top of a
+//     bounce has a velocity near zero for one frame and is not at rest, which
+//     is precisely the reading a single-frame test would get wrong.
+//  2. **The engine zeroes the velocities itself** when it decides, so a car
+//     the engine has put to sleep passes both gates above by construction -
+//     there is nothing left for CoopIII to write.
+//  3. **bIsStatic at +0x51 bit 2 is the engine's own published answer**, which
+//     is why `VehicleAtRest` in game/vehicle.cpp reads it as well as counting.
+//     Reading it is not redundancy: it is the difference between agreeing with
+//     the engine and running a second opinion beside it.
+//
+// The threshold this counts against is frame-rate scaled and reads a global,
+// so CoopIII does not reproduce it. It uses the tightest fixed numbers in the
+// engine instead - CanPedExitCar's - which is the conservative direction: a
+// car that satisfies those is a car a player can both get into and get out of,
+// which is the entire point of letting it settle in the first place.
+constexpr size_t  PHYSICAL_STATIC_FRAMES  = 0xED;   // CPhysical::m_nStaticFrames
+constexpr uint8_t PHYSICAL_STATIC_LIMIT   = 0x0A;   // `cmp byte [ebx+0EDh],0Ah`
+
+// Is this car quiet enough that nothing is left to simulate?
+//
+// Pure arithmetic on purpose, so tools/clienttest can hold the decision to the
+// disassembly without a running game - the same shape as
+// WorldRemoveUnlinksFromMovingList. The turn test is per component and not a
+// magnitude, because that is what CanPedExitCar does at 0x0055243A, 0x00552464
+// and 0x0055248E: three `fabs` compares, not one `MagnitudeSqr`.
+constexpr bool VehicleAtRestNumbers(float moveSpeedSq, float turnX, float turnY,
+                                    float turnZ) {
+	return moveSpeedSq <= VEH_EXIT_MAX_SPEED_SQ &&
+	       (turnX < 0.0f ? -turnX : turnX) <= VEH_EXIT_MAX_TURN &&
+	       (turnY < 0.0f ? -turnY : turnY) <= VEH_EXIT_MAX_TURN &&
+	       (turnZ < 0.0f ? -turnZ : turnZ) <= VEH_EXIT_MAX_TURN;
+}
+
+// The pose half of both gates, and the one the whole wedged-car bug turns on.
+//
+// **A car is refused when its up.z is INSIDE +-0.1, not outside it.** Upright
+// passes, upside down passes, on its side does not - which is the pose a car
+// ends up in when it was rolling at the moment the session stopped having a
+// driver for it, and the pose the per-frame correction then makes permanent.
+// Written down as a function because it reads backwards from the way the bug
+// is described, and because both gates share it (0x00552307 and 0x005523D7 are
+// the same two constants).
+constexpr bool VehiclePoseAllowsPedThrough(float upZ) {
+	return upZ > 0.1f || upZ < -0.1f;
+}
+
+namespace offs {
+
+// m_vehDoor. A uint16, not the uint32 re3 declares in Ped.h:447 - every
+// access in the three functions above is `movzx eax, word [reg+2E8h]` or
+// `mov word [reg+2E8h], ax`. Writing a dword here would reach into the next
+// member.
+constexpr size_t PED_VEH_DOOR = 0x2E8;
+
+// eCarNodes, the component index a door is named by (re3 Automobile.h:9-31,
+// CAR_WHEEL_RF = 1). Read out of the three `sub eax,0Bh / cmp eax,5 /
+// jmp [eax*4 + table]` switches above, which cover 11..16 and leave 13 and 14
+// (the wings) on the default arm. The seat each one belongs to is not
+// guesswork either - SetExitCar picks the door from the seat and that is the
+// mapping below, read backwards.
+constexpr uint16_t CAR_DOOR_RF = 11;   // pPassengers[0]
+constexpr uint16_t CAR_DOOR_RR = 12;   // pPassengers[2]
+constexpr uint16_t CAR_DOOR_LF = 15;   // pDriver
+constexpr uint16_t CAR_DOOR_LR = 16;   // pPassengers[1]
+
+// CVehicle::m_nGettingInFlags, the byte between m_nNumGettingIn and
+// m_nGettingOutFlags, which this file already had on either side of it. The
+// bit each door claims comes from QuitEnteringCar's `and [ebp+1CAh], 0FBh`
+// family, one per door, which is also what fixes the bit *order*: the flag
+// for the right-front door is 4, not 1.
+constexpr size_t  VEH_GETTING_IN_FLAGS = 0x1CA;   // int8
+constexpr uint8_t CAR_DOOR_FLAG_LF     = 0x01;
+constexpr uint8_t CAR_DOOR_FLAG_LR     = 0x02;
+constexpr uint8_t CAR_DOOR_FLAG_RF     = 0x04;
+constexpr uint8_t CAR_DOOR_FLAG_RR     = 0x08;
+
+// Bit 4 of the third CVehicle bitfield byte. SetEnterCar, SetCarJack and
+// QuitEnteringCar all touch it as `[+1F7h] shr 4 & 1` / `and 0EFh` / `or 10h`.
+constexpr uint8_t VEH_IS_BEING_CARJACKED = 0x10;
+
+static_assert(PED_VEH_DOOR == PED_HEADING_RATE + 4,
+              "m_vehDoor follows m_headingRate (re3 Ped.h:446-447)");
+static_assert(VEH_GETTING_IN_FLAGS == VEH_NUM_GETTING_IN + 1 &&
+                  VEH_GETTING_OUT_FLAGS == VEH_GETTING_IN_FLAGS + 1,
+              "m_nNumGettingIn, m_nGettingInFlags, m_nGettingOutFlags are "
+              "three consecutive bytes (re3 Vehicle.h:121-123)");
+static_assert((CAR_DOOR_FLAG_LF | CAR_DOOR_FLAG_LR | CAR_DOOR_FLAG_RF |
+               CAR_DOOR_FLAG_RR) == 0x0F,
+              "the four door flags are four distinct bits of one nibble");
+static_assert((VEH_IS_BEING_CARJACKED & VEH_HAS_BEEN_OWNED_BY_PLAYER) == 0,
+              "two different bits of the same CVehicle bitfield byte");
+
+} // namespace offs
+
+// The states an entry or an exit passes through, from the writes that found
+// the functions above. PED_DRAG_FROM_CAR is the one a ped being pulled out of
+// a seat by somebody else is in; it is here because SetExitCar tests for it,
+// not because CoopIII ever sets it.
+constexpr uint32_t PEDSTATE_CARJACK       = 50;
+constexpr uint32_t PEDSTATE_DRAG_FROM_CAR = 51;
+constexpr uint32_t PEDSTATE_ENTER_CAR     = 52;
+constexpr uint32_t PEDSTATE_EXIT_CAR      = 54;
+
+// PED_SEEK_CAR, the walk to the door the enter key starts. CPed::SetSeekCar
+// (0x004D3EF0) returns at once on `cmp [ebx+224h],18h`, stores the car in
+// m_pSeekTarget, m_carInObjective (+170h) and m_pMyVehicle (+310h), writes
+// m_distanceToCountSeekDone = 0.5f (3F000000h) and ends on
+// `mov [ebx+224h],18h` at 0x004D3F7C. SetCarJack_AllClear's
+// `cmp [ebp+224h],18h` at 0x004E0485 is re3's `m_nPedState != PED_SEEK_CAR`.
+// So m_pMyVehicle is set for the whole walk with bInVehicle still false.
+constexpr uint32_t PEDSTATE_SEEK_CAR      = 24;
+
+// What CPed::SetEnterCar tests of the ped before it will open any door, from
+// 0x004E09A6 on: IsPedInControl, m_fHealth, and then, after the door's own
+// tests, `cmp dword [ebx+1D8h],0 / jne 004E0A23` at 0x004E0A07 - a ped still
+// holding m_pVehicleAnim is refused every door of every car, silently, with
+// SetMoveState(PEDMOVE_STILL). SetCarJack has the same test. Every engine
+// path that takes a ped out of a car nils the pointer; one of CoopIII's that
+// does not locks the player out of every car (entrystuck.h).
+
+// PED_DRAG_FROM_CAR again, from the function that actually sets it:
+// CPed::SetBeingDraggedFromCar returns early at 0x004E0649 if the ped is
+// already in 33h, clears bUsesCollision (`[+51h] and 0FEh`), and writes 33h at
+// 0x004E0701 after LineUpPedWithCar. A cop who opens a stopped car's door is
+// what puts a player in it.
+
+// ---- busted ----
+//
+// PED_ARRESTED, 38h. CoopIII never writes it. It is here because it is the one
+// thing on the wire that says a player has been arrested. Every site below is
+// the retail image, not re3:
+//
+//   0x00421459  cmp [ecx+224h],38h / jne        CGameLogic::Update (0x00421400),
+//               WBSTATE_PLAYING arm. Two tests in a row on the focus player's
+//               ped: 31h calls KillPlayer (0x004A12E0), 38h calls
+//               CPlayerInfo::ArrestPlayer (0x004A1330)
+//   0x004C2B9D  mov [ebx+224h],38h               CCopPed::SetArrestPlayer
+//               (0x004C2B00). Refuses 30h/31h/38h first and copies the old
+//               state into m_nLastPedState (+228h). No animation is blended
+//               on the player anywhere in it; the only BlendAnimation in the
+//               arrest is ANIM_STD_ARREST on the *cop*, in CCopPed::ArrestPlayer
+//   0x004C2CCB  mov [esi+224h],38h               CCopPed::ArrestPlayer, behind
+//               CanSetPedState (0x004CE7A0)
+//   0x004DED31  mov [ebp+224h],38h               PedAnimGetInCB: a player a cop
+//               caught climbing into a car finishes getting in and is arrested
+//               in the seat (bGonnaKillTheCarJacker, +15Ah bit 6)
+//   0x004CF022  cmp [esi+224h],38h / je          PedSetDraggedOutCarCB: for an
+//               arrested ped the drag animation is NOT faded out, so a player
+//               a cop pulled out of a car stays lying where he landed
+//
+// ArrestPlayer sets CPlayerInfo::m_WBState (+0xD8, a byte) to 2 and
+// m_nWBTime (+0xDC) to CTimer's clock. CGameLogic::Update's BUSTED arm
+// (0x0042165E, jump table 0x005ECDA4 entry 2) fades to black at 0x800 ms and
+// at 0x1000 ms takes the fine (table 0x005ECD88: 100,100,200,400,600,900,1500
+// by wanted level) and the weapons, empties the car seat, then calls
+// RestorePlayerStuffDuringResurrection (0x00421A60) with the nearest police
+// station. That ends in CPlayerPed::SetInitialState (0x004EFC40), which writes
+// PED_IDLE at 0x004EFD13 - the way back out of 38h.
+constexpr uint32_t PEDSTATE_ARRESTED = 56;
+
+static_assert(PEDSTATE_ARRESTED > PEDSTATE_TABLE_MAX,
+              "ProcessControl's per-state switch stops at 55, so an arrested "
+              "ped takes its default arm");
+
+static_assert(PEDSTATE_ENTER_CAR != PEDSTATE_DRIVING &&
+                  PEDSTATE_EXIT_CAR != PEDSTATE_DRIVING &&
+                  PEDSTATE_CARJACK != PEDSTATE_DRIVING,
+              "entering and leaving are not the same state as sitting there");
+
+// The door a ped was leaving by, handed back when the ped is taken out of the
+// car some other way than the end of its own exit.
+//
+// CPed::SetExitCar claims the door as it starts the get-out animation:
+//
+//   004E1813  movzx eax, word [ebp+2E8h]         m_vehDoor
+//   004E1824  jmp [eax*4 + 5F93F4h]              door -> 1/2/4/8
+//   004E1839  or [esi+1CBh], cl                  m_nGettingOutFlags |= flag
+//
+// and it is given back at the end of the chain: PedSetOutCarCB - 0x004CE8F0,
+// the finish callback the get-out chain pushes at 0x004DF8EB - with
+// `and [eax+1CBh],bl` at 0x004CED5E, straight before its pDriver == this test
+// (and the dragged-out callback the same way at 0x004CF090). ~CPed knows the
+// gap and covers
+// it: at 0x004C517A it tests m_nPedState for 36h and 33h and clears the same
+// bit (0x004C519F). A ped warped out of a seat mid-exit goes through neither,
+// and the bit stays set for the rest of the car's life - which SetEnterCar
+// reads at 0x004E09CD as "somebody is getting out of this door" and answers
+// with SetMoveState(STILL). The player walks to the door and stands there.
+//
+// Same two states as ~CPed, and nothing for any other: a ped that was simply
+// sitting there never claimed a door.
+constexpr uint8_t GettingOutFlagsAfterUnseat(uint8_t flags, uint32_t pedState,
+                                             uint8_t doorFlag) {
+	return pedState == PEDSTATE_EXIT_CAR || pedState == PEDSTATE_DRAG_FROM_CAR
+	           ? static_cast<uint8_t>(flags & ~doorFlag)
+	           : flags;
+}
+
+// Is the engine taking this ped out of its seat by itself, through a jack
+// played on this machine?
+//
+// Either the drag has started (33h), or the ped is still sitting there and a
+// jack through its own door is on its way: AllClear has set the car's
+// bIsBeingCarJacked and put that door's bit into m_nGettingInFlags, and
+// PedAnimDoorOpenCB is about to call SetBeingDraggedFromCar on it. Pulling the
+// ped out by hand in either window is what used to teleport it: in the first
+// the drag is cut off mid-animation, in the second the jacker's door-open
+// callback finds an empty seat and just climbs in.
+constexpr bool EngineTakingPedOut(uint32_t pedState, uint8_t seatDoorFlag,
+                                  uint8_t gettingInFlags, uint8_t vehFlagsC) {
+	if (pedState == PEDSTATE_DRAG_FROM_CAR)
+		return true;
+	return pedState == PEDSTATE_DRIVING && seatDoorFlag != 0 &&
+	       (gettingInFlags & seatDoorFlag) != 0 &&
+	       (vehFlagsC & offs::VEH_IS_BEING_CARJACKED) != 0;
+}
+
+// Who actually runs the entry, and it is not CPed::ProcessControl.
+//
+// ProcessControl's state switch (the jump table at 0x005F8778, indexed by
+// m_nPedState - 1) sends PED_ENTER_CAR, PED_CARJACK and PED_EXIT_CAR to an
+// empty arm at 0x004CB9F7 - it does nothing for any of them, exactly as re3
+// Ped.cpp:2751-2752 says. The state machine is driven from CWorld::Process's
+// walk over ms_listMovingEntityPtrs instead (re3 World.cpp:1967-1999): the
+// same walk that calls SetPedPositionInCar on a seated ped calls EnterCar()
+// on an entering one, and ExitCar() on a leaving one.
+//
+// Two consequences, and both are load-bearing:
+//
+//  - a remote ped only animates into a car while it is on the moving list,
+//    which is the same condition docs/protocol.md 1.13.2 already relies on
+//    for a seated ped to be positioned at all. Nothing extra is needed.
+//  - the engine cleans up after itself if the car goes away underneath:
+//    that walk does `bInVehicle = false; QuitEnteringCar()` the moment
+//    m_pMyVehicle reads null. The reference WarpPedIntoCar and
+//    SetEnterCar_AllClear both register nils that pointer when the car is
+//    destroyed, so this is the ordinary case rather than a corner.
+
 // ---- script ---------------------------------------------------------------
 //
 // Not used by v1 (docs/protocol.md §3 scopes the campaign out). Recorded now
@@ -1818,7 +6592,14 @@ constexpr float VEH_EXIT_SETTLE_SPEED_Z = -0.00001f;
 constexpr uintptr_t CRunningScript__ProcessCommands = 0x00439500;
 
 // The 1100..1154 range handler. Its `cmp eax,36h` bound is one of five
-// anchors that pinned this build as 1.0 rather than 1.1.
+// anchors that pinned this build as 1.0 rather than 1.1. The dispatcher's
+// last link reaches it: `cmp dx,4B0h / jge ret / movsx eax,dx / push eax /
+// call 00589D00` at 0x00439632..0x0043963D. It opens `push ebx / push esi /
+// push edi / push ebp / sub esp,190h` (ten bytes, nothing in the image
+// branches or points into them), then `lea eax,[ebp-44Ch] / cmp eax,36h / ja
+// 0058B778 / jmp [eax*4 + 00610AB4h]`: base 1100, entry 0 (0x00589D2D) is
+// LOAD_COLLISION_WITH_SCREEN, re3 Script6.cpp:764 statement for statement.
+// 0x00588490 beside it is the 1000 range's, not a CLEO leftover.
 constexpr uintptr_t CRunningScript__ProcessCommands1100To1199 = 0x00589D00;
 constexpr uintptr_t g_ScriptOpcodeTable_1100                  = 0x00610AB4;
 
@@ -1833,6 +6614,430 @@ constexpr uintptr_t CRunningScript__ProcessCommands500To599 = 0x004429C0;
 constexpr uintptr_t g_ScriptOpcodeTable_500                 = 0x005EF298;  // base 500
 constexpr uintptr_t CRunningScript__ProcessCommands600To699 = 0x00444B20;
 constexpr uintptr_t g_ScriptOpcodeTable_600                 = 0x005EF424;  // base 657
+
+// ---- the script engine, for the session's mission (game/missionaddr.h) ----
+//
+// Read out of gta3.exe 2026-09-24. They were III.CLEO's and plugin-sdk's
+// numbers before that; every one held. tools/clienttest/missions.cpp checks
+// the bytes named here when it has the exe.
+
+// The dispatcher (ProcessOneCommand, above) is `mov eax,[ecx+10h] / movzx
+// edx,byte [eax+0074B248h] / add [ecx+10h],2`, then the NOT bit into
+// [ecx+82h], then twelve `cmp dx,<limit> / push eax / call <range>` links.
+// Each range handler is __thiscall(int32 command), `ret 4`, and returns al.
+// So an ip moved back 2 reads the same opcode and NOT bit again, and the
+// dispatcher itself writes neither the and/or state nor the result.
+// CRunningScript::Process runs `call 00439500 / test al,al / je` (0x00439483):
+// a handler's nonzero al ends the script's frame, as WAIT's does (0x00439679,
+// wake time into +7Ch, then `mov al,1`).
+// Every operand read, the dispatcher's, CollectParameters' and
+// StoreParameters', is `[ip + 0074B248h]` in 32 bits, so an ip of `buffer -
+// ScriptSpace` runs a buffer of our own.
+constexpr uintptr_t CRunningScript__ProcessCommands0To99    = 0x00439650;   // call at 0x00439552
+constexpr uintptr_t g_ScriptOpcodeTable_0                   = 0x005EE884;   // base 0
+constexpr uintptr_t CRunningScript__ProcessCommands100To199 = 0x0043AEA0;   // call at 0x0043956B
+constexpr uintptr_t g_ScriptOpcodeTable_100                 = 0x005EEA7C;   // base 100
+constexpr uintptr_t CRunningScript__ProcessCommands200To299 = 0x0043D530;   // call at 0x00439580
+constexpr uintptr_t g_ScriptOpcodeTable_200                 = 0x005EEC40;   // base 214
+constexpr uintptr_t CRunningScript__ProcessCommands300To399 = 0x0043ED30;   // call at 0x0043959B
+constexpr uintptr_t g_ScriptOpcodeTable_300                 = 0x005EEE30;   // base 304
+constexpr uintptr_t CRunningScript__ProcessCommands400To499 = 0x00440CB0;   // call at 0x004395B0
+constexpr uintptr_t g_ScriptOpcodeTable_400                 = 0x005EEFC8;   // base 400
+constexpr uintptr_t CRunningScript__ProcessCommands700To799 = 0x004458A0;   // call at 0x004395EF
+constexpr uintptr_t g_ScriptOpcodeTable_700                 = 0x005EF4D0;   // base 700
+constexpr uintptr_t CRunningScript__ProcessCommands900To999 = 0x0044CB80;   // call at 0x00439613
+constexpr uintptr_t g_ScriptOpcodeTable_900                 = 0x005EFA14;   // base 900
+constexpr uintptr_t CRunningScript__ProcessCommands1000To1099 = 0x00588490; // call at 0x0043962B
+constexpr uintptr_t g_ScriptOpcodeTable_1000                = 0x00610928;   // base 1001
+
+// char ScriptSpace[0x28000]: main.scm's 0x20000, then the mission's 0x8000.
+// The dispatcher reads the opcode at [ip + 0074B248h]; CTheScripts::Init
+// (0x00438790) zeroes it up to `cmp eax,28000h`; START_MISSION (0x00588DE0)
+// reads `push 8000h / push 76B248h` from main.scm and starts a script at 20000h.
+constexpr uintptr_t CTheScripts__ScriptSpace = 0x0074B248;
+constexpr uint32_t  SIZE_SCRIPT_SPACE        = 0x28000;
+constexpr uint32_t  SIZE_MAIN_SCRIPT         = 0x20000;
+
+// tUsedObject UsedObjectArray[200] { char name[24]; int32 index; } and
+// uint16 NumberOfUsedObjects: main.scm's table of object models, which a
+// negative model operand names (-1 is the first). CREATE_OBJECT's handler
+// (0x0043DD20, range 200's table 0x005EEC40 entry 49) does `neg esi / lea
+// eax,[esi*8] / sub eax,esi / mov esi,[eax*4+006E69E0h]` - index at +18h,
+// stride 1Ch - with no test against the count. CTheScripts::Init zeroes 0C8h
+// of them from 0x00438A00 and `mov word [0095CC72h],0`; the loader at
+// 0x00454960 sets the count from the file and copies the names in.
+constexpr uintptr_t CTheScripts__UsedObjectArray     = 0x006E69C8;
+constexpr size_t    USED_OBJECT_STRIDE               = 0x1C;
+constexpr size_t    USED_OBJECT_INDEX                = 0x18;
+constexpr size_t    USED_OBJECTS_MAX                 = 200;
+constexpr uintptr_t CTheScripts__NumberOfUsedObjects = 0x0095CC72;   // uint16
+
+// CRunningScript *pActiveScripts. CTheScripts::Process (0x00439040) walks it
+// from `mov ecx,[008E2BF4h]` at 0x004393BF through `mov ebp,[ecx]`, and
+// StartNewScript (0x00439000) puts a new script at its head through
+// AddScriptToList (0x00438FE0, `next = *list / prev = 0 / *list = this`).
+constexpr uintptr_t CTheScripts__pActiveScripts = 0x008E2BF4;
+constexpr uintptr_t CTheScripts__Process        = 0x00439040;   // recorded
+constexpr uintptr_t CTheScripts__StartNewScript = 0x00439000;   // recorded
+
+// int32 OnAMissionFlag, $ONMISSION's offset in the script space.
+// DECLARE_MISSION_FLAG's handler (0x00440596) stores its operand with `mov
+// [008F1B64h],eax`; IsPlayerOnAMission (0x00439410) and DoDeatharrestCheck
+// (0x00452A30) read [74B248h + it].
+constexpr uintptr_t CTheScripts__OnAMissionFlag = 0x008F1B64;
+
+// bool. START_MISSION sets it (0x00588E65); TERMINATE_THIS_SCRIPT clears it
+// for a script with m_bMissionFlag (+0x85) set (0x0043A53C). MISSION_HAS_FINISHED
+// does not touch it.
+constexpr uintptr_t CTheScripts__bAlreadyRunningAMissionScript = 0x0095CDB3;
+
+// CRunningScript, 0x88 bytes. CRunningScript::Init (0x004386C0) writes every
+// field below in re3's order; Process (0x00439440), UpdateCompareFlag
+// (0x0044FD90) and DoDeatharrestCheck (0x00452A30) read them.
+constexpr uintptr_t CRunningScript__Init               = 0x004386C0;   // recorded
+constexpr uintptr_t CRunningScript__Process            = 0x00439440;   // recorded
+constexpr uintptr_t CRunningScript__UpdateCompareFlag  = 0x0044FD90;   // recorded
+constexpr uintptr_t CRunningScript__DoDeatharrestCheck = 0x00452A30;   // recorded
+constexpr uintptr_t CRunningScript__StoreParameters    = 0x004385A0;   // recorded
+namespace offs {
+constexpr size_t SCRIPT_NEXT              = 0x00;   // Process loop: mov ebp,[ecx]
+constexpr size_t SCRIPT_PREV              = 0x04;   // Init, AddScriptToList
+constexpr size_t SCRIPT_NAME              = 0x08;   // char[8]; NAME_THREAD lowercases it
+constexpr size_t SCRIPT_IP                = 0x10;   // dispatcher: mov eax,[ecx+10h]
+constexpr size_t SCRIPT_STACK             = 0x14;   // uint32[6]; Init zeroes 14h..28h
+constexpr size_t SCRIPT_SP                = 0x2C;   // uint16; DoDeatharrestCheck dec word [ebx+2Ch]
+constexpr size_t SCRIPT_LOCALS            = 0x30;   // int32[16] + two timers at 70h/74h
+constexpr size_t SCRIPT_COND_RESULT       = 0x78;   // UpdateCompareFlag: mov [ecx+78h],al
+constexpr size_t SCRIPT_IS_MISSION        = 0x79;   // START_MISSION: mov byte [ebp+79h],1
+constexpr size_t SCRIPT_WAKE_TIME         = 0x7C;   // WAIT: mov [ebx+7Ch],eax
+constexpr size_t SCRIPT_AND_OR            = 0x80;   // uint16; UpdateCompareFlag
+constexpr size_t SCRIPT_NOT               = 0x82;   // dispatcher: mov byte [ecx+82h],1/0
+constexpr size_t SCRIPT_DEATHARREST_ARMED = 0x83;   // Init sets 1; DoDeatharrestCheck tests
+constexpr size_t SCRIPT_DEATHARREST_DONE  = 0x84;   // DoDeatharrestCheck: mov byte [ebx+84h],1
+constexpr size_t SCRIPT_MISSION_FLAG      = 0x85;   // START_MISSION sets; TERMINATE reads
+} // namespace offs
+constexpr size_t SCRIPT_STACK_DEPTH = 6;
+
+// UpdateCompareFlag: `cmp dx,1 / jb / cmp dx,8 / ja` for an `if and`,
+// `cmp dx,15h / jb / cmp dx,1Ch / ja` for an `if or`, 0 for neither.
+constexpr uint16_t SCRIPT_ANDOR_NONE  = 0;
+constexpr uint16_t SCRIPT_ANDOR_ORS_1 = 21;
+constexpr uint16_t SCRIPT_ANDOR_ORS_8 = 28;
+
+// An operand's type byte: CollectParameters' switch (table 0x005EE81C,
+// indexed by type - 1) reads 4 bytes for 1, a global for 2, [this+30h+4i]
+// for 3, 1 byte for 4, 2 for 5, and 2 over 16.0f for 6. 0 ends
+// START_NEW_SCRIPT's argument list (0x0043A59F).
+constexpr uint8_t SCRIPT_PARAM_END    = 0;
+constexpr uint8_t SCRIPT_PARAM_INT32  = 1;
+constexpr uint8_t SCRIPT_PARAM_GLOBAL = 2;
+constexpr uint8_t SCRIPT_PARAM_LOCAL  = 3;
+constexpr uint8_t SCRIPT_PARAM_INT8   = 4;
+constexpr uint8_t SCRIPT_PARAM_INT16  = 5;
+constexpr uint8_t SCRIPT_PARAM_FLOAT  = 6;
+
+// SET_PLAYER_COORDINATES (0x0043A92C) compares z with the -100.0f at
+// 0x005EE7DC and finds the ground itself at or below it.
+constexpr float SCRIPT_Z_FIND_GROUND = -100.0f;
+
+// ---- is a car in the air (game/stunt.h) ----
+//
+// IS_CAR_IN_AIR_PROPER, 01F3: the 400 table above, entry 99 (the range
+// handler opens `lea edx,[eax-190h] / cmp edx,63h`, base 400). Handler
+// 0x004428F0:
+//
+//   004428F8  call 004382E0              CollectParameters(&ip, 1)
+//   00442902  mov  ecx,[009430DCh]       the vehicle pool
+//   00442909  call 0043EAF0              CPool<CVehicle>::GetAt(ScriptParams[0])
+//   0044290E  cmp  byte [eax+0EEh],0     m_nCollisionRecords
+//   00442915  jne  / mov al,1 / xor al,al  in the air: nothing touched it
+//   00442925  call 0044FD90              UpdateCompareFlag(al)
+//
+// No other entry of any table lands in it and no branch, call or dword in the
+// image points into its middle, so the call at 0x00442925 is this
+// instruction's answer and nobody else's. GetAt reads its handle off the
+// stack and writes nothing, so ScriptParams[0] still holds the car there.
+//
+// "Nothing touched it this frame" is what airborne means to the script, and
+// it is also what a car whose physics this machine skips looks like.
+// CAutomobile::ProcessControl's skip arm (0x0053298E, `mov byte [ebp+0EEh],0`
+// beside bHasContacted, bIsInSafePosition, bWasPostponed and bHasHitWall)
+// zeroes the count every frame an ABANDONED car sits still - a session car
+// its driver has stepped out of, with somebody still in the back of it.
+// AddCollisionRecord is the `inc byte [ebp+0EEh]` at 0x00497224.
+//
+// Two of main.scm's threads ask it, both started by INIT_THREADS for every
+// game and never ended: HJ (the insane stunt bonus) and USJ (the unique
+// jumps), each about the car the player is in, driver or passenger. No
+// mission script asks it.
+constexpr int32_t   OPCODE_IS_CAR_IN_AIR_PROPER  = 0x01F3;
+constexpr uintptr_t IS_CAR_IN_AIR_PROPER_HANDLER = 0x004428F0;
+constexpr uintptr_t IS_CAR_IN_AIR_PROPER_ANSWER  = 0x00442925;   // call UpdateCompareFlag
+constexpr uintptr_t CPool_CVehicle__GetAt        = 0x0043EAF0;
+namespace offs {
+constexpr size_t PHYSICAL_COLLISION_RECORDS = 0xEE;   // uint8, after m_nStaticFrames
+} // namespace offs
+
+// ---- riding as a passenger (game/sidejob.h, game/ridecam.h) ----
+//
+// Read out of gta3.exe 2026-09-25; tools/clienttest/passengers.cpp checks the
+// bytes when it has the exe.
+//
+// The odd jobs' key. IS_BUTTON_PRESSED's handler (0x0043DAF9, above) asks
+//
+//   0043DB13  mov ecx,ebx / push esi / push eax
+//   0043DB17  call 00452C00                  GetPadState(pad, button)
+//   0043DB1C  test ax,ax                     pressed if not zero
+//
+// and nothing else in the image calls 0x00452C00 but GET_PAD_STATE's handler
+// (0x0043DC1F). GetPadState is __thiscall on the script, two words pushed as
+// dwords, `ret 8`, the answer in ax: CPad::GetPad(pad), then `cmp edx,13h /
+// ja` and the table at 0x005F0014, whose entry 14 reads +1Ch (Square) and
+// entry 19 +26h (RightShock). main.scm asks for button 19, or 14 under
+// controller setup 3, in the four odd jobs and nowhere else: their triggers,
+// and the missions' own cancel.
+constexpr uintptr_t CRunningScript__GetPadState     = 0x00452C00;
+constexpr uintptr_t IS_BUTTON_PRESSED_PadStateCall  = 0x0043DB17;   // E8 rel32
+constexpr uintptr_t GET_PAD_STATE_PadStateCall      = 0x0043DC1F;   // left alone
+constexpr uintptr_t GetPadState_ButtonTable         = 0x005F0014;
+constexpr int32_t   PAD_BUTTON_SQUARE               = 14;
+constexpr int32_t   PAD_BUTTON_RIGHTSHOCK           = 19;
+
+// CCamera::Process, __thiscall on TheCamera, no arguments. CGame::Process
+// calls it at 0x0048C9B5, after CWorld::Process (0x0048C97A) and right behind
+// CReplay::ShouldStandardCameraBeProcessed (0x0048C9A7 / test al,al / je).
+// It opens as re3 Camera.cpp's does: the 1.6f PlayerMinDist static
+// (`mov [00628C88h],3FCCCCCDh`), m_bJust_Switched = 0 (`mov byte
+// [006FAD55h],0`), the camera's position copied into +6BCh, then
+// UpdateTargetEntity behind m_bLookingAtPlayer (+5Eh),
+// m_bTargetJustBeenOnTrain (+67h) and WhoIsInControlOfTheCamera == 2 (+0CCh),
+// and pTargetEntity (+7A4h) = FindPlayerPed() when it is null. Three other
+// calls reach it (0x0048C33E, 0x0048C5E8, 0x004A067E), none of them the
+// frame's.
+constexpr uintptr_t CCamera__Process                = 0x0046D3F0;
+constexpr uintptr_t CGame__Process_CameraCall       = 0x0048C9B5;   // E8 rel32
+constexpr uintptr_t CReplay__ShouldStandardCameraBeProcessed = 0x00597680;
+
+// CPed::SetPedPositionInCar, __thiscall, no arguments. CWorld::Process's last
+// walk over the moving list puts every ped in a car where the car's matrix
+// says its seat is:
+//
+//   004B1E59  cmp byte [ecx+314h],0          bInVehicle
+//   004B1E7F  mov edi,[ecx+310h]             m_pMyVehicle
+//   004B1E89  cmp [edi+284h],2 / call 004E33C0   a train: SetPedPositionInTrain
+//   004B1EAC  sub eax,32h / cmp eax,6 / ja 004B1EE2   the state, table 0x005F7AD0
+//   004B1EE2  call 004D4970                  the default arm, PED_DRIVING's
+//   004B1EE7  lea ecx,[esi+4] / call 004B8EC0 / mov ecx,esi / call 00474330
+//
+// which is CMatrix::UpdateRW and CEntity::UpdateRwFrame. The function opens
+// with re3's two tests: CReplay's mode (`cmp byte [0095CD5Bh],1`) and
+// bChangedSeat (+156h bit 3), then RpAnimBlendClumpGetAssociation for the
+// get-in and shuffle anims (5Ah, 5Bh...).
+constexpr uintptr_t CPed__SetPedPositionInCar       = 0x004D4970;
+
+// POINT_CAMERA_AT_CAR (0158), entry 40 of the 300 table (base 304), handler
+// 0x0043F56E. The 300 range keeps the script in ebp from its `mov ebp,ecx`
+// (0x0043ED33) to its return:
+//
+//   0043F571  mov ecx,ebp / push 3 / call 004382E0   CollectParameters(&ip, 3)
+//   0043F587  call 0043EAF0                  the car, from the vehicle pool
+//   0043F590  mov cx,[006ED464h] / mov bx,[006ED468h]  mode, switch
+//   0043F59E  push 1 / push ebx / push ecx / mov ecx,6FACF8h / push eax
+//   0043F5A8  call 00471500                  TheCamera.TakeControl(car, mode, switch, SCRIPT)
+//
+// TakeControl is re3's, `ret 10h`: WhoIsInControlOfTheCamera (+0CCh) =
+// controller unless the script holds it and Obbe asks, m_bLookingAtVector (+5Fh)
+// = 0, pTargetEntity (0x006FB49C, +7A4h) = the entity, m_iModeToGoTo (+E9C8h),
+// m_iTypeOfSwitch (+E9CCh), m_bLookingAtPlayer (+5Eh) = 0,
+// m_bStartInterScript (+65h) = 1.
+constexpr int32_t   OPCODE_POINT_CAMERA_AT_CAR          = 0x0158;
+constexpr uintptr_t POINT_CAMERA_AT_CAR_HANDLER         = 0x0043F56E;
+constexpr uintptr_t POINT_CAMERA_AT_CAR_TakeControlCall = 0x0043F5A8;   // E8 rel32
+constexpr uintptr_t CCamera__TakeControl                = 0x00471500;
+
+// SET_FIXED_CAMERA_POSITION (015F), entry 47 of the same table, handler
+// 0x0043F78E: CollectParameters(&ip, 6), the position and the up offset built
+// on the stack, then `mov ecx,6FACF8h / push ebx / push eax / call 0046FCC0`.
+// SetCamPositionForFixedMode(const CVector &pos, const CVector &up), `ret 8`,
+// is six fld/fstp: the position into +6E0h..+6E8h and the offset into
+// +6ECh..+6F4h.
+constexpr int32_t   OPCODE_SET_FIXED_CAMERA_POSITION     = 0x015F;
+constexpr uintptr_t SET_FIXED_CAMERA_POSITION_HANDLER    = 0x0043F78E;
+constexpr uintptr_t CCamera__SetCamPositionForFixedMode  = 0x0046FCC0;
+
+// RESTORE_CAMERA_JUMPCUT (02EB), entry 47 of the 700 table (base 700), is
+// only `mov ecx,6FACF8h / call 0046FAE0` (0x00446EAD). RestoreWithJumpCut is
+// re3's: m_bRestoreByJumpCut (+63h) = 1, m_bLookingAtPlayer = 1,
+// m_bLookingAtVector = 0, m_iTypeOfSwitch = 2, WhoIsInControlOfTheCamera = 0,
+// then the target back on FindPlayerVehicle or the player.
+constexpr int32_t   OPCODE_RESTORE_CAMERA_JUMPCUT        = 0x02EB;
+constexpr uintptr_t RESTORE_CAMERA_JUMPCUT_HANDLER       = 0x00446EAD;
+constexpr uintptr_t RESTORE_CAMERA_JUMPCUT_Call          = 0x00446EB2;   // E8 rel32
+constexpr uintptr_t CCamera__RestoreWithJumpCut          = 0x0046FAE0;
+
+namespace offs {
+constexpr size_t CAMERA_WHO_CONTROLS = 0xCC;    // int32, 0 nobody, 1 the script, 2 Obbe
+constexpr size_t CAMERA_TARGET       = 0x7A4;   // CEntity*, TakeControl's `mov [006FB49Ch],eax`
+constexpr size_t CAMERA_FIXED_SOURCE = 0x6E0;   // CVector, SetCamPositionForFixedMode
+constexpr size_t CAMERA_FIXED_UP     = 0x6EC;   // CVector, its up offset
+} // namespace offs
+
+// **Who the camera is looking at is a raw pointer until the camera next runs.**
+// TakeControl stores the entity into pTargetEntity (0x0047157F, `mov
+// [006FB49Ch],eax`) and calls nothing but FindPlayerVehicle/FindPlayerPed on
+// the way; the RegisterReference that lets the entity's destruction nil it is
+// made later, inside CCamera::Process, once the switch the script asked for is
+// carried out:
+//
+//   0046A1F6  push 6FB49Ch / mov ecx,[006FB49Ch] / call 004A7480
+//                                     &pTargetEntity
+//   0046A211  movzx ecx,[ebp+76h] / imul ecx,ecx,1A4h
+//   0046A21B  lea eax,[ecx+ebp+32Ch] / mov ecx,[ebp+ecx+32Ch] / call 004A7480
+//                                     &Cams[ActiveCam].CamTargetEntity
+//
+// So Cams sit at +1A4h (Mode at +1B0h is Cams[0] + 0Ch, TheCamera__Cams_Mode),
+// and a CCam's CamTargetEntity at +188h of it. A car or a ped taken away
+// between a TakeControl and the next CCamera::Process - POINT_CAMERA_AT_CAR or
+// _CHAR replayed and the car's despawn drained in the same PreFrame, the unique
+// jump's shot on a rider's copy - leaves the camera holding a freed slot, which
+// Process then registers a reference on and follows. What Process does with a
+// target that is gone (0x0046D49F..0x0046D4F7) is what CoopIII does instead,
+// before the entity goes: pTargetEntity nil -> FindPlayerPed(), and each of the
+// two cams' nil CamTargetEntity -> pTargetEntity.
+namespace offs {
+constexpr size_t CAMERA_CAMS       = 0x1A4;   // CCam Cams[3]
+constexpr size_t CAM_TARGET_ENTITY = 0x188;   // CEntity *CCam::CamTargetEntity
+} // namespace offs
+constexpr size_t CAMERA_NUM_CAMS = 3;
+constexpr uintptr_t CCamera__Process_TargetFallback = 0x0046D49F;   // cmp [ebx+7A4h],0
+constexpr int32_t CAMCONTROL_NOBODY  = 0;
+constexpr int32_t CAMCONTROL_SCRIPT  = 1;
+constexpr int16_t CAM_MODE_FIXED     = 15;   // main.scm's FIXED, USJ's shot
+constexpr int16_t CAM_SWITCH_JUMP_CUT = 2;
+
+// CPool<CPed,CPlayerPed>::GetAt(int32 handle), __thiscall on the ped pool,
+// `ret 4`: `flags[h >> 8] == (h & 0xFF) ? base + (h >> 8) * 5F0h : 0`.
+// ADD_BLIP_FOR_CHAR's handler (0x0044079E) calls it as `mov ecx,[008F2C60h]
+// / call`, CPools::GetPed (0x004A1AA0) is a thunk to it, and 152 of its 158
+// callers are script handlers. Its first 5 bytes are `53 8B 5C 24 08`, and
+// no branch in the image lands inside them.
+constexpr uintptr_t CPool_CPed__GetAt         = 0x0043EB30;
+constexpr uintptr_t ADD_BLIP_FOR_CHAR_HANDLER = 0x0044079E;
+
+// CTheScripts::HighlightImportantArea(uint32 id, float x1, float y1, float x2,
+// float y2, float z), __cdecl, plain `ret`: the blue marker on the ground a
+// location check draws when its last operand, the "sphere", is set. It is the
+// check that draws it, for the frame it is asked in. IS_PLAYER_IN_AREA_3D's
+// handler (range 0's table entry 0x57, 0x0043AB45) is re3 Script.cpp's:
+//     cmp  dword [006ED47Ch],0 / je              ScriptParams[7], the sphere
+//     fld  [006ED46Ch] / fadd [006ED478h]         z1 + z2
+//     fmul [005EE7E0h]                            * 0.5f
+//     mov  eax,ebx / add eax,[ebx+10h]            this + m_nIp, the marker's id
+//     push y2 / push x2 / push y1 / push x1 / push eax
+//     call 00454320 / add esp,18h
+// and 21 more handlers call it the same way. Its body sorts the corners,
+// takes their middle, finds the ground for a z at or below -100.0f
+// ([005EFBC4h], call 004B3A80, plus 2.0f) and ends in CShadows::
+// RenderIndicatorShadow (0x00517810), which is C3dMarkers::PlaceMarkerSet
+// (0x0051BB80) of a type-4 marker in 0, 128, 255 with the id it was given.
+// First bytes `83 EC 18 D9 44 24 30` (sub esp,18h / fld [esp+30h]); nothing
+// in its body branches back into them.
+constexpr uintptr_t CTheScripts__HighlightImportantArea = 0x00454320;
+
+// III.CLEO hooks CGame::Initialise's call to CTheScripts::Init at 0x0048C26B
+// (the dword is in III.CLEO.asi four times), and patches about fifty sites
+// inside CTheScripts::Process's body plus the dispatcher's first bytes. It
+// keeps the range handlers' addresses in its own table and calls them there,
+// so a detour at their entries is reached either way.
+constexpr uintptr_t CTheScripts__Init      = 0x00438790;   // recorded
+constexpr uintptr_t CLEO_INIT_HOOK_CALL    = 0x0048C26B;   // recorded
+
+// The garages' two questions, on the array the garage section below proves
+// (CGarages__aGarages, 32 of 0x8C): IS_CAR_IN_MISSION_GARAGE (021C, handler
+// 0x00443759) calls HasCarBeenDroppedOffYet (0x00426C20), `cmp byte
+// [g*8Ch + 0072BCD1h],5`, GARAGE_STATE == GS_CLOSEDCONTAINSCAR and nothing
+// else; HAS_RESPRAY_HAPPENED (0329, 0x00448951) calls HasResprayHappened
+// (0x004274F0), which reads GARAGE_RESPRAY_HAPPENED and writes 0 there.
+
+// The two mission Cessnas' questions compare these with 2 and write nothing:
+// HasCesnaBeenDestroyed (0x0054E150) and HasDropOffCesnaBeenShotDown
+// (0x0054E250).
+constexpr uintptr_t CPlane__CesnaMissionStatus        = 0x0064CFE8;   // recorded
+constexpr uintptr_t CPlane__DropOffCesnaMissionStatus = 0x0064CFF0;   // recorded
+
+// A replayed cutscene is skipped by CCutsceneMgr::Update (0x00404EE0) on
+// pad 0's Cross (+20h/+4Ah), Start in the intro only, the left button
+// (0x008809F0/0x008472A0), either Enter (NewKeyState +23Ch and +25Ah) or
+// the space bar (+18h + 2*' '), each new and not old, at 0x0040503C..0x0040512D.
+constexpr uintptr_t CCutsceneMgr__Update = 0x00404EE0;   // recorded
+
+// ---- skipping a cutscene (game/cutsceneskip.h) ------------------------------
+//
+// The whole of the engine's skip, read out of CCutsceneMgr::Update past its
+// load-status switch (re3 CutsceneMgr.cpp:410-420, statement for statement):
+//
+//   00404F8C  cmp byte [0095CCF5h],0 / je 00405136      !ms_running -> out
+//   00404FA5  mov ebp,70D9D0h / mov esi,5EBEB4h          faststricmp(ms_cutsceneName, "end")
+//   00405016  je 00405136                                the credits: never
+//   0040501C  movzx eax,byte [006FAD6Eh] / imul eax,eax,69h
+//   00405026  cmp word [eax*4+006FAEA8h],11h / jne       Cams[ActiveCam].Mode != MODE_FLYBY
+//   00405035  cmp dword [0095CB40h],0 / jne               ms_cutsceneLoadStatus != 0
+//   00405042  GetPad(0): [+20h] && ![+4Ah]                Cross just down
+//   0040506B  cmp byte [0095CDC2h],0 / GetPad(0) [+18h] && ![+42h]   playingIntro && Start
+//   004050A7  [008809F0h] && ![008472A0h]                 left button (New/Old mouse state)
+//   004050CD  [006E630Ch]/[006F20ACh], [006E632Ah]/[006F20CAh]   either Enter
+//   0040510F  [006E6128h]/[006F1EC8h]                     the space bar
+//   00405131  call 00405140                               FinishCutscene
+//
+// 0x00405131 is the only reference to FinishCutscene anywhere in the image
+// (every E8/E9 rel32 and every absolute dword scanned; tools/clienttest checks
+// it), so taking that call site is taking every skip there is.
+// FinishCutscene is __cdecl, no arguments: `mov ecx,6FACF8h`, TheCamera's
+// GetCutSceneFinishTime * 0.001 into ms_cutsceneTimer (0x00941548),
+// CCamera::FinishCutscene, the player ped visible, MakePlayerSafe(false),
+// `add esp,8 / ret`.
+//
+// 0x0095CCF5 is re3's ms_running: SetupCutsceneToStart (0x00404DC0), which
+// Update's load-status case 1 calls, ends `mov byte [0095CCF5h],1`
+// (0x00404EBD). CCutsceneMgr__ms_running further down is 0x0095CD95, which is
+// re3's ms_loaded (LoadCutsceneData's `mov byte [0095CD95h],1` at 0x0040485B);
+// it is on from LOAD_CUTSCENE to CLEAR_CUTSCENE, this one from the scene's
+// first frame to CLEAR_CUTSCENE.
+constexpr uintptr_t CCutsceneMgr__FinishCutscene      = 0x00405140;   // __cdecl ()
+constexpr uintptr_t CCutsceneMgr__Update_FinishCall   = 0x00405131;   // E8 rel32
+constexpr uintptr_t CCutsceneMgr__ms_started          = 0x0095CCF5;   // bool, re3 ms_running
+constexpr uintptr_t CCutsceneMgr__ms_cutsceneLoadStatus = 0x0095CB40; // uint32
+constexpr uintptr_t CCutsceneMgr__ms_cutsceneName     = 0x0070D9D0;   // char[8]
+constexpr uintptr_t CUTSCENE_NAME_END                 = 0x005EBEB4;   // "end"
+constexpr uintptr_t TheCamera__ActiveCam              = 0x006FAD6E;   // uint8, TheCamera + 0x76
+constexpr uintptr_t TheCamera__Cams_Mode              = 0x006FAEA8;   // int16, TheCamera + 0x1B0
+constexpr size_t    CAMERA_CAM_STRIDE                 = 0x1A4;        // imul 69h, then *4
+constexpr int16_t   CAM_MODE_FLYBY                    = 0x11;
+// CGame::playingIntro. SET_INTRO_IS_PLAYING's handler writes it
+// (0x005898C8 `mov byte [0095CDC2h],1`, 0x005898DB the 0) and nothing else
+// does; 00_intro.sc turns it on for the whole intro.
+constexpr uintptr_t CGame__playingIntro               = 0x0095CDC2;   // bool
+
+// IS_BUTTON_PRESSED (00E1), entry 0x0B of ProcessCommands200To299's table at
+// 0x005EEC40 (base 0xD6), is the handler at 0x0043DAF9:
+//
+//   0043DB01  call 004382E0                  CollectParameters(&ip, 2)
+//   0043DB06  mov ax,[006ED460h] / mov si,[006ED464h] / push esi / push eax
+//   0043DB17  call 00452C00                  GetPadState(pad, button)
+//   0043DB2D  cmp byte [0095CDC2h],0         playingIntro, pad 0, button 0Ch
+//             (Start): the left button, Enter or the space bar just down also
+//             count (re3 Script.cpp:3953-3958)
+//   0043DBE7  mov ecx,ebx / push dword [esp+4]
+//   0043DBED  call 0044FD90                  UpdateCompareFlag(value), ret 4
+//
+// GetPadState's switch (table 0x005F0014) reads button 0Ch at +18h (Start)
+// and 10h at +20h (Cross), the offsets Update reads. The call at 0x0043DBED
+// is redirected, and its answer only changed while the intro plays, for the
+// intro's own skip; UpdateCompareFlag itself is left alone (196 callers).
+constexpr uintptr_t IS_BUTTON_PRESSED_HANDLER         = 0x0043DAF9;
+constexpr uintptr_t IS_BUTTON_PRESSED_CompareCall     = 0x0043DBED;   // E8 rel32
+constexpr int32_t   PAD_BUTTON_START                  = 12;
+constexpr int32_t   PAD_BUTTON_CROSS                  = 16;
 
 // ---- combat ---------------------------------------------------------------
 //
@@ -1957,6 +7162,33 @@ constexpr uint8_t EXPLOSION_MOLOTOV = 1;
 constexpr uint8_t EXPLOSION_ROCKET  = 2;
 constexpr uint8_t EXPLOSION_TYPE_COUNT = 10;   // re3 Explosion.h, for bounding
 
+// The one explosion a bullet makes without going through a car, and the one
+// the culprit of which is always the local player whoever fired.
+//
+// CWeapon::BlowUpExplosiveThings (0x00564A60) is called with the victim at the
+// tail of CWeapon::DoBulletImpact (0x005605F2), hit or miss, for every round.
+// It tests the victim's model against the two indices at [0x005F5B08] and
+// [0x005F5B4C] (re3: the exploding barrel and the petrol pump), sets
+// bHasBeenDamaged at [ebx+175h] bit 5, and then:
+//
+//   00564ACE  push 64h                 lifetime 100
+//   00564AD0  push eax                 &pos, 0.5 above the object
+//   00564AD5  push 7                   the type
+//   00564AD7  call 004A1150            FindPlayerPed()
+//   00564ADC  push eax                 culprit = the local player, always
+//   00564ADD  push ebx                 the object
+//   00564ADE  call 005591C0            CExplosion::AddExplosion
+//
+// Nothing reads AddExplosion's result: the next instruction reloads the model
+// index for the upward kick. FireShotgun does not call this function.
+constexpr uint8_t EXPLOSION_BARREL  = 7;
+// CAutomobile::BlowUpCar's two, from its own call to AddExplosion (the block
+// on BlowUpCar above: `push 3` at 0x0053BF20, `push 4` on the arm at
+// 0x0053BF15).
+constexpr uint8_t EXPLOSION_CAR       = 3;
+constexpr uint8_t EXPLOSION_CAR_QUICK = 4;
+constexpr uintptr_t CWeapon__BlowUpExplosiveThings = 0x00564A60;
+
 // ---- projectiles ----
 //
 // gaProjectileInfo and its stride come from CProjectileInfo::GetProjectileInfo
@@ -2029,6 +7261,5158 @@ constexpr uintptr_t CProjectileInfo__AddProjectile = 0x0055B030;
 constexpr uintptr_t CProjectileInfo__RemoveProjectile = 0x0055B700;
 constexpr uintptr_t CProjectileInfo__RemoveNotAdd     = 0x0055B770;
 constexpr uintptr_t CProjectileInfo__GetProjectileInfo = 0x0055B010;
+
+// ---- damage, death and respawn --------------------------------------------
+//
+// Verified 2026-09-21. Two functions, and between them they are the whole
+// feature: one decides that a ped was hurt, the other that it died.
+//
+// __thiscall bool CPed::InflictDamage(CEntity *damagedBy, eWeaponType method,
+//                                     float damage, ePedPieceTypes pedPiece,
+//                                     uint8 direction).
+//
+// Found by working backwards from CPed::SetDie, which was already located
+// (docs/addresses-unverified.md) and is now proved below: scanning .text for
+// E8 rel32s to it gives eleven call sites, and the pair at 0x004EAD15 /
+// 0x004EADBD sits inside one function whose tail is re3 PedFight.cpp:2444-2470
+// statement for statement. 0x004EA410 is a `ret` followed by zero padding to
+// the next 16-byte boundary, so 0x004EA420 is a real function start and not a
+// landing halfway into one.
+//
+// The prologue names it beyond argument:
+//
+//   0x004EA420  fld  [0x005F9AB8] -> [esp+10h]    float dieDelta = 4.0f
+//   0x004EA435  fld  [0x005F9A88] -> [esp+14h]    float dieSpeed = 0.0f
+//   0x004EA43F  mov  ebx, 0Dh                     dieAnim = ANIM_STD_KO_FRONT
+//   0x004EA448  mov  byte [esp+8], 0              headShot = false
+//   0x004EA44F  mov  byte [esp+0Ch], 0            willLinger = false
+//   0x004EA454  call FindPlayerPed / cmp ebp,eax  if (player == this)
+//   0x004EA462  cmp  byte [eax+584h], 0           !player->m_bCanBeDamaged
+//   0x004EA485  [ebp+224h] == 30h or 31h          DyingOrDead()
+//   0x004EA4A1  mov al,[ebp+51h] / and al,1       bUsesCollision, which
+//                                                 re-confirms ENTITY_FLAGS_A
+//                                                 and ENTITY_USES_COLLISION
+//   0x004EA4A8  cmp  dword [esp+38h], 14h         method != WEAPONTYPE_DROWNING
+//
+// and the tail closes it:
+//
+//   fld [ebp+2C0h] / fsub healthImpact / fcomp [0x005F9ADC]
+//                                       m_fHealth - healthImpact >= 1.0f
+//   cmp byte [ebp+314h],0               bInVehicle
+//   mov ecx,[ebp+310h] / [ecx+50h] &= 7 |= 58h
+//                                       m_pMyVehicle->SetStatus(
+//                                           STATUS_PLAYER_DISABLED), 58h>>3 = 11
+//   push [0x005F9A88] / push [0x005F9AB8] / push 0ADh / call CPed::SetDie
+//                                       SetDie(ANIM_STD_NUM, 4.0f, 0.0f)
+//   mov al,1 / ret 14h                  returns true when the ped died
+//
+// `ret 14h` is five stack arguments with `this` in ecx, and the 21 call sites
+// land in exactly the modules re3 says call it: CGarages, CFire, CWorld's
+// explosion sweep, CPed's own collision and drowning paths, KillPedWithCar,
+// CAutomobile's drowning, CExplosion::Update and five places inside CWeapon.
+//
+// CoopIII detours this to take a hit on a remote player's ped away from the
+// local engine and put it on the wire instead, and calls it directly to apply
+// somebody else's hit to the local player. docs/protocol.md §1.10.
+constexpr uintptr_t CPed__InflictDamage = 0x004EA420;
+
+// __thiscall void CPed::SetDie(AnimationId anim, float delta, float speed).
+//
+// `ret 0Ch`, three stack arguments, and re3 Ped.cpp:6303-6353 in order:
+// FindPlayerPed / `cmp byte [eax+584h],0` (m_bCanBeDamaged), `m_threatEntity
+// = nil` at +0x18C, the DyingOrDead pair 30h/31h, `delta *= 0.5f` off
+// 0x005F84B0 for PED_FALL/PED_GETUP, CPed::SetStoredState (0x004C5DB0),
+// ClearAll (0x004C7F20), `m_fHealth = 0` at +0x2C0, the PED_DRIVING (2Ch)
+// arm calling CPed::IsPlayer (0x004D48E0) and then vtable slot 0x40,
+// `bInVehicle` at +0x314 with `m_pVehicleAnim->blendDelta = -1000.0f` at
+// +0x1D8/+0x1C, `m_nPedState = 30h` (PED_DIE), and finally `cmp esi,0ADh`
+// for the ANIM_STD_NUM case.
+//
+// Two things to know before calling it on a remote ped. It sets health to 0
+// and clears the ped's collision through ClearAll, so it's a one-way trip:
+// the way back is a new ped, not an undo. And its PED_DRIVING arm calls
+// FlagToDestroyWhenNextProcessed for anything that isn't the player, so a
+// seated remote ped has to be taken out of its car before it is killed or
+// the engine deletes it on the next frame.
+//
+// **Re-read 2026-09-22, whole function, 0x004D37D0..0x004D3945.** The
+// destroy arm is four instructions and the gate is exactly one state:
+//
+//   004D3848  mov  eax,[ebx+224h] / cmp eax,2Ch    m_nPedState == PED_DRIVING
+//   004D3855  call 004D48E0                        CPed::IsPlayer
+//   004D385C  test al,al / jnz                      the player is spared
+//   004D3860  mov ebp,[ecx] / call [ebp+40h]        vtable +0x40,
+//                                       FlagToDestroyWhenNextProcessed
+//
+// Nothing else reaches it. A ped that is merely `bInVehicle` without being
+// in PED_DRIVING takes the other arm (004D3867), which only kills its
+// vehicle animation - `[m_pVehicleAnim+1Ch] = 0xC47A0000`, -1000.0f. So
+// testing `m_nPedState == PED_DRIVING` before the call is both necessary and
+// sufficient; testing `bInVehicle` would unseat peds that did not need it.
+//
+// **SetDie and CPed::RemoveBodyPart commute, and that is measured rather
+// than reasoned.** Both functions were disassembled end to end and the sets
+// of fields they touch are disjoint:
+//
+//   SetDie           +0x18C +0x224 +0x2C0 +0x314 +0x1D8 +0x4C +0x157
+//                    +0x228 +0x4EC
+//   RemoveBodyPart   +0x1A4 (m_pFrames[node]) +0x156 +0x4F2, the RwFrame
+//                    visibility walk, and the particle system
+//
+// Neither reads what the other writes, so a limb taken off before a death
+// and a limb taken off after one leave the ped in the same state. The two
+// flag bytes are +0x157 and +0x156, adjacent and *not* the same byte, which
+// is the near-miss this note exists for. CoopIII still sends the limb before
+// the death because that is the order `CPed::InflictDamage` does it in - see
+// docs/population.md §5.4.
+constexpr uintptr_t CPed__SetDie = 0x004D37D0;
+
+// __thiscall void CPed::RemoveBodyPart(PedNode nodeId, int8 direction).
+//
+// Found from CPed::InflictDamage above, which calls 0x004EAEE0 ten times and
+// nothing else more than that - re3 PedFight.cpp has exactly ten
+// RemoveBodyPart calls in InflictDamage, and the pushed node arguments come in
+// re3's order to the instruction:
+//
+//   0x004EA7F0..0x004EA889  push 2 / 3 / 4 / 7 / 8, each after a `mov ebx`
+//                           of 11h/13h/14h/15h/16h - the bullet arm, head
+//                           first, with its ANIM_STD_KO_SHOT_* die animation
+//   0x004EA932..0x004EA984  push 3 / 8 / 2 / 4 / 7 - the explosion arm,
+//                           `random & 1/2/4/8/10h` in that order
+//
+// and in every one the direction is `mov al,[esp+44h] / push eax`, the int8
+// fifth argument of InflictDamage passed straight through.
+//
+// The body is re3 PedFight.cpp:2522-2566 statement for statement:
+//
+//   0x004EAEE7  mov eax,[ebp+eax*4+1A4h] / cmp [eax+10h],0
+//                                  m_pFrames[nodeId]->frame, PED_FRAMES
+//   0x004EAEF8  push 5F9C98h / call  the "Trying to remove ped component"
+//                                  printf; the string is at that address
+//   0x004EAF10  cmp byte [5F4DD4h],0  CGame::nastyGame
+//   0x004EAF21  cmp [esp+34h],2 / je  nodeId != PED_HEAD
+//   0x004EAF33  call 004EB060         CPed::SpawnFlyingComponent(node, dir)
+//   0x004EAF49  call 004EAE20         RecurseFrameChildrenVisibilityCB
+//   0x004EAFA1  call 00474CC0         CEntity::GetIsOnScreen
+//   0x004EB02E  cmp bl,10h / jb       the sixteen PARTICLE_BLOOD_SMALLs
+//   0x004EB033  [ebp+156h] &= DFh |= 20h   bBodyPartJustCameOff
+//   0x004EB047  mov [ebp+4F2h],al          m_bodyPartBleeding = nodeId
+//   0x004EB052  ret 8                 two stack arguments, `this` in ecx
+//
+// Everything it does is to the ped and the particle system: it does not
+// damage, kill or move anybody. So calling it on a replica is exactly as safe
+// as its effect is visible, and it is how an observer shows a limb its host's
+// engine took off. docs/protocol.md, version 17.
+constexpr uintptr_t CPed__RemoveBodyPart = 0x004EAEE0;
+
+// The defaults every caller of SetDie passes, read off the two globals the
+// call sites push rather than copied from re3's declaration.
+constexpr float PED_DIE_DELTA = 4.0f;   // 0x005F9AB8
+constexpr float PED_DIE_SPEED = 0.0f;   // 0x005F9A88
+
+// AnimationId. ANIM_STD_KO_FRONT is InflictDamage's `mov ebx,0Dh` default;
+// ANIM_STD_NUM is SetDie's `cmp esi,0ADh` and means "no die animation at
+// all", which is the arm that only clears bIsPedDieAnimPlaying.
+//
+// Note the retail number: 0ADh is 173, while re3's `main` AnimationId enum
+// puts ANIM_STD_NUM at 174. re3 has one animation this build does not, so
+// anything that bounds an id must use the group's own numAssociations read at
+// runtime (ped.cpp AnimGroupCount) and never a count taken from re3.
+constexpr uint16_t ANIM_STD_KO_FRONT = 13;
+constexpr uint16_t ANIM_STD_NUM      = 173;
+
+// eWeaponType past the inventory range. These aren't weapons, they're damage
+// *causes*, and they never have a CPed::m_weapons slot - IsInventoryWeapon in
+// pedanim.h is what keeps one of them from indexing that array.
+//
+// WEAPONTYPE_DROWNING is the one the binary states directly: InflictDamage
+// tests `cmp dword [esp+38h],14h` twice, once for the bUsesCollision bypass
+// and once for the in-vehicle branch, and 14h is 20. The rest follow from
+// re3's enum with that as the anchor.
+//
+// DROWNING and the default arm matter more than they look. Neither checks a
+// proof flag at all, so the four proofs a remote ped carries do not cover
+// them: a remote ped standing in water on an observer's machine drowns
+// locally, whatever its owner says. That hole is why CoopIII refuses damage
+// at InflictDamage rather than relying on the flags.
+constexpr uint8_t WEAPONTYPE_LAST_WEAPONTYPE = 14;
+constexpr uint8_t WEAPONTYPE_ARMOUR          = 15;
+constexpr uint8_t WEAPONTYPE_RAMMEDBYCAR     = 16;
+constexpr uint8_t WEAPONTYPE_RUNOVERBYCAR    = 17;
+constexpr uint8_t WEAPONTYPE_EXPLOSION       = 18;
+constexpr uint8_t WEAPONTYPE_UZI_DRIVEBY     = 19;
+constexpr uint8_t WEAPONTYPE_DROWNING        = 20;
+constexpr uint8_t WEAPONTYPE_FALL            = 21;
+constexpr uint8_t WEAPONTYPE_UNIDENTIFIED    = 22;
+
+// ePedPieceTypes, InflictDamage's fourth argument. Seven of them, and it
+// switches on all seven in the bullet arm to pick which limb comes off
+// (re3 PedFight.cpp:2200-2240). Nothing indexes an array with it, but it
+// still gets bounded on the way in: an unknown piece would take the shot
+// down the `default:` path and leave dieAnim at whatever it was.
+constexpr uint8_t PEDPIECE_TORSO    = 0;
+constexpr uint8_t PEDPIECE_MID      = 1;
+constexpr uint8_t PEDPIECE_LEFTARM  = 2;
+constexpr uint8_t PEDPIECE_RIGHTARM = 3;
+constexpr uint8_t PEDPIECE_LEFTLEG  = 4;
+constexpr uint8_t PEDPIECE_RIGHTLEG = 5;
+constexpr uint8_t PEDPIECE_HEAD     = 6;
+constexpr uint8_t PEDPIECE_COUNT    = 7;
+
+// InflictDamage's fifth argument: which way the hit came from, 0 front,
+// 1 left, 2 back, 3 right. It only picks between the four
+// ANIM_STD_HIGHIMPACT_* animations (25..28), so a bad value is cosmetic
+// rather than dangerous, but it gets bounded anyway because it arrives off a
+// socket.
+constexpr uint8_t PED_DAMAGE_DIRECTIONS = 4;
+
+// ---- fire -----------------------------------------------------------------
+//
+// Verified 2026-09-21, against the binary and not against re3's NUM_FIRES.
+// docs/roadmap.md §5.7 asked two questions before any of this could be
+// designed, and this block is the answer to both.
+//
+// **Is the fire table a fixed size in retail, and what size?** Yes, and 40.
+// Three separate functions carry the bound and all three agree, which is what
+// makes it a fact rather than a reading:
+//
+//   0x00479336  cmp ebp,28h / jl      CFireManager::Update
+//   0x00479304  cmp eax,28h / jl      CFireManager::GetNextFreeFire
+//   0x004794C4  cmp ebx,28h / jl      FindFurthestFire_NeverMindFireMen
+//
+// and all three walk it with `add <reg>,30h`, with GetNextFreeFire and
+// FindFurthestFire also doing `imul <reg>,<reg>,30h` to turn an index back
+// into a pointer. So NUM_FIRES is 40 and sizeof(CFire) is 0x30.
+//
+// re3 also says 40 (src/core/config.h:107). That is a coincidence worth
+// naming rather than leaning on: the last three bugs in this project were all
+// an re3 constant that did not match retail (the four-entry anim group, the
+// twelve-entry node array, the ANIM_STD_NUM off-by-one), so this one was
+// measured the same way and happens to have come back equal.
+//
+// **Can a CFire point at an entity rather than just a position?** Yes, and
+// the answer has more in it than a yes. CFire::ProcessFire opens on
+// `mov eax,[ebx+10h] / test eax,eax` and, when m_pEntity is set, *rewrites
+// m_vecPos from that entity's matrix every single frame* before doing
+// anything else:
+//
+//   0x004798D8  mov eax,[ebx+10h]             m_pEntity
+//   0x004798E3  add eax,34h                   ->GetPosition()
+//   0x004798E6  fld [eax] / fstp [ebx+4]      m_vecPos.x
+//                     ... y, z                m_vecPos = entity position
+//   0x004798FA  mov al,[esi+50h] / and al,7   entity type
+//   0x00479904  cmp eax,3                     ENTITY_TYPE_PED
+//   0x0047990D  cmp [esi+4B4h],ebx            ped->m_pFire != this -> Extinguish
+//   0x004795DD  cmp [ecx+1E4h],0              veh->m_pCarFire (StartFire's arm)
+//
+// So the two kinds of fire are genuinely different sync problems, which is
+// what §5.7 suspected. A fire on the pavement has a position that *is* its
+// state. A fire on an entity has a position that is *derived* from the
+// entity, a life tied to that entity, and a two-way link the engine asserts
+// every frame - and it cannot exist at all on a machine where that entity
+// does not. That is also why CReplay's two memcpys are not the precedent they
+// look like: replay is one process, so m_pEntity and m_pSource still point at
+// something. Across the wire they are per-process pool pointers (§1.5).
+//
+// CFire, 0x30 bytes, every field pinned by CFire::CFire at 0x00479220 unless
+// noted, and cross-confirmed by StartFire and ProcessFire:
+//
+//   +0x00  bool  m_bIsOngoing              ctor 0, Update's `cmp byte,1`
+//   +0x01  bool  m_bIsScriptFire           ctor 0, GetNextFreeFire's second test
+//   +0x02  bool  m_bPropagationFlag        ctor 1, StartFire writes the arg
+//   +0x03  bool  m_bAudioSet               ctor 1
+//   +0x04  CVector m_vecPos                ctor (0,0,0); ProcessFire rewrites
+//   +0x10  CEntity *m_pEntity              ctor nil
+//   +0x14  CEntity *m_pSource              ctor nil; ProcessFire passes it
+//                                          straight to InflictDamage
+//   +0x18  uint32 m_nExtinguishTime        StartFire: GetTimeInMilliseconds()
+//                                          + 2710h (10000)
+//   +0x1C  uint32 m_nStartTime             StartFire: + 190h (400)
+//   +0x20  int32  field_20                 ctor 1
+//   +0x24  uint32 m_nNextTimeToAddFlames   StartFire 0; ProcessFire compares
+//                                          it against [0x00885B48]
+//   +0x28  uint32 m_nFiremenPuttingOut     ctor 0
+//   +0x2C  float  m_fStrength              ctor 3F4CCCCDh = 0.8f
+constexpr uintptr_t gFireManager      = 0x008F31D0;
+constexpr size_t    FIREMGR_TOTAL     = 0x00;   // uint32 m_nTotalFires
+constexpr size_t    FIREMGR_FIRES     = 0x04;   // CFire m_aFires[NUM_FIRES]
+constexpr size_t    NUM_FIRES         = 40;     // 28h, three witnesses above
+constexpr size_t    SIZEOF_CFIRE      = 0x30;
+
+constexpr size_t FIRE_ONGOING     = 0x00;
+constexpr size_t FIRE_SCRIPT      = 0x01;
+constexpr size_t FIRE_POS         = 0x04;
+constexpr size_t FIRE_ENTITY      = 0x10;
+constexpr size_t FIRE_SOURCE      = 0x14;
+constexpr size_t FIRE_EXTINGUISH  = 0x18;
+constexpr size_t FIRE_STRENGTH    = 0x2C;
+
+// gFireManager's m_nTotalFires is the dword CFire::ReportThisFire increments
+// and CFire::Extinguish decrements, which is how the global was found in the
+// first place:
+//
+//   0x004798B0  inc dword [0x008F31D0]        ReportThisFire
+//   0x00479D4F  dec dword [0x008F31D0]        Extinguish, !m_bIsScriptFire arm
+//
+// It is not a count of burning fires. Extinguish only decrements it for a
+// fire that is not a script fire, and StartScriptFire never reports one at
+// all, so anything that wants "how many fires are alive" has to walk the
+// array. combat.cpp's BurningFires() does.
+static_assert(FIREMGR_FIRES == 4, "m_aFires starts one dword into the manager");
+
+// The back-pointers the engine keeps on the burning entity itself. Both are
+// asserted by ProcessFire every frame: a fire whose entity no longer points
+// back at it extinguishes itself on the spot.
+constexpr size_t PED_FIRE     = 0x4B4;   // CFire *CPed::m_pFire
+constexpr size_t VEHICLE_FIRE = 0x1E4;   // CFire *CVehicle::m_pCarFire
+
+// __thiscall void CFireManager::Update() - the loop above, called once a
+// frame from 0x0048C936 with ecx = 0x008F31D0.
+constexpr uintptr_t CFireManager__Update = 0x00479310;
+
+// __thiscall CFire *CFireManager::GetNextFreeFire() - first slot with neither
+// m_bIsOngoing nor m_bIsScriptFire set, nil if all 40 are taken.
+constexpr uintptr_t CFireManager__GetNextFreeFire = 0x004792E0;
+
+// __thiscall void CFireManager::StartFire(CVector pos, float size,
+//                                         bool propagation)   [ret 14h]
+//
+// A fire on the pavement: m_pEntity and m_pSource are both nilled, the
+// extinguish time is fixed at ten seconds, and nothing owns it.
+//
+// **It has exactly one caller in the whole image**, at 0x0055957E inside
+// CExplosion::AddExplosion. That single fact retires half of §5.7's phase
+// two: in retail 1.0 the only thing that puts an ownerless fire on the ground
+// is an explosion, and CoopIII already replays every player's explosion at a
+// fixed world position every machine agrees on (§1.9.3). Pavement fires are
+// therefore already the same on every machine, and syncing them again would
+// double them.
+constexpr uintptr_t CFireManager__StartFirePos = 0x00479500;
+
+// __thiscall CFire *CFireManager::StartFire(CEntity *entityOnFire,
+//                                           CEntity *fleeFrom, float strength,
+//                                           bool propagation)   [ret 10h]
+//
+// A fire on a ped or a car. Returns nil rather than starting one when the
+// target already has a fire, when a ped is not IsPedInControl, or when a car's
+// engine is already past 225:
+//
+//   004795A6  cmp dword [ebx+4B4h],0 / je         ped: m_pFire must be nil
+//   004795C2  call 004CE6C0 / test al,al / jne    ped: IsPedInControl
+//   004795DD  cmp dword [ecx+1E4h],0 / je         car: m_pCarFire must be nil
+//   00479601  call 00545960 / cmp eax,0E1h / jb   automobile: engine status < 225
+//
+// So an entity holds one CFire at most, and a second StartFire on it is a
+// no-op. That is what makes a doubled ignition harmless where a doubled hit
+// is not: fire damage is dealt per CFire, never per ignition.
+//
+// Six callers, each resolved from its rel32 (this used to name CExplosion as
+// one of them, which was wrong - the explosion reaches it through the two
+// CWorld functions):
+//
+//   0x00479AA0  CFire::ProcessFire, spreading to FindPlayerPed()
+//   0x004B3E3C  CWorld::SetPedsOnFire     (0x004B3D30)
+//   0x004B3F9C  CWorld::SetCarsOnFire     (0x004B3E90)
+//   0x0053BEFE  CAutomobile::BlowUpCar, the car lighting itself
+//   0x00558985  CBulletInfo::Update's car arm, behind `cmp [ebp],9`. Dead in
+//               retail: CBulletInfo::AddBullet (0x00558470) has one caller,
+//               FireSniper at 0x00562107, so no bullet is ever cause 9
+//   0x0055C232  CShotInfo::Update, the flamethrower reaching a ped
+constexpr uintptr_t CFireManager__StartFireEntity = 0x00479590;
+
+// ---- the flamethrower, from trigger to fire ---------------------------------
+//
+// The flamethrower never calls InflictDamage. Every health point it takes is
+// taken later by a CFire it lit, and CFire::ProcessFire calls InflictDamage
+// with m_pSource and cause 9 and has forgotten everything else. By then a
+// flame, a molotov's blast and a car's own explosion all look the same. The
+// last place the flamethrower is still itself is CShotInfo::Update.
+//
+//   CWeapon::Fire (0x0055C380), table 0x00603184 entry 7 (weapon 9 - 2)
+//     -> 0x0055C70F  call CWeapon::FireAreaEffect (0x00561E00)
+//        a heading from the shooter's forward; the camera's aim instead when
+//        the shooter is FindPlayerPed() and the camera allows it (0x00561E54,
+//        0x00561E63), so an observer's replay is always flat
+//        -> 0x00561FA2  call CShotInfo::AddShot(shooter, 9, source, target)
+//        -> 0x00561FC2  call 0x00561C70, the particles
+//   every frame, CGame::Process (0x0048C940) -> CWeapon::UpdateWeapons
+//     (0x0055C310), whose first instruction is call CShotInfo::Update
+//     (0x0055BFF0)
+//
+// CShotInfo::Update, per in-use slot (0x0055C047 tests m_inUse):
+//
+//   0055C05E  weapon info flags: bit 1 slows it down, bit 4 widens it
+//   0055C11D  m_startPos += m_areaAffected * timestep
+//   0055C133  cmp [edi+20h],0 / je        no source, no peds
+//   0055C148  fcomp 1.0f                  r = max(m_radius, 1.0f)
+//   0055C170  for each of the source's m_nearPeds:
+//   0055C179    call 004D4930             CPed::IsPointerValid
+//   0055C1A8    call 004CE6C0             IsPedInControl
+//   0055C1CB    fcomp r                   |ped - m_startPos|^2 < r (not r^2)
+//   0055C1D9    [esi+53h] shr 1 / and 1   bFireProof -> skip
+//   0055C1E4    call 004D48E0             IsPlayer; if not: SetFindPathAndFlee
+//               (0x004D1D70, source, 10000), SetMoveState(SPRINT)
+//   0055C232    call StartFire(ped, source, 0.8f [0x00603028], 1)
+//   0055C24A  every fourth frame, (frame + slot) & 3 == 0:
+//   0055C26C    call CWorld::SetCarsOnFire(m_startPos, 4.0f [0x0060302C], source)
+//               -> for a car not wrecked, not burning, not bFireProof, within
+//                  5.0 in z and 4.0 in x and y: StartFire(car, source, 0.8f, 1)
+//                  at 0x004B3F9C
+//
+// The bFireProof test at 0x0055C1D9 corrects a note in the fire section
+// below, which said this function checks nothing but IsPedInControl and a
+// distance. It checks the proof flag like everything else that lights a ped.
+//
+// Nothing else calls CShotInfo::Update and nothing else calls AddShot, so
+// every slot in gaShotInfo is a flamethrower and every StartFire made while
+// Update runs is one of the two above. The only other thing the window
+// contains is the flee logic, which starts no fires.
+constexpr uintptr_t CWeapon__FireAreaEffect = 0x00561E00;
+constexpr uintptr_t CShotInfo__AddShot      = 0x0055BD70;   // __cdecl, 8 dwords
+constexpr uintptr_t CShotInfo__Update       = 0x0055BFF0;   // __cdecl void(), ret
+constexpr uintptr_t CWorld__SetPedsOnFire   = 0x004B3D30;   // CExplosion::Update only
+constexpr uintptr_t CWorld__SetCarsOnFire   = 0x004B3E90;   // CExplosion + CShotInfo
+
+// gaShotInfo, 100 slots of 0x2C. The base and the stride are Update's own loop
+// (`mov edi,64F0D0h` ... `add edi,2Ch` ... `cmp [esp+0Ch],64h`); the fields
+// are AddShot's writes, in its order:
+//
+//   0055BDD7  mov byte [esi+64F0F8h],1       +0x28 m_inUse
+//   0055BDDE  mov [esi+64F0D0h],ebx          +0x00 m_weapon
+//   0055BDE4  fstp [esi+64F0D4h] ..          +0x04 m_startPos
+//   0055BE06  fstp [esi+64F0E0h] ..          +0x10 m_areaAffected
+//   0055BE2B  fstp [esi+64F0ECh]             +0x1C m_radius, off the weapon info
+//   0055BF9B  mov [esi+64F0F0h],eax          +0x20 m_sourceEntity
+//   0055BFDE  fstp [esi+64F0F4h]             +0x24 m_timeout, a float of ms
+constexpr uintptr_t gaShotInfo        = 0x0064F0D0;
+constexpr size_t    NUM_SHOT_INFOS    = 100;
+constexpr size_t    SIZEOF_SHOTINFO   = 0x2C;
+constexpr size_t    SHOT_WEAPON       = 0x00;
+constexpr size_t    SHOT_POS          = 0x04;
+constexpr size_t    SHOT_RADIUS       = 0x1C;
+constexpr size_t    SHOT_SOURCE       = 0x20;
+constexpr size_t    SHOT_IN_USE       = 0x28;
+
+// CPed::m_nearPeds and m_numNearPeds, the list CShotInfo::Update walks.
+// CPed::BuildPedLists fills them (`mov [ebp+edx*4+4F4h],eax / inc word
+// [ebp+51Ch]` at 0x004C55D0) and stops at 0Ah (0x004C55E5), then nils the rest
+// up to 0Ah (0x004C5605). The count is a word.
+constexpr size_t PED_NEAR_PEDS     = 0x4F4;
+constexpr size_t PED_NUM_NEAR_PEDS = 0x51C;
+constexpr size_t PED_NEAR_PEDS_MAX = 10;
+static_assert(PED_NEAR_PEDS + PED_NEAR_PEDS_MAX * 4 == PED_NUM_NEAR_PEDS,
+              "the count sits right after the ten pointers");
+
+// __thiscall int32 CFireManager::StartScriptFire(const CVector &pos,
+//                                                CEntity *target,
+//                                                float strength,
+//                                                bool propagation)
+//
+// The script's own fire, and the one kind that is not tied to an explosion.
+// Only the host runs CTheScripts::Process (docs/campaign.md), so this is
+// Area D's problem rather than this one's; it is recorded because §5.7's
+// phase three has to account for it.
+constexpr uintptr_t CFireManager__StartScriptFire = 0x00479E60;
+
+// __thiscall void CFire::ProcessFire() - the whole of the burning rule, and
+// the only producer of WEAPONTYPE_FLAMETHROWER damage in the image. See the
+// two call sites named in combat.h.
+constexpr uintptr_t CFire__ProcessFire = 0x004798D0;
+
+// __thiscall void CFire::Extinguish() - clears m_bIsOngoing, nils the
+// entity's back-pointer and, for a ped, calls CPed::RestorePreviousState
+// (0x004C5E30). Safe on a fire that is not burning: the whole body is inside
+// `cmp byte [ebx],0 / je end`.
+constexpr uintptr_t CFire__Extinguish = 0x00479D40;
+
+// How many of the 40 slots are actually alight. Pure arithmetic over the
+// table geometry above so tools/clienttest can check the walk without the
+// game; the caller supplies the reader.
+//
+// Bounded by NUM_FIRES and by nothing else - there is no count to trust. This
+// is the shape the last three crashes said to use: the engine's own bound,
+// read out of the engine's own loop, applied by us.
+template <typename ReadByte>
+inline uint32_t CountOngoingFires(ReadByte readByte) {
+	uint32_t n = 0;
+	for (size_t i = 0; i < NUM_FIRES; ++i) {
+		if (readByte(gFireManager + FIREMGR_FIRES + i * SIZEOF_CFIRE + FIRE_ONGOING))
+			++n;
+	}
+	return n;
+}
+
+// ---- a ped alight without waking its NPC logic (roadmap §5.7 phase three) ---
+//
+// **Why an observer sees no flame on a burning remote player, exactly.** Not
+// a missing feature, a working guard. Everything in retail that sets peds
+// alight in a radius tests bFireProof first, and every remote player is
+// bFireProof:
+//
+//   004B3D9A  mov al,[ecx+53h] / shr al,1 / and al,1 / jne skip   the ped
+//             loop in CWorld::SetPedsOnFire, right after its m_pFire test
+//   004B3EFB  the same three instructions in the car loop
+//   004EA898  the same three, as InflictDamage's entry for cause 9
+//             (WEAPONTYPE_FLAMETHROWER, jump table 0x005F9EB8 entry 9):
+//             fire proof returns false before anything else happens
+//
+// So the rocket that lands between two players lights the victim's own ped
+// on the victim's machine and is refused by every observer, which is the
+// "observers never decide damage" rule doing its job. The flame has to be
+// replicated deliberately or not at all - and the same bFireProof test is
+// why replicating it cannot cost the remote ped any health.
+//
+// CShotInfo::Update checks it too, at 0x0055C1D9, right after its distance
+// test. This note used to say it was the one path that did not, and it was
+// wrong: nothing in retail 1.0 lights a bFireProof ped. ped.cpp still puts out
+// a fire on a remote ped that it did not light itself (PlanRemoteFire), which
+// now covers fires lit before the proof flag was set, or by another mod.
+//
+// Verified 2026-09-22. §5.7 said the entity arm of StartFire "calls SetFlee,
+// SetMoveState(PEDMOVE_SPRINT), SetMoveAnim() and SetPedState(PED_ON_FIRE)"
+// and treated that as the price of a flame. It is not the price: it is one
+// branch of the function, and **the engine itself skips it**.
+//
+// CFireManager::StartFire(entity, fleeFrom, strength, propagation), the ped
+// arm, reads:
+//
+//   00479640  mov [ebp+4B4h], esi           ped->m_pFire = fire
+//   00479646  call 004A1150                 FindPlayerPed()
+//   0047964B  cmp ebp, eax
+//   0047964F  je  00479890                  ...which jumps straight to 004796C7
+//   -------- everything between is NPC logic; only a non-player ped runs it
+//   0047965C  call 004D1D70 / 00479690 call 004D1C40    CPed::SetFlee
+//   004796A7  and al,0DFh                   clear bit 5 of [ped+157h]
+//   004796B1  call 004C5A30 (push 4)        CPed::SetMoveState(PEDMOVE_SPRINT)
+//   004796BA  call [vtable+48h]             CPed::SetMoveAnim()
+//   004796BD  mov [ebp+224h], 20h           m_nPedState = PED_ON_FIRE
+//   -------- 004796C7 onward is shared, and is nothing but field writes
+//
+// So there is a second, already-shipping way for a ped to be on fire in GTA
+// III with no burning-ped logic attached to it at all, and it is the way the
+// engine uses for the one ped whose movement is not the engine's to decide.
+// A remote player is exactly that ped on this machine. CoopIII takes the
+// same branch rather than inventing one: the writes below are the common
+// tail, transcribed, in its order.
+//
+//   0047971E  m_vecPos       = entity->GetPosition()      FIRE_POS
+//   00479739  m_bIsOngoing   = 1                          FIRE_ONGOING
+//   0047973C  m_bIsScriptFire= 0                          FIRE_SCRIPT
+//   00479764  call 004D48E0  CPed::IsPlayer -> m_nExtinguishTime is
+//             now + 0D05h (3333 ms) for a player ped, now + 2710h plus a
+//             random spread for anything else                FIRE_EXTINGUISH
+//   0047982E  m_nStartTime   = now + 190h (400 ms)         FIRE_START_TIME
+//   0047983D  m_pEntity      = entity                      FIRE_ENTITY
+//   00479844  call 004A7480  CEntity::RegisterReference(&m_pEntity)
+//   0047984D  m_pSource      = fleeFrom                    FIRE_SOURCE
+//   0047985F  call 004A7480  the same, for m_pSource, when it is not nil
+//   00479866  call 004798B0  CFire::ReportThisFire
+//   0047986B  m_nNextTimeToAddFlames = 0                   FIRE_NEXT_FLAMES
+//   00479872  m_fStrength    = strength                    FIRE_STRENGTH
+//   0047987D  m_bPropagationFlag = propagation             FIRE_PROPAGATION
+//   00479880  m_bAudioSet    = 1                           FIRE_AUDIO_SET
+//
+// What the tail does *not* write is as load-bearing as what it does:
+// field_20 (+0x20) and m_nFiremenPuttingOut (+0x28) keep whatever the slot's
+// last tenant left in them. Only CFire::CFire touches those, and it runs
+// once at startup, so a fire that "resets" them is doing something retail
+// never does. CoopIII writes exactly this list and nothing else.
+//
+// And the NPC arm is the *only* thing StartFire puts on a ped.
+// CFire::ProcessFire writes nothing to a burning ped but the position it reads
+// back out of it: it asserts the m_pFire back-pointer, nudges m_vecPos.z,
+// sets a burning car's engine damage, and calls InflictDamage - which for a
+// remote player is refused twice over (below). Nothing in the per-frame path
+// touches m_nPedState, m_nMoveState or the clump. That is why this is a
+// visual replication and not a second authority over the pose stream.
+constexpr uint32_t PEDSTATE_ON_FIRE = 32;   // 20h, StartFire's own write
+
+// __thiscall bool CPed::IsPedInControl() - StartFire's gate for a ped, at
+// 0x004795C2, and the reason §5.7 called this a reconciliation loop rather
+// than an event handler: a seated, dying or dead remote ped is refused a
+// fire and has to be offered one again on a later frame.
+//
+//   004CE6C0  cmp dword [ecx+224h],22h / jg fail    m_nPedState <= 34
+//   004CE6C9  [ecx+155h] bit 3 / bit 4 set -> fail
+//   004CE6E3  fld [ecx+2C0h] / fcomp [0x5F8438]     m_fHealth > 0.0f
+//
+// Both field offsets are ones this file already had - PED_STATE at 0x224 and
+// PED_HEALTH at 0x2C0 - which is what identifies the function. PED_DRIVING
+// is 44 and PED_DIE/PED_DEAD are 48/49, so all three fail the first test.
+constexpr uintptr_t CPed__IsPedInControl = 0x004CE6C0;
+
+// __thiscall void CFire::ReportThisFire() - ten instructions, and both of
+// them matter:
+//
+//   004798B0  inc dword [0x008F31D0]                   m_nTotalFires++
+//   004798B6  push 3E8h / push [ecx+0Ch],[ecx+8],[ecx+4] / push 7
+//   004798C6  call 00475E10                            an EVENT_FIRE at m_vecPos
+//
+// The count is what CFire::Extinguish decrements, so skipping this call
+// would leave the manager's total drifting down every time a remote player
+// stopped burning. The event is the city simulation noticing a fire that is
+// really in this world, which it is.
+constexpr uintptr_t CFire__ReportThisFire = 0x004798B0;
+
+// StartFire registers both &m_pEntity and &m_pSource through
+// CEntity::RegisterReference (0x004A7480, recorded above with the seating
+// work), so a burning ped that gets deleted leaves the fire pointing at
+// nothing instead of at a freed pool slot. The fire seam does the same.
+
+// The rest of the CFire layout, from the same transcription. FIRE_ONGOING,
+// FIRE_SCRIPT, FIRE_POS, FIRE_ENTITY, FIRE_SOURCE, FIRE_EXTINGUISH and
+// FIRE_STRENGTH are above.
+constexpr size_t FIRE_PROPAGATION = 0x02;
+constexpr size_t FIRE_AUDIO_SET   = 0x03;
+constexpr size_t FIRE_START_TIME  = 0x1C;
+constexpr size_t FIRE_NEXT_FLAMES = 0x24;
+
+// 0.8f, and it is the same number three different ways: CFire::CFire's own
+// initialiser (3F4CCCCDh), the constant CWorld::SetPedsOnFire pushes
+// (0x005F7A50) and the one CShotInfo::Update pushes (0x00603028). There is
+// no second strength for a ped in retail 1.0.
+constexpr float FIRE_PED_STRENGTH = 0.8f;
+
+// Which slot a CFire pointer is, and where a slot lives. Pure arithmetic
+// over the table geometry, so tools/clienttest can check the round trip
+// without the game.
+//
+// CoopIII remembers the *index*, never the pointer, for the same reason
+// RemotePlayer::poolHandle is a pool reference and not a CPed* - the slot
+// outlives the tenant, and an index that has been re-let is a question the
+// contents can answer (m_pEntity still points at our ped) where a pointer
+// would just keep matching.
+inline uintptr_t FireSlot(size_t index) {
+	return gFireManager + FIREMGR_FIRES + index * SIZEOF_CFIRE;
+}
+
+// -1 for anything that is not the start of one of the 40 slots.
+inline int FireSlotIndex(const void *fire) {
+	const uintptr_t addr = reinterpret_cast<uintptr_t>(fire);
+	const uintptr_t base = gFireManager + FIREMGR_FIRES;
+	if (addr < base)
+		return -1;
+	const uintptr_t delta = addr - base;
+	if (delta % SIZEOF_CFIRE != 0)
+		return -1;
+	const uintptr_t index = delta / SIZEOF_CFIRE;
+	if (index >= NUM_FIRES)
+		return -1;
+	return static_cast<int>(index);
+}
+
+// ---- the moving entity list -----------------------------------------------
+//
+// CWorld::ms_listMovingEntityPtrs (0x008F433C) is a CPtrList of every physical
+// the engine still has to simulate, and CWorld::Process walks it four times a
+// frame. The very first of those walks, at 0x004B1B20, is three instructions:
+//
+//     mov ebp, [edi]        node->item, the entity
+//     mov edi, [edi+8]      node->next
+//     mov eax, [ebp+4Ch]    entity->m_rwObject
+//
+// so a node whose entity has been freed faults on the third one, at
+// 0x004B1B25, with nothing in the call stack to say who freed it. This block
+// exists because CoopIII destroys peds the engine is still holding, and
+// getting that wrong is invisible until it is fatal.
+
+// __thiscall void CPhysical::AddToMovingList(void).
+//
+//     push 0Ch / call CPtrNode::operator new
+//     test eax,eax / je +2 / mov [eax],ebx     node->item = this
+//     mov [ebx+0E8h], eax                      m_movingListNode = node
+//     ... links it at the head of [0x008F433C]
+//
+// Note what isn't there: any check for an entity that is already in the list.
+// Call it twice and the first node is simply forgotten by the entity while
+// staying in the list, which is the other way to end up at 0x004B1B25.
+constexpr uintptr_t CPhysical__AddToMovingList = 0x004958F0;
+
+// __thiscall void CPhysical::RemoveFromMovingList(void).
+//
+// The safe half of the pair: it opens `mov ecx,[ebx+0E8h] / test ecx,ecx /
+// je end`, so calling it on an entity that isn't in the list costs four
+// instructions and does nothing. That is what makes it usable as an
+// unconditional belt before a teardown.
+constexpr uintptr_t CPhysical__RemoveFromMovingList = 0x00495940;
+
+// CPed::FlagToDestroyWhenNextProcessed, vtable slot 16 (+0x40). Recorded for
+// the evidence rather than to be called: it is what CAutomobile::BlowUpCar,
+// CPed::SetDie's PED_DRIVING arm and CopPed all use to hand a ped to the
+// engine to destroy on its own schedule.
+constexpr uintptr_t CPed__FlagToDestroyWhenNextProcessed = 0x004D6570;
+constexpr size_t    VTABLE_FLAG_TO_DESTROY               = 16;
+
+// Will the engine's own CWorld::Remove take this entity out of the moving
+// list, or quietly leave it there?
+//
+// Both CWorld::Add (0x004AE930) and CWorld::Remove (0x004AE9D0) end with the
+// same three tests, byte for byte:
+//
+//     mov al,[ebx+50h] / and al,7
+//     cmp al,1 / je skip          ENTITY_TYPE_BUILDING
+//     cmp al,5 / je skip          ENTITY_TYPE_DUMMY
+//     mov al,[ebx+51h] / shr al,2 / and al,1      bIsStatic
+//     jne skip
+//     call AddToMovingList        (in Add)
+//     call RemoveFromMovingList   (in Remove)
+//
+// which also re-confirms ENTITY_FLAGS_A and ENTITY_IS_STATIC. The gate is
+// symmetric on paper and asymmetric in practice, because the flag can change
+// between the two calls: an entity linked in while it was moving, and static
+// by the time it is removed, never gets unlinked. ~CPed's first statement is
+// CWorld::Remove(this), so that is the path every ped teardown takes.
+inline bool WorldRemoveUnlinksFromMovingList(uint8_t entityFlagsA) {
+	return (entityFlagsA & offs::ENTITY_IS_STATIC) == 0;
+}
+
+// Does this entity need the unlink doing by hand before it is destroyed?
+//
+// `linked` is m_movingListNode != null. The dangerous combination is the one
+// this returns true for: still in the list, and static, so the engine's own
+// teardown will walk straight past it.
+inline bool NeedsMovingListUnlink(uint8_t entityFlagsA, bool linked) {
+	return linked && !WorldRemoveUnlinksFromMovingList(entityFlagsA);
+}
+
+// Is this address inside the game image? Every CEntity vtable is, because
+// they all live in the exe's read-only data.
+inline bool IsImageAddress(uintptr_t value) {
+	return value >= IMAGE_BASE && value < IMAGE_BASE + IMAGE_SIZE;
+}
+
+// Could this value be a pointer to a game object, or is it something that
+// was never a pointer at all?
+//
+// Deliberately weak. It is not trying to prove a pointer is good, only to
+// reject a value that cannot possibly be one, because that is the shape the
+// crash at 0x004B1B25 actually had: `node->item` was 0x0000020E, 526, which
+// is a small integer sitting where an entity pointer belongs.
+//
+// Three cheap tests. Below 64K is the reserved null region no allocation ever
+// lands in. Above 2 GB is kernel space for a 32-bit process without
+// /LARGEADDRESSAWARE, and gta3.exe is not. And every C++ object with a vtable
+// is at least 4-byte aligned, which 526 is not.
+inline bool LooksLikeGameObject(uintptr_t value) {
+	constexpr uintptr_t USER_MIN = 0x00010000;
+	constexpr uintptr_t USER_MAX = 0x80000000;
+	return value >= USER_MIN && value < USER_MAX && (value & 3) == 0;
+}
+
+// Is a node in CWorld::ms_listMovingEntityPtrs safe for CWorld::Process to
+// dereference?
+//
+// `item` is the node's entity pointer and `vtable` is the first dword at that
+// address, which the caller only reads once `LooksLikeGameObject(item)` has
+// said it is worth reading. The vtable of a live entity always points into
+// the image; a block that has been recycled for something else almost never
+// does.
+inline bool MovingListNodeIsSane(uintptr_t item, uintptr_t vtable) {
+	return LooksLikeGameObject(item) && IsImageAddress(vtable);
+}
+// ---- the HUD: bitmap font, 2D sprites, world to screen --------------------
+//
+// Everything a nametag needs to be drawn with the game's own font and the
+// game's own weapon icons rather than an imitation of them. Verified
+// 2026-09-21 by walking the retail image and matching it against
+// reference/re3 src/render/Hud.cpp, src/render/Font.cpp and
+// src/render/Sprite.cpp statement for statement.
+//
+//   CHud::Initialise (0x005048F0) is re3 Hud.cpp:179-205. It pushes "hud"
+//   (0x005FDB28) and "MODELS/HUD.TXD" (0x005FDB2C) into the txd store, then:
+//     mov  ebp,0095CB9Ch
+//     mov  eax,[ebx*8+005FDA70h] / mov edx,[ebx*8+005FDA74h]   WeaponFilenames
+//     mov  ecx,ebp / call 0051EA70              CSprite2d::SetTexture(n, mask)
+//     inc  ebx / add ebp,4 / cmp ebx,17h
+//   so Sprites lives at 0x0095CB9C, a CSprite2d is 4 bytes wide (it is one
+//   RwTexture*), and there are 23 of them. CHud::Shutdown (0x00504C50) walks
+//   the same base with the same stride and the same count.
+//
+//   CHud::Draw (0x005052A0) opens with re3 Hud.cpp:320-329 exactly:
+//     push 1 / call 00492F60                    CPad::GetPad(1)
+//     cmp  word [eax+18h],0                     NewState.Start
+//     cmp  word [eax+42h],0                     OldState.Start (0x2A + 0x18)
+//     mov  byte [0095CD89h],al                  m_Wants_To_Draw_Hud = !it
+//     cmp  byte [0095CD5Bh],1                   CReplay::Mode == PLAYBACK
+//     cmp  byte [0095CD89h],1 / test al,al      && !TheCamera.m_WideScreenOn
+//   with al loaded from 0x006FAD68, which is TheCamera + 0x70. Its one and
+//   only caller is Render2dStuff, at 0x0048E420, and the four calls after it
+//   are OnscnTimer / CMessages::Display / CDarkel::DrawMessages /
+//   CGarages::PrintMessages / CPad::PrintErrorMessage / CFont::DrawFonts, in
+//   re3 main.cpp:1510-1519 order.
+//
+//   CFont::Initialise's tail (0x00500B00-0x00500B90) calls sixteen setters in
+//   re3 Font.cpp:127-143 order, which is what names them one by one, and each
+//   setter body writes a different member of the struct at 0x008F317C. That
+//   struct matches re3's CFontDetails field for field, so the setter list
+//   below is proved twice over: by the order they are called in and by the
+//   offset each one writes.
+//
+//   CFont::InitPerFrame (0x00500BE0) is re3 Font.cpp:105-112:
+//     mov eax,[0095CC04h] / push 1Eh / call 0051EB70 / mov [008F31B4h],eax
+//     mov eax,[0095CC08h] / push 0Fh / call 0051EB70
+//     mov eax,[0095CC0Ch] / push 0Fh / call 0051EB70
+//   i.e. Details.bank = GetBank(30, Sprite[0].m_pTexture) and two more banks
+//   of 15. This was the "high confidence, unverified" row in
+//   docs/addresses-unverified.md; it holds, so it lives here now.
+//
+//   CSprite::CalcScreenCoors (0x0051C3A0) is re3 Sprite.cpp:37-58:
+//     fld [008E2DC4h] / fld [009434F0h]         far clip, near clip
+//     push 7095F0h / call 004BA4D0              TheCamera.m_viewMatrix * in
+//     fld 1.0f / fadd nearclip / fcomp z        z <= nearZ + 1 -> false
+//     fcom farclip / cmp byte [esp+38h],0       farclip argument
+//     fld 1.0f / fdiv z                         recip
+//     fild [008F436Ch] / fmul / fmul [edi]      out->x *= SCREEN_WIDTH*recip
+//     fild [008F4370h] / fmul / fmul [edi+4]    out->y *= SCREEN_HEIGHT*recip
+//     fild width  -> [esi]                      *outw
+//     fild height -> [ebx]                      *outh
+//     fld [005FF280h] / fdiv [005FBC6Ch]        DefaultFOV / CDraw::ms_fFOV
+//   It is __cdecl (plain ret) and takes five dwords.
+
+constexpr uintptr_t CHud__Draw     = 0x005052A0;   // __cdecl, no arguments
+constexpr uintptr_t CHud__Sprites  = 0x0095CB9C;   // CSprite2d[23]
+constexpr size_t    SIZEOF_SPRITE2D          = 0x04;
+constexpr size_t    NUM_HUD_SPRITES          = 23;
+constexpr uintptr_t CHud__m_Wants_To_Draw_Hud = 0x0095CD89;   // bool
+
+// int16, the HUD item a tutorial points at by flashing it, -1 for none.
+// FLASH_HUD_OBJECT's handler (range 900's table entry 99, 0x0044F9F9) is
+//     push 1 / call 004382E0                      CollectParameters, one operand
+//     mov  ax,[006ED460h] / mov [0095CC82h],ax    m_ItemToFlash = ScriptParams[0]
+// and CHud::Draw skips the radar every other eight frames while it is 8:
+//     0050836B  cmp word [0095CC82h],8 / jne draw
+//               mov eax,[009412ECh] / and eax,8 / jne draw   CTimer::m_FrameCounter
+//     0050837F  cmp word [0095CC82h],8 / je 0050849E         past the radar
+// The mission's own cleanup puts it back (`or word [0095CC82h],0FFFFh` at
+// 0x00437CC7, right before CHud::SetHelpMessage), so on the owner's machine
+// a mission that ends mid-flash stops it.
+constexpr uintptr_t CHud__m_ItemToFlash = 0x0095CC82;
+constexpr int16_t   HUD_ITEM_NONE       = -1;
+constexpr int16_t   HUD_ITEM_RADAR      = 8;
+
+// TheCamera + this is the byte CHud::Draw tests before drawing anything.
+// Cutscenes and the widescreen bars set it.
+constexpr size_t CAMERA_WIDESCREEN_ON = 0x70;   // -> 0x006FAD68
+
+// A HUD sprite index IS the eWeaponType: Hud.cpp:539 is
+// `Sprites[WeaponType].Draw(...)` and the retail does the same indexing off
+// the value it read out of m_weapons[m_currentWeapon] (0x00506216,
+// `lea ebx,[ebx*4] / add ebx,0095CB9Ch`). 0..12 are the twelve weapons plus
+// the detonator; 13 and 14 are blank entries.
+constexpr uint8_t HUD_SPRITE_LAST_WEAPON = 12;
+
+// CSprite2d::Draw(const CRect &r, const CRGBA &col, float u0, float v0,
+//                 float u1, float v1, float u2, float v2, float u3, float v3)
+// __thiscall, ret 28h. The retail call at 0x0050625E passes the rect pointer
+// first and the colour pointer second, and the callee hands both straight to
+// CSprite2d::SetVertices (0x0051F220) with the colour repeated four times,
+// which is re3 Sprite2d.cpp's Draw.
+constexpr uintptr_t CSprite2d__Draw          = 0x0051ED90;
+constexpr uintptr_t CSprite2d__SetRenderState = 0x0051F950;
+constexpr uintptr_t CSprite2d__DrawBank      = 0x0051EC50;
+constexpr uintptr_t CSprite2d__GetBank       = 0x0051EB70;
+
+// The UV inset the HUD itself draws a weapon icon with, read out of
+// 0x0050622C-0x0050625C: 0.015 at 0x005FDBBC, 1.0 at 0x005FDB5C, 0.0 at
+// 0x005FDB60. Same eight numbers as re3 Hud.cpp:539-551, same order.
+constexpr float HUD_ICON_U0 = 0.015f, HUD_ICON_V0 = 0.015f;
+constexpr float HUD_ICON_U1 = 1.0f,   HUD_ICON_V1 = 0.0f;
+constexpr float HUD_ICON_U2 = 0.015f, HUD_ICON_V2 = 1.0f;
+constexpr float HUD_ICON_U3 = 1.0f,   HUD_ICON_V3 = 1.0f;
+
+// CRect is { left, bottom, right, top } in memory, in that order, even
+// though its constructor takes (l, t, r, b). CRect::CRect at 0x004BA330 is
+// four fld/fstp pairs and says so outright: arg1 -> +0x00, arg2 -> +0x0C,
+// arg3 -> +0x08, arg4 -> +0x04. re3 math/Rect.h declares the same order.
+// Build one by hand rather than calling the constructor and getting the
+// argument order backwards.
+constexpr size_t RECT_LEFT = 0x00, RECT_BOTTOM = 0x04, RECT_RIGHT = 0x08,
+                 RECT_TOP = 0x0C;
+
+// CSprite::CalcScreenCoors(const RwV3d *in, RwV3d *out, float *outw,
+//                          float *outh, bool farclip) -> bool
+// __cdecl. out->z comes back as the view-space depth, which is the only
+// distance a nametag needs, so nothing here has to know where the camera is.
+constexpr uintptr_t CSprite__CalcScreenCoors = 0x0051C3A0;
+constexpr uintptr_t CDraw__ms_fFarClipZ      = 0x008E2DC4;
+constexpr uintptr_t CDraw__ms_fNearClipZ     = 0x009434F0;
+constexpr uintptr_t CDraw__ms_fFOV           = 0x005FBC6C;
+constexpr uintptr_t CCamera__m_viewMatrix    = 0x007095F0;
+
+// RsGlobal, from re3 skel/skeleton.h: appName, width, height, maximumWidth,
+// maximumHeight, maxFPS, quit. The analysis pass already had quit at
+// 0x008F4378, which puts the struct at 0x008F4360 and the two members below
+// where CalcScreenCoors and every SCREEN_SCALE_* in the HUD read them.
+// SCREEN_WIDTH is the int at 0x008F436C; the HUD's own scaling is
+// `value * SCREEN_WIDTH / 640` (1/640 = 0.0015625 at 0x005FDB58) on x and
+// `value * SCREEN_HEIGHT / 448` (1/448 at 0x005FDB4C) on y, so the retail
+// build does scale its HUD with the resolution.
+constexpr uintptr_t RsGlobal__maximumWidth  = 0x008F436C;   // int32
+constexpr uintptr_t RsGlobal__maximumHeight = 0x008F4370;   // int32
+constexpr float     HUD_REF_WIDTH  = 640.0f;
+constexpr float     HUD_REF_HEIGHT = 448.0f;
+
+// CFont. Details is the struct every setter writes into; the offsets in the
+// comments are from re3's CFontDetails and each one is witnessed by the
+// setter beside it.
+constexpr uintptr_t CFont__Details      = 0x008F317C;
+constexpr uintptr_t CFont__Sprite       = 0x0095CC04;   // CSprite2d[3]
+constexpr uintptr_t CFont__InitPerFrame = 0x00500BE0;
+// DrawFonts is DrawBank(bank), DrawBank(bank + 1), DrawBank(bank + 2) off
+// Details.bank and nothing else (0x00501B50-0x00501B78), and DrawBank renders
+// what is queued and zeroes the count (`mov [ebx*4+006F4500h],0` at
+// 0x0051ECBC). So calling it early only flushes: Render2dStuff calls it again
+// at 0x0048E443 for whatever is queued after. Eleven call sites in the image;
+// the scoreboard adds a twelfth, to get the HUD's text under its panel.
+constexpr uintptr_t CFont__DrawFonts    = 0x00501B50;
+
+// PrintChar(float x, float y, wchar c), __cdecl, reached from PrintString's
+// inner loop (0x0050179F, its only caller). Before anything else it drops the
+// glyph unless 0 < x < SCREEN_WIDTH and 0 < y < SCREEN_WIDTH:
+//   mov edx,[008F436Ch] / fild / fcomp [esp+50h]    x      (jne skip)
+//   fld [esp+50h] / fcomp [005FD704h]                x > 0.0f
+//   fld [esp+54h] / fcomp [005FD704h]                y > 0.0f
+//   fild edx / fcomp [esp+54h]                       y, against the WIDTH
+// edx is still maximumWidth at the fourth test; maximumHeight (0x008F4370) is
+// never loaded. re3 Font.cpp keeps the same bug. On a window taller than it is
+// wide nothing prints with its top at y >= width, which is what hid the
+// version mark in a 958x1000 window. Queued, not drawn: the glyph goes into a
+// sprite bank through CSprite2d::AddSpriteToBank (0x0051EBC0).
+constexpr uintptr_t CFont__PrintChar    = 0x00500C30;
+
+// The call in PrintString's loop, `E8 8C F4 FF FF`, and the only one in the
+// image. No rel32 call, jmp or jcc anywhere in .text lands inside the cull
+// block below (tools/clienttest scans for it when given the exe).
+constexpr uintptr_t CFont__PrintString_PrintCharCall = 0x0050179F;
+
+// game/fontcull.cpp rewrites the fourth test to load the height. The eight
+// bytes at 0x00500C7F are two instructions, both only there to get edx onto
+// the FPU stack:
+//   89 54 24 10    mov [esp+10h],edx
+//   DB 44 24 10    fild dword [esp+10h]
+// and become
+//   DB 05 70 43 8F 00   fild dword [008F4370h]      maximumHeight
+//   66 90               nop
+// Same x87 stack, same flags into the fcomp after it. [esp+10h] is scratch:
+// its next use is the store at 0x00500CB0, before the load at 0x00500CB8.
+// edx is not read again before `call 005017E0` at 0x00500C99 clobbers it.
+// Nothing branches into the eight bytes: every jump in PrintChar goes to
+// 0x00500CEF, 0x00500DEC, 0x00500E90, 0x00500F39 or 0x00500F4B, so they are
+// only ever reached by falling through the `jne 00500F4B` at 0x00500C79.
+// Not a detour: no code of ours runs, nothing to trampoline.
+constexpr uintptr_t CFont__PrintChar_CullY = 0x00500C7F;
+
+// Retail's whole cull block, 0x00500C30..0x00500C95, the four tests. The fix
+// goes in only if all of it is still this, so a mod that has touched any part
+// of it (or detoured PrintChar at its entry) keeps it.
+constexpr uint8_t PRINTCHAR_CULL_RETAIL[] = {
+    0x8B, 0x15, 0x6C, 0x43, 0x8F, 0x00,   // mov edx,[008F436Ch]      width
+    0x53,                                 // push ebx
+    0x83, 0xEC, 0x48,                     // sub esp,48h
+    0x8B, 0x5C, 0x24, 0x58,               // mov ebx,[esp+58h]        c
+    0x89, 0x54, 0x24, 0x10,               // mov [esp+10h],edx
+    0xDB, 0x44, 0x24, 0x10,               // fild dword [esp+10h]
+    0xD8, 0x5C, 0x24, 0x50,               // fcomp dword [esp+50h]    x
+    0xDF, 0xE0,                           // fnstsw ax
+    0xF6, 0xC4, 0x45,                     // test ah,45h
+    0x0F, 0x85, 0xF6, 0x02, 0x00, 0x00,   // jne 00500F4B
+    0xD9, 0x44, 0x24, 0x50,               // fld dword [esp+50h]
+    0xD8, 0x1D, 0x04, 0xD7, 0x5F, 0x00,   // fcomp dword [005FD704h]  0.0f
+    0xDF, 0xE0,                           // fnstsw ax
+    0xF6, 0xC4, 0x45,                     // test ah,45h
+    0x0F, 0x85, 0xE1, 0x02, 0x00, 0x00,   // jne 00500F4B
+    0xD9, 0x44, 0x24, 0x54,               // fld dword [esp+54h]      y
+    0xD8, 0x1D, 0x04, 0xD7, 0x5F, 0x00,   // fcomp dword [005FD704h]  0.0f
+    0xDF, 0xE0,                           // fnstsw ax
+    0xF6, 0xC4, 0x45,                     // test ah,45h
+    0x0F, 0x85, 0xCC, 0x02, 0x00, 0x00,   // jne 00500F4B
+    0x89, 0x54, 0x24, 0x10,               // mov [esp+10h],edx        0x00500C7F
+    0xDB, 0x44, 0x24, 0x10,               // fild dword [esp+10h]     width again
+    0xD8, 0x5C, 0x24, 0x54,               // fcomp dword [esp+54h]    y
+    0xDF, 0xE0,                           // fnstsw ax
+    0xF6, 0xC4, 0x45,                     // test ah,45h
+    0x0F, 0x85, 0xB5, 0x02, 0x00, 0x00,   // jne 00500F4B
+};
+constexpr uint8_t PRINTCHAR_CULL_Y_HEIGHT[] = {
+    0xDB, 0x05, 0x70, 0x43, 0x8F, 0x00,   // fild dword [008F4370h]
+    0x66, 0x90,                           // nop
+};
+static_assert(sizeof(PRINTCHAR_CULL_RETAIL) == 0x00500C96 - CFont__PrintChar,
+              "the cull block runs up to the last jne");
+static_assert(CFont__PrintChar_CullY + sizeof(PRINTCHAR_CULL_Y_HEIGHT) <=
+                  CFont__PrintChar + sizeof(PRINTCHAR_CULL_RETAIL),
+              "the fix sits inside the block");
+static_assert(uint32_t(PRINTCHAR_CULL_Y_HEIGHT[2] | PRINTCHAR_CULL_Y_HEIGHT[3] << 8 |
+                       PRINTCHAR_CULL_Y_HEIGHT[4] << 16 | PRINTCHAR_CULL_Y_HEIGHT[5] << 24) ==
+                  RsGlobal__maximumHeight,
+              "and the fild reads the height");
+
+// CSprite2d::DrawRect(const CRect &r, const CRGBA &col), static, __cdecl, two
+// pointers. The disassembly listing runs off the rails at the padding before
+// it, so read the bytes: 0x0051F970 is `8B 44 24 04` (mov eax,[esp+4]), then
+// SetVertices(r, col, col, col, col, 0) at 0x0051EE90, RwRenderStateSet
+// (0x005A43C0) texture raster nil, flat shading, z-test and z-write off,
+// vertex alpha = (col.a != 255), RwIm2DRenderPrimitive(TRIFAN, maVertices, 4)
+// (0x005A4430), then z-test and z-write back on and Gouraud. Drawn at once,
+// not queued. Render2dStuff itself calls it three times on the way into
+// CHud::Draw (0x0048E336, 0x0048E391, 0x0048E3F4) and CFont::PrintString
+// calls it for a text background (0x00500FB5), so the state it leaves is one
+// the HUD already runs in.
+constexpr uintptr_t CSprite2d__DrawRect = 0x0051F970;
+
+// PrintString(float x, float y, wchar *s), __cdecl, three dwords. It returns
+// immediately if the first character is '*' (cmp word [esi],2Ah at
+// 0x00500F64) and it treats '~' as the start of a colour token, so a nickname
+// has to be filtered before it gets here.
+constexpr uintptr_t CFont__PrintString = 0x00500F50;
+
+// GetStringWidth(wchar *s, bool spaces) -> float in st0, __cdecl. The width
+// comes back in screen pixels with whatever scale is currently set, so set
+// the style, the scale and prop on/off first. PrintString itself calls it
+// this way at 0x00501005 (`push 0 / push esi / call 005018A0`).
+constexpr uintptr_t CFont__GetStringWidth = 0x005018A0;
+
+constexpr uintptr_t CFont__SetScale               = 0x00501B80;   // +0x04,+0x08
+constexpr uintptr_t CFont__SetSlantRefPoint       = 0x00501BA0;   // +0x10,+0x14
+constexpr uintptr_t CFont__SetSlant               = 0x00501BC0;   // +0x0C
+constexpr uintptr_t CFont__SetColor               = 0x00501BD0;   // +0x00
+constexpr uintptr_t CFont__SetJustifyOn           = 0x00501C60;   // +0x18
+constexpr uintptr_t CFont__SetJustifyOff          = 0x00501C80;
+constexpr uintptr_t CFont__SetCentreOn            = 0x00501C90;   // +0x19
+constexpr uintptr_t CFont__SetCentreOff           = 0x00501CB0;
+constexpr uintptr_t CFont__SetWrapx               = 0x00501CC0;   // +0x28
+constexpr uintptr_t CFont__SetCentreSize          = 0x00501CD0;   // +0x2C
+constexpr uintptr_t CFont__SetBackgroundOn        = 0x00501CE0;   // +0x1B
+constexpr uintptr_t CFont__SetBackgroundOff       = 0x00501CF0;
+constexpr uintptr_t CFont__SetBackgroundColor     = 0x00501D00;   // +0x24
+constexpr uintptr_t CFont__SetBackGroundOnlyTextOn  = 0x00501D30; // +0x1C
+constexpr uintptr_t CFont__SetBackGroundOnlyTextOff = 0x00501D40;
+constexpr uintptr_t CFont__SetRightJustifyOn      = 0x00501D50;   // +0x1A
+constexpr uintptr_t CFont__SetRightJustifyOff     = 0x00501D70;
+constexpr uintptr_t CFont__SetPropOff             = 0x00501D90;   // +0x1D
+constexpr uintptr_t CFont__SetPropOn              = 0x00501DA0;
+constexpr uintptr_t CFont__SetFontStyle           = 0x00501DB0;   // +0x34, int16
+constexpr uintptr_t CFont__SetRightJustifyWrap    = 0x00501DC0;   // +0x30
+constexpr uintptr_t CFont__SetAlphaFade           = 0x00501DD0;   // +0x20
+constexpr uintptr_t CFont__SetDropShadowPosition  = 0x00501E70;   // +0x3C, int16
+constexpr uintptr_t CFont__SetDropColor           = 0x00501DE0;   // +0x3E
+// Details.bank sits at +0x38 between style and dropShadowPosition, which is
+// what CFont::DrawFonts reads (`mov eax,[008F31B4h]` at 0x00501B50).
+
+// Details.wrapX. CFont::PrintString starts a new line as soon as x passes it
+// (`fld [008F31A4h]` at 0x00501040), and CFont::Initialise leaves it at a flat
+// 640.0f whatever the resolution is (0x00500B10 pushes the constant at
+// 0x005FD708). So anything printing past x=640 on a wider screen has to raise
+// it first, and put it back if it does.
+constexpr size_t FONTDETAILS_WRAPX = 0x28;
+
+// re3 Font.h's enum. FONT_HEADING is the face the clock, the money and the
+// health counter are drawn in, and the retail proves the value: the
+// DrawHealth setup at 0x005063E8 is `push 2 / call 00501DB0`.
+constexpr int16_t FONT_BANK    = 0;
+constexpr int16_t FONT_PAGER   = 1;
+constexpr int16_t FONT_HEADING = 2;
+
+// A glyph cell in FONT_BANK/FONT_HEADING is 32*scaleX wide and 40*scaleY*0.5
+// tall in screen pixels (re3 Font.cpp CFont::PrintChar). Line height is the
+// only one a caller needs.
+constexpr float FONT_CELL_HEIGHT = 20.0f;
+
+// SetAlphaFade is multiplied into whatever SetColor is handed next, and
+// CHud::Draw leaves it at whatever its zone-name fade last computed
+// (0x0050939C). Anything that prints its own text has to set it.
+constexpr float FONT_ALPHA_OPAQUE = 255.0f;
+
+// ---- can this point see that point ----------------------------------------
+//
+// CWorld has two ray tests and they are not interchangeable.
+// ProcessLineOfSight walks every sector the line crosses to find the *nearest*
+// hit and fills in a CColPoint and the entity that owns it.
+// GetIsLineOfSightClear answers yes or no and returns the moment anything
+// blocks. For "is this player behind something" the second one is the right
+// tool and it is several times cheaper on a blocked line, which is the case
+// that happens in a city.
+//
+//   CWorld::GetIsLineOfSightClear (0x004AEAA0) is re3 World.cpp:462-560:
+//     push ebx/esi/edi/ebp / sub esp,260h
+//     cmp word [0095CC64h],0FFFFh / inc it, or call 004B1F60 and set it to 1
+//                                            AdvanceCurrentScanCode, inlined
+//     mov eax,[esp+274h] / fld [eax]         point1.x, i.e. argument 1
+//     fmul 0.025 / fadd 50.0                 GetSectorIndexX: x/40 + 2000/40,
+//                                            which agrees with the
+//                                            WORLD_MIN_XY and SECTOR_SIZE_XY
+//                                            already recorded above
+//   and the four-branch sector walk after it calls
+//   GetIsLineOfSightSectorClear seventeen times, once per arm and once per
+//   step of the diagonal. All 57 call sites in the image clean `add esp,24h`,
+//   which is the nine arguments re3 declares. One of them, at 0x0042BC51,
+//   pushes six zeroes then `push 1 / push ecx / push eax`, i.e.
+//   (p1, p2, true, false, false, false, false, false) with a defaulted ninth,
+//   the same shape as re3 PathFind.cpp:1462.
+//
+//   CWorld::GetIsLineOfSightSectorClear (0x004B2000) is re3 World.cpp:563-598:
+//     cmp byte [esp+0Ch],0                   checkBuildings
+//     push 0 / push eax / push ebp / push esi / call 004B2160
+//     lea eax,[esi+4]                        the BUILDINGS_OVERLAP list
+//     cmp byte [esp+1Ch],0 / lea eax,[esi+10h]  checkVehicles, list index 4
+//   so a CPtrList is 4 bytes and the lists are in re3's eEntityList order.
+//
+// The two flags worth understanding before choosing them, both from
+// GetIsLineOfSightSectorListClear (0x004B2160), re3 World.cpp:601-622:
+//   ignoreSeeThrough goes straight to CCollision::TestLineOfSight, which then
+//     skips surfaces the collision data marks see-through. Glass and railings.
+//   ignoreSomeObjects skips anything CameraToIgnoreThisObject says yes to,
+//     which is every temporary object plus every object flagged
+//     m_bCameraToIgnoreThisObject. That flag is the level's own list of props
+//     that are not allowed to get between you and what you are looking at.
+// It also skips entities with bUsesCollision clear, and it stamps
+// m_scanCode on everything it touches.
+constexpr uintptr_t CWorld__GetIsLineOfSightClear          = 0x004AEAA0;
+constexpr uintptr_t CWorld__GetIsLineOfSightSectorClear    = 0x004B2000;
+constexpr uintptr_t CWorld__GetIsLineOfSightSectorListClear = 0x004B2160;
+constexpr uintptr_t CWorld__ClearScanCodes                 = 0x004B1F60;
+
+// **Refuted, 2026-09-22.** This line used to read
+// `CWorld__ProcessLineOfSight = 0x004B0DE0`, on the evidence that the function
+// takes 11 arguments (`add esp,2Ch` at every call site) and opens with the
+// same inlined AdvanceCurrentScanCode. Both are true and neither separates it
+// from `CWorld::ProcessVerticalLine`, which also takes 11
+// (point1, z2, point, entity, six bools, poly) and also advances the scan
+// code. Three things say it is the vertical one:
+//
+//   - it reads its *first* argument only and derives one sector from it
+//     (`mov esi,[esp+50h] / fld [esi] / fmul 0.025 / fadd 50.0 / fistp`, then
+//     the same for [esi+4]). A line between two points needs the sector of
+//     both ends and a walk between them; a vertical line needs one;
+//   - its frame is 0x40 bytes with three saved registers. The real
+//     ProcessLineOfSight's is 0x260 with four, the size the sector walk needs
+//     and the same shape as GetIsLineOfSightClear above;
+//   - CWeapon::ProcessLineOfSight (0x00564C00) forwards eleven of its
+//     thirteen arguments to 0x004AF970 and to nothing else, and re3
+//     Weapon.cpp:2301-2304 says that call is CWorld::ProcessLineOfSight.
+//
+// Nothing in the tree had used the old constant, so this is a trap that was
+// never sprung rather than a bug that was fixed. The names are now what the
+// functions are.
+constexpr uintptr_t CWorld__ProcessVerticalLine = 0x004B0DE0;
+constexpr uintptr_t CWorld__ProcessLineOfSight  = 0x004AF970;
+
+// The camera's own position, for casting from. CCamera derives from
+// CPlaceable, so it is the matrix position at the usual offs::POSITION:
+// CSprite::CalcHorizonCoors (0x0051C4A0) opens `mov eax,6FAD2Ch` and then
+// `fld [eax] / fld [eax+4]` with the z forced to zero, which is re3
+// Sprite.cpp:19-21's `CVector p = TheCamera.GetPosition(); p.z = 0.0f;`.
+// 0x006FAD2C is TheCamera + 0x34.
+//
+// The engine casts a ray from exactly here for the same kind of question: re3
+// AudioLogic.cpp:3646 decides whether a sound is occluded with
+// GetIsLineOfSightClear(TheCamera.GetPosition(), soundPos, true, ...).
+
+// ---- the radar: CRadar's blip table ---------------------------------------
+//
+// Everything needed to put something on the minimap through the game's own
+// radar rather than by painting a sprite over the top of it. Verified
+// 2026-09-22 against the retail image and matched against reference/re3
+// src/core/Radar.cpp statement for statement.
+//
+// The route in was the usual one: walk the script opcode that already does
+// the thing. COMMAND_ADD_BLIP_FOR_CHAR is opcode 391, so the 300..399
+// dispatcher table at 0x005EEE30 (base opcode 304) entry 87 is the handler,
+// at 0x0044079E, and it is re3 Script3.cpp:1380-1390 call for call:
+//
+//     call 004382E0                     CollectParameters(&m_nIp, 1)
+//     mov  ecx,[008F2C60] / call 0043EB30   CPools::GetPedPool()->GetAt
+//     call 00438460 / call 004A41C0     the handler's own "useless call" to
+//                                       GetActualBlipArrayIndex
+//     push 3 / push 1 / push eax / push 2
+//     call 004A5640 / add esp,10h       SetEntityBlip(BLIP_CHAR, handle,
+//                                       RADAR_TRACE_GREEN, BOTH), __cdecl
+//     push 3 / push ebx / call 004A57E0 ChangeBlipScale(blip, 3)
+//
+// which is also where the game's own answer to "what does a person look like
+// on the radar" comes from: colour 1, scale 3, no sprite.
+//
+// ---- the array, and its size, measured three separate ways ----------------
+//
+// CRadar::SetEntityBlip (0x004A5640) opens with the free-slot search, and it
+// is the whole of the bound:
+//
+//     xor ecx,ecx / xor eax,eax
+//     add eax,30h / inc ecx                     stride 0x30
+//     cmp byte [eax + 006ED603h],0              m_bInUse
+//     je  found
+//     cmp ecx,20h / jb loop                     32 slots
+//
+// Confirmed twice more, independently:
+//
+//   - CRadar::Initialise (0x004A3EF0) clears the table with `add ebp,30h /
+//     cmp ebx,20h / jl`, the same stride and the same count;
+//   - CReplay's save and restore (0x0059632C, 0x00596874) both do
+//     `push 600h / push 006ED5E0h / call memcpy`, and 0x600 is 32 * 0x30.
+//
+// re3's NUMRADARBLIPS is also 32, so this is one of the few places the
+// decompilation and retail agree - but the number below is read off the
+// binary, not off re3. It had to be: the last fixed-size array this project
+// took from re3 was declared as 16 and was 12 in the retail build, and
+// writing past it corrupted the engine's own stack.
+//
+// ---- and the array has no bounds check ------------------------------------
+//
+// If all 32 slots are in use the search loop falls out with ecx == 32 and
+// SetEntityBlip writes the 33rd entry anyway. re3 guards that behind
+// #ifdef FIX_BUGS; retail does not, so the write lands at
+// 0x006ED5E0 + 32*0x30 = 0x006EDBE0, which is CDarkel::RegisteredKills - the
+// uint16[200] kill register, zeroed eight words at a time by the loop at
+// 0x00421310 and incremented per model id at 0x00421019. It does not crash.
+// It quietly rewrites the kill-frenzy counters, and GetNewUniqueBlipIndex
+// then hands back a handle for slot 32 that every later ChangeBlip* call
+// happily writes through.
+//
+// So nothing may call SetEntityBlip without counting the free slots first.
+// RADAR_TRACE_OVERFLOW_TARGET is here so a test can pin that arithmetic
+// rather than trusting a comment.
+constexpr uintptr_t CRadar__ms_RadarTrace = 0x006ED5E0;
+constexpr size_t    SIZEOF_RADAR_TRACE    = 0x30;
+constexpr size_t    NUM_RADAR_BLIPS       = 32;
+constexpr uintptr_t CDarkel__RegisteredKills        = 0x006EDBE0;   // uint16[200]
+constexpr uintptr_t RADAR_TRACE_OVERFLOW_TARGET     = 0x006EDBE0;
+
+// re3's NUM_DEFAULT_MODELS, and read off the reset loop rather than off re3:
+// CDarkel::ResetModelsKilledByPlayer at 0x00421310 clears eight words per
+// iteration and stops at `cmp ax,0C8h` (0x00421318). 200 entries, uint16 each.
+// The array has no bounds check anywhere - `inc word [eax*2+006EDBE0h]` at
+// 0x00421019 is the whole of the increment - so anything that indexes it with
+// a number that came off a socket has to bound it here first.
+constexpr size_t NUM_DEFAULT_MODELS = 200;
+
+// sRadarTrace, every member witnessed by the instruction that writes it
+// inside SetEntityBlip. The absolute address in each comment is what the
+// disassembly actually shows, since the retail build folds the base in.
+constexpr size_t TRACE_COLOR         = 0x00;   // mov [edx+006ED5E0h],eax  arg3
+constexpr size_t TRACE_BLIP_TYPE     = 0x04;   // mov [edx+006ED5E4h],eax  arg1
+constexpr size_t TRACE_ENTITY_HANDLE = 0x08;   // mov [edx+006ED5E8h],eax  arg2
+constexpr size_t TRACE_POS_2D        = 0x0C;   // CVector2D, coord blips only
+constexpr size_t TRACE_POS           = 0x14;   // CVector,   coord blips only
+constexpr size_t TRACE_BLIP_INDEX    = 0x20;   // GetNewUniqueBlipIndex's word
+constexpr size_t TRACE_DIM           = 0x22;   // mov byte [..006ED602h],1
+constexpr size_t TRACE_IN_USE        = 0x23;   // mov byte [..006ED603h],1
+constexpr size_t TRACE_RADIUS        = 0x24;   // mov dword [..006ED604h],3F800000h
+constexpr size_t TRACE_SCALE         = 0x28;   // mov word [..006ED608h],1
+constexpr size_t TRACE_BLIP_DISPLAY  = 0x2A;   // mov word [..006ED60Ah],ax  arg4
+constexpr size_t TRACE_RADAR_SPRITE  = 0x2C;   // mov word [..006ED60Ch],0
+static_assert(TRACE_RADAR_SPRITE + 2 <= SIZEOF_RADAR_TRACE,
+              "sRadarTrace members must fit the stride the engine strides by");
+
+// eBlipType. BLIP_CHAR is 2 and BLIP_CAR is 1, and both are witnessed in the
+// engine's own destructors rather than taken from re3's enum order:
+//   ~CPed     (0x004C50D0) does CWorld::Remove, then
+//             `mov ecx,[008F2C60h] / call 0043EB70`, then
+//             `push eax / push 2 / call 004A56C0`
+//   ~CVehicle (0x00551060) does `mov ecx,[009430DCh] / call 00429050`, then
+//             `push eax / push 1 / call 004A56C0`
+//
+// That pair also settles the thing that makes this feature nearly free.
+// CPools::GetPedRef (0x004A1A80) is *literally* `mov ecx,[008F2C60h] / call
+// 0043EB70 / ret`, the same pool and the same function ~CPed uses, so **the
+// handle a BLIP_CHAR entry holds is byte for byte what CPools::GetPedRef
+// returns** - which is exactly what RemotePlayer::poolHandle already is. And
+// the engine clears an entity's blip in the destructor, so a ped CoopIII
+// destroys takes its blip with it without being asked.
+constexpr uint32_t BLIP_NONE          = 0;
+constexpr uint32_t BLIP_CAR           = 1;
+constexpr uint32_t BLIP_CHAR          = 2;
+constexpr uint32_t BLIP_OBJECT        = 3;
+constexpr uint32_t BLIP_COORD         = 4;
+constexpr uint32_t BLIP_CONTACT_POINT = 5;
+
+// eBlipDisplay.
+constexpr uint16_t BLIP_DISPLAY_NEITHER     = 0;
+constexpr uint16_t BLIP_DISPLAY_MARKER_ONLY = 1;
+constexpr uint16_t BLIP_DISPLAY_BLIP_ONLY   = 2;
+constexpr uint16_t BLIP_DISPLAY_BOTH        = 3;
+
+// The trace colours, which are indices into GetRadarTraceColour and not
+// RGBA. 0..6, proved by that function's own jump table (`cmp eax,6 / ja` then
+// `jmp [eax*4 + 005F71F4h]`) and by the RGBA constants each arm returns,
+// which match re3 Radar.cpp:909-955 exactly - e.g. GREEN is 0x5FA06AFF when
+// m_bDim is set and 0x007F00FF when it is not.
+//
+// Note the inversion, which is easy to get backwards: GetRadarTraceColour's
+// second argument is m_bDim, and a *set* m_bDim selects the lighter of the
+// two. SetEntityBlip leaves m_bDim = 1, so the lighter pair is the default
+// and it is what every script blip in the game uses.
+constexpr uint32_t RADAR_TRACE_RED        = 0;
+constexpr uint32_t RADAR_TRACE_GREEN      = 1;
+constexpr uint32_t RADAR_TRACE_LIGHT_BLUE = 2;
+constexpr uint32_t RADAR_TRACE_GRAY       = 3;
+constexpr uint32_t RADAR_TRACE_YELLOW     = 4;
+constexpr uint32_t RADAR_TRACE_MAGENTA    = 5;
+constexpr uint32_t RADAR_TRACE_CYAN       = 6;
+
+// eRadarSprite. Only the four the draw special-cases are named, because the
+// retail proves those four and nothing else: DrawBlips' second loop opens
+// `mov bx,[ebp+006ED60Ch]` and then skips 2, 0x11, 0x12 and 0x14 - which is
+// BOMB, SAVE, SPRAY and WEAPON in re3's enum order, so the numbering holds.
+// A blip with RADAR_SPRITE_NONE is the plain coloured square, which is what
+// every mission target in the game looks like.
+constexpr uint16_t RADAR_SPRITE_NONE   = 0;
+constexpr uint16_t RADAR_SPRITE_BOMB   = 2;
+constexpr uint16_t RADAR_SPRITE_SAVE   = 17;
+constexpr uint16_t RADAR_SPRITE_SPRAY  = 18;
+constexpr uint16_t RADAR_SPRITE_WEAPON = 20;
+
+// All __cdecl. GetActualBlipArrayIndex is the gate every ChangeBlip* goes
+// through: it returns -1 unless `handle >> 16` still matches the slot's
+// m_BlipIndex, which is what makes a handle stale once the slot is reused.
+// It does NOT range-check the low half (`and eax,0FFFFh` and straight into
+// `[edx*8 + 006ED600h]`), so a fabricated handle reads and writes wherever
+// its low word points. Only ever pass one SetEntityBlip returned.
+constexpr uintptr_t CRadar__SetEntityBlip           = 0x004A5640;
+constexpr uintptr_t CRadar__SetCoordBlip            = 0x004A5590;
+constexpr uintptr_t CRadar__ClearBlip               = 0x004A5720;
+constexpr uintptr_t CRadar__ClearBlipForEntity      = 0x004A56C0;
+constexpr uintptr_t CRadar__ChangeBlipColour        = 0x004A5770;
+constexpr uintptr_t CRadar__ChangeBlipScale         = 0x004A57E0;
+constexpr uintptr_t CRadar__ChangeBlipDisplay       = 0x004A5810;
+constexpr uintptr_t CRadar__SetBlipSprite           = 0x004A5840;
+constexpr uintptr_t CRadar__GetActualBlipArrayIndex = 0x004A41C0;
+constexpr uintptr_t CRadar__GetNewUniqueBlipIndex   = 0x004A4180;
+constexpr uintptr_t CRadar__SetRadarMarkerState     = 0x004A5C60;
+constexpr uintptr_t CRadar__GetRadarTraceColour     = 0x004A5BB0;
+
+// Recorded rather than called. DrawMap and DrawBlips are the two halves of
+// the radar the HUD runs, in that order, from CHud::Draw (0x0050838D and
+// 0x00508499). Initialise is called from CGame::Initialise (0x0048C1DD),
+// CGame::ReInitialise (0x0048C4F6) and LoadAllRadarBlips (0x004A6F35), and
+// it wipes every m_bInUse in the table - which is why nothing may trust a
+// blip handle it is holding across a game load. Ask the table.
+constexpr uintptr_t CRadar__DrawMap     = 0x004A4200;
+constexpr uintptr_t CRadar__DrawBlips   = 0x004A42F0;
+constexpr uintptr_t CRadar__Initialise  = 0x004A3EF0;
+
+// How far the radar reaches, in metres, which is the distance at which
+// LimitRadarPoint (0x004A4F30) stops moving a blip and starts pinning it to
+// the rim. DrawMap computes it: 120.0f (0x42F00000, written at 0x004A426A
+// and 0x004A42B4) on foot, ramping to 350.0f (0x43AF0000 at 0x004A42A8) in a
+// car, over the speed band 0.3 to 0.9 at 0x005F70F8 and 0x005F70FC.
+constexpr uintptr_t CRadar__m_radarRange    = 0x008E281C;   // float
+constexpr float     RADAR_RANGE_ON_FOOT_M   = 120.0f;
+constexpr float     RADAR_RANGE_AT_SPEED_M  = 350.0f;
+
+// The byte DrawBlips tests before drawing the 3D marker half of a
+// BLIP_DISPLAY_BOTH or MARKER_ONLY blip: `cmp byte [0095CD87h],0 / je` at
+// 0x004A490A. It is CTheScripts::DbgFlag, and it is off in a retail build,
+// which is why BLIP_DISPLAY_BOTH and BLIP_DISPLAY_BLIP_ONLY look identical in
+// a normal game and why asking for BLIP_ONLY costs nothing.
+constexpr uintptr_t CTheScripts__DbgFlag = 0x0095CD87;
+
+// ---- the radar: how the game draws the player's own arrow -----------------
+//
+// The local player is not in ms_RadarTrace and never was. CRadar::DrawBlips
+// draws them separately, at the centre of the radar, before it walks the
+// table at all, and it is a *rotating* sprite - which is where the arrowhead
+// and the direction it points both come from. Verified 2026-09-22 against
+// the retail image; every address below is witnessed by the instruction that
+// uses it, and the whole preamble is quoted so the order is not guesswork.
+//
+// CRadar::DrawBlips (0x004A42F0) opens:
+//
+//     cmp  byte [006FAD68h],1 / je ret       TheCamera.m_WideScreenOn
+//     cmp  byte [0095CD89h],0 / jne draw     CHud::m_Wants_To_Draw_Hud
+//     ... six RwRenderStateSet calls (0x005A43C0) ...
+//     lea  eax,[esp+50h] / lea esi,[esp+68h]
+//     mov  dword [esp+68h],0 / mov [esp+6Ch],0       CVector2D in = (0,0)
+//     push esi / push eax / call 004A5040 / pop / pop
+//                                           TransformRadarPointToScreenSpace
+//     call 004A1220                         FindPlayerHeading(), st0
+//     movzx eax,byte [006FAD6Eh] / imul eax,eax,69h
+//     cmp  word [eax*4 + 006FAEA8h],1       TheCamera.Cams[ActiveCam].Mode
+//     jne  else                             MODE_TOPDOWN
+//   then:                                   angle = PI + FindPlayerHeading()
+//     fld  [005F710Ch] / fadd [esp+24h]     005F710C is 3.14159274
+//     push 0FFh / push eax / fstp [esp]
+//     push [esp+54h] / push [esp+54h]       out.y, out.x
+//     push 008F6268h                        &CRadar::CentreSprite
+//   else:                                   angle = heading - (PI + fwd.Heading())
+//     fldz / fld [006FAD0Ch] / fchs / fld [006FAD10h] / fpatan
+//                                           Atan2(-fwd.x, fwd.y)
+//     fld  [005F710Ch] / fadd st(1) / fsubr [esp+24h]
+//     push 0FFh / push eax / ... / push 008F6268h
+//     call 004A5D10 / add esp,14h           DrawRotatingRadarSprite, __cdecl,
+//                                           (sprite, x, y, angle, alpha)
+//
+// and then, for the N marker, the same four calls every blip in the table
+// goes through - which is the sequence this feature copies:
+//
+//     fld  [006299B8h] / fadd 0.0           vec2DRadarOrigin.x
+//     fld  [005F7114h] / fmul [008E281Ch]   M_SQRT2 * m_radarRange
+//     fadd [006299BCh]                      + vec2DRadarOrigin.y
+//     push ebx / push eax / call 004A50D0   TransformRealWorldPointToRadarSpace
+//     push eax / call 004A4F30              LimitRadarPoint, returns dist in st0
+//     push edx / push eax / call 004A5040   TransformRadarPointToScreenSpace
+//     push 0FFh / push y / push x / push 0Eh
+//     call 004A5EF0                         DrawRadarSprite(RADAR_SPRITE_NORTH)
+//
+// The blip loop at 0x004A4750 is the same four, and it is where the alpha
+// comes from as well:
+//
+//     call 004A50D0 / pop / pop
+//     lea  eax,[esp+48h] / push eax / call 004A4F30 / pop ecx
+//     fstp [esp+34h] / push [esp+34h] / call 004A4F90 / mov [esp+0Ch],al
+//                                           CalculateBlipAlpha(dist) -> uint8
+//     push esi / push eax / call 004A5040
+//     mov  ax,[ebp+006ED60Ch] / test ax,ax / jne sprite
+//     ... ShowRadarTrace (004A5870) for RADAR_SPRITE_NONE ...
+//   sprite:
+//     push [esp+8] / push y / push x / push eax / call 004A5EF0
+//
+// All five are __cdecl (the caller pops), and the two transforms take
+// (out, in) in that order - proved by DrawBlips passing the freshly zeroed
+// CVector2D as the *second* argument to 0x004A5040 and reading the result
+// out of the first.
+constexpr uintptr_t CRadar__TransformRealWorldPointToRadarSpace = 0x004A50D0;
+constexpr uintptr_t CRadar__TransformRadarPointToScreenSpace    = 0x004A5040;
+constexpr uintptr_t CRadar__LimitRadarPoint          = 0x004A4F30;   // -> float
+constexpr uintptr_t CRadar__CalculateBlipAlpha       = 0x004A4F90;   // -> uint8
+constexpr uintptr_t CRadar__DrawRadarSprite          = 0x004A5EF0;
+constexpr uintptr_t CRadar__DrawRotatingRadarSprite  = 0x004A5D10;
+constexpr uintptr_t CRadar__ShowRadarTrace           = 0x004A5870;
+constexpr uintptr_t FindPlayerHeading                = 0x004A1220;   // -> float
+constexpr uintptr_t CRadar__vec2DRadarOrigin         = 0x006299B8;   // CVector2D
+
+// The centre arrow's sprite, and it is NOT a special case hiding outside the
+// sprite table - it is RadarSprites[4]. Both facts are witnessed:
+//
+//   CRadar::LoadTextures (0x004A4074) does
+//     mov ecx,008F6268h / push 005F7020h / call 0051EA40
+//   and the string at 0x005F7020 is "radar_centre", so CentreSprite is the
+//   CSprite2d at 0x008F6268;
+//
+//   the pointer table at 0x005F6CA4 reads 0, 008F1A40, 008F5FB4, 00885B24,
+//   008F6268, ... and its entry 14 is 008F6274, which is the sprite
+//   DrawBlips draws the compass with as `push 0Eh / call 004A5EF0`. So the
+//   table is CRadar::RadarSprites, entry 4 is CentreSprite and entry 14 is
+//   NorthSprite - re3's enum order, measured rather than trusted.
+//
+// Knowing it is in the table is what rules out the cheap version of this
+// feature. A blip with m_eRadarSprite = 4 *would* draw the arrowhead, but
+// DrawBlips reaches DrawRadarSprite for it, not DrawRotatingRadarSprite, so
+// it would come out pointing the same way forever. The rotation only exists
+// on the path the local player's own marker takes.
+constexpr uintptr_t CRadar__CentreSprite  = 0x008F6268;
+constexpr uintptr_t CRadar__RadarSprites  = 0x005F6CA4;   // CSprite2d*[21]
+constexpr uint16_t  RADAR_SPRITE_CENTRE   = 4;
+constexpr uint16_t  RADAR_SPRITE_NORTH    = 14;
+
+// CSprite2d::Draw(float x1, float y1, float x2, float y2, float x3, float y3,
+//                 float x4, float y4, const CRGBA &col)
+// __thiscall, `ret 24h` - nine dwords, the colour last. It pushes that one
+// pointer four times into CSprite2d::SetVertices (0x0051F070), calls
+// SetRenderState (0x0051F950) and then RwIm2DRenderPrimitive with 4 vertices
+// as a TRIFAN. This is the overload DrawRotatingRadarSprite ends in, and the
+// *only* reason CoopIII calls it directly rather than calling
+// DrawRotatingRadarSprite: that function builds its CRGBA in place at
+// 0x004A5E98 as `push alpha / push 0FFh / push 0FFh / push 0FFh`, so its
+// colour is hardcoded white and only the alpha is a parameter.
+constexpr uintptr_t CSprite2d__DrawFourCorners = 0x0051EE40;
+
+// DrawRotatingRadarSprite's own geometry, read out of 0x004A5D10 rather than
+// out of re3, because retail differs from the decompilation in one way that
+// matters. The half-extents are
+//
+//     fild [008F436Ch] / fmul [005F7148h] / fmul [005F7174h]   x
+//     fild [008F4370h] / fmul [005F7158h] / fmul [005F7174h]   y
+//
+// i.e. SCREEN_SCALE_X(8.0) and SCREEN_SCALE_Y(8.0) - but each is then put
+// through `fnstcw / or byte [esp+5],0Ch / fistp qword / fldcw`, which is the
+// compiler's round-toward-zero truncation to an integer. re3 keeps them as
+// floats. So the retail arrow's half-extents are whole pixels, and anything
+// drawn beside it has to truncate too or it will be a fraction of a pixel
+// bigger at most resolutions.
+//
+// The corners are four points at i*HALFPI + (angle - PI/4), with
+// x = cx + sin(a) * halfX and y = cy + cos(a) * halfY, handed to
+// CSprite2d::Draw in the order 3, 2, 0, 1.
+//
+//     005F7148  0.0015625      1/640      005F7158  0.002232143  1/448
+//     005F7174  8.0                       005F7178  0.78539819   PI/4
+//     005F717C  1.5707964      HALFPI     005F710C  3.1415927    PI
+//     005F7110  0.0                       005F711C  1.0
+//
+// The two reciprocals are read at runtime rather than compiled in. They are
+// the same two constants TransformRadarPointToScreenSpace uses for the whole
+// radar, and a mod that rescales the HUD by patching them has to move our
+// arrow with the game's or the two stop matching - which is the entire point
+// of drawing this one.
+constexpr uintptr_t RADAR_RECIP_REF_WIDTH  = 0x005F7148;   // float, 1/640
+constexpr uintptr_t RADAR_RECIP_REF_HEIGHT = 0x005F7158;   // float, 1/448
+constexpr float     RADAR_SPRITE_HALF_REF  = 8.0f;         // 0x005F7174
+
+// TransformRadarPointToScreenSpace's own numbers, for the record and for the
+// install-time sanity check. Retail is re3's non-FIX_BUGS form: x is
+// (in.x + 1) * 0.5 * SCREEN_SCALE_X(94) + 40, with RADAR_LEFT *not* scaled,
+// and y is (1 - in.y) * 0.5 * SCREEN_SCALE_Y(76) + (height - 123/448*height).
+constexpr float RADAR_LEFT_PX   = 40.0f;    // 0x005F7154
+constexpr float RADAR_WIDTH_REF = 94.0f;    // 0x005F714C
+constexpr float RADAR_HEIGHT_REF = 76.0f;   // 0x005F715C
+// ---- where a bullet goes, and the trail it leaves -------------------------
+//
+// Four symbols, and they exist because of one report: a remote player's
+// bullet trail is drawn in a different place on each screen. The question
+// "does the trail come from the source CoopIII hands the engine, or from the
+// muzzle of the ped it happens to be rendering" is answered here, and the
+// answer is the first one - which is why the fix is about the *direction*.
+//
+// The trail is CBulletTraces, and it is world-space from end to end. Nothing
+// in it reads a screen dimension: AddTrace stores two CVectors, CBulletTrace
+// ::Update walks the near end toward the far one by 0.8 m a frame, and Render
+// builds the quad's width as CrossProduct(TheCamera.GetForward(), sup - inf)
+// normalised and divided by 20 - a fixed 5 cm half-width in metres. A trail
+// cannot move with the resolution. Only its thickness in pixels can.
+//
+//   CBulletTraces::AddTrace   0x00518E90   __cdecl(CVector *start, CVector *target)
+//     `xor eax,eax` then `cmp eax,10h / cmp byte [ebx+72B1D0h],0 / add ebx,1Ch`
+//     is the free-slot search: sixteen entries, 28 bytes each, m_bInUse at
+//     +0x18. `lea ebx,[eax+eax*8] / lea ebx,[ebx+ebx*2] / add ebx,eax` is that
+//     28 again as a multiply. It then copies three floats to +0x00 and three
+//     to +0x0C, sets +0x18, clears +0x19 and finishes
+//     `call CGeneral::GetRandomNumber / and al,1Fh / add al,19h` into +0x1A,
+//     which is re3 SpecialFX.cpp:284-298's `m_lifeTime = 25 + rand % 32`
+//     exactly. Six call sites, and they are re3's six: two in DoBulletImpact,
+//     two in FireShotgun, two in FireInstantHitFromCar.
+//
+//     Retail agrees with re3's NUMBULLETTRACES (16) here. It does not always
+//     agree - the animation node array is twelve where re3 declares sixteen,
+//     and that one crashed the game - so the fact is the `cmp eax,10h`, not
+//     the header.
+//
+//   CWeapon::ProcessLineOfSight  0x00564C00  __cdecl, 13 arguments
+//     A thunk and nothing else: it re-pushes eleven of its thirteen arguments
+//     and drops argument 5 (type) and argument 6 (shooter) on the way to
+//     CWorld::ProcessLineOfSight, which is re3 Weapon.cpp:2301-2304 statement
+//     for statement. `add esp,2Ch` inside, `add esp,34h` at every call site.
+//     Seven call sites and all seven are weapon fire: four in FireInstantHit
+//     (its four branches), one each in FireShotgun, FireM16_1stPerson and
+//     FireInstantHitFromCar. That makes it the one place in the engine where
+//     every instant-hit path states the line it is about to test, before
+//     anything has decided what the line hit.
+//
+//   CWeapon::DoBulletImpact      0x0055F950  __thiscall, `ret 1Ch`
+//     (shooter, victim, source, target, point, ahead.x, ahead.y) - seven
+//     stack dwords, which is the 1Ch, with `this` in ecx. Opens
+//     `push ebx/esi/edi/ebp / sub esp,128h`, then GetWeaponInfo(m_eWeaponType)
+//     off [ecx], then `cmp [esp+144h],0` for `if (victim)`, then
+//     CGlass::WasGlassHitByBullet with the col point's three floats, then
+//     `push eax / push ebx / call 00518E90` - AddTrace(source, &traceTarget).
+//     re3 Weapon.cpp:855-1124.
+//
+//   CWeapon::DoDoomAiming        0x00562EB0  __cdecl(CEntity*, CVector*, CVector*)
+//     `ret` with no immediate, so the caller cleans: re3 declares it static
+//     (Weapon.h:54) and the binary agrees. Its fingerprint is the unused
+//     `CEntity entity;` re3 keeps under #ifndef FIX_BUGS - a stack CEntity
+//     constructed at 0x00473C30 and destructed at 0x00473E40 with nothing in
+//     between. Then `[ebx+50h] and 7 cmp 3` (IsPed) and `[ebx+158h] shr 3
+//     and 1` (bCrouchWhenShooting) for the early return, then
+//     `(*target - *source).Magnitude()` for FindObjectsInRange. Exactly two
+//     call sites, which are re3's two: FireInstantHit (0x0055DAA4) and
+//     FireShotgun (0x00560E20). Everything it does is write `target->z`.
+//
+// **The two facts the whole tracer fix rests on**, both read out of
+// FireInstantHit's fourth branch - the one every ped that is not the local
+// player takes, and therefore the one every remote player takes:
+//
+//   1. The shot's direction is the ped's own matrix forward, flattened.
+//      0x0055D9AC is `fld [ebp+14h] / fchs / fld [ebp+18h] / fpatan`, i.e.
+//      Atan2(-fwd.x, fwd.y), and the sin/cos of that back out to exactly
+//      normalise2D(fwd). Nothing in that branch reads an aim, a look
+//      direction or a camera.
+//
+//   2. The shot is flat. 0x0055DA47 is `mov eax,[esp+98h]` (source.z) and
+//      0x0055DA6F is `mov [esp+8Ch],eax` (target.z) - a dword copy, not an
+//      arithmetic. Only DoDoomAiming above ever puts a slope on it, and that
+//      is this machine's auto-aim at whatever ped it can see, not the
+//      shooter's aim.
+//
+// Which is the whole bug: an observer replaying somebody else's shot got the
+// origin off the wire and then derived the direction from a ped that is
+// interpolated, whose heading is not their aim, and whose pitch is never
+// applied at all (docs/protocol.md 1.8.3). DoDoomAiming is the seam that
+// fixes it, because it is handed `target` as a pointer and the engine's own
+// purpose for it is "move this shot".
+//
+// **A third fact, and it is why the direction is now sampled at AddTrace
+// rather than at ProcessLineOfSight.** On the 3rd-person mouse camera branch
+// the ray and the streak are not the same line, because the ray does not start
+// at the barrel. 0x0055D898 builds `&src` at [esp+0E8h] and `&trgt` at
+// [esp+0F4h] and hands both to Find3rdPersonCamTargetVector, whose mouse arm
+// ends `source += Dot(pos - source, target) * target` - the muzzle projected
+// onto the camera's own axis. The ProcessLineOfSight at 0x0055D907 is then
+// passed that `src` as point1 (the `lea eax,[esp+114h]` at 0x0055D8FE is
+// eleven pushes deep, so it is [esp+0E8h]), while the DoBulletImpact at
+// 0x0055F73A is passed [esp+90h] - the local copy of CWeapon::Fire's
+// fireSource, made at 0x0055D316 and never written again.
+//
+// So the engine tests one line and draws another, and the two are a parallel
+// offset apart: however far the hand is off the camera axis. An observer given
+// the *ray's* direction and told to fire from the *muzzle* reconstructs
+// neither. Given the *trail's* direction it reconstructs the trail exactly,
+// because both of its ends then come from the same two points.
+//
+// **And one retail bug found on the way**, which is what the shooter sees on
+// their own screen. FireInstantHit's third branch - the local player using
+// the 3rd-person mouse camera - calls ProcessLineOfSight with its own `src`
+// and `trgt` locals (0x0055D898: `lea eax,[esp+0E8h] / lea edi,[esp+0F4h]`)
+// and never writes the `target` local at [esp+84h]. The shared tail at
+// 0x0055F709 then does `lea eax,[esp+84h]` and passes it to DoBulletImpact,
+// whose no-victim arm is `AddTrace(source, target)`. So a mouse-aimed shot
+// that hits nothing draws its trail from the muzzle to whatever was left in
+// that stack slot. The other three branches all pass `&target` to
+// ProcessLineOfSight itself (branch 1 at 0x0055D79D, its else at 0x0055D859,
+// branch 4 at 0x0055DACD, all `lea ...,[esp+84h]` once the pushes are
+// accounted for), so pointer identity between "the point2 the engine tested"
+// and "the target it is about to draw" is an exact test for whether the
+// branch that ran wrote it.
+// **And the part of the report that was about the resolution after all**,
+// which is worth writing down because the answer is "yes, but not to the
+// question that was asked".
+//
+// Nothing in CBulletTraces reads a screen dimension, so a trail cannot move
+// with the resolution - that stands. But the *aim* can, on the one branch a
+// mouse-aiming player is always on, and the retail binary says so plainly.
+// CCamera::Find3rdPersonCamTargetVector (0x0046B580) builds the shot's
+// direction from the crosshair's screen fraction, and its horizontal half has
+// one factor its vertical half does not:
+//
+//   0046B611  cmp  byte [0095CD23h],0      the widescreen preference
+//   0046B61A  fld  [005F0A64h]             1.777778   (16:9)
+//   0046B622  fld  [005F0A68h]             1.333333   (4:3)
+//   0046B62E  fld  [ebp+19Ch]              m_f3rdPersonCHairMultX
+//   0046B634  fsub [005F0464h]               - 0.5
+//   0046B640  fmul [005F0A6Ch]               * 1.8
+//   0046B646  fmul st,st(4)                  * that aspect     <-- X only
+//   0046B648  fmul [005F0464h]               * 0.5
+//   0046B64E  fld  [ebp+eax+254h]            * FOV
+//
+//   0046B662  fld  [005F0464h]             0.5
+//   0046B668  fsub [ebp+1A0h]                - m_f3rdPersonCHairMultY
+//   0046B66E  fmul [005F0A6Ch]               * 1.8
+//   0046B674  fmul [005F0464h]               * 0.5
+//   0046B67A  fmul st,st(3)                  * FOV             <-- no aspect
+//
+// Two things follow. The aspect ratio is **a two-valued constant picked by a
+// menu toggle**, not the shape of the window: 16:9 if the widescreen option is
+// on, 4:3 if it is off, at any resolution. And the crosshair itself is drawn
+// at a fixed fraction of the screen, which in retail is 0.53 across and 0.40
+// down - off centre horizontally, which is the only reason the factor bites at
+// all. With the toggle not matching what is actually being rendered, every
+// mouse-aimed shot leaves the barrel about 0.8 degrees to one side of the
+// crosshair, always the same side: `(0.53 - 0.5) * 1.8 * 0.5 * FOV * (16/9 -
+// 4/3)`. At a 70 degree FOV that is 15 cm at ten metres.
+//
+// That is world space, so it is the same on every screen and it is not why two
+// machines disagree. It is, exactly, "el que dispara ve el trail de las balas
+// hacia un lado". Retail's, not ours, and not fixable from here without
+// deciding what the player's aspect ratio really is.
+// Which is also the one thing on this install that another mod is very likely
+// to have already changed: `docs/compat.md` lists ThirteenAG's Widescreen Fix
+// in `_ESSENTIALS`, and making the game aim at a real aspect ratio instead of
+// one of these two constants is exactly what that mod is for. So CoopIII does
+// not assume either way - it reads the site at startup and says what it found.
+// The seven bytes are the `cmp byte ptr ds:[0095CD23h],0` at the head of the
+// selection; anything else there means somebody rewrote it.
+constexpr uintptr_t CCamera__Find3rdPersonCamTargetVector = 0x0046B580;
+constexpr uintptr_t CCamera__AimAspectSelect              = 0x0046B611;
+constexpr uintptr_t CMenuManager__PrefsUseWideScreen      = 0x0095CD23;
+constexpr uintptr_t kAimAspectWide                        = 0x005F0A64;   // 1.777778
+constexpr uintptr_t kAimAspectStandard                    = 0x005F0A68;   // 1.333333
+constexpr uint8_t   kAimAspectSelectBytes[]               = {0x80, 0x3D, 0x23,
+                                                             0xCD, 0x95, 0x00, 0x00};
+
+constexpr uintptr_t CBulletTraces__AddTrace     = 0x00518E90;
+constexpr uintptr_t CBulletTraces__aTraces      = 0x0072B1B8;
+constexpr size_t    SIZEOF_BULLETTRACE          = 0x1C;
+constexpr int       NUM_BULLET_TRACES           = 16;
+constexpr uintptr_t CWeapon__ProcessLineOfSight = 0x00564C00;
+constexpr uintptr_t CWeapon__DoBulletImpact     = 0x0055F950;
+constexpr uintptr_t CWeapon__DoDoomAiming       = 0x00562EB0;
+
+// ---- what a bullet does to a ped before it hurts him ------------------------
+//
+// Every reaction a round causes runs in the fire path, ahead of the damage
+// call, and none of it tests a proof flag. DoBulletImpact's ped arm, after the
+// type gate at 0x0055FA1D and DoesLOSBulletHitPed (0x004EB5C0):
+//
+//   0055FAC8  call 004CCE20                 GetLocalDirection -> ebx (0..3)
+//   0055FADA  call 004DDEC0                 ReactToAttack(shooter)
+//   0055FAE3  call 004CE6C0                 IsPedInControl
+//   0055FAF2  [victim+158h] bit 4           bIsDucking
+//             either fails -> straight to the damage call
+//   0055FB36  weapon 4 or 0Dh:              shotgun / helicannon
+//     0055FB84  [victim+154h] &= ~1           bIsStanding = false
+//     0055FBBB  call 004959A0                 ApplyMoveForce(-5x, -5y, 5)
+//     0055FBCF  call 004D09B0                 SetFall(1500, 19h + dir, 0)
+//   0055FC06  call 004D48E0                 IsPlayer:
+//     0055FC17  [victim+55Ch] vs now, jae     hit anim delay not over -> skip
+//     0055FC2E  call 004E67F0                 ClearAttackByRemovingAnim
+//     0055FC41  call 00403620                 AddAnimation(clump, 0, 1Dh + dir)
+//     0055FC71 / 0055FC8A                     delay = now + 2500 (AK, M16)
+//                                                   or now + 1000
+//   0055FC9C  not a player: the same two calls, no delay
+//   0055FCEA  call 004EA420                 CPed::InflictDamage
+//
+// FireShotgun's ped arm has no in-control or ducking gate:
+//
+//   00560FEF  call 004DDEC0                 ReactToAttack(shooter)
+//   00561050  [victim+4C8h] vs now - 3000   m_getUpTimer, jbe -> may fall
+//   0056105E  [victim+154h] bit 0           bIsStanding, and may fall:
+//     00561070  bIsStanding = false, ApplyMoveForce(-6x, -6y, 5)
+//             otherwise                     ApplyMoveForce(-2x, -2y, 0)
+//   005610E6  call 004D09B0                 SetFall(1500, 19h + dir, 0), may fall only
+//   00561112  call 004EA420                 CPed::InflictDamage
+//
+// x, y is the flat unit vector from the ped to the fire source. The floats are
+// -6, -2, 5 and 0 at 0x00603130, 0x00603134, 0x006030DC and 0x00603060.
+//
+// Two more fire paths flinch a ped the same way, and both matter for a hit
+// that arrives as C_Damage instead:
+//
+//   CBulletInfo::Update (sniper)   005586ED IsPedInControl, 005586FA ducking,
+//                                  0055870B ClearAttackByRemovingAnim,
+//                                  00558717 `push 1Dh` - always the front one,
+//                                  then InflictDamage at 00558785
+//   FireInstantHitFromCar          00562B8B ReactToAttack(FindPlayerPed()),
+//                                  00562B92 ClearAttackByRemovingAnim,
+//                                  00562BA5 AddAnimation(1Dh + dir), no gate,
+//                                  then InflictDamage at 00562BE0 (cause 13h)
+//
+// And CPed::InflictDamage (0x004EA420, last `ret 14h` at 0x004EADE3) plays
+// none of it. Its calls are FindPlayerPed, FindPlayerVehicle, IsPlayer,
+// AnnoyPlayerPed (0x004F3700, a temper byte), IsPedHeadAbovePos (0x004EB670),
+// an association lookup (0x00405750), GetRandomNumber, RemoveBodyPart, SetDie
+// and CDarkel's two registers. No AddAnimation, SetFall, ApplyMoveForce or
+// ClearAttackByRemovingAnim, so a hit that only reaches InflictDamage costs
+// health and nothing else unless it kills.
+//
+// ReactToAttack on a player whose attacker is a ped is three calls and a
+// return (0x004DDECC-0x004DDF02): InformMyGangOfAttack, SetLookFlag(attacker)
+// and SetLookTimer(700). The first one is not cosmetic. For every nearby ped
+// whose m_leader (+0x180) is this player and whose fear is under his temper
+// (m_pedStats +0x24 < +0x25), it calls SetObjective(KILL_CHAR_ON_FOOT,
+// attacker) and SetObjectiveTimer(30000) (0x004E4B30-0x004E4B6D). Anyone
+// following the player turns on whoever shot him, for thirty seconds.
+constexpr uintptr_t CPed__ReactToAttack             = 0x004DDEC0;   // (CEntity*), ret 4
+constexpr uintptr_t CPed__InformMyGangOfAttack      = 0x004E4AD0;   // for the record
+constexpr uintptr_t CPed__ClearAttackByRemovingAnim = 0x004E67F0;   // (), ret
+constexpr uintptr_t CPed__SetFall                   = 0x004D09B0;   // (int, AnimationId, bool), ret 0Ch
+constexpr uintptr_t CPhysical__ApplyMoveForce       = 0x004959A0;   // (float, float, float), ret 0Ch
+constexpr uintptr_t CPed__GetLocalDirection         = 0x004CCE20;   // for the record
+
+constexpr uint32_t ANIM_KO_SKID_FRONT      = 0x19;   // + direction, 0055FBC0 / 005610D7
+constexpr uint32_t ANIM_SHOT_FRONT_PARTIAL = 0x1D;   // + direction, 0055FC33 / 00562B9B
+constexpr int32_t  SHOTGUN_FALL_MS         = 1500;   // `push 5DCh`
+constexpr uint32_t GETUP_GRACE_MS          = 3000;   // `add esi,0FFFFF448h`
+constexpr uint32_t HIT_ANIM_HOLD_RIFLE_MS  = 2500;   // `add edi,9C4h`, AK47 and M16
+constexpr uint32_t HIT_ANIM_HOLD_MS        = 1000;   // `add esi,3E8h`, the rest
+constexpr float    SHOTGUN_PUSH_FALL       = -6.0f;
+constexpr float    SHOTGUN_PUSH_FALL_Z     = 5.0f;
+constexpr float    SHOTGUN_PUSH_STAND      = -2.0f;
+constexpr float    HIT_ANIM_BLEND_DELTA    = 8.0f;   // 41000000h into +0x1C
+
+namespace offs {
+// CPed::m_getUpTimer. SetFall writes -1 here for a timeless fall
+// (`or dword [ebp+4C8h],-1` at 0x004D0A5C), and FireShotgun reads it as above.
+constexpr size_t PED_GETUP_TIMER = 0x4C8;
+// The three bits a get-up clears. CPed::SetGetUp reads bUpdateAnimHeading as
+// `mov al,[ebx+156h] / shr al,4 / and al,1` (0x004D0FA1) and clears it with
+// `and al,0EFh`; it clears bGetUpAnimStarted with `and al,0DFh` on +0x158
+// (0x004D109F), the bit it tests at 0x004D0F31. PedGetupCB clears
+// bFallenDown with `and al,0EFh` on +0x15C (0x004CE837) and
+// bGetUpAnimStarted again (0x004CE880).
+constexpr uint8_t PED_UPDATE_ANIM_HEADING = 0x10;   // byte C (+0x156) bit 4
+constexpr uint8_t PED_GETUP_ANIM_STARTED  = 0x20;   // byte E (+0x158) bit 5
+constexpr size_t  PED_FLAGS_I             = 0x15C;
+constexpr uint8_t PED_FALLEN_DOWN         = 0x10;   // byte I (+0x15C) bit 4
+// CPlayerPed::m_nHitAnimDelayTimer, past the end of CPed. Only read after
+// IsPlayer said yes, which is why it can be.
+constexpr size_t PLAYER_HIT_ANIM_DELAY = 0x55C;
+// Byte A bit 0 and byte E bit 4 of the flag block at PED_FLAGS.
+constexpr size_t  PED_FLAGS_E     = 0x158;
+constexpr uint8_t PED_IS_STANDING = 0x01;   // byte A
+constexpr uint8_t PED_IS_DUCKING  = 0x10;   // byte E
+} // namespace offs
+
+// ---- fists and the bat ------------------------------------------------------
+//
+// Read off the retail image with dumpbin /disasm, 2026-09-23. re3's
+// PedFight.cpp:1530-1691 and Weapon.cpp:355-505 were the map; the image
+// differs from the second in one place, marked. Two paths and they share
+// nothing but the victim's functions. Neither touches a vehicle: both walk the
+// striker's m_nearPeds (PED_NEAR_PEDS) and nothing else, so a punch or a bat
+// never reaches a car in retail 1.0.
+//
+// **Fists: CPed::FightStrike** (0x004E8EC0, thiscall(CVector &node), `ret 4`),
+// from CPed::Fight once the move's anim is inside its fire window. The first
+// near ped whose hit spheres the node reaches, then:
+//   004E915F  IsPlayer(victim) && state 25h (GETUP): return, nothing happens
+//   004E9189  old health = victim+2C0h
+//   004E91CC  damageMult = move.damage * (2 + rand&1) + 1, a byte
+//   004E9237  dir = victim->GetLocalDirection(striker - victim)
+//   004E9242  striker IsPlayer: adrenaline (+57Ch) makes it 20; otherwise
+//             it is scaled by m_pedStats->m_attackStrength (+28h)
+//   004E92A2  move 8 (KICK): dir + 1 half the time
+//   004E92CD  victim->ReactToAttack(striker)
+//   004E92D2  StartFightDefend(dir, move.hitLevel, x) at 004E932C, where x is
+//             65h when the striker holds a weapon and the victim is not a
+//             player, damageMult otherwise
+//   004E9337  PlayHitSound(victim) (004E8E20), m_fightState (+4B1h) = -1
+//   004E93A7  not dying or dead: InflictDamage(striker, 0, damageMult * 3.0f,
+//             piece, dir) - cause 0 whatever the striker holds
+//   004E9482  victim not FALL/DIE/DEAD and health > 0, and any of
+//               health < 40 && old > 40 && victim not a player
+//               health < 20 && old > 20
+//               striker holds a weapon && striker is a player
+//               victim's m_pedStats->m_flags (+30h, a word) & 20h
+//             -> SetFall(0, 19h + dir, 0) at 004E956F, and bIsStanding = 0 if
+//             that left it in FALL
+//   004E9598  victim DIE, or not standing: bIsStanding = 0 and
+//             ApplyMoveForce((victim - striker, z 0, normalised, z 1) * k * 0.6)
+//             with k = min(dm * 0.6, 4) for move 12 (GROUNDKICK),
+//             min(dm * 2, 14) for a dying victim under dm 20, dm otherwise
+//   004E9744  CEventList::RegisterEvent(assault)
+//
+// **The bat: CWeapon::FireMelee** (0x0055CA20, thiscall(CEntity *shooter,
+// CVector &source), `ret 8`), the WEAPON_FIRE_MELEE arm of CWeapon::Fire
+// (0x0055C8DB). Every near ped in reach, not just the first:
+//   0055CA57  anim2Playing = RpAnimBlendClumpGetAssociation(clump,
+//             info->m_Anim2ToPlay)
+//   0055CC6A  IsPlayer(victim) && state 25h: skip him
+//   0055CD50  not dying or dead: victim->ReactToAttack(shooter)
+//   0055CD7F  StartFightDefend(dir, lvl, 0Ah), lvl 1 (GROUND) for the bat
+//             against a ped in FALL/DIE/DEAD, 4 (HIGH) otherwise
+//   0055CE0E  not dying or dead, first arm that fits:
+//               shooter a player, bat, anim2Playing   100.0f (006030C0)
+//               shooter a player, adrenaline          3.5 * m_nDamage (006030C4)
+//               victim a player, bat                  2.0 * m_nDamage (006030C8)
+//               otherwise                             m_nDamage (info+14h)
+//   0055D06E  victim not FALL/DIE/DEAD, health > 0, and
+//             (health < 20 && old > 20) or (bat && victim not a player):
+//             bIsStanding = 0, ApplyMoveForce(-5 * flat unit toward the
+//             shooter, 3.0), SetFall(ms, 19h + dir, 0) with ms 3000 for the
+//             bat on a non-player and 1500 otherwise. re3 has those two the
+//             other way round. Then shooter->m_pSeekTarget = victim
+//   0055D1C0  otherwise, a victim in DIE and no anim2Playing: the same shove
+//   0055D249  weapon state 4, RegisterEvent(assault)
+//
+// So the victim's whole reaction lives in the striker's call, and only the
+// health goes through InflictDamage. On another machine's ped CoopIII keeps
+// the health off (HookedInflictDamage) and now keeps the reaction off too,
+// and the owner plays it from the two melee bytes on the wire (melee.h).
+//
+// CPed::StartFightDefend (0x004E7780, thiscall(uint8 dir, uint8 hitLevel,
+// uint8 x), `ret 0Ch`): DEAD (31h) gets the floor hit and blood, FALL (24h)
+// the floor hit, IsPedInControl the defend or a SetFall. Its other caller,
+// 0x004DD354, is not melee.
+//
+// tFightMoves, 24 rows of 18h from 0x005F9844: animId +0, strikeRadius +10h
+// (0x005F9854 in FightStrike), hitLevel +14h (0x005F9858), damage +15h
+// (0x005F9859). Rows 1..12 are the moves that strike; 12 is the only one at
+// level 1.
+//
+// (Not melee, but found on the way: object.h's third uproot arm,
+// CWeapon__FireMeleeObjectArm at 0x00558A64, is inside CBulletInfo::Update
+// (0x00558550), the sniper round, not in FireMelee. FireMelee has no object
+// arm at all.)
+constexpr uintptr_t CPed__FightStrike       = 0x004E8EC0;   // thiscall(CVector &), ret 4
+constexpr uintptr_t CWeapon__FireMelee      = 0x0055CA20;   // thiscall(CEntity *, CVector &), ret 8
+constexpr uintptr_t CPed__StartFightDefend  = 0x004E7780;   // thiscall(u8, u8, u8), ret 0Ch
+constexpr uintptr_t CPed__PlayHitSound      = 0x004E8E20;   // for the record
+constexpr uintptr_t CVector__Normalise      = 0x004BA560;   // thiscall(), on the vector
+constexpr uintptr_t tFightMoves             = 0x005F9844;
+constexpr size_t    SIZEOF_FIGHTMOVE        = 0x18;
+constexpr size_t    FIGHTMOVE_HIT_LEVEL     = 0x14;
+constexpr int32_t   NUM_FIGHTMOVES          = 24;
+constexpr int32_t   FIGHTMOVE_KICK          = 8;
+constexpr int32_t   FIGHTMOVE_GROUNDKICK    = 12;
+
+constexpr uint8_t HITLEVEL_GROUND = 1;
+constexpr uint8_t HITLEVEL_HIGH   = 4;
+
+constexpr uint8_t  STRIKE_ARMED_DEFEND    = 0x65;     // `push 65h` at 004E9320
+constexpr uint8_t  SWING_DEFEND           = 0x0A;     // `push 0Ah` at 0055CD79
+constexpr float    STRIKE_DAMAGE_PER_MULT = 3.0f;     // 0x005F9B00
+constexpr float    STRIKE_KNOCK_NPC_BELOW = 40.0f;    // 0x005F9C00
+constexpr float    MELEE_KNOCK_BELOW      = 20.0f;    // 0x005F9C04, 0x006030CC
+constexpr float    STRIKE_PUSH_SCALE      = 0.6f;     // 0x005F9C10, a double
+constexpr float    STRIKE_GROUNDKICK_MULT = 0.6f;     // 0x005F9AE0
+constexpr float    STRIKE_GROUNDKICK_CAP  = 4.0f;     // 0x005F9AB8
+constexpr float    STRIKE_DYING_MULT      = 2.0f;     // 0x005F9A84
+constexpr float    STRIKE_DYING_CAP       = 14.0f;    // 0x005F9C08
+constexpr uint8_t  STRIKE_DYING_BELOW     = 20;       // `cmp byte [esp+24h],14h`
+constexpr float    SWING_PUSH             = -5.0f;    // 0x006030B8
+constexpr float    SWING_PUSH_Z           = 3.0f;     // 0x006030B4
+constexpr float    SWING_HEAVY_DAMAGE     = 100.0f;   // 0x006030C0
+constexpr float    SWING_ADRENALINE_MULT  = 3.5f;     // 0x006030C4
+constexpr float    SWING_PLAYER_BAT_MULT  = 2.0f;     // 0x006030C8
+constexpr int32_t  SWING_FALL_MS          = 1500;     // `push 5DCh`
+constexpr int32_t  SWING_FALL_NPC_BAT_MS  = 3000;     // `push 0BB8h`
+constexpr uint16_t STAT_ONE_HIT_KNOCKDOWN = 0x20;
+
+namespace offs {
+constexpr size_t PED_FIGHT_MOVE       = 0x4AC;   // int32, m_curFightMove
+constexpr size_t PED_FIGHT_STATE      = 0x4B1;   // int8, m_fightState
+constexpr size_t PEDSTATS_FLAGS       = 0x30;    // uint16, CPedStats::m_flags
+constexpr size_t PLAYER_ADRENALINE    = 0x57C;   // bool, CPlayerPed only
+} // namespace offs
+
+constexpr size_t WEAPONINFO_DAMAGE = 0x14;   // int32 m_nDamage, `fild [ebp+14h]`
+
+// ---- the drive-by ------------------------------------------------------------
+//
+// Read off the retail image with dumpbin /disasm, 2026-09-23. re3's
+// Automobile.cpp:3036-3104 and Weapon.cpp:316-345/1640-1760 were the map, and
+// the image differs from them in two places, both marked.
+//
+// **The trigger.** CAutomobile::ProcessControl's STATUS_PLAYER arm calls
+// DoDriveByShootings (0x00564000) at 0x00531A5D, so only the car the local pad
+// drives ever runs it; a copy of somebody else's car is status 3 here
+// (game/carstatus.h) and never does. In order:
+//   00564008  pDriver = [esi+1A4h], weapon = &pDriver->m_weapons[m_currentWeapon]
+//   00564029  `cmp dword [ebx],3 / jne out` - an uzi or nothing
+//   00564038  CWeapon::Update(pDriver->m_audioEntityId)
+//   00564049  looking left / right: CPad::GetLookLeft / GetLookRight in the
+//             top-down camera, the active CCam's LookingLeft (+1A4h+6FAD00h)
+//             and LookingRight otherwise
+//   005640C2  left: RpAnimBlendClumpGetAssociation (0x004055C0) for 78h, and
+//             blendDelta (+1Ch) = -1000.0f if there is one; then 77h, and
+//             CAnimManager::AddAnimation(clump, 0, 77h) if there is none or
+//             its blendDelta is below 0.0, else `or [edx+30h],1` (SetRun)
+//   00564120  right: the same with the two ids swapped, only when the front
+//             passenger seat (+1A8h) is empty or the camera is first-person
+//   005641A2  CPad::GetCarGunFired, and now > weapon->m_nTimer:
+//             FireFromCar(this, left) at 0x005641BF, m_nTimer = now + 46h
+//   005641D1  neither: CWeapon::Reload, and both ids get blendDelta -1000.0f
+//
+// **One round.** CWeapon::FireFromCar (0x0055C940, thiscall(CAutomobile *,
+// bool), `ret 8`) refuses unless the state is 0 or 1 and the clip is > 0, then
+// calls FireInstantHitFromCar (0x005624D0, the same two args) and, when that
+// says yes, DMAudio.PlayOneShot(car->m_audioEntityId, 2Fh, 0.0) at 0x0055C996
+// and the ammo bookkeeping. FireInstantHitFromCar:
+//   source    the car's matrix times (-/+ (bbox.max.x + 0.2), seat.y + rand *
+//             0.001, seat.z + 0.5), plus timestep * m_vecMoveSpeed
+//   target    the same times (-/+ range, seat.y, seat.z + 0.5), plus a random
+//             +-1.28 on each axis (0x00562902..0x0056296C)
+//   00562972  DoDriveByAutoAiming(FindPlayerPed(), &source, &target)
+//   0056298F  CEventList::RegisterEvent(GUNSHOT, PED, FindPlayerPed() x2)
+//   005629E5  CParticle::AddParticle(0Ch GUNFLASH, source, zero, ...), unless
+//             TheCamera.GetLookingLRBFirstPerson (0x0046BA20)
+//   00562A7A  CPointLights::AddLight(0, source, zero, 5.0, 1.0, 0.8, 0.0, 0, 0)
+//   00562AB2  CWeapon::ProcessLineOfSight(source, target, ..., type,
+//             car->pDriver, 1, 1, 1, 1, 1, 1, 0). The driver, not the car:
+//             re3 passes the shooter here and the image does not
+//   victim    CBulletTraces::AddTrace(source, point) at 0x00562B07, then
+//     ped     not dying: ReactToAttack(FindPlayerPed()), the flinch, and
+//             CPed::InflictDamage(car, 13h, 3 * m_nDamage, piece, dir) at
+//             0x00562BE0 - `push ebx` at 0x00562BDF, and ebx is the car. The
+//             only one of the image's 21 InflictDamage sites that pushes 13h
+//     vehicle CVehicle::InflictDamage(FindPlayerPed(), 13h, m_nDamage) at
+//             0x00562D2B, again the only 13h among its eight sites
+//     other   CGlass::WasGlassHitByBullet (0x00504670)
+//     then    table 0x00603214 by type: building script sound 6Ah, vehicle
+//             PlayOneShot(victim, 38h, 1.0), ped 37h plus CPed::Say(65h),
+//             object 6Bh, dummy 6Ch. No smoke, unlike the helicopter's round
+//   no victim AddTrace(source, source + (target - source) * 30.0 / range) at
+//             0x00562E4F. re3 draws nothing here; the image draws 30 m
+//
+// So a drive-by is not CWeapon::Fire and nothing combat.cpp hooked on foot
+// ever saw one. And an observer cannot replay it through the engine: every
+// culprit and every event in it is FindPlayerPed(), which on the observer's
+// machine is the observer.
+constexpr uintptr_t CAutomobile__DoDriveByShootings = 0x00564000;   // for the record
+constexpr uintptr_t CWeapon__FireFromCar            = 0x0055C940;   // thiscall(CAutomobile *, bool), ret 8
+constexpr uintptr_t CWeapon__FireInstantHitFromCar  = 0x005624D0;   // for the record
+constexpr uintptr_t RpAnimBlendClumpGetAssociation  = 0x004055C0;   // for the record
+
+constexpr uint16_t ANIM_STD_CAR_DRIVEBY_LEFT  = 0x77;   // `push 77h` at 0x005640DD
+constexpr uint16_t ANIM_STD_CAR_DRIVEBY_RIGHT = 0x78;   // `push 78h` at 0x005640C5
+constexpr float    DRIVEBY_ANIM_DROP_DELTA    = -1000.0f;   // 0C47A0000h into +0x1C
+constexpr float    DRIVEBY_MISS_TRAIL         = 30.0f;      // 0x00603138
+constexpr float    DRIVEBY_LIGHT_RADIUS       = 5.0f;       // 0x006030DC
+constexpr uint32_t DRIVEBY_ROUND_MS           = 70;         // `add eax,46h` at 0x005641C9
+
+// Cross-confirmation for a ped offset this file already had, from a function
+// that had nothing to do with how it was first found. FireInstantHit's first
+// branch is `[ebp+50h] and 7 cmp 3` (IsPed) then `cmp dword [ebp+49Ch],0`
+// (m_pPointGunAt), and then it dereferences that pointer as a CEntity: type
+// byte at +0x50, position at +0x34, and +0x1F0 handed to
+// CPedIK::GetComponentPosition - which is offs::PED_IK, already in this file.
+// The byte below it at +0x49B is m_wepAccuracy (`movzx eax,byte [ebp+49Bh]`
+// then `100 - eax`), so the run m_currentWeapon / m_maxWeaponTypeAllowed /
+// m_wepSkills / m_wepAccuracy / m_pPointGunAt lands on 0x498..0x49C exactly
+// as re3 Ped.h:480-484 declares it.
+static_assert(offs::PED_POINT_GUN_AT == 0x49C,
+              "m_pPointGunAt, witnessed again by CWeapon::FireInstantHit");
+
+// ---- a passenger's free aim (game/passengeraim.h) ---------------------------
+//
+// Read off the retail image with dumpbin /disasm, 2026-09-25. re3's Cam.cpp
+// Process_FollowPedWithMouse, World.cpp ProcessLineOfSightSectorList and
+// Weapon.cpp FireInstantHit were the map.
+//
+// **Ignoring one entity.** CWorld::ProcessLineOfSightSectorList's entity test
+// (0x004B0CC0..0x004B0CEF) is re3 World.cpp:333 in order:
+//   004B0CC2  mov ax,[0095CC64h] / cmp [ebp+58h],ax     scan code
+//   004B0CD8  cmp ebp,[008F6494h] / je skip              e == pIgnoreEntity
+//   004B0CE4  mov al,[ebp+51h] / and al,1 / jne          bUsesCollision
+//   004B0CEB  cmp byte [esp],0 / je skip                 || deadPeds
+// A ped in a seat has bUsesCollision clear (seat.cpp puts it back on the way
+// out), so a line from inside a car finds none of its occupants, and the car
+// itself is the one entity left to name.
+constexpr uintptr_t CWorld__pIgnoreEntity   = 0x008F6494;   // CEntity*
+constexpr uintptr_t CWorld__bIncludeDeadPeds = 0x0095CD8F;  // bool, the `cmp` at 0x004B0C99
+
+// **The on-foot mouse camera.** CCam::Using3rdPersonMouseCam (0x00457460) is
+// `cmp byte [005F03D8h],0` (CCamera::m_bUseMouse3rdPerson) then
+// `cmp word [ebx+0Ch],4` (Mode == MODE_FOLLOWPED) and CamTargetEntity at
+// [ebx+188h]. CCam::Process's switch is `movsx eax,word [ebx+0Ch] / dec eax /
+// jmp [eax*4+005F0B84h]` (0x004599AE); entry 3, mode 4, is 0x00459A5E, which
+// calls 0x0045FF70 when m_bUseMouse3rdPerson is set and 0x0045E3A0 when not.
+//
+// Process_FollowPedWithMouse's clip is re3 Cam.cpp's, call for call:
+//   004605C8  pIgnoreEntity = CamTargetEntity ([ebx+188h])
+//   004605E5  CWorld::ProcessLineOfSight(TargetCoors, Source, ...)
+//   00460646  the entity it found IsPed (`and al,7 / cmp al,3`)
+//   00460691  ProcessLineOfSight again, from the col point
+//   00460827  pIgnoreEntity = 0
+//   00460923  CWorld::TestSphereAgainstWorld(Source + Front*Near, r, 0, 1,1,0,1,0,0)
+//   00460B8E  the same, inside the near-clip loop (`inc edi / cmp edi,5`)
+// TestSphereAgainstWorld (0x004B4710) is cdecl, eleven dwords (`add esp,2Ch`):
+// the centre by value, the radius, then the entity to ignore, which it reads
+// at [esp+5Ch] after four pushes and `sub esp,38h`. Aimed at a ped in a seat,
+// every one of those finds the car around him and pulls the camera inside it.
+constexpr uintptr_t CCamera__m_bUseMouse3rdPerson   = 0x005F03D8;   // bool
+constexpr uintptr_t CCam__Using3rdPersonMouseCam    = 0x00457460;   // for the record
+constexpr uintptr_t CCam__Process_FollowPedWithMouse = 0x0045FF70;  // for the record
+constexpr uintptr_t CWorld__TestSphereAgainstWorld  = 0x004B4710;
+constexpr uintptr_t FollowPedMouse_LineOfSightCall1 = 0x004605E5;   // E8 rel32
+constexpr uintptr_t FollowPedMouse_LineOfSightCall2 = 0x00460691;   // E8 rel32
+constexpr uintptr_t FollowPedMouse_SphereCall1      = 0x00460923;   // E8 rel32
+constexpr uintptr_t FollowPedMouse_SphereCall2      = 0x00460B8E;   // E8 rel32
+constexpr int16_t   CAM_MODE_FOLLOWPED              = 4;
+constexpr size_t    CAM_TARGET_ENTITY               = 0x188;         // CCam::CamTargetEntity
+constexpr uintptr_t TheCamera__Cams0                = 0x006FAE9C;   // TheCamera + 0x1A4
+
+// **The shot.** FireInstantHit's third branch is the local player on that
+// camera: `call FindPlayerPed / cmp ebp,eax` (0x0055D879), then
+// `mov ecx,6FAE9Ch / call 00457460` (0x0055D886) - Cams[0], not the active
+// one - and Find3rdPersonCamTargetVector (0x0046B580) with the weapon's range
+// ([eax+4]), the fire source by value and &src, &trgt; it ends `ret 18h`.
+// Otherwise the fourth branch, heading plus DoDoomAiming, which is where the
+// replay's aim override already goes in.
+//
+// CPedIK::GetComponentPosition(RwV3d &, node), thiscall, `ret 8` (0x004ED0F0):
+// `mov edx,[ecx] / mov eax,[edx+eax*4+1A4h]` is m_ped->m_pFrames[node], then
+// the frame's position walked up its parents. FireInstantHit's first branch
+// calls it on the target's +1F0h with node 1 (0x0055D5A3), PED_MID in re3's
+// PedNode; PED_HANDR is 6 in the same enum.
+// The range it passes is CWeaponInfo +4: FireInstantHit keeps GetWeaponInfo's
+// result at [esp+4] (0x0055D30D, `mov [esp+8],eax` before the `pop ecx`), and
+// 0x0055D8A8 reads it back as [esp+0Ch] two pushes later and pushes [eax+4].
+constexpr size_t WEAPONINFO_RANGE = 0x04;   // float m_fRange
+
+constexpr uintptr_t CPedIK__GetComponentPosition = 0x004ED0F0;
+constexpr uint32_t  PED_NODE_HANDR               = 6;
+
+// CWeapon::Update(int32 audioEntity), thiscall, `ret 4` (0x00563A10):
+// `mov eax,[ebx+4] / dec eax / cmp eax,3 / ja out / jmp [eax*4+00603228h]`,
+// the FIRING arm back to READY past m_nTimer, the RELOADING arm calling
+// CWeapon::Reload (0x005639D0) and writing 0. DoDriveByShootings calls it for
+// its driver at 0x00564038, because nothing else does for a ped in a seat;
+// a passenger's gun needs the same call or it never finishes a reload.
+constexpr uintptr_t CWeapon__Update = 0x00563A10;
+
+// ---- the car camera's call (game/carcam.h) ----------------------------------
+//
+// Read off the retail image with dumpbin /disasm, 2026-09-26. re3's Cam.cpp
+// CCam::Process was the map for the names.
+//
+// CCam::Process's mode switch at 0x004599AE is `movsx eax,word [ebx+0Ch] /
+// dec eax / cmp eax,2Bh / ja 00459CD0 / jmp [eax*4+005F0B84h]`, so the table
+// is indexed by Mode - 1. Entry 17, MODE_CAM_ON_A_STRING (18, the car camera),
+// is 0x00459A3F and entry 21, MODE_BEHINDBOAT (22), is 0x00459B21. The two
+// arms are byte for byte the same:
+//   lea eax,[esp+18h] / mov ecx,ebx          &TargetCoors, `this`
+//   push [esp+4] / push [ebx+0D0h] / push [esp+10h] / push eax
+//   call ... / jmp 00459D2A
+// so the callee is __thiscall with four dwords. Both callees open
+// `push ebx / push esi / mov ebx,ecx / push edi / sub esp,..` then read
+// CamTargetEntity ([ebx+188h]) and leave unless its type is 2 (a vehicle),
+// and return `ret 10h`. Each has exactly one caller in the image, its arm.
+//
+// Car camera mods (SACarCam and its LCS build) rewrite exactly these two
+// calls' displacements from DllMain, plus a `jmp` over WellBufferMe's first
+// byte (0x00456F40, cdecl, six dwords, eighteen callers). docs/compat.md 2.7
+// has the whole list.
+constexpr uintptr_t CCam__Process_ModeSwitch       = 0x004599AE;
+constexpr uintptr_t CCam__Process_ModeTable        = 0x005F0B84;   // [Mode - 1], 44 entries
+constexpr int16_t   CAM_MODE_CAM_ON_A_STRING       = 18;
+constexpr int16_t   CAM_MODE_BEHINDBOAT            = 22;
+constexpr uintptr_t CCam__Process_CamOnAStringArm  = 0x00459A3F;
+constexpr uintptr_t CCam__Process_BehindBoatArm    = 0x00459B21;
+constexpr uintptr_t CCam__Process_CamOnAStringCall = 0x00459A54;   // E8 rel32
+constexpr uintptr_t CCam__Process_BehindBoatCall   = 0x00459B36;   // E8 rel32
+constexpr uintptr_t CCam__Process_Cam_On_A_String  = 0x0045C090;
+constexpr uintptr_t CCam__Process_BehindBoat       = 0x0045B470;
+constexpr uintptr_t CCam__WellBufferMe             = 0x00456F40;   // for the record
+
+// **A gun's motor.** CAutomobile::TankControl turns the turret and then says
+// so (0x0053D6CD..0x0053D6DE):
+//   mov ecx,95CDBEh / mov eax,[ebx+64h] / push 1Ah / push eax
+//   call 0057C840                    DMAudio.PlayOneShot(m_audioEntityId, 26, |turn|)
+// and cDMAudio::PlayOneShot is a straight hand-on to
+// cAudioManager::PlayOneShot (0x0057A500, called at 0x0057C85A with the
+// global at 880FC0h in ecx), which past its initialised flag tests
+// `cmp dword [esp+34h],0 / jl out` and `cmp dword [esp+34h],0C8h / jge out`
+// at 0x0057A512: an entity index below zero plays nothing.
+constexpr uintptr_t cAudioManager__PlayOneShot     = 0x0057A500;
+constexpr uintptr_t TANK_TURRET_SOUND_CALL         = 0x0053D6DE;
+constexpr uint16_t  SOUND_CAR_TANK_TURRET_ROTATE   = 0x1A;
+
+// ---- pickups --------------------------------------------------------------
+//
+// Found the usual way: opcode 531 CREATE_PICKUP, through the dispatcher at
+// CRunningScript__ProcessCommands and the 500-range table at 0x005EF298 (base
+// opcode 500) entry 31, to the handler at 0x0044328D. That handler's one
+// interesting call names CPickups::GenerateNewOne, and GenerateNewOne names
+// the array, the stride, both bounds and every field offset in one function.
+// docs/pickups.md is the write-up; this block is the evidence.
+//
+// NOTHING HERE CAME OFF re3's DECLARATIONS. re3 happens to agree on 336, 320
+// and 20 - that was checked afterwards, it is not where the numbers came from.
+// Four re3 constants have already been refuted on this project.
+
+// CPickup aPickUps[336], stride 0x1C. Slots [0,320) are the general range;
+// [320,336) are reserved for PICKUP_FLOATINGPACKAGE and the nautical mines,
+// which GenerateNewOne allocates by scanning *downwards* from 335.
+//
+// Four independent witnesses for the bound and the stride, which is the
+// standard the fire array was held to:
+//
+//   1. CPickups::GenerateNewOne (0x004304B0)
+//        0x004304C8  mov ebp,24A4h / mov ebx,14Fh      slot 335, 335*28=9380
+//        0x004304D4  sub ebp,1Ch   / dec ebx           descending, stride 28
+//        0x004304FA  cmp ebx,140h                      general range = 320
+//        0x00430568  cmp ebx,150h                      total = 336
+//   2. CPickups::Update (0x004303D0)
+//        0x0043044A  mov esi,87AF98h / mov ebx,140h
+//                    87AF98h - 878C98h = 2300h = 8960 = 320 * 28
+//   3. CPickups::RemoveAllFloatingPickups (0x004307FF)
+//        add esi,1Ch / cmp ebp,150h / jl
+//   4. CPickups::Save (0x00433E40)
+//        mov dword [edx],24C0h    = 9408 = 336 * 28, the save block size,
+//        then a field-by-field copy with each field's real width - which is
+//        the struct layout below, witnessed a second time by a function that
+//        had nothing to do with how any of it was found.
+constexpr uintptr_t CPickups__aPickUps  = 0x00878C98;
+constexpr size_t    NUM_PICKUPS         = 336;
+constexpr size_t    NUM_GENERAL_PICKUPS = 320;
+constexpr size_t    SIZEOF_PICKUP       = 0x1C;
+
+// The 20-deep ring that HAS_PICKUP_BEEN_COLLECTED reads, and the *only* thing
+// it reads. CPickups::AddToCollectedPickupsArray (0x00433D60) pushes
+// `slot | (m_nIndex << 16)` and wraps at 14h; CPickups::IsPickUpPickedUp
+// (0x00430770) scans all 20, and **zeroes the entry it matched** - it is a
+// consuming read. Bound witnessed twice (cmp ecx,14h, and cmp word [..],14h).
+//
+// This matters more than it looks: rampage.sc and rewards.sc poll opcode 532,
+// so a pickup somebody else collected has to be pushed into *this* machine's
+// ring too or the observer's rampage never starts. docs/pickups.md section 6.
+constexpr uintptr_t CPickups__aPickUpsCollected    = 0x0087C538; // int32[20]
+constexpr uintptr_t CPickups__CollectedPickUpIndex = 0x0095CC8A; // int16
+constexpr size_t    NUM_COLLECTED_PICKUPS          = 20;
+
+namespace offs {
+
+// CPickup, 0x1C bytes. Every offset below is written by GenerateNewOne at the
+// address in the comment and read back by CPickup::Update off `esi`, and the
+// whole set is copied again with its widths by CPickups::Save.
+constexpr size_t PICKUP_TYPE     = 0x00; // uint8  0 = PICKUP_NONE = free slot
+constexpr size_t PICKUP_REMOVED  = 0x01; // uint8  0x0043058F writes 0
+constexpr size_t PICKUP_QUANTITY = 0x02; // uint16 0x00430596, mov word [..9Ah],cx
+constexpr size_t PICKUP_OBJECT   = 0x04; // CObject*, 0x0043063A from GiveUsAPickUpObject
+constexpr size_t PICKUP_TIMER    = 0x08; // uint32 absolute ms, 0x004305AB
+constexpr size_t PICKUP_MODEL    = 0x0C; // int16  0x00430614
+constexpr size_t PICKUP_INDEX    = 0x0E; // uint16 generation, 0x00433DC8
+constexpr size_t PICKUP_POS      = 0x10; // CVector, 0x0043061D/0623/062B
+
+} // namespace offs
+
+// ePickupType. Read off GenerateNewOne's timer arms and the two switch bounds,
+// not off re3's enum: `cmp al,4` -> +4E20h (20 s), `cmp al,7` -> +7530h
+// (30 s), `al == 8 || 9` -> forced to 8 with +5DCh, `al == 0Ah || 0Bh` ->
+// forced to 0Ah with +5DCh. The award switch at 0x00430ED3 indexes
+// `m_eType - 1` into a 14-entry table and the mine switch at 0x004308B2
+// indexes `m_eType - 8` into a 6-entry one, which pins both ends of the range.
+enum ePickupType : uint8_t {
+	PICKUP_NONE                     = 0,
+	PICKUP_IN_SHOP                  = 1,
+	PICKUP_ON_STREET                = 2,
+	PICKUP_ONCE                     = 3,
+	PICKUP_ONCE_TIMEOUT             = 4,
+	PICKUP_COLLECTABLE1             = 5,
+	PICKUP_IN_SHOP_OUT_OF_STOCK     = 6,
+	PICKUP_MONEY                    = 7,
+	PICKUP_MINE_INACTIVE            = 8,
+	PICKUP_MINE_ARMED               = 9,
+	PICKUP_NAUTICAL_MINE_INACTIVE   = 10,
+	PICKUP_NAUTICAL_MINE_ARMED      = 11,
+	PICKUP_FLOATINGPACKAGE          = 12,
+	PICKUP_FLOATINGPACKAGE_FLOATING = 13,
+	PICKUP_ON_STREET_SLOW           = 15,
+};
+
+// Once a frame out of CGame::Process (the call at 0x0048C98E, between
+// gAccidentManager.Update and CGarages::Update). Scans only a sixth of the
+// general range per frame - `mov eax,0AAAAAAABh / mul [m_FrameCounter] /
+// shr edx,2 / imul edx,6` then `imul ebx,35h` (53 = 320/6), so it reaches 318
+// of the 320 general slots, the same off-by-two retail has always had. Slots
+// 320..335 are scanned in full every frame.
+//
+// **This is CoopIII's detour point and it is complete.** A whole-image scan
+// for E8/E9 rel32 targets equal to CPickup::Update found exactly two call
+// sites, 0x0043042F and 0x0043047F, and both are inside this function. There
+// is no other way to collect a pickup in this build.
+constexpr uintptr_t CPickups__Update = 0x004303D0;
+
+// CPickup::Update(CPlayerPed *player, CVehicle *vehicle, int playerId),
+// __thiscall, returns true when it collected something. The argument order is
+// read off the call site rather than off re3: CPickups::Update pushes
+// CWorld::PlayerInFocus, then the result of FindPlayerVehicle, then the
+// result of FindPlayerPed - so the ped is first.
+//
+// The shape of it, which is what the design in docs/pickups.md section 4
+// turns on:
+//
+//   0x00430872  cmp byte [esi+1],0 / jne 0x004313D5    m_bRemoved -> respawn
+//   0x00430880  mov ecx,[esi+4] / test ecx,ecx / je    m_pObject nil ->
+//                                                      return false
+//   0x004308B2  jmp [eax*4+5EE1D8h]                    mines, types 8..13
+//   0x00430C58  the touch test
+//   0x00430E19  CanBePickedUp, inlined
+//   0x00430EB3  CPad::GetPad(0)->StartShake(120,100)
+//   0x00430ED3  jmp [eax*4+5EE1A0h]                    the award, m_eType-1
+//
+// The nil check at 0x00430880 sits *below* the respawn branch and *above*
+// everything else, which is why nilling m_pObject blocks the award without
+// blocking the respawn.
+constexpr uintptr_t CPickup__Update = 0x00430860;
+
+// The award switch's jump table, indexed by m_eType - 1, bound `cmp eax,0Dh`.
+// Entries 5 and 7..12 point at the common exit 0x00431382, and entry 13
+// (ON_STREET_SLOW) shares ON_STREET's arm - which is re3's switch exactly,
+// fallthrough for fallthrough.
+constexpr uintptr_t CPickup__UpdateAwardTable = 0x005EE1A0;
+constexpr uintptr_t CPickup__UpdateMineTable  = 0x005EE1D8;
+
+// The mines, read arm by arm off that table (m_eType - 8):
+//
+//   8  MINE_INACTIVE        0x004308B9  arms when the local player's car
+//                                       (Update's second argument) is not
+//                                       touching it: type 9, timer now + 10 s
+//   9  MINE_ARMED           0x004314A1  `jmp 0x0043094D`, the shared tail
+//   10 NAUTICAL_INACTIVE    0x00430A1D  floats on CWaterLevel, arms when no
+//                                       car in the pool touches it: type 11
+//   11 NAUTICAL_ARMED       0x00430902  floats, then falls into the tail
+//   12, 13                  0x00430AFD, 0x00430BAE, the floating packages
+//
+// The shared tail goes off when the timer has passed or when any car in the
+// pool touches it (CVehicle::IsSphereTouchingVehicle, 0x00552620, radius
+// [0x005EDE5C]), and then does exactly this:
+//
+//   0x004309E2  push 0 / push eax(pos) / push 6 / push 0 / push 0
+//   0x004309EB  call 0x005591C0      AddExplosion(nil, nil, EXPLOSION_MINE, pos, 0)
+//   0x004309F7  call 0x004AE9D0      CWorld::Remove(m_pObject)
+//   0x00430A08  call [ebx]           its deleting destructor, flag 1
+//   0x00430A0A  m_bRemoved = 1, m_pObject = nil, m_eType = PICKUP_NONE
+//
+// re3 has the same arms (Pickups.cpp:285-347). It does not have the script's
+// side right: re3 Script3.cpp:2034 has DROP_NAUTICAL_MINE make a
+// PICKUP_MINE_INACTIVE, and the retail handler pushes 0Ah.
+//
+// That call is the only one to AddExplosion in CPickup::Update, and it is the
+// seam game/mine.cpp takes: redirected, it still makes the explosion and also
+// says where.
+constexpr uintptr_t CPickup__Update_MineExplosion = 0x004309EB;
+constexpr uint8_t   EXPLOSION_MINE                = 6;
+
+// The two script commands that drop them, 700..799's table (0x005EF4D0, base
+// 700) at entries 52 and 53. Both CollectParameters three floats, put a z at
+// or below MAP_Z_LOW_LIMIT on the ground, and end in
+// `push 0 / push type / push model / push z / push y / push x /
+// call CPickups::GenerateNewOne`:
+//
+//   0x02F0 DROP_MINE           0x00447271  model [0x005F5A0C], `push 8`
+//   0x02F1 DROP_NAUTICAL_MINE  0x0044734A  model [0x005F5A8C], `push 0Ah`
+//
+// GenerateNewOne forces either to its inactive type with a 1500 ms timer. Ray's
+// fourth mission is the campaign's only user: a partner's boat drops nautical
+// mines in its wake.
+constexpr uintptr_t COMMAND_DROP_MINE_Handler          = 0x00447271;
+constexpr uintptr_t COMMAND_DROP_NAUTICAL_MINE_Handler = 0x0044734A;
+
+// CPickups::GenerateNewOne(CVector pos, uint32 modelIndex, uint8 type,
+//                          uint32 quantity) -> slot | (m_nIndex << 16)
+// cdecl. Argument order read off COMMAND_CREATE_PICKUP's call at 0x0044336B:
+// the pushes are 0 (quantity), ScriptParams[1] (type), the model, then z, y, x.
+// **It never calls the RNG.** That is what makes every script pickup identical
+// on every machine, which is the whole premise of docs/pickups.md section 1.
+constexpr uintptr_t CPickups__GenerateNewOne = 0x004304B0;
+
+// CPickups::GetNewUniquePickupIndex(int32 slot) bumps m_nIndex (wrapping
+// 0xFFFE -> 1) and returns `slot | (m_nIndex << 16)`.
+// CPickups::GetActualPickupIndex(int32 handle) undoes it and returns -1 when
+// the generation no longer matches. Same stale-handle scheme as the blips,
+// and like them it is a *per process* handle - docs/pickups.md section 2 is
+// why a slot index must never go on the wire.
+constexpr uintptr_t CPickups__GetNewUniquePickupIndex = 0x00433DB0;
+constexpr uintptr_t CPickups__GetActualPickupIndex    = 0x00433DF0;
+
+// CPickups::AddToCollectedPickupsArray(int32 slot) - note it takes the raw
+// slot and composes the handle itself off m_nIndex.
+// CPickups::IsPickUpPickedUp(int32 handle) - consuming, see above.
+constexpr uintptr_t CPickups__AddToCollectedPickupsArray = 0x00433D60;
+constexpr uintptr_t CPickups__IsPickUpPickedUp           = 0x00430770;
+
+// CPickups::RemovePickUp(int32 handle). CWorld::Remove, the deleting
+// destructor, m_pObject = nil, m_eType = PICKUP_NONE, m_bRemoved = 1.
+// **It frees the slot**, so it is the script's REMOVE_PICKUP and NOT what an
+// observer wants when somebody else collected a respawning pickup - that has
+// to keep m_eType. docs/pickups.md section 4.
+constexpr uintptr_t CPickups__RemovePickUp             = 0x004307A0;
+constexpr uintptr_t CPickups__RemoveAllFloatingPickups = 0x004307FF;
+
+// CPickups::GivePlayerGoodiesWithPickUpMI(int16 modelIndex, int playerIndex).
+// Returns true when it handled the model, which is how the award switch tells
+// a weapon from everything else. A flat chain of `cmp dx,[MI_...]`, and each
+// arm is what identifies the global above it - see the model index block.
+constexpr uintptr_t CPickups__GivePlayerGoodiesWithPickUpMI = 0x004339F0;
+
+// CPickups::WeaponForModel(int32 model) -> eWeaponType, 0 when it is not a
+// weapon. Opens `cmp edx,[MI_PICKUP_BODYARMOUR] / mov eax,0Fh` (armour is
+// weapon slot 15), then a jump table at 0x005EE170 over `model - 0AAh`.
+constexpr uintptr_t CPickups__WeaponForModel = 0x004306F0;
+
+// uint16[] each, indexed by eWeaponType. Read off the IN_SHOP and ONCE arms of
+// the award switch: `movsx eax,word [eax*2+5ED924h]` is compared against and
+// subtracted from CPlayerInfo::m_nMoney, so 0x005ED924 is the cost table;
+// `movzx eax,word [eax*2+5ED8D4h]` is handed to CPed::GiveWeapon, so
+// 0x005ED8D4 is the ammo table.
+constexpr uintptr_t AmmoForWeapon = 0x005ED8D4;
+constexpr uintptr_t CostOfWeapon  = 0x005ED924;
+
+// The pickup model indices. int16 globals, filled at *runtime* by CModelInfo's
+// name lookup - they all read 0xFFFF in the file on disk, so nothing here can
+// be checked statically and they must be read in-process.
+//
+// The names below are not taken from re3's declaration order. Each one is
+// identified by what the code does with it, which is a stronger claim:
+//
+//   0x005F5B10  ADRENALINE  sets CPed+57Ch and a +20000 ms deadline at +580h,
+//                           and swaps +54Ch into +548h        (0x00433A2A)
+//   0x005F5B14  BODYARMOUR  `mov dword [ebx+2C4h],42C80000h` = m_fArmour =
+//                           100.0f, and CanBePickedUp refuses it above 99.5
+//   0x005F5B18  INFO        plays a sound and nothing else    (0x00433A85)
+//   0x005F5B1C  HEALTH      `mov dword [ebx+2C0h],42C80000h` = m_fHealth =
+//                           100.0f, and CanBePickedUp refuses it above 99.5
+//   0x005F5B20  BONUS       sound only                        (0x00433AC5)
+//   0x005F5B24  BRIBE       takes a wanted star off; and it is the one model
+//                           whose touch test uses a 2 m vehicle sphere
+//   0x005F5B28  KILLFRENZY  CanBePickedUp gates it on IsPlayerOnAMission,
+//                           CDarkel::FrenzyOnGoing and CGame::nastyGame
+//   0x005F5B2C  CAMERA      collectable *only* from a vehicle, and its arm at
+//                           0x004310A6 sets the static-camera globals - so
+//                           retail 1.0 does have the pickup camera that re3
+//                           keeps behind CAMERA_PICKUP
+constexpr uintptr_t MI_PICKUP_ADRENALINE = 0x005F5B10;
+constexpr uintptr_t MI_PICKUP_BODYARMOUR = 0x005F5B14;
+constexpr uintptr_t MI_PICKUP_INFO       = 0x005F5B18;
+constexpr uintptr_t MI_PICKUP_HEALTH     = 0x005F5B1C;
+constexpr uintptr_t MI_PICKUP_BONUS      = 0x005F5B20;
+constexpr uintptr_t MI_PICKUP_BRIBE      = 0x005F5B24;
+constexpr uintptr_t MI_PICKUP_KILLFRENZY = 0x005F5B28;
+constexpr uintptr_t MI_PICKUP_CAMERA     = 0x005F5B2C;
+
+// CDarkel::FrenzyOnGoing() and CTheScripts::IsPlayerOnAMission(), both called
+// from the inlined CanBePickedUp at 0x00430E8C/0x00430E99. Recorded because
+// the first is half of why a rampage is a session-wide thing and not a
+// per-player one (docs/pickups.md section 6): the engine already refuses a
+// second killfrenzy pickup while one is running, and there is exactly one
+// CDarkel.
+constexpr uintptr_t CDarkel__FrenzyOnGoing          = 0x00420E60;
+constexpr uintptr_t CTheScripts__IsPlayerOnAMission = 0x00439410;
+
+// ---------------------------------------------------------------------------
+// CDarkel - the whole of a rampage (docs/rampage.md)
+// ---------------------------------------------------------------------------
+//
+// Every address below was read out of `dumpbin /disasm` of
+// reference/bin/gta3.exe and is quoted at the instruction that proves it. The
+// region needs realigning by hand before it makes sense: the padding runs
+// between these functions are zeroes, `dumpbin` decodes them as `add [eax],al`
+// and comes out of the run one byte late, so a naive grep for a function's
+// address finds nothing at all. Every entry point here was re-decoded from the
+// bytes in the listing.
+//
+// ---- the statics, and what each one is pinned by --------------------------
+//
+// Status is the anchor. CDarkel::ReadStatus at 0x00420E50 is the whole
+// function `66 A1 B4 CC 95 00 / C3` - `mov ax,[0095CCB4] / ret` - and
+// CDarkel::FrenzyOnGoing at 0x00420E60 is `66 83 3D B4 CC 95 00 01 /
+// 0F 94 C0 / C3`, `cmp word [0095CCB4],1 / sete al / ret`. So Status is a
+// uint16 at 0x0095CCB4 and KILLFRENZY_ONGOING is 1. StartFrenzy writes 1 into
+// it (0x0042110C), Update writes 2 at 0x00420819 and 3 at 0x004206B6, which
+// puts PASSED at 2 and FAILED at 3 - the three numbers rampage.sc compares
+// against after `01FA: $FRENZY_STATUS = rampage_status`.
+//
+// The rest fall out of StartFrenzy (0x004210E0) and RegisterKillByPlayer
+// (0x00420F60) writing and reading them in the order re3's Darkel.cpp does.
+constexpr uintptr_t CDarkel__Status         = 0x0095CCB4;   // uint16
+constexpr uintptr_t CDarkel__KillsNeeded    = 0x008F1AB8;   // int32, counts DOWN
+constexpr uintptr_t CDarkel__TimeLimit      = 0x00885BAC;   // int32 ms, <0 = none
+constexpr uintptr_t CDarkel__TimeOfFrenzyStart = 0x009430D8; // int32, CTimer ms
+constexpr uintptr_t CDarkel__PreviousTime   = 0x00885B00;   // int32 s, tick sound
+constexpr uintptr_t CDarkel__WeaponType     = 0x009430F0;   // int32 eWeaponType
+constexpr uintptr_t CDarkel__ModelToKill    = 0x008F2C78;   // int32, -1 any ped
+constexpr uintptr_t CDarkel__ModelToKill2   = 0x00885B40;   // int32          -2 any car
+constexpr uintptr_t CDarkel__ModelToKill3   = 0x00885B3C;   // int32
+constexpr uintptr_t CDarkel__ModelToKill4   = 0x00885B34;   // int32
+constexpr uintptr_t CDarkel__bNeedHeadShot  = 0x0095CDCA;   // bool
+constexpr uintptr_t CDarkel__bStandardSound = 0x0095CDB6;   // bool
+constexpr uintptr_t CDarkel__bProperKillFrenzy = 0x0095CD98; // bool
+constexpr uintptr_t CDarkel__pStartMessage  = 0x008F2C08;   // wchar*
+
+// FRENZY_ANY_PED and FRENZY_ANY_CAR, and they are read off the comparisons
+// rather than off re3's #defines: `cmp dword [008F2C78h],0FFFFFFFFh` at
+// 0x00420FC1 inside RegisterKillByPlayer, and `cmp dword [008F2C78h],
+// 0FFFFFFFEh` at 0x0042107F inside RegisterCarBlownUpByPlayer. Same global,
+// two sentinels, one per kind of rampage.
+constexpr int32_t FRENZY_ANY_PED = -1;
+constexpr int32_t FRENZY_ANY_CAR = -2;
+
+// The four values rampage.sc compares `$FRENZY_STATUS` against.
+constexpr uint16_t KILLFRENZY_NONE    = 0;
+constexpr uint16_t KILLFRENZY_ONGOING = 1;
+constexpr uint16_t KILLFRENZY_PASSED  = 2;
+constexpr uint16_t KILLFRENZY_FAILED  = 3;
+
+// __cdecl void CDarkel::StartFrenzy(eWeaponType weaponType, int32 time,
+//         uint16 kill, int32 modelId0, wchar *text, int32 modelId2,
+//         int32 modelId3, int32 modelId4, bool standardSound,
+//         bool needHeadShot)
+//
+// Ten arguments, all on the stack, caller-cleaned - the function ends
+// `pop ebp / pop ebx / ret` with no operand at 0x0042130B. The order is
+// witnessed by the writes:
+//
+//   0x004210F8  mov [009430F0],eax        arg1  -> WeaponType
+//   0x00421193  mov [00885BAC],ebx        arg2  -> TimeLimit
+//   0x00421115  mov [008F1AB8],eax        arg3  -> KillsNeeded (movzx from 16)
+//   0x0042111E  mov [008F2C78],eax        arg4  -> ModelToKill
+//   0x00421142  mov [008F2C08],eax        arg5  -> pStartMessage
+//   0x00421127  mov [00885B40],eax        arg6  -> ModelToKill2
+//   0x00421130  mov [00885B3C],eax        arg7  -> ModelToKill3
+//   0x00421139  mov [00885B34],eax        arg8  -> ModelToKill4
+//   0x00421174  mov [0095CDB6],al         arg9  -> bStandardSoundAndMessages
+//   0x0042117D  mov [0095CDCA],al         arg10 -> bNeedHeadShot
+//
+// **Two callers in the whole image**, and both are the script: 0x00442BD2
+// behind opcode 01F9 `init_rampage`, and 0x0044B9FE behind 0x0367
+// `init_headshot_rampage`. Nothing else in GTA III starts a frenzy, which is
+// what makes this a safe place to learn that one has started.
+constexpr uintptr_t CDarkel__StartFrenzy = 0x004210E0;
+
+// __cdecl void CDarkel::RegisterKillByPlayer(CPed *victim, eWeaponType weapon,
+//                                            bool headshot)
+//
+// The one function in the engine that means "a kill that counts". Three
+// stack arguments, caller-cleaned - CPed::InflictDamage pushes them at
+// 0x004EAD30..0x004EAD39 and then `add esp,0Ch`.
+//
+// The qualification test, transcribed:
+//
+//   0x00420F60  cmp word [0095CCB4],1     Status == ONGOING, else skip to
+//   0x00420F76  jne 0042100F              the statistics at the bottom
+//   0x00420F7C  cmp eax,[009430F0]        weapon == WeaponType
+//   0x00420F84  cmp eax,12h               || WEAPONTYPE_EXPLOSION
+//   0x00420F89  cmp eax,13h / WeaponType==3    || UZI_DRIVEBY with UZI
+//   0x00420F97  cmp eax,10h / WeaponType==11h  || RAMMEDBYCAR with RUNOVERBYCAR
+//   0x00420FA5  cmp eax,11h / WeaponType==10h  || the same pair reversed
+//   0x00420FB3  cmp eax,9   / WeaponType==0Ah  || FLAMETHROWER with MOLOTOV
+//   0x00420FC1  cmp [008F2C78],-1         ModelToKill == FRENZY_ANY_PED
+//   0x00420FCA  movsx eax,word [ebp+5Ch]  victim->m_modelIndex - the ONLY
+//                                         field of the victim this function
+//                                         reads before the statistics
+//   0x00420FCE  cmp [008F2C78],eax        .. or one of the four model ids
+//   0x00420FD6  cmp [00885B40],eax
+//   0x00420FDE  cmp [00885B3C],eax
+//   0x00420FE6  cmp [00885B34],eax
+//   0x00420FEE  cmp byte [0095CDCA],0     bNeedHeadShot
+//   0x00420FF7  test bl,bl                .. and the headshot argument
+//   0x00421000  dec dword [008F1AB8h]     KillsNeeded--
+//   0x0042100A  DMAudio.PlayFrontEndSound(5Ch, 0)      SOUND_RAMPAGE_KILL
+//
+// and then, unconditionally and whether or not a frenzy is running:
+//
+//   0x00421013  inc [008F1B7Ch]           CStats::PeopleKilledByPlayer
+//   0x00421019  inc word [eax*2+6EDBE0h]  RegisteredKills[model]
+//   0x00421021  [ebp+15Bh] >> 7           bChrisCriminal, picking
+//   0x0042103C  inc [eax*4+00880DBCh]     CStats::PedsKilledOfThisType[..]
+//   0x00421047  inc [008F647Ch]           CStats::HeadsPopped, if headshot
+//   0x0042104D  inc [008F2C8Ch]           CStats::KillsSinceLastCheckpoint
+//
+// **Six callers**, which is why CoopIII hooks the function rather than any
+// one of them: 0x004EAD39 (CPed::InflictDamage), 0x0053BDB6 and 0x0053BE17,
+// 0x00541D5A, 0x00552776 and 0x005527A0. A rampage kill made with a car, a
+// fire or a blast arrives through one of the five that are not InflictDamage.
+constexpr uintptr_t CDarkel__RegisterKillByPlayer = 0x00420F60;
+
+// __cdecl void CDarkel::RegisterKillNotByPlayer(CPed *victim, eWeaponType)
+//
+// Two instructions: `inc dword [008E2C50h] / ret`, CStats::PeopleKilledByOthers
+// and nothing else. Recorded because it is the hole this whole feature exists
+// to fill - see the note at CDarkel__KILL_CREDIT_TEST below.
+constexpr uintptr_t CDarkel__RegisterKillNotByPlayer = 0x00421060;
+
+// The statistics RegisterKillByPlayer moves below its rampage branch, read
+// off the instructions quoted above it. CStats__PeopleKilledByPlayer is
+// further up, with the police helicopter. PedsKilledOfThisType is int32
+// indexed by ePedType, PEDTYPE_CRIMINAL for a ped with bChrisCriminal:
+// `inc [00880E04h]` at 0x0042102E is base + 48h, index 18.
+// PeopleKilledByOthers is the one RegisterKillNotByPlayer moves.
+constexpr uintptr_t CStats__PedsKilledOfThisType     = 0x00880DBC;   // int32[23]
+constexpr uintptr_t CStats__HeadsPopped              = 0x008F647C;
+constexpr uintptr_t CStats__KillsSinceLastCheckpoint = 0x008F2C8C;
+constexpr uintptr_t CStats__PeopleKilledByOthers     = 0x008E2C50;
+constexpr int       PEDTYPE_CRIMINAL                 = 18;
+constexpr int       NUM_PEDTYPES                     = 23;
+namespace offs {
+// CPed::bChrisCriminal, bit 7 of +0x15B: `mov al,[ebp+15Bh] / shr al,7` at
+// 0x00421021.
+constexpr size_t  PED_FLAGS_15B          = 0x15B;
+constexpr uint8_t PED_CHRIS_CRIMINAL_BIT = 0x80;
+} // namespace offs
+
+// __cdecl void CDarkel::RegisterCarBlownUpByPlayer(CVehicle *vehicle)
+//
+// Re-read from the file 2026-09-23 (dumpbin loses sync on the padding at
+// 0x00421067, so 0x00421070..0x0042107F was decoded from the bytes):
+//
+//   0x00421070  66 83 3D B4CC9500 01   cmp word [0095CCB4],1   Status
+//   0x00421078  53 / 8B 5C 24 08       push ebx / mov ebx,[esp+8]  the car
+//   0x0042107D  75 41                  jne 004210C0            to the stats
+//   0x0042107F  cmp [008F2C78],-2      ModelToKill == FRENZY_ANY_CAR
+//   0x00421088  movsx eax,word [ebx+5Ch], then the four model slots
+//   0x004210B1  dec [008F1AB8]         KillsNeeded--
+//   0x004210BB  call 0057CC20          PlayFrontEndSound(5Dh, 0)
+//   0x004210C4  inc word [eax*2+006EDBE0]   RegisteredKills[model], always
+//   0x004210CC  inc [00941288]         CStats::CarsExploded, always
+//   0x004210D3  ret                    one argument, caller-cleaned
+//
+// The kill register's shape with no weapon and no headshot test, and a -2
+// sentinel instead of -1. **The difference that matters is the callers.** A
+// scan for E8 rel32 finds two: 0x0053BF04, inside CAutomobile::BlowUpCar,
+// reached unconditionally with no culprit test anywhere in that function,
+// and 0x0054A04F in CHeli::UpdateHelis. CBoat::BlowUpCar doesn't call it.
+// So every machine counts a car its own copy of which blows up, whoever blew
+// it up, which is why game/darkel.cpp keeps CoopIII's replays off the counter
+// rather than copying the kill's report-and-relay.
+constexpr uintptr_t CDarkel__RegisterCarBlownUpByPlayer = 0x00421070;
+
+// int32 CStats::CarsExploded. `mov eax,[00941288]` at 0x00482AF9, pushed
+// with the "CAR_EXP" string (0x005F3A24) on the stats screen. Moved by the
+// car register above and by nothing CoopIII does.
+constexpr uintptr_t CStats__CarsExploded = 0x00941288;
+
+// __thiscall void CPlayerInfo::AwardMoneyForExplosion(CVehicle *wreck). ret 4.
+//
+// The only money the engine pays for destroying a car:
+//
+//   0x004A15F0  mov eax,[00885B48]            CTimer ms, for the 6 s chain
+//   0x004A162A  mov edx,[edx+128h] / [edx+0D0h]  pHandling->nMonetaryValue
+//   0x004A1646  fmul [005F6AB4]               0.002f (3B03126Fh)
+//   0x004A168A  add [eax*4+0094139Ch],ebp     Players[PlayerInFocus].m_nMoney
+//
+// Two callers, and they disagree about who earned it. The fire timer in
+// CAutomobile::ProcessControl calls it at 0x0053479B with no test at all:
+// whoever's engine watches a car burn out is paid for it, whoever lit it.
+// CVehicle::ProcessDelayedExplosion calls it at 0x00551D6C only when
+// `this != FindPlayerVehicle()` and m_pBlowUpEntity (+0x218) is
+// FindPlayerPed() (0x00551D42..0x00551D56). docs/rampage.md §9 says why
+// money didn't travel; game/money.cpp hooks it for the server's money rule
+// and passes every call straight through with the rule off.
+constexpr uintptr_t CPlayerInfo__AwardMoneyForExplosion = 0x004A15F0;
+
+// The rest of it, re-read for the money rule. `this` is the CPlayerInfo both
+// callers pass (Players + PlayerInFocus * 13Ch at 0x00534787 and 0x00551D58):
+//
+//   0x004A15FC  sub eax,[ebx+104h] / cmp eax,1770h   now - last award, 6000
+//   0x004A160B  jae -> mov dword [ebx+108h],1        a chain of one
+//   0x004A160D  inc dword [ebx+108h]                 or one more in it
+//   0x004A1624  mov [ebx+104h],eax                   last award = now
+//   0x004A1654  or byte [esp+5],0Ch / fistp          the 0.002f product, truncated
+//   0x004A166E  push 5F6AB8h ("$%d") / call 0059E5B0 sprintf into gString
+//   0x004A16A0  call 005A41D0 / add ...,ebp          (chain - 1) more times, one
+//                                                    discarded rand() each
+//   0x004A16C1  ret 4
+//
+// So a burnout pays unit * chain, the chain counted on the payer's own
+// CPlayerInfo. The two return addresses are what tell the callers apart from
+// inside a detour.
+constexpr uintptr_t AWARD_RETURN_FIRE_TIMER = 0x005347A0;   // after 0x0053479B
+constexpr uintptr_t AWARD_RETURN_BOMB_TIMER = 0x00551D71;   // after 0x00551D6C
+constexpr uint32_t  EXPLOSION_CHAIN_MS      = 6000;         // 1770h
+constexpr float     EXPLOSION_REWARD_FACTOR = 0.002f;       // [005F6AB4h]
+
+// The bomb timer's pay gate, read whole (ebp = the car throughout; the
+// function sets it at 0x00551C92, `mov ebp,ecx`, and never writes it again):
+//
+//   0x00551D38  cmp word [ebp+216h],0 / jne 0x00551D7F  not gone off yet
+//   0x00551D42  call 0x004A10C0                        FindPlayerVehicle()
+//   0x00551D47  cmp ebp,eax / je 0x00551D71            the bomber's own car: no pay
+//   0x00551D4B  call 0x004A1150                        FindPlayerPed()
+//   0x00551D50  cmp [ebp+218h],eax / jne 0x00551D71    m_pBlowUpEntity is he
+//   0x00551D58  Players + PlayerInFocus * 13Ch
+//   0x00551D6C  call 0x004A15F0                        AwardMoneyForExplosion(this)
+//   0x00551D71  BlowUpCar(m_pBlowUpEntity) through +74h
+//
+// So single player pays a bomb's car to the player whose ped it blames,
+// unless he is sitting in it, once, before the blast and whether or not
+// BlowUpCar then refuses. On another player's machine the bomber is a
+// remote ped, never FindPlayerPed(), and the gate pays nobody. game/money.cpp
+// takes both calls: with money on it asks them about the bomber - his ped,
+// and the car his ped is in, read the way FindPlayerVehicle reads it
+// (`cmp byte [ped+314h],0` at 0x004A10D5, `mov eax,[ped+310h]` at
+// 0x004A10DE) - so the award is made here and routed to him like any other.
+//
+// And that is all a car bomb pays. Of the 35 instructions in .text that name
+// Players[].m_nMoney by address (0x0094139C), the ones that change it are the
+// garages, the pickups, script commands, a cheat, a pedestrian's dealings with
+// the player, the taxi fare, a crash, the crane, the helicopter, the load and
+// the two adds in AwardMoneyForExplosion; the rest only read it. None is in
+// CPed::InflictDamage, CPed::SetDie or CDarkel::RegisterKillByPlayer:
+// a pedestrian the bomb kills is a kill for the stats and a rampage, and
+// money only in the cash pickup it drops. A car the blast sets burning pays
+// through the fire timer (0x0053479B), and one whose own delayed explosion it
+// lights (CVehicle::InflictDamage, 0x00551C37) through this same gate.
+constexpr uintptr_t BombTimer_FindPlayerVehicleCall = 0x00551D42;
+constexpr uintptr_t BombTimer_FindPlayerPedCall     = 0x00551D4B;
+constexpr uintptr_t BombTimer_AwardCall             = 0x00551D6C;
+
+// CVehicle::ProcessDelayedExplosion (0x00551C90, recorded with BlowUpCar's
+// callers) is the bomb timer's caller. The timer is the uint16 at +0x216
+// (`mov cx,[ebp+216h]` at 0x00551C97, `sub [ebp+216h],bx` at 0x00551CF0); at
+// zero it pays through the gate above and calls BlowUpCar(m_pBlowUpEntity)
+// through vtable +74h at 0x00551D7C, with m_pBlowUpEntity read at 0x00551D50
+// and 0x00551D73. tHandlingData::nMonetaryValue is the dword the award reads
+// at +0xD0 through the car's pHandling (+0x128), 0x004A162A..0x004A1630.
+namespace offs {
+// CAutomobile's bomb (m_bombType, CARBOMB_*): the low three bits of the flags
+// byte at +0x4D9, beside the taxi light. IS_CAR_ARMED_WITH_BOMB (0x00443ACA)
+// compares `[car+4D9h] & 7` with its operand, and ARM_CAR_WITH_BOMB
+// (0x00444459) writes `and bl,0F8h / or bl,al` there, then m_pBombRigger at
+// +0x4DC. Read and written for a car's bomb only (mission-audit.md R6,
+// game/vehicle.cpp).
+constexpr size_t  AUTOMOBILE_BOMB      = 0x4D9;
+constexpr uint8_t AUTOMOBILE_BOMB_MASK = 0x07;
+constexpr size_t VEH_BOMB_TIMER          = 0x216;   // uint16, ms
+constexpr size_t VEH_BLOW_UP_ENTITY      = 0x218;   // CEntity*
+constexpr size_t HANDLING_MONETARY_VALUE = 0xD0;    // uint32 in tHandlingData
+// CEntity *m_pBombRigger. Both writers above store FindPlayerPed() there and
+// neither registers the reference; the two readers are the ignition arm and
+// CWorld::UseDetonator, below.
+constexpr size_t  AUTOMOBILE_BOMB_RIGGER      = 0x4DC;
+// bDriverLastFrame, bit 4 of the same byte: `shr al,4 / and al,1` at
+// 0x0053170D and `and al,0EFh / or al,10h` at 0x00531769.
+constexpr uint8_t AUTOMOBILE_DRIVER_LAST_FRAME = 0x10;
+} // namespace offs
+
+// How a car bomb goes off, all three ways, read where each one lights the
+// timer ProcessDelayedExplosion counts down. CARBOMB_* in protocol.h are the
+// engine's own numbers, compared and written raw by all of these.
+//
+// The ignition, CAutomobile::ProcessControl:
+//
+//   0x005316FA  cmp dword [ebp+1A4h],0 / je            pDriver
+//   0x00531707  test bDriverLastFrame / jne            only the frame one gets in
+//   0x00531714  [ebp+4D9h] & 7 == 5                    CARBOMB_ONIGNITIONACTIVE
+//   0x00531720  mov word [ebp+216h],3E8h               1000 ms
+//   0x00531729  m_pBlowUpEntity = m_pBombRigger, RegisterReference if not nil
+//   0x00531761  bDriverLastFrame = 1
+//
+// So any driver sets it off, the local player or a ped CoopIII sat in the
+// seat, and it blames whoever the car's copy names as the rigger.
+//
+// The timer, further down the same function, behind `FindPlayerVehicle() ==
+// this` and CPad::CarGunJustDown (0x004934F0 on pad 0):
+//
+//   0x00533391  [ebp+4D9h] & 7 == 1                    CARBOMB_TIMED
+//   0x005333A5  and al,0F8h / or al,4                  -> CARBOMB_TIMEDACTIVE
+//   0x005333AD  mov word [ebp+216h],1B58h              7000 ms
+//   0x005333C9  m_pBlowUpEntity = FindPlayerPed()      whoever pressed it
+//   0x005333F2  == 2 -> and al,0F8h / or al,5          ONIGNITION -> ..ACTIVE
+//
+// And the detonator, which is CWeapon::Fire's WEAPONTYPE_DETONATOR arm (Fire's
+// table at 0x00603184, entry 12 - 2 = 10, is 0x0055C718): `push ebp / call
+// 0x004B4650` with the shooter, then the weapon keeps one round. The callee
+// matches re3 World.cpp:2148-2162 statement for statement:
+//
+//   0x004B4652  mov esi,[9430DCh]                      the vehicle pool
+//   0x004B4671  imul ebp,ebp,5A8h                      walked from the top
+//   0x004B4698  cmp dword [edx+284h],0 / jne           automobiles only
+//   0x004B46A1  [edx+4D9h] & 7 == 3                    CARBOMB_REMOTE
+//   0x004B46AD  cmp [edx+4DCh],edi / jne               rigged by the shooter
+//   0x004B46BB  and al,0F8h                            -> CARBOMB_NONE
+//   0x004B46C3  mov word [edx+216h],1F4h               500 ms
+//   0x004B46CC  m_pBlowUpEntity = m_pBombRigger, RegisterReference if not nil
+//
+// It has exactly one caller in the image, the one in Fire. The rigger is
+// compared by pointer, so a copy whose rigger is not this machine's idea of
+// the shooter's ped is never matched: game/vehicle.cpp writes the session's
+// rigger on every copy for exactly that reason.
+constexpr uintptr_t CWorld__UseDetonator          = 0x004B4650;   // cdecl (CEntity*)
+constexpr uintptr_t CWeapon__Fire_UseDetonator    = 0x0055C71D;
+constexpr uint16_t  CARBOMB_IGNITION_FUSE_MS      = 1000;
+constexpr uint16_t  CARBOMB_TIMED_FUSE_MS         = 7000;
+constexpr uint16_t  CARBOMB_REMOTE_FUSE_MS        = 500;
+static_assert(CARBOMB_ONIGNITIONACTIVE == 5 && CARBOMB_TIMED == 1 && CARBOMB_TIMEDACTIVE == 4 &&
+                  CARBOMB_ONIGNITION == 2 && CARBOMB_REMOTE == 3,
+              "the wire's bomb numbers are the ones the three arms above compare");
+static_assert(CARBOMB_TIMED_FUSE_MS == CARBOMB_FUSE_MAX_MS,
+              "no bomb in the engine burns longer than the timed one");
+
+// __cdecl uint16 CDarkel::ReadStatus()
+//
+// `mov ax,word [0095CCB4] / ret`, and the reason it is worth a detour rather
+// than a read: **it has exactly one caller in the whole image**, 0x00442BE8,
+// which is the handler for script opcode 01FA. So this function is not "the
+// status" - it is *the script's* view of the status, and nothing else in the
+// game goes through it. CHud::Draw reads the global directly (0x005062CE
+// calls FrenzyOnGoing), CanBePickedUp reads it through FrenzyOnGoing, and
+// CDarkel::Update reads the global itself at 0x00420660.
+//
+// That is what lets CoopIII hold every machine's `rampage.sc` at the same
+// point in the script without touching the HUD, the timer or the sounds.
+constexpr uintptr_t CDarkel__ReadStatus = 0x00420E50;
+
+// __cdecl void CDarkel::Update() - one caller, 0x0048C90E in CGame::Process.
+// A switch on Status through the table at 0x005ECD30. The ONGOING arm is
+// 0x0042067B and it is the whole of the ending:
+//
+//   0x0042067B  FrameTime = TimeLimit - (CTimer::ms - TimeOfFrenzyStart)
+//   0x0042068E  jg ongoing; 0x00420696 TimeLimit < 0 -> ongoing
+//               else Status = 3 (FAILED) and the weapon is put back
+//   0x004207FE  cmp [008F1AB8h],0 / jg out    KillsNeeded <= 0
+//   0x00420819  Status = 2 (PASSED)
+//
+// Recorded but not detoured: CoopIII lets this run on every machine exactly
+// as retail does, so the HUD, the clock, the tick sound and the weapon
+// restore are all the engine's. Only the script's *view* of the outcome is
+// held back until the session has agreed one.
+constexpr uintptr_t CDarkel__Update = 0x00420660;
+
+// __cdecl void CDarkel::ResetOnPlayerDeath() - 0x00420E70, three callers at
+// 0x004A12FB / 0x004A134B / 0x004A139B. Status = FAILED when the local
+// player dies. Left alone for the same reason as Update: it is a real local
+// ending, and it is reported to the session as one candidate verdict.
+constexpr uintptr_t CDarkel__ResetOnPlayerDeath = 0x00420E70;
+
+// **The site this whole feature exists for.**
+//
+// CPed::InflictDamage decides which of the two registers a death goes into,
+// and it decides it on the identity of the damaging entity:
+//
+//   004EAD15  call 004D37D0        CPed::SetDie - the ped is dead here
+//   004EAD1A  call 004A1150        FindPlayerPed()
+//   004EAD1F  cmp esi,eax          damagedBy == our player?
+//   004EAD21  je  004EAD30
+//   004EAD23  test esi,esi         null damager -> not by player
+//   004EAD25  je  004EAD50
+//   004EAD27  call 004A10C0        FindPlayerVehicle()
+//   004EAD2C  cmp esi,eax          damagedBy == our car?
+//   004EAD2E  jne 004EAD50
+//   004EAD39  call 00420F60        RegisterKillByPlayer(this, method, headshot)
+//   004EAD55  call 00421060        RegisterKillNotByPlayer(this, method)
+//
+// In a CoopIII session the ped is hosted by one machine and shot by another,
+// so on the host `esi` is the *replica* of the shooter's ped - neither
+// FindPlayerPed() nor FindPlayerVehicle() - and the kill goes to
+// RegisterKillNotByPlayer, which only bumps a statistic. On the shooter's own
+// machine CPed::InflictDamage returned long before this line, because
+// game/combat.cpp turns the hit into a packet instead. **So today a co-op NPC
+// kill counts for nobody at all.** docs/rampage.md §2.
+constexpr uintptr_t CDarkel__KILL_CREDIT_TEST = 0x004EAD1A;
+
+// The headshot argument, and where it comes from, because CoopIII has to
+// reconstruct it on a machine that did not fire the shot.
+//
+// `headShot` is a stack local of CPed::InflictDamage: cleared at 0x004EA448
+// (`mov byte [esp+8],0`) and set in exactly one place, 0x004EA7F7
+// (`mov byte [esp+8],1`), inside the bullet-weapon arm's PEDPIECE_HEAD case -
+// the same case that calls RemoveBodyPart(PED_HEAD). It is then pushed at
+// 0x004EAD30. So `headshot` is "the fatal bullet took the head off", and the
+// piece is the only part of it that travels.
+//
+// The limb only comes off when re3's `dontRemoveLimb` is false, and for the
+// pistol, the uzi and the shotgun that is a CGeneral::GetRandomNumber() roll,
+// which two machines will not agree on. **It does not matter here**: all three
+// headshot rampages in rampage.sc (07, 19, 20) use SNIPERRIFLE, SNIPERRIFLE
+// and M16, and those two weapons take the arm where `dontRemoveLimb` is
+// unconditionally false. For them, and for them alone, headshot is exactly
+// `pedPiece == PEDPIECE_HEAD`.
+constexpr uintptr_t CDarkel__HEADSHOT_SET_SITE = 0x004EA7F7;
+
+// DMAudio, and the two sounds a rampage kill makes. `mov ecx,95CDBEh` before
+// every call in Darkel.cpp's neighbourhood, and the function is
+// __thiscall void CAudioEngine::PlayFrontEndSound(uint16 sound, uint32 frame),
+// `ret 8`.
+constexpr uintptr_t DMAudio_Object                 = 0x0095CDBE;
+constexpr uintptr_t CAudioEngine__PlayFrontEndSound = 0x0057CC20;
+constexpr uint16_t  SOUND_RAMPAGE_KILL             = 0x5C;
+constexpr uint16_t  SOUND_RAMPAGE_CAR_BLOWN        = 0x5D;
+
+// CPlayerInfo, from the award switch. CWorld::Players is 0x009412F0 with a
+// 0x13C stride (`imul eax,eax,4Fh` then `[eax*4 + 9412F0h]`, so 4Fh*4 = 13Ch),
+// and CWorld::PlayerInFocus is the byte at 0x0095CD61. Both are cross-
+// confirmed by FindPlayerPed (0x004A1150) and FindPlayerVehicle (0x004A10C0),
+// which are already in this file and open with exactly those two instructions.
+//
+//   m_nMoney             +0xAC   `sub [ebx+94139Ch],eax` at 0x00430F20 for a
+//                                shop purchase, `add [ebp*4+94139Ch],eax` at
+//                                0x0043132C for PICKUP_MONEY
+//   m_nCollectedPackages +0xB4   `inc dword [edi+9413A4h]` at 0x0043126A
+//   m_nTotalPackages     +0xB8   compared against it at 0x0043127A; set to
+//                                100 by opcode 749 out of packages.sc
+// FindPlayerCoors(CVector *out) -> out. Called from CPickup::Update's respawn
+// branch at 0x004313ED to measure how far the player has walked away. Same
+// PlayerInFocus / imul 4Fh prologue as FindPlayerPed, then `cmp byte
+// [eax+314h],0` (CPed::bInVehicle) picking the *vehicle's* matrix position
+// over the ped's - so it answers "where is the player", not "where is the
+// ped", which is what a proximity test wants.
+//
+// **It does not null-check the ped.** With no player it dereferences zero at
+// +314h. Every caller here guards with FindPlayerPed first.
+constexpr uintptr_t FindPlayerCoors = 0x004A1030;
+
+constexpr uintptr_t CWorld__Players       = 0x009412F0;
+constexpr uintptr_t CWorld__PlayerInFocus = 0x0095CD61;
+
+namespace offs {
+constexpr size_t PLAYERINFO_STRIDE             = 0x13C;
+constexpr size_t PLAYERINFO_MONEY              = 0xAC;
+constexpr size_t PLAYERINFO_COLLECTED_PACKAGES = 0xB4;
+constexpr size_t PLAYERINFO_TOTAL_PACKAGES     = 0xB8;
+// The rest of what the money rule touches (game/money.h):
+//
+//   m_nVisibleMoney      +0xB0   what the HUD prints: `mov eax,[edx*4+9413A0h]`
+//                                into "$%08d" at 0x00505E7B. CPlayerInfo::Process
+//                                walks it toward m_nMoney by 12345 / 1234 / 123 /
+//                                42 / 1 a frame, for a gap over 100000 / 10000 /
+//                                1000 / 50 / under (0x0049FDC4..0x0049FE31). So
+//                                writing m_nMoney alone rolls the counter the
+//                                way earning does, and never snaps it.
+//   last explosion award +0x104  AwardMoneyForExplosion's chain clock and
+//   explosion chain      +0x108  count (addresses above)
+//   bGetOutOfJailFree    +0x116  byte, tested before the arrest fine
+//   bGetOutOfHospitalFree +0x117 byte, tested before the hospital fee
+constexpr size_t PLAYERINFO_VISIBLE_MONEY      = 0xB0;
+constexpr size_t PLAYERINFO_LAST_EXPLOSION_MS  = 0x104;
+constexpr size_t PLAYERINFO_EXPLOSION_CHAIN    = 0x108;
+constexpr size_t PLAYERINFO_JAIL_FREE          = 0x116;
+constexpr size_t PLAYERINFO_HOSPITAL_FREE      = 0x117;
+} // namespace offs
+
+// The rest of CPickup::Update's COLLECTABLE1 arm, after the two writes above
+// (0x0043127A..0x004312EE):
+//
+//   cmp edx,eax / jne 004312C2        m_nCollectedPackages == m_nTotalPackages
+//   push 5EDE78h / call 0059E460      printf "All collectables have been picked up"
+//   push -1 / push 1388h / push -1 / push 5EDEA0h / call 00426B20
+//                                     TriggerMessage("CO_ALL", -1, 5000, -1)
+//   add [eax*4+0094139Ch],0F4240h     PlayerInFocus's m_nMoney += 1000000
+// else
+//   push total / push 1388h / push collected / push 5EDEA8h / call 00426B20
+//                                     TriggerMessage("CO_ONE", collected, 5000, total)
+//
+// then the removal and DMAudio.PlayFrontEndSound(50h, 0) (`push 0 / push 50h /
+// jmp 00431378`, which is `mov ecx,95CDBEh / call 0057CC20`).
+//
+// CGarages::TriggerMessage(const char *id, int16 num1, uint16 ms, int16 num2),
+// cdecl, `add esp,10h` at every call. Read at 0x00426B20: strcmp against
+// MessageIDString (0x00878358); the same id, still up and under 500 ms old
+// (`cmp eax,1F4h / jbe 00426BC0`), returns without touching the numbers, so
+// a second package inside half a second would still read the first one's
+// count. Otherwise it stamps the times and writes `movsx eax,si / mov
+// [00885BA8h],eax` (num1, MessageNumberInString) and `movsx eax,bx / mov
+// [008E2C14h],eax` (num2, MessageNumberInString2).
+constexpr uintptr_t CGarages__TriggerMessage          = 0x00426B20;
+constexpr uintptr_t CGarages__MessageNumberInString   = 0x00885BA8;   // int32
+constexpr uintptr_t CGarages__MessageNumberInString2  = 0x008E2C14;   // int32
+constexpr uintptr_t TEXT_KEY_CO_ALL                   = 0x005EDEA0;   // "CO_ALL"
+constexpr uintptr_t TEXT_KEY_CO_ONE                   = 0x005EDEA8;   // "CO_ONE"
+constexpr int32_t   PACKAGE_REWARD                    = 1000;      // 3E8h
+constexpr int32_t   ALL_PACKAGES_REWARD               = 1000000;   // 0F4240h
+constexpr uint16_t  PACKAGE_MESSAGE_MS                = 5000;      // 1388h
+
+// What busted and wasted cost, both inside CGameLogic::Update once the
+// WBState (+0xD8) has been set for 0x1000 ms. Under `shared` this is money
+// leaving the session's wallet like any other change, so it is recorded to
+// say that the engine clamps it and nothing here needs to.
+//
+//   busted  0x004216C7  cmp eax,6 / ja 004216D3   wanted level, 0..6
+//           0x004216CC  jmp [eax*4+005ECD88h]     table: 004216D3 x2 (64h),
+//                                                 004216DA (0C8h), 004216E1
+//                                                 (190h), 004216E8 (258h),
+//                                                 004216EF (384h), 004216F6 (5DCh)
+//           0x004216FB  cmp byte [ebx+116h],0     jail free: no fine, flag cleared
+//           0x00421716  sub ebp,eax / jge / xor   money = max(0, money - fine)
+//   wasted  0x004214D9  cmp byte [ebx+117h],0     hospital free: no fee
+//           0x004214F6  add eax,0FFFFFC18h / jge  money = max(0, money - 1000)
+constexpr uintptr_t BUSTED_FINE_TABLE = 0x005ECD88;
+constexpr int32_t   BUSTED_FINES[7]   = {100, 100, 200, 400, 600, 900, 1500};
+constexpr int32_t   HOSPITAL_FEE      = 1000;
+
+// ---- the wanted level (docs/wanted.md) ------------------------------------
+//
+// It hangs off the *ped*, not off CPlayerInfo. docs/roadmap.md §2.3 and the
+// early design notes both say `CPlayerInfo::m_pWanted` and both are
+// wrong about the name, though right about the consequence: CPlayerPed is the
+// only class in the process that has one, its first member sits at the end of
+// CPed, and a CCivilianPed - which every remote player and every replica is -
+// is exactly SIZEOF_PED bytes with nowhere to put a second.
+//
+// Four witnesses for the offset, three of them reached the usual way. Opcodes
+// 269..272 are ALTER_WANTED_LEVEL / _NO_DROP / IS_WANTED_LEVEL_GREATER /
+// CLEAR_WANTED_LEVEL, and they live in the 200..299 range: the dispatcher at
+// 0x00439500 tests `cmp dx,0C8h` / `cmp dx,12Ch` and calls 0x0043D530, which
+// is `lea ebp,[eax-0D6h] / cmp ebp,54h / jmp [ebp*4 + 5EEC40h]` - base opcode
+// **214**, not 200, and 85 entries.
+//
+//   0043E0EC  mov ecx,[eax+53Ch]      opcode 271, then
+//   0043E0F7  mov edx,[ecx+18h]       m_nWantedLevel, compared against arg 1
+//   004F3194  mov ecx,[ecx+53Ch]      CPlayerPed::SetWantedLevel
+//   004F31B4  mov ecx,[ecx+53Ch]      CPlayerPed::SetWantedLevelNoDrop
+//   004F4A76  mov eax,[eax+53Ch]      CPopulation::AddToPopulation's cop gate
+//
+// The rest of CWanted comes from CWanted::UpdateWantedLevel (0x004AD900),
+// which writes four members in one pass and is re3 Wanted.cpp:47-77 bracket
+// for bracket - chaos 3200/1600/800/400/200/40 mapping to 6..1 stars, with
+// m_MaxCops 10/8/6/4/3/1, m_MaximumLawEnforcerVehicles 3/3/2/2/2/1 and
+// m_RoadblockDensity 12/10/8/4/0/0.
+namespace offs {
+constexpr size_t PLAYER_PED_WANTED   = 0x53C;  // CPlayerPed::m_pWanted, CWanted*
+constexpr size_t WANTED_LEVEL        = 0x18;   // CWanted::m_nWantedLevel, int32
+constexpr size_t WANTED_CHAOS        = 0x00;   // CWanted::m_nChaos, int32
+constexpr size_t WANTED_CURRENT_COPS = 0x10;   // uint8
+constexpr size_t WANTED_MAX_COPS     = 0x11;   // uint8
+constexpr size_t WANTED_MAX_LAW_CARS = 0x12;   // uint8
+} // namespace offs
+
+// __thiscall CPlayerPed::SetWantedLevel(int32). Two script opcodes call it:
+// jump-table entry 55 of 0x005EEC40 is ALTER_WANTED_LEVEL (269), which passes
+// ScriptParams[1], and entry 58 is CLEAR_WANTED_LEVEL (272), which passes a
+// literal 0. The function itself is five instructions - load the argument,
+// `mov ecx,[ecx+53Ch]`, tail into CWanted::SetWantedLevel (0x004ADA50),
+// `ret 4`.
+//
+// **It is not idempotent, and that is why CoopIII only calls it on a
+// disagreement.** CWanted::SetWantedLevel calls ClearQdCrimes (0x004ADF20)
+// and then sets m_nChaos to the *bottom* of the requested bracket - 820 for
+// four stars, from `mov dword [ebx],334h`. Calling it every tick with the
+// level the player already has would throw away their accumulated chaos 25
+// times a second and stop them ever reaching the next star.
+constexpr uintptr_t CPlayerPed__SetWantedLevel = 0x004F3190;
+
+// Recorded, not used. Established while proving the four above; here so the
+// next person starts from a list instead of a search.
+//
+//   CWanted::SetWantedLevel            0x004ADA50   thiscall(int32)
+//   CWanted::SetWantedLevelNoDrop      0x004ADAC0   `cmp arg,[ecx+18h] / jg`
+//   CWanted::UpdateWantedLevel         0x004AD900   chaos -> stars
+//   CWanted::RegisterCrime             0x004AD9F0
+//   CWanted::RegisterCrime_Immediately 0x004ADA10
+//   CWanted::SetMaximumWantedLevel     0x004ADAE0   table 0x005F7800
+//   CWanted::WorkOutPolicePresence     0x004ADD00   cdecl(CVector, float)
+//   CWanted::ClearQdCrimes             0x004ADF20
+//   CWanted::MaximumWantedLevel        0x005F7714   the level clamp
+//   CWanted::nMaximumWantedLevel       0x005F7718   the chaos clamp
+//   CEventList::ReportCrimeForEvent    0x00476070
+//   CRunningScript::ProcessCommands200To299  0x0043D530, base 214, 85 entries
+//
+// And the one fact that made this feature small, from the tail of
+// CEventList::RegisterEvent:
+//
+//   00475DD1  call 004A1150         FindPlayerPed()
+//   00475DD6  cmp  [esp+28h],eax    the `criminal` argument
+//   00475DDA  jne  00475DF0         not the player: report nothing
+//   00475DE8  call 00476070         ReportCrimeForEvent
+//
+// A crime is only ever reported against the local player's own ped, so M3
+// replaying a remote player's shot through CWeapon::Fire on this machine
+// cannot move this machine's wanted level. Nobody had to write that.
+
+// The engine's own ceiling, from CWanted::SetMaximumWantedLevel's case 6
+// (`mov dword [5F7714h],6`) and from SetWantedLevel's `cmp ebp,[5F7714h] /
+// jle` clamp against it. Three bits on the wire hold 0..7, so the eighth
+// value is not a state the game has.
+//
+// Pinned to the wire's copy rather than declared a second time. Two constants
+// for one fact is how the ped pool's slot size and the animation node array
+// both went wrong on this project: they only ever agreed with themselves.
+static_assert(WANTED_LEVEL_CEILING == 6,
+              "CWanted::MaximumWantedLevel is 6 in retail 1.0; protocol.h's "
+              "clamp has to be the same number");
+
+// ---- crimes against a pedestrian (game/copcrime.h) --------------------------
+//
+// __cdecl void CEventList::RegisterEvent(eEventType, eEventEntity, CEntity *,
+// CPed *criminal, int32 timeout), the entity overload. Its tail is the gate
+// quoted above; the call at 0x00475DE8 pushes (type, ent, copsDontCare), so
+// the crime id ReportCrimeForEvent gets is the victim's own pointer.
+constexpr uintptr_t CEventList__RegisterEvent = 0x00475C50;
+constexpr uintptr_t REPORT_CRIME_FOR_EVENT_CALL = 0x00475DE8;   // its only caller
+
+// __cdecl void CEventList::ReportCrimeForEvent(eEventType, intptr crimeId,
+// bool copsDontCare). `mov ebx,[esp+2Ch]` at 0x00476077 is the type, and ebx
+// is what everything after reads: the switch at 0x00476085 through the table
+// at 0x005F12C4 (16 arms, type - 1; 0x004760E0 is "no crime"), then
+// `cmp ebx,3` at 0x00476171 -> CPlayerPed::SetWantedLevelNoDrop(1) and
+// `cmp ebx,0Ch` at 0x00476184 -> SetWantedLevelNoDrop(2). So a different type
+// on the way in changes the crime and both floors.
+//
+// Hookable: seven bytes of pushes and a `sub`, one E8 caller, no jump back
+// into them from anywhere in the image and no pointer to it in the data.
+constexpr uintptr_t CEventList__ReportCrimeForEvent = 0x00476070;
+constexpr uint8_t   REPORT_CRIME_FOR_EVENT_PROLOGUE[] = {0x53, 0x56, 0x57, 0x55,
+                                                         0x83, 0xEC, 0x18};
+constexpr uintptr_t REPORT_CRIME_EVENT_TABLE     = 0x005F12C4;
+constexpr uintptr_t REPORT_CRIME_NO_CRIME_ARM    = 0x004760E0;
+constexpr uintptr_t REPORT_CRIME_FLOOR1_CMP      = 0x00476171;   // 83 FB 03
+constexpr uintptr_t REPORT_CRIME_FLOOR2_CMP      = 0x00476184;   // 83 FB 0C
+constexpr uintptr_t CPlayerPed__SetWantedLevelNoDrop = 0x004F31B0;
+
+// __thiscall void CWanted::ReportCrimeNow(eCrimeType, const CVector &, bool),
+// reached from RegisterCrime_Immediately at 0x004ADA3E and from the queue.
+// Switch at 0x004AE194 over a 16-arm table at 0x005F782C (crime - 1); each
+// arm is `fld [k] / fmul [esp+4] / fiadd [ebx]`, k the chaos for that crime.
+// 0x004AE3E3 is the shared tail, i.e. no chaos (POSSESSION_GUN).
+constexpr uintptr_t CWanted__ReportCrimeNow     = 0x004AE110;
+constexpr uintptr_t REPORT_CRIME_NOW_TABLE      = 0x005F782C;
+constexpr uintptr_t REPORT_CRIME_NOW_TAIL       = 0x004AE3E3;
+
+// __cdecl int32 CWanted::WorkOutPolicePresence(CVector, float radius), what
+// decides between RegisterCrime_Immediately and the queue (0x00476117, 14 m).
+// It counts peds by *model* - `movsx ebp,word [ebx+5Ch]` at 0x004ADD5D, then
+// 1, 2..3 and 4 (cop, swat, fbi, army) - and never reads m_nPedType, so a
+// replica wearing a police model is already a witness here.
+constexpr uintptr_t CWanted__WorkOutPolicePresence = 0x004ADD00;
+constexpr uintptr_t POLICE_PRESENCE_MODEL_READ     = 0x004ADD5D;
+constexpr uintptr_t POLICE_PRESENCE_END            = 0x004ADF16;
+
+// eEventType, the ones a hurt pedestrian produces. Each comes in a pair and
+// every caller picks between the two with `cmp dword [victim+32Ch],6`:
+constexpr int32_t EVENT_ASSAULT          = 1;
+constexpr int32_t EVENT_ASSAULT_POLICE   = 3;
+constexpr int32_t EVENT_HIT_AND_RUN      = 9;
+constexpr int32_t EVENT_HIT_AND_RUN_COP  = 10;
+constexpr int32_t EVENT_SHOOT_PED        = 11;
+constexpr int32_t EVENT_SHOOT_COP        = 12;
+constexpr int32_t EVENT_PED_SET_ON_FIRE  = 14;
+constexpr int32_t EVENT_COP_SET_ON_FIRE  = 15;
+constexpr int32_t EVENT_LAST_REPORTED    = 16;   // CAR_SET_ON_FIRE, the table's end
+
+// eCrimeType, 1..16 in the table above. There is no "killed a cop": a kill is
+// whichever of these the killing blow was.
+constexpr int32_t CRIME_NONE        = 0;
+constexpr int32_t CRIME_HIT_PED     = 2;
+constexpr int32_t CRIME_HIT_COP     = 3;
+constexpr int32_t CRIME_SHOOT_PED   = 4;
+constexpr int32_t CRIME_SHOOT_COP   = 5;
+constexpr int32_t CRIME_RUNOVER_PED = 10;
+constexpr int32_t CRIME_RUNOVER_COP = 11;
+constexpr int32_t CRIME_PED_BURNED  = 13;
+constexpr int32_t CRIME_COP_BURNED  = 14;
+constexpr int32_t CRIME_LAST        = 16;   // DESTROYED_CESSNA
+
+// Every place the engine turns a hurt pedestrian into an event. `cmpAt` is
+// the `cmp dword [victim+32Ch],6`, the two pushes are the event for a cop and
+// for anybody else, `callAt` is the RegisterEvent call the civilian arm
+// reaches. The victim pushed is the pointer compared in all nine.
+struct PedEventSite {
+	uintptr_t   cmpAt;
+	uintptr_t   copPushAt;
+	uintptr_t   civPushAt;
+	uintptr_t   callAt;
+	const char *what;
+};
+constexpr PedEventSite PED_EVENT_SITES[] = {
+    {0x004796CE, 0x004796E3, 0x004796F3, 0x00479716, "CFireManager::StartFire(CEntity *)"},
+    {0x004B19C2, 0x004B19DA, 0x004B19EF, 0x004B19F1, "CWorld::TriggerExplosionSectorList"},
+    {0x004E9720, 0x004E9732, 0x004E9742, 0x004E9744, "CPed::FightStrike"},
+    {0x004ECCB7, 0x004ECCC9, 0x004ECCD9, 0x004ECCDB, "CPed::KillPedWithCar"},
+    {0x0055878E, 0x005587A7, 0x005587C0, 0x005587C2, "CBulletInfo::Update"},
+    {0x0055D254, 0x0055D269, 0x0055D27C, 0x0055D27E, "CWeapon::FireMelee"},
+    {0x0055FCF3, 0x0055FD0B, 0x0055FD22, 0x0055FD24, "CWeapon::DoBulletImpact"},
+    {0x0056111B, 0x00561133, 0x00561149, 0x0056114B, "CWeapon::FireShotgun"},
+    {0x00562CC6, 0x00562CDD, 0x00562CFE, 0x00562D00, "CWeapon::FireInstantHitFromCar"},
+};
+
+// The respawn window each type gets, in milliseconds, or 0 for "never comes
+// back". A pure function so the server can be given the same number without
+// the game, and so a test can walk the whole type range.
+//
+// Read off the award switch's tails, not off re3:
+//   IN_SHOP         0x00430FBE  add eax,1388h    =   5 000
+//   ON_STREET       0x0043111C  add eax,7530h    =  30 000
+//   ON_STREET_SLOW  0x0043113A  add eax,493E0h   = 300 000  (bribe model)
+//                   0x00431146  add eax,0AFC80h  = 720 000  (anything else)
+// and ONCE / ONCE_TIMEOUT / COLLECTABLE1 / MONEY all end in the inline
+// Remove(), which sets m_eType = PICKUP_NONE and frees the slot for good.
+//
+// Every one of those is `CTimer::m_snTimeInMilliseconds + k`, i.e. an absolute
+// stamp on a *local* clock. The constant travels; the deadline must not.
+constexpr uint32_t PickupRespawnMs(uint8_t type, bool isBribeModel) {
+	switch (type) {
+	case PICKUP_IN_SHOP:        return 5000;
+	case PICKUP_ON_STREET:      return 30000;
+	case PICKUP_ON_STREET_SLOW: return isBribeModel ? 300000u : 720000u;
+	default:                    return 0;
+	}
+}
+
+// ---- what a dead pedestrian leaves behind ---------------------------------
+//
+// docs/pickups.md 10. Found from CPed::SetDead (0x004D3970, already in this
+// file under the ProcessControl call sequence), whose tail is:
+//
+//   004D39F2  call 004A1150          FindPlayerPed
+//   004D39F7  cmp  ebx,eax
+//   004D39F9  je   004D3A09          the local player drops nothing
+//   004D39FB  mov  ecx,ebx
+//   004D39FD  call 00433660          CreateDeadPedWeaponPickups
+//   004D3A02  mov  ecx,ebx
+//   004D3A04  call 00433490          CreateDeadPedMoney
+//
+// which is re3 Ped.cpp:6383-6384 in the engine's own order, weapons first.
+// A whole-image scan for E8/E9 rel32 targets equal to either address finds
+// **exactly one reference each**, and both are those two call sites. So
+// these two functions are reached from nowhere else in this build and
+// detouring them covers every ped drop there is.
+//
+// Both are __thiscall and take nothing but `this`.
+
+// CPed::CreateDeadPedMoney(). re3 Pickups.cpp:1445-1473, statement for
+// statement, and **the RNG is all of it**:
+//
+//   00433497  cmp  byte [005F4DD4],0 / jne      CGame::nastyGame, else return
+//   004334B0  movsx edi,word [ebx+5Ch]          m_modelIndex
+//             cmp edi,1 / je ret                MI_COP
+//             lea eax,[edi-2] / cmp eax,3 / jbe ret   MI_..2..5
+//             cmp edi,6 / je ret                MI_FIREMAN
+//   004334D0  cmp  byte [ebx+160h],2 / je ret   CharCreatedBy == MISSION_CHAR
+//   004334E1  cmp  byte [ebx+314h],0 / jne ret  bInVehicle
+//   004334F2  call 005A41D0                     CGeneral::GetRandomNumber
+//             movzx ebp,ax, then the 88888889h/sar 5/imul 3Ch pair = %60
+//   00433514  cmp  ebp,0Ah / jl ret             money < 10 -> nothing at all
+//   00433521  cmp  ebp,2Bh / jne / mov ebp,2BCh money == 43 -> 700
+//   0043352B  the 66666667h/sar 4 pair = /40, inc esi   pickupCount
+//   00433544  idiv esi                          moneyPerPickup
+//   00433567  call 005A41D0 / and eax,0FFh / fmul [005EE138] / fsin
+//             fmul [005EDE5C] / fadd pos.x      1.5 * Sin(rnd%256 * PI/128)
+//   004335AE  the same again with fcos for y
+//   00433606  call 004B3AE0                     FindGroundZFor3DCoord, +0.5f
+//   0043361F  call 005A41D0 / and eax,7 / add ebp   quantity + (rnd & 7)
+//   00433643  call 004304B0                     GenerateNewOne, type 7, model
+//                                               from the int16 at 005F5A08
+//
+// **Four RNG draws per pickup and one for the amount.** Nothing about this
+// function is reproducible on a second machine, which is why the money half
+// of a drop can only ever be decided by one of them.
+constexpr uintptr_t CPed__CreateDeadPedMoney = 0x00433490;
+
+// CPed::CreateDeadPedWeaponPickups(). re3 Pickups.cpp:1478-1523.
+//
+// **It never calls the RNG once.** The whole function was disassembled and
+// scanned for rel32 calls to CGeneral::GetRandomNumber (0x005A41D0) and there
+// are none; the only calls it makes are 005A0CB0 (the FPU range-reduction
+// helper behind fsin/fcos), 004B3AE0 (FindGroundZFor3DCoord), 004AEAA0
+// (GetIsLineOfSightClear), 00430660 (GenerateNewOne_WeaponType) and 004CFB70
+// (ClearWeapons). The scatter is `angleToPed = i * 1.75f` - an index, not a
+// draw - and the line-of-sight retry is
+// `GetIsLineOfSightClear(edge, pedPos, true, 0,0,0,0,0,0)` at 0x004338C6:
+// **buildings only**, every dynamic flag zero, so it reads nothing but static
+// collision and answers the same on every machine.
+//
+//   00433669  cmp  byte [ebx+314h],0 / jne ret   bInVehicle
+//   00433684  mov  eax,[ebx+edi+35Ch]            m_weapons[i].m_eWeaponType
+//             test eax,eax / je next             WEAPONTYPE_UNARMED
+//             cmp  eax,0Ch / je next             WEAPONTYPE_DETONATOR
+//   0043369E  cmp  dword [ebx+edi+368h],0 / je next   m_nAmmoTotal == 0
+//   00433980  movzx edx,word [eax*2+005ED8FC]    AmmoForWeapon_OnStreet[w]
+//             cmp eax,edx / jl / mov eax,edx     Min(m_nAmmoTotal, that)
+//   004339A4  push 4                             PICKUP_ONCE_TIMEOUT
+//   004339B3  call 00430660                      GenerateNewOne_WeaponType
+//   004339BF  cmp  bp,0Dh / jl                   13 inventory slots
+//   004339CB  call 004CFB70                      ClearWeapons
+//
+// So a weapon drop is a pure function of the ped's position and its
+// inventory. Two machines holding the same ped in the same place with the
+// same guns would produce byte-identical pickups - which is worth knowing
+// and is *not* what makes the design work, because an observer has neither:
+// AmbientPedState carries no inventory and no health.
+constexpr uintptr_t CPed__CreateDeadPedWeaponPickups = 0x00433660;
+
+// CPickups::GenerateNewOne_WeaponType(CVector pos, eWeaponType, uint8 type,
+//                                     uint32 quantity). cdecl.
+//
+// Eleven instructions: it maps the weapon to a model through 0x00430690 (a
+// jump table at 0x005EE144 returning 0AAh..0B5h) and then tail-calls
+// GenerateNewOne with the same pos, type and quantity. Recorded because it
+// is what the weapon half of a drop goes through - an observer replaying a
+// drop uses the model-index form above and needs no weapon type at all,
+// since the model is what the engine wrote into the slot.
+constexpr uintptr_t CPickups__GenerateNewOne_WeaponType = 0x00430660;
+constexpr uintptr_t CPickups__ModelForWeapon            = 0x00430690;
+
+// uint16[], indexed by eWeaponType: how much ammo a weapon left on the street
+// carries at most. `movzx edx,word [eax*2+005ED8FCh]` at 0x00433987, compared
+// against m_nAmmoTotal and used as the cap. A third table beside AmmoForWeapon
+// (0x005ED8D4) and CostOfWeapon (0x005ED924), and 0x28 bytes below the first
+// of them.
+constexpr uintptr_t AmmoForWeapon_OnStreet = 0x005ED8FC;
+
+// CPed::ClearWeapons(). The tail of CreateDeadPedWeaponPickups, and the one
+// thing a suppressed drop still has to do - skipping it would leave a corpse
+// holding an inventory the engine meant to empty.
+//
+//   004CFB73  RemoveWeaponModel(GetWeaponInfo(m_weapons[m_currentWeapon])->
+//                               m_nModelId)      via 00564FD0 / 004CF980
+//   004CFB96  mov byte [ebx+499h],1              m_maxWeaponTypeAllowed =
+//                                                WEAPONTYPE_BASEBALLBAT
+//   004CFB9D  mov byte [ebx+498h],0              m_currentWeapon = UNARMED
+//   004CFBC2  AddWeaponModel(...)                via 004CF8F0
+//             then the 13-slot clear loop
+//
+// re3 Ped.cpp:4770-4790, statement for statement.
+constexpr uintptr_t CPed__ClearWeapons = 0x004CFB70;
+
+// CGame::nastyGame - the byte CreateDeadPedMoney opens on. Not read by
+// CoopIII; recorded because a machine with it clear makes no money drops at
+// all, which would look exactly like the seam having failed to install.
+constexpr uintptr_t CGame__nastyGame = 0x005F4DD4;
+
+// MI_MONEY. int16, runtime-filled like the eight pickup models above.
+// `movzx eax,word [005F5A08]` at 0x0043362D, pushed to GenerateNewOne as the
+// model index for every money pickup.
+constexpr uintptr_t MI_MONEY = 0x005F5A08;
+
+// The expiry GenerateNewOne stamps on the two drop types, in milliseconds.
+// Absolute, on CTimer::m_snTimeInMilliseconds, so like every other pickup
+// deadline it is local and must never travel - but the *duration* is a
+// constant, and it is why a drop needs no server table and no backfill:
+// every copy of it is gone within half a minute however it was made.
+//
+//   004305A5  cmp al,4 / add edx,4E20h   PICKUP_ONCE_TIMEOUT  20 000 ms
+//   004305BB  cmp al,7 / add ecx,7530h   PICKUP_MONEY         30 000 ms
+constexpr uint32_t PICKUP_ONCE_TIMEOUT_MS = 20000;
+constexpr uint32_t PICKUP_MONEY_MS        = 30000;
+
+// The server needs the same numbers and cannot include this file, so
+// protocol.h carries its own copy. Two hardcoded copies of a table that only
+// agree with themselves are worth nothing; this is what makes them agree with
+// each other, at compile time, in both builds.
+static_assert(PickupRespawnMs(PICKUP_IN_SHOP, false) ==
+                  ::coopiii::PickupRespawnMs(PICKUP_IN_SHOP, false),
+              "shop window agrees with protocol.h");
+static_assert(PickupRespawnMs(PICKUP_ON_STREET, false) ==
+                  ::coopiii::PickupRespawnMs(PICKUP_ON_STREET, false),
+              "street window agrees with protocol.h");
+static_assert(PickupRespawnMs(PICKUP_ON_STREET_SLOW, true) ==
+                  ::coopiii::PickupRespawnMs(PICKUP_ON_STREET_SLOW, true),
+              "bribe window agrees with protocol.h");
+static_assert(PickupRespawnMs(PICKUP_ON_STREET_SLOW, false) ==
+                  ::coopiii::PickupRespawnMs(PICKUP_ON_STREET_SLOW, false),
+              "slow window agrees with protocol.h");
+static_assert(PICKUP_COLLECTABLE1 == ::coopiii::PICKUP_TYPE_PACKAGE,
+              "the hidden package agrees with protocol.h");
+static_assert(PICKUP_TYPE_ONCE_TIMEOUT == PICKUP_ONCE_TIMEOUT &&
+                  PICKUP_TYPE_MONEY == PICKUP_MONEY &&
+                  PICKUP_DROP_FORGET_MS >= 2 * PICKUP_MONEY_MS,
+              "a collected drop is remembered past the longest it lies on the ground");
+static_assert(PickupRespawnMs(PICKUP_ONCE, false) == 0 &&
+                  PickupRespawnMs(PICKUP_COLLECTABLE1, false) == 0 &&
+                  PickupRespawnMs(PICKUP_MONEY, false) == 0,
+              "the types that end in the engine's inline Remove() never return");
+
+// ---- garages, doors and the Pay'n'Spray ------------------------------------
+//
+// Found the usual way: opcode 864 OPEN_GARAGE and 865 CLOSE_GARAGE, through
+// the dispatcher at CRunningScript__ProcessCommands, the 800-range link
+// (`cmp dx,384h`) to ProcessCommands800To899 (0x00448240) and the table at
+// 0x005EF77C (base opcode 800), entries 64 and 65. Both handlers are four
+// instructions long and between them they name the array, its stride and both
+// mutators. Opcodes 944/945 IS_GARAGE_OPEN / IS_GARAGE_CLOSED - table
+// 0x005EFA14, base 900, entries 44/45 - name the two predicates and pin the
+// state enum's values from the other end.
+//
+// NOTHING BELOW CAME OFF re3's DECLARATIONS. re3 happens to agree on 140 and
+// on the whole field layout; that was checked afterwards. Five re3 constants
+// have been refuted on this project.
+
+// CGarage aGarages[32], stride 0x8C. Three independent witnesses:
+//
+//   1. COMMAND_OPEN_GARAGE's handler (0x0044B230)
+//        0044B243  mov ecx,[006ED460h]        ScriptParams[0], the index
+//        0044B249  imul ecx,ecx,8Ch           stride 140
+//        0044B24F  add ecx,72BCD0h            the array
+//        0044B255  call 00426F20              CGarage::OpenThisGarage
+//      and 0x0044B275 is the same four instructions with 0x00426F40.
+//   2. CGarages::IsGarageOpen (0x00426CF0), which builds 140*idx out of three
+//      `lea`s and then reads the byte at +1:
+//        0F BF 4C 24 04         movsx ecx,word [esp+4]
+//        8D 04 CD 00 00 00 00   lea eax,[ecx*8]
+//        8D 04 81               lea eax,[ecx+eax*4]     33*idx
+//        8D 04 48               lea eax,[eax+ecx*2]     35*idx
+//        8A 14 85 D1 BC 72 00   mov dl,[eax*4 + 0072BCD1h]
+//      35*4 = 140, and the +1 in the displacement is m_eGarageState.
+//   3. CGarages::Update (0x00421E40), whose loop is the bound:
+//        00421E74  mov esi,72BCD0h
+//        00421E94  cmp byte [ebp+0072BCD0h],0    IsUsed(): type != GARAGE_NONE
+//        00421E9F  call 004222D0                 CGarage::Update, this in ecx
+//        00421EA5  add ebp,8Ch / add esi,8Ch
+//        00421EB1  cmp ebx,20h / jl              32 garages, not NumGarages
+//
+// The loop bound is the literal 0x20, not CGarages::NumGarages, so 32 is the
+// number to walk and a garage the script never created is skipped by its own
+// type byte being zero.
+constexpr uintptr_t CGarages__aGarages = 0x0072BCD0;
+constexpr size_t    NUM_GARAGES        = 32;
+constexpr size_t    SIZEOF_GARAGE      = 0x8C;
+
+// CGarages::SetTargetCarForMissonGarage, __cdecl (int16 garage, CVehicle*),
+// the one thing SET_TARGET_CAR_FOR_MISSION_GARAGE's handler (0x00443714)
+// calls, with `pop ecx / pop ecx` after it. Its whole body:
+//   00426BD8  test eax,eax / jne            the car
+//   00426BEC  mov [eax*4 + 0072BD2Ch],0     null: m_pTarget = nil, ret
+//   00426C01  mov [edx + 0072BD2Ch],eax     else m_pTarget = car
+//   00426C07  cmp byte [edx+0072BCD1h],5    and GS_CLOSEDCONTAINSCAR
+//   00426C10  mov byte [edx+0072BCD1h],0    becomes GS_FULLYCLOSED
+// 0x0072BD2C is aGarages + GARAGE_TARGET. There is no RegisterReference: re3's
+// version of this function has one, retail's does not, so a car deleted
+// under a garage leaves m_pTarget pointing at a freed slot (game/teardown.h).
+constexpr uintptr_t CGarages__SetTargetCarForMissonGarage = 0x00426BD0;
+
+// CGarage::Update, __thiscall, one garage. This is the whole state machine and
+// it is the function CoopIII detours.
+//
+//   004222D0  53 56 57 55        push ebx/esi/edi/ebp
+//   004222D4  89 CD              mov ebp,ecx            this
+//   004222D6  81 EC 08 02 00 00  sub esp,208h
+//   004222DC  80 7D 00 0D        cmp byte [ebp+0],0Dh   type != GARAGE_CRUSHER
+//
+// That last compare is the first line of re3's Garages.cpp:1220 and it pins
+// both m_eGarageType at +0 and GARAGE_CRUSHER == 13, i.e. the whole eGarageType
+// enum, since it is dense from GARAGE_NONE == 0.
+constexpr uintptr_t CGarage__Update            = 0x004222D0;
+constexpr uintptr_t CGarages__Update           = 0x00421E40;
+constexpr uintptr_t CGarage__OpenThisGarage    = 0x00426F20;
+constexpr uintptr_t CGarage__CloseThisGarage   = 0x00426F40;
+constexpr uintptr_t CGarage__UpdateDoorsHeight = 0x00426730;
+constexpr uintptr_t CGarages__IsGarageOpen     = 0x00426CF0;
+constexpr uintptr_t CGarages__IsGarageClosed   = 0x00426D20;
+
+// The two mutators in full, because they are twenty bytes between them and
+// they are the *only* legal transitions into a moving state:
+//
+//   OpenThisGarage  0x00426F20
+//     8A 41 01        mov al,[ecx+1]
+//     84 C0 74 08     test al,al / je set          GS_FULLYCLOSED
+//     3C 02 74 04     cmp al,2   / je set          GS_CLOSING
+//     3C 05 75 04     cmp al,5   / jne ret         GS_CLOSEDCONTAINSCAR
+//     C6 41 01 03     mov byte [ecx+1],3           GS_OPENING
+//     C3
+//
+//   CloseThisGarage 0x00426F40
+//     8A 41 01        mov al,[ecx+1]
+//     3C 01 74 04     cmp al,1 / je set            GS_OPENED
+//     3C 03 75 04     cmp al,3 / jne ret           GS_OPENING
+//     C6 41 01 02     mov byte [ecx+1],2           GS_CLOSING
+//     C3
+//
+// Neither touches m_fDoorPos. A garage that is already open is left alone by
+// OpenThisGarage - which is exactly why HoldGarageOpen below cannot use it for
+// the common case and has to write GS_OPENED itself. See garage.cpp.
+
+namespace offs {
+
+// CGarage, 0x8C bytes. Every offset below is either written or read by
+// CGarage::Update at the address in the comment; the Pay'n'Spray arm alone
+// witnesses eleven of them.
+constexpr size_t GARAGE_TYPE       = 0x00; // uint8  0x004222DC cmp byte [ebp+0],0Dh
+constexpr size_t GARAGE_STATE      = 0x01; // uint8  0x00426F2F mov byte [ecx+1],3
+constexpr size_t GARAGE_CLOSING_NO_CAR = 0x03; // bool
+constexpr size_t GARAGE_DEACTIVATED    = 0x04; // bool
+constexpr size_t GARAGE_RESPRAY_HAPPENED = 0x05; // bool 0x00422AEA mov [ebp+5],1
+constexpr size_t GARAGE_TARGET_MODEL = 0x08; // int32
+constexpr size_t GARAGE_DOOR1      = 0x0C; // CEntity*
+constexpr size_t GARAGE_DOOR2      = 0x10; // CEntity*
+constexpr size_t GARAGE_ROTATED_DOOR = 0x19; // bool 0x00422B2F mov dl,[ebp+19h]
+constexpr size_t GARAGE_X1         = 0x1C; // float 0x00422949 fld [ebp+1Ch]
+constexpr size_t GARAGE_X2         = 0x20; // float 0x0042294E fld [ebp+20h]
+constexpr size_t GARAGE_Y1         = 0x24; // float 0x00422991 fld [ebp+24h]
+constexpr size_t GARAGE_Y2         = 0x28; // float 0x00422996 fld [ebp+28h]
+constexpr size_t GARAGE_Z1         = 0x2C; // float
+constexpr size_t GARAGE_Z2         = 0x30; // float
+constexpr size_t GARAGE_DOOR_POS   = 0x34; // float 0x00422B96 fstp [ebp+34h]
+constexpr size_t GARAGE_DOOR_HEIGHT = 0x38; // float 0x00422B9C fcomp [ebp+38h]
+constexpr size_t GARAGE_DOOR1_Z    = 0x4C; // float 0x00422A13 fld [ebp+4Ch]
+constexpr size_t GARAGE_TIME_TO_ACT = 0x54; // uint32 0x004226B0 mov eax,[ebp+54h]
+constexpr size_t GARAGE_TARGET     = 0x5C; // CVehicle*
+
+} // namespace offs
+
+static_assert(offs::GARAGE_TARGET + 4 + 4 + 0x28 == SIZEOF_GARAGE,
+              "m_pTarget, the unused pointer after it and the 0x28-byte "
+              "CStoredCar are the tail of the 140 the stride proves");
+
+// eGarageState. The values are not taken from re3's enum: 0, 2 and 5 are the
+// three OpenThisGarage accepts, 1 and 3 are the two CloseThisGarage accepts,
+// 4 is written by the Pay'n'Spray's GS_OPENING arm at 0x00422BAF
+// (`mov byte [ebp+1],4`), and IsGarageOpen's `cmp dl,1 / cmp dl,4` plus
+// IsGarageClosed's `cmp byte [..],0` say which of them count as open and as
+// shut. Six of the seven are therefore witnessed by an instruction; only
+// GS_AFTERDROPOFF is inferred from the gap, and CoopIII never writes it.
+enum eGarageState : uint8_t {
+	GS_FULLYCLOSED       = 0,
+	GS_OPENED            = 1,
+	GS_CLOSING           = 2,
+	GS_OPENING           = 3,
+	GS_OPENEDCONTAINSCAR = 4,
+	GS_CLOSEDCONTAINSCAR = 5,
+	GS_AFTERDROPOFF      = 6,
+};
+
+// eGarageType, dense from 0, with GARAGE_CRUSHER == 13 nailed by Update's own
+// first instruction and GARAGE_RESPRAY == 5 by the jump table at 0x005ED168
+// that the respray arm dispatches its five states through.
+enum eGarageType : uint8_t {
+	GARAGE_NONE                          = 0,
+	GARAGE_MISSION                       = 1,
+	GARAGE_BOMBSHOP1                     = 2,
+	GARAGE_BOMBSHOP2                     = 3,
+	GARAGE_BOMBSHOP3                     = 4,
+	GARAGE_RESPRAY                       = 5,
+	GARAGE_COLLECTORSITEMS               = 6,
+	GARAGE_COLLECTSPECIFICCARS           = 7,
+	GARAGE_COLLECTCARS_1                 = 8,
+	GARAGE_COLLECTCARS_2                 = 9,
+	GARAGE_COLLECTCARS_3                 = 10,
+	GARAGE_FORCARTOCOMEOUTOF             = 11,
+	GARAGE_60SECONDS                     = 12,
+	GARAGE_CRUSHER                       = 13,
+	GARAGE_MISSION_KEEPCAR               = 14,
+	GARAGE_FOR_SCRIPT_TO_OPEN            = 15,
+	GARAGE_HIDEOUT_ONE                   = 16,
+	GARAGE_HIDEOUT_TWO                   = 17,
+	GARAGE_HIDEOUT_THREE                 = 18,
+	GARAGE_FOR_SCRIPT_TO_OPEN_AND_CLOSE  = 19,
+	GARAGE_KEEPS_OPENING_FOR_SPECIFIC_CAR = 20,
+	GARAGE_MISSION_KEEPCAR_REMAINCLOSED  = 21,
+};
+
+// ---- the engine taking a car away on purpose ---------------------------------
+//
+// Verified 2026-09-25 against the retail image for the session-car removal
+// work (docs/protocol.md 1.44). Every call site below was found by scanning
+// .text for E8 rel32s to the function, so the lists are complete, not a
+// sample.
+//
+// DestroyVehicleAndDriverAndPassengers, a free __cdecl (CVehicle*): the driver
+// at +1A4h and each passenger at +1A8h (count at +1CCh) go through 0x00420F60
+// and their own vtable slot, then `push ebx / call 004AE9D0` (CWorld::Remove)
+// and the car's deleting destructor through [vtable+0] with 1. Four callers,
+// all in CGarage::Update, told apart by what surrounds them:
+//   0x0042321E  GARAGE_MISSION: `mov byte [ebp+1],5` (GS_CLOSEDCONTAINSCAR)
+//               behind `cmp byte [ebp+3],0` (m_bClosingWithoutTargetCar)
+//   0x0042360A  GARAGE_COLLECTSPECIFICCARS: followed by the police car and
+//               bank van rewards, `inc [008F1B34]` / `inc [00941444]`
+//   0x00423B45  Craig: `push model / call 00426E50` right before it
+//   0x0042416F  GARAGE_CRUSHER: CrushedCarId `[00943060]` from
+//               CPool::GetIndex before, `inc [00943050]` (CarsCrushed) after
+constexpr uintptr_t DestroyVehicleAndDriverAndPassengers = 0x00552760;
+constexpr uintptr_t GARAGE_DESTROY_MISSION_CALL   = 0x0042321E;
+constexpr uintptr_t GARAGE_DESTROY_COLLECTED_CALL = 0x0042360A;
+constexpr uintptr_t GARAGE_DESTROY_CRAIG_CALL     = 0x00423B45;
+constexpr uintptr_t GARAGE_DESTROY_CRUSHER_CALL   = 0x0042416F;
+
+// CGarage::MarkThisCarAsCollectedForCraig, __thiscall (mi) ret 4. Maps the
+// corpse model 73h to 64h, takes the list index as `type - 8`, finds the model
+// in the sixteen-int table at 0x005ECDD4 and `or [eax*4 + 008E286Ch], bit`,
+// then pays $1000 (`add [edx+0094139Ch], 3E8h`) and $200000 for a full list.
+// So CGarages::CarTypesCollected is three int32 at 0x008E286C.
+constexpr uintptr_t CGarage__MarkThisCarAsCollectedForCraig = 0x00426E50;
+// (CGarages__CarTypesCollected is declared with the lists that travel, below.)
+
+// Craig's GS_FULLYCLOSED arm: `call 004A10C0` (FindPlayerVehicle) then
+// `cmp byte [eax+1F4h],2 / je` to "come back when you're not so busy" - the
+// only VehicleCreatedBy test in the arm, and the arm destroys nothing.
+constexpr uintptr_t GARAGE_CRAIG_MISSION_CAR_TEST = 0x00423BDB;
+
+// CGarage::StoreAndRemoveCarsForThisHideout, __thiscall (CStoredCar*, nMax)
+// ret 8. Walks the vehicle pool from the top; for a car inside the garage's
+// box (strict compares against +1Ch..+30h) it tests
+// `cmp byte [ebp+1F4h],2 / je skip` at 0x0042794C - a MISSION_VEHICLE is left
+// where it is and nothing else about it is touched - and otherwise stores it
+// (0x004275C0) when there is room, CancelPlayerEnteringCars (0x004A13B0),
+// CWorld::Remove and the deleting destructor. Two callers, found by scan:
+// the hideout arm of CGarage::Update as the door arrives shut, and the pass
+// over the three hideouts at 0x00428130 that closes them (before a save).
+constexpr uintptr_t CGarage__StoreAndRemoveCarsForThisHideout = 0x00427840;
+constexpr uintptr_t HIDEOUT_STORE_UPDATE_CALL = 0x00424A50;
+constexpr uintptr_t HIDEOUT_STORE_CLOSE_CALL  = 0x004281A2;
+
+// CEntity::PruneReferences (0x004A7530, above with the seating) is what a
+// caller needs after nulling a pointer it registered: every node whose
+// `*ref != this` goes back on the free list at 0x008F1AF8.
+
+// The crane. CCrane::Update's IDLE arm walks the pickup rectangle's sectors
+// and calls FindCarInSectorList (__thiscall, CPtrList*, ret 4) twice per
+// sector, `lea eax,[edi+10h]` and `add edi,14h` - the vehicle list and the
+// overlap list. Scan finds those two callers and no others.
+// FindCarInSectorList opens `mov ax,[0095CC64h] / cmp [ebp+58h],ax / je next`
+// then stamps m_scanCode: a car whose scan code already equals the current
+// one is never looked at. Node: item at +0, next at +8.
+constexpr uintptr_t CCrane__FindCarInSectorList = 0x00544850;
+constexpr uintptr_t CRANE_FIND_VEHICLES_CALL    = 0x00543FFC;
+constexpr uintptr_t CRANE_FIND_OVERLAP_CALL     = 0x00544007;
+// The military crane's delivery, ROTATING_TARGET's arm: `cmp byte [ebx+7Ch],0`
+// (m_bIsMilitaryCrane), RegisterCarForMilitaryCrane (0x00544B80, which is
+// `or [008F6248h], bit` per model), the $1500 unless the list is full
+// (0x00544BE0 tests `and 7Fh / cmp 7Fh`), then `push [ebx+70h]` (the car) and
+// the call below to CWorld::Remove, then the deleting destructor.
+constexpr uintptr_t CRANE_MILITARY_REMOVE_CALL = 0x005442A6;
+// (CCranes__CarsCollectedMilitaryCrane is declared with the lists, below.)
+
+// CCarGenerator::Process (0x00542BB0) on a car whose status reads 0
+// (STATUS_PLAYER): `add [ebx+20h],0EA60h` (the timer, a minute on),
+// `or [ebx+24h],-1` (the handle), `mov byte [ebx+2Ah],1` (blocking) and
+// `and byte [eax+1F6h],7Fh` on the car. That is the generator letting go of
+// a car a player has taken, and what CoopIII does on every other machine.
+constexpr uint32_t CARGEN_TAKEN_DELAY_MS = 60000;
+
+// The door lock the automobile constructor puts on three models:
+//   0x0052CF5A  cmp dword [eax+224h],1 / jne skip
+//   0x0052CF63  lea eax,[esi-74h] / cmp eax,1 / jbe lock    116 police, 117 Enforcer
+//   0x0052CF6B  cmp esi,7Ah / jne skip                      122 Rhino
+//   0x0052CF74  mov dword [eax+224h],5                      CARLOCK_LOCKED_INITIALLY
+// Only the driver getting out through the engine's own exit takes it off
+// again, which a copy's driver never does here.
+constexpr int CARLOCK_LOCKED_INITIALLY = 5;
+
+// ---- the Pay'n'Spray, which is three things and not one --------------------
+//
+// The whole of it is one arm of CGarage::Update: GS_FULLYCLOSED, once
+// m_nTimeToStartAction has passed. Transcribed from 0x004226B0, in order,
+// because every one of these lines is a decision about what has to travel:
+//
+//   004226B0  mov eax,[ebp+54h]            m_nTimeToStartAction
+//   004226B3  mov ebx,[00885B48h]          CTimer::m_snTimeInMilliseconds
+//   004226B9  cmp ebx,eax / jbe out
+//   004226C8  mov byte [ebp+1],3           GS_OPENING   <- the edge CoopIII watches
+//   004226D0  call 0057CC20                PlayFrontEndSound(SOUND_GARAGE_OPENING)
+//   004226DA  call 004A1150                FindPlayerPed
+//   004226DF  mov eax,[eax+53Ch]           CPed::m_pWanted  (sizeof(CPed) == 0x53C)
+//   004226E5  cmp dword [eax+18h],0        m_nWantedLevel  -> bTakeMoney
+//   004226FB  call 004AD790                CWanted::Reset()        <- 1. WANTED
+//   00422702  call 00492F60 / and [eax+DFh],0FBh   SetEnablePlayerControls
+//   0042271A  and byte [wanted+16h],0FEh   m_bIgnoredByCops = false
+//   00422722  call 004A10C0 / test / je    if (!FindPlayerVehicle()) skip
+//   00422734  mov eax,[eax+284h]           IsCar()
+//   00422747  fld [eax+200h]               m_fHealth < threshold -> bTakeMoney
+//   00422767  mov dword [eax+200h],447A0000h   m_fHealth = 1000.0f   <- 2. REPAIR
+//   00422776  mov dword [eax+530h],0       m_fFireBlowUpTimer = 0
+//   00422787  call 0053C240 (ecx = car)    CAutomobile::Fix()        <- 2. REPAIR
+//   00422791  fld [eax+2Ch] / fcomp 0      GetUp().z < 0 -> flip up and right
+//   0042284E  mov al,[eax+4D9h] / shr 5    bFixedColour -> skip the repaint
+//   0042287F  call 00520FD0                ChooseVehicleColour       <- 3. PAINT
+//   00422901  mov [eax+19Ch],dl            m_currentColour1
+//   00422913  mov [eax+19Dh],bl            m_currentColour2
+//   00422926  call 005A41D0 x 600          the spray particles, GetRandomNumber
+//   00422A63  call 00428000                CenterCarInGarage
+//   00422AEA  mov byte [ebp+5],1           m_bResprayHappened = true
+//
+// Three effects, three different answers about what travels. See
+// client/src/game/garage.h.
+//
+// CAutomobile::Fix itself is declared with the rest of the damage model above,
+// at the "it is an event, not a number" block. The damage work and the garage
+// work found it independently and agreed on 0x0053C240, which is worth saying
+// once rather than declaring twice.
+
+// Recorded, and deliberately NOT called by this feature. CWanted::Reset is the
+// wanted level's own seam and wanted.cpp owns it; garage.cpp marks the
+// place and clears nothing. See "the wanted seam" in garage.h.
+constexpr uintptr_t CWanted__Reset = 0x004AD790;
+
+// ---- the respray colour is not random, and that is worse -------------------
+//
+// docs/roadmap.md 5.9 says the model info "picks those at random", which is
+// true of the extra components and NOT of the colours. The retail
+// CVehicleModelInfo::ChooseVehicleColour contains no call to
+// CGeneral::GetRandomNumber at all:
+//
+//   00520FD0  53                   push ebx
+//   00520FD1  89 CB                mov ebx,ecx                 this
+//   00520FD3  8A 83 D4 01 00 00    mov al,[ebx+1D4h]           m_numColours
+//   00520FDB  84 C0 ... 75 0D      if (numColours == 0) { *col1 = *col2 = 0; ret 8 }
+//   00520FF1  0F B6 C8             movzx ecx,al
+//   00520FF4  0F B6 83 D5 01 00 00 movzx eax,[ebx+1D5h]        m_lastColorVariation
+//   00520FFB  40 99 F7 F9          inc eax / cdq / idiv ecx    (last + 1) % numColours
+//   00520FFF  88 93 D5 01 00 00    mov [ebx+1D5h],dl
+//   0052100B  8A 8C 03 C4 01 00 00 mov cl,[ebx+eax+1C4h]       m_colours1[]
+//   0052101C  8A 94 03 CC 01 00 00 mov dl,[ebx+eax+1CCh]       m_colours2[]
+//   00521030  76 68                if (numColours <= 1) ret
+//   00521032  E8 89 00 F8 FF       call 004A10C0               FindPlayerVehicle
+//   0052103E  0F BF 48 5C          movsx ecx,[eax+5Ch]         its model index
+//   00521042  39 1C 8D 08 D4 83 00 cmp [0083D408h + ecx*4],ebx same model info?
+//   0052104E  8A 90 9C 01 00 00    ... compare both colours, and if they match
+//                                  advance m_lastColorVariation once more
+//
+// So it is a **round robin over the model's own colour table**, plus a
+// tiebreak against whatever the local player happens to be driving. Both
+// halves are machine-local state: m_lastColorVariation counts every car of
+// that model this engine has ever created, and FindPlayerVehicle is a
+// different car on every machine.
+//
+// The conclusion is the same as if it had been an RNG roll - the colour has to
+// travel - but the reason is not, and it is a stronger reason. An RNG could in
+// principle be seeded to agree. A counter over "how many Kurumas has this
+// process made" cannot be, and neither can "what is the local player sitting
+// in right now". This is the third time this class has bitten the project
+// (vehicle extras and vehicle colours are roadmap 5.9); it is the same class,
+// and re3's source would have given the wrong reason for it.
+constexpr uintptr_t CVehicleModelInfo__ChooseVehicleColour = 0x00520FD0;
+
+namespace offs {
+constexpr size_t MODELINFO_COLOURS1    = 0x1C4; // uint8[8]
+constexpr size_t MODELINFO_COLOURS2    = 0x1CC; // uint8[8]
+constexpr size_t MODELINFO_NUM_COLOURS = 0x1D4; // uint8
+constexpr size_t MODELINFO_LAST_COLOUR = 0x1D5; // uint8, the round-robin cursor
+} // namespace offs
+
+static_assert(offs::MODELINFO_COLOURS2 == offs::MODELINFO_COLOURS1 + 8 &&
+                  offs::MODELINFO_NUM_COLOURS == offs::MODELINFO_COLOURS2 + 8,
+              "ChooseVehicleColour's two `mov cl,[ebx+eax+X]` displacements "
+              "and the count it divides by are consecutive");
+
+// ---- which way a garage rests, which is the only classification we need ----
+//
+// Every type's GS_OPENING and GS_CLOSING arms are the same four statements:
+// ramp m_fDoorPos by the door speed times CTimer::ms_fTimeStep, call
+// UpdateDoorsHeight(), and on reaching the limit take the resting state and
+// play a sound. Every type's *resting* arms are the ones that look at
+// FindPlayerPed / FindPlayerVehicle / FindPlayerCoors and decide something.
+//
+// So a garage has exactly two resting positions and each type sits at one of
+// them when nobody is using it:
+//
+//   - the shops stand open and close over a car being worked on: RESPRAY,
+//     the three BOMBSHOPs and the CRUSHER. Their GS_OPENED arm is the one
+//     that starts a visit.
+//   - everything else stands shut and opens for somebody: the three HIDEOUTs
+//     (which are the safehouse garages - init.sc calls them GARAGE_SAVEONE,
+//     SAVETWO and SAVETHREE), the mission lockups, the collection garages and
+//     the script-driven ones.
+//
+// That is the whole classification this feature needs, and it is why the wire
+// carries one bit per garage rather than a state: "my engine has this garage
+// away from where it rests".
+constexpr bool GarageRestsOpen(uint8_t type) {
+	return type == GARAGE_RESPRAY || type == GARAGE_BOMBSHOP1 ||
+	       type == GARAGE_BOMBSHOP2 || type == GARAGE_BOMBSHOP3 ||
+	       type == GARAGE_CRUSHER;
+}
+
+// IsGarageOpen's own test, byte for byte: `cmp dl,1 / je true / cmp dl,4 /
+// jne false`. GS_OPENING and GS_CLOSING are deliberately *not* open - a door
+// on its way up is not up yet, and IsGarageOpen agrees.
+constexpr bool GarageStateIsOpen(uint8_t state) {
+	return state == GS_OPENED || state == GS_OPENEDCONTAINSCAR;
+}
+
+// Which side of its resting position the door is heading for. A moving state
+// is classified by its destination, not by where the door has got to: that is
+// the whole "the transition travels, the door position does not" argument in
+// one function.
+constexpr bool GarageHeadingOpen(uint8_t state) {
+	return state == GS_OPENED || state == GS_OPENEDCONTAINSCAR ||
+	       state == GS_OPENING;
+}
+
+// The one bit that goes on the wire, per garage: is this machine's own state
+// machine away from where this type of garage rests?
+constexpr bool GarageDeviates(uint8_t type, uint8_t state) {
+	if (type == GARAGE_NONE)
+		return false;
+	return GarageHeadingOpen(state) != GarageRestsOpen(type);
+}
+// ---- breakable street objects ---------------------------------------------
+//
+// docs/objects.md is the investigation and the design. This is the first time
+// this project has touched `CObject`, so every one of these was walked out of
+// the retail image rather than read off re3, and where re3 was checked and
+// turned out to be right that is said too - four re3 constants have been
+// refuted here and one was very nearly a fifth (the pool stride below).
+//
+// The anchor for the whole layout is CObjectData::SetObjectData, which copies
+// ten fields out of the object.dat table into a CObject in one straight run.
+// One function pins five CObject offsets and the two flag bytes at once,
+// which is why it is the thing to find first.
+//
+//   004BC270  mov eax,[esp+4] / mov ecx,[esp+8]     modelId, CObject&
+//   004BC278  mov eax,[eax*4+0083D408h]             ms_modelInfoPtrs
+//   004BC281  cmp word [edx+24h],0FFFFh / je ret    GetObjectID() == -1
+//   004BC290  shl edx,5 / add edx,6F4708h           ms_aObjectInfo[id], 0x20
+//   004BC299  fld [edx]     / fstp [ecx+0C0h]       m_fMass
+//   004BC2A1  fld [edx+4]   / fstp [ecx+0C4h]       m_fTurnMass
+//   004BC2AA  fld [edx+8]   / fstp [ecx+0CCh]       m_fAirResistance
+//   004BC2B3  fld [edx+0Ch] / fstp [ecx+0D0h]       m_fElasticity
+//   004BC2BC  fld [edx+10h] / fstp [ecx+0D4h]       m_fBuoyancy
+//   004BC2C5  fld [edx+14h] / fstp [ecx+170h]       m_fUprootLimit
+//   004BC2CE  fld [edx+18h] / fstp [ecx+178h]       m_fCollisionDamageMultiplier
+//   004BC2D7  mov al,[edx+1Ch] / mov [ecx+17Ch],al  m_nCollisionDamageEffect
+//   004BC2E0  mov al,[edx+1Dh] / mov [ecx+17Dh],al  m_nSpecialCollisionResponseCases
+//   004BC2E9  mov al,[edx+1Eh] / mov [ecx+17Eh],al  m_bCameraToAvoidThisObject
+//   004BC2F2  fld [edx] / fcomp [005F7E78h]         m_fMass >= 99998.0f
+//   004BC301  [ecx+122h] &= 0FBh, |= 4              bInfiniteMass  = true
+//   004BC311  [ecx+122h] &= 0FDh                    bAffectedByGravity = false
+//   004BC31F  [ecx+52h]  &= 0FDh, |= 2              bExplosionProof = true
+//
+// re3 ObjectData.cpp:72-104 statement for statement, and it independently
+// re-confirms two bits this file already had from elsewhere: bExplosionProof
+// is byte B bit 1, and the CPhysical flag byte lives at +0x122 in re3's
+// declared order (bIsHeavy 0, bAffectedByGravity 1, bInfiniteMass 2).
+constexpr uintptr_t CObjectData__SetObjectData   = 0x004BC270;   // __cdecl
+constexpr uintptr_t CObjectData__ms_aObjectInfo  = 0x006F4708;
+constexpr size_t    SIZEOF_OBJECTINFO            = 0x20;
+constexpr size_t    MODELINFO_OBJECT_ID          = 0x24;   // int16, -1 == not an object
+
+namespace object {
+
+// CObject, on top of CPhysical. Every offset below is witnessed by an
+// instruction quoted in this block; none of them is arithmetic off re3.
+constexpr size_t OBJECT_MATRIX     = 0x128;   // CMatrix, the ORIGINAL placement
+constexpr size_t OBJECT_MATRIX_POS = 0x158;   // OBJECT_MATRIX + CMatrix's 0x30
+constexpr size_t UPROOT_LIMIT      = 0x170;   // float
+constexpr size_t CREATED_BY        = 0x174;   // int8, eObjectCreatedBy
+constexpr size_t OBJECT_FLAGS      = 0x175;   // the seven-bit bitfield byte
+constexpr size_t BONUS_VALUE       = 0x176;   // int8
+constexpr size_t DAMAGE_MULTIPLIER = 0x178;   // float
+constexpr size_t DAMAGE_EFFECT     = 0x17C;   // uint8, eCollisionDamageEffect
+constexpr size_t SPECIAL_RESPONSE  = 0x17D;   // uint8, COLLRESPONSE_*
+constexpr size_t CAMERA_AVOID      = 0x17E;   // bool
+constexpr size_t END_OF_LIFE_TIME  = 0x184;   // uint32, TEMP_OBJECT expiry
+constexpr size_t REF_MODEL_INDEX   = 0x188;   // int16
+constexpr size_t COLOUR1           = 0x194;   // int8
+constexpr size_t COLOUR2           = 0x195;   // int8
+
+// CPhysical::m_fDamageImpulse and the entity that caused it, straight out of
+// CObject::ProcessControl's first two instructions - `push [ebx+10Ch]` is the
+// argument to ObjectDamage and re3 Object.cpp:85 says that argument is
+// m_fDamageImpulse. m_pDamageEntity is its declared neighbour; nothing below
+// trusts it for anything a wrong answer could break (docs/objects.md).
+constexpr size_t DAMAGE_IMPULSE    = 0x10C;   // float,     CPhysical
+constexpr size_t DAMAGE_ENTITY     = 0x110;   // CEntity*,  CPhysical
+
+// eObjectCreatedBy, +0x174. The value is what decides whether an object is
+// the map's or somebody's, and it is the whole of CObject::CanBeDeleted
+// (0x004BB010, which returns false for 2 and 4 and true for everything else).
+constexpr uint8_t UNKNOWN_OBJECT  = 0;
+constexpr uint8_t GAME_OBJECT     = 1;   // placed by the map. what we sync.
+constexpr uint8_t MISSION_OBJECT  = 2;   // the script's
+constexpr uint8_t TEMP_OBJECT     = 3;   // debris, self-expiring
+constexpr uint8_t CUTSCENE_OBJECT = 4;
+
+// The bitfield byte at +0x175, in re3 Object.h's declaration order.
+// bHasBeenDamaged is the one that is witnessed directly, twice: the explosion
+// arm writes it (`[ebp+175h] &= 0DFh / |= 20h` at 0x004B15CE) and
+// CObject::ProcessControl reads it (`[ebx+175h] >> 5 & 1` at 0x004BB177) in
+// the exploding-barrel branch re3 Object.cpp:99 describes. bUseVehicleColours
+// is witnessed by CObject::Render reading bit 6 at 0x004BB20C beside the
+// TEMP_OBJECT and m_nRefModelIndex tests re3 Object.cpp:120 has in the same
+// order, which pins the two ends of the byte and so the order between them.
+constexpr uint8_t OBJ_IS_PICKUP             = 1 << 0;
+constexpr uint8_t OBJ_PICKUP_WITH_MESSAGE   = 1 << 1;
+constexpr uint8_t OBJ_OUT_OF_STOCK          = 1 << 2;
+constexpr uint8_t OBJ_GLASS_CRACKED         = 1 << 3;
+constexpr uint8_t OBJ_GLASS_BROKEN          = 1 << 4;
+constexpr uint8_t OBJ_HAS_BEEN_DAMAGED      = 1 << 5;
+constexpr uint8_t OBJ_USE_VEHICLE_COLOURS   = 1 << 6;
+
+// bRenderDamaged is CEntity flags byte B bit 7 - the top bit of the byte that
+// already holds bExplosionProof (bit 1), bIsVisible (bit 2) and
+// bRenderScorched (bit 4). Witnessed by ObjectDamage's own case 1, which is
+// the whole of DAMAGE_EFFECT_CHANGE_MODEL:
+//
+//   004BB390  mov al,[ecx+52h] / and al,7Fh / or al,80h / mov [ecx+52h],al
+//
+// re3 Entity.h:57 is the last flag in flagsB, so that bit lands exactly where
+// re3's declaration order puts it. It is read again by case 4, which tests
+// the same bit (`shr al,7` at 0x004BB403) to decide whether this is the first
+// hit or the second.
+constexpr uint8_t ENTITY_RENDER_DAMAGED = 0x80;   // byte B, +0x52
+
+// eCollisionDamageEffect. Read off ObjectDamage's own compare chain, which
+// walks the effect down in the engine's order and so states the values
+// exactly: 1, 2, 3, 4, then 50, 60, 70, 80.
+//
+//   004BB336  movzx eax,byte [ecx+17Ch] / test eax,eax / je end      0
+//   004BB345  sub eax,1 / je 004BB390                                1
+//   004BB34A  sub eax,1 / je end                                     2  (no-op)
+//   004BB353  sub eax,1 / je 004BB3A0                                3
+//   004BB358  sub eax,1 / je 004BB400                                4
+//   004BB361  sub eax,2Eh / je 004BB480                             50
+//   004BB36A  sub eax,0Ah / je 004BB6D5                             60
+//   004BB373  sub eax,0Ah / je 004BB961                             70
+//   004BB37C  sub eax,0Ah / je 004BBB42                             80
+//
+// The game's own data/object.dat documents the same list in its header
+// comment, which is a second, independent witness that costs nothing to read.
+constexpr uint8_t DAMAGE_EFFECT_NONE              = 0;
+constexpr uint8_t DAMAGE_EFFECT_CHANGE_MODEL      = 1;
+constexpr uint8_t DAMAGE_EFFECT_SPLIT_MODEL       = 2;   // does nothing
+constexpr uint8_t DAMAGE_EFFECT_SMASH_COMPLETELY  = 3;
+constexpr uint8_t DAMAGE_EFFECT_CHANGE_THEN_SMASH = 4;
+constexpr uint8_t DAMAGE_EFFECT_SMASH_CARDBOARD   = 50;
+constexpr uint8_t DAMAGE_EFFECT_SMASH_WOODENBOX   = 60;
+constexpr uint8_t DAMAGE_EFFECT_SMASH_TRAFFICCONE = 70;
+constexpr uint8_t DAMAGE_EFFECT_SMASH_BARPOST     = 80;
+
+// The threshold every break in the game goes through, and the one number an
+// applier has to beat. 0x005F7D88 reads 43160000.
+constexpr float OBJECT_DAMAGE_THRESHOLD = 150.0f;
+
+// __thiscall void CObject::ObjectDamage(float amount).  `ret 4`.
+//
+// **Breaking is a state, not a destroy-and-replace.** Nothing in this
+// function frees the object, removes it from the world or allocates
+// anything - every arm writes flags on the CObject that is already there.
+// That is what makes the whole feature a latch rather than a lifecycle, and
+// it is worth saying because the obvious guess (the engine swaps in a broken
+// object) is wrong for every case.
+//
+// Two gates, in this order, both of which an applier has to satisfy:
+//
+//   004BB24A  cmp byte [ecx+17Ch],0 / je ret          m_nCollisionDamageEffect == 0
+//   004BB270  mov al,[ecx+51h] / and al,1 / je ret    !bUsesCollision
+//
+// then MI_BODYCAST's special case, then the one threshold the whole thing
+// turns on:
+//
+//   004BB319  fld st(0) / fmul [ecx+178h] / fcomp [005F7D88h]
+//                                           amount * mult > 150.0f
+//
+// The other constants in the bodycast arm are 50.0f (0x005F7D7C), 0.5f
+// (0x005F7D80) and 0.0f (0x005F7D84), and nBodyCastHealth is an int16 at
+// 0x005F7D4C, so re3 Object.cpp:158-167 is right down to the field type.
+//
+// The two outcomes, as the engine writes them:
+//
+//   case 1   bRenderDamaged = true                                  (004BB390)
+//   case 2   nothing at all
+//   case 3   bIsVisible=0, bUsesCollision=0, bIsStatic=1,
+//            bExplosionProof=1, m_vecMoveSpeed=0, m_vecTurnSpeed=0  (004BB3A0)
+//   case 4   bRenderDamaged ? the case-3 block : bRenderDamaged=true (004BB400)
+//   50/60/70/80  the case-3 block, then particles and a sound
+//
+// which is why one byte of "how broken is it" is enough on the wire: there
+// are two visible states, and case 4 is the only thing that needs both.
+constexpr uintptr_t CObject__ObjectDamage   = 0x004BB240;
+
+// The rest of the CObject block, for orientation and because two of them are
+// how the offsets above were confirmed a second time.
+constexpr uintptr_t CObject__CObject        = 0x004BABD0;   // CObject::CObject(void)
+constexpr uintptr_t CObject__CanBeDeleted   = 0x004BB010;
+constexpr uintptr_t CObject__ProcessControl = 0x004BB040;
+constexpr uintptr_t CObject__Render         = 0x004BB1E0;
+constexpr uintptr_t CObject__operator_new   = 0x004BAE70;
+
+// Every call site of ObjectDamage in the image, found by scanning .text for
+// E8/E9 rel32 targets equal to 0x004BB240. **Six, and that is all of them**:
+//
+//   00497AA5   CPhysical, the ped-or-vehicle against a static object arm
+//   0049D84B   CPhysical, the two-moving-entities arm
+//   004B1626   CWorld::TriggerExplosionSectorList, the static arm
+//   004B1A24   CWorld::TriggerExplosionSectorList, the moving arm
+//   004BB055   CObject::ProcessControl, with m_fDamageImpulse
+//
+// (five sites; 0x00497AA5 and 0x0049D84B are the two CPhysical arms and the
+// compiler merged re3 Physical.cpp:1761 and :1764 into the second.)
+//
+// **Nothing in CWeapon is on that list**, which is the finding that shrank
+// this whole job: a bullet that hits an object runs the ENTITY_TYPE_OBJECT
+// arm of CWeapon::FireInstantHit, and that arm adds eight spark particles,
+// clears bIsStatic when m_fUprootLimit <= 0 and applies `normal * -4.0f` -
+// and then stops. It never calls ObjectDamage. Shooting street furniture in
+// retail III nudges it; it does not break it. The one exception is
+// CWeapon::BlowUpExplosiveThings, which turns a barrel or a petrol pump into
+// a CExplosion - and an explosion is already agreed on every machine.
+constexpr uintptr_t OBJECT_DAMAGE_CALLSITES[] = {
+    0x00497AA5, 0x0049D84B, 0x004B1626, 0x004B1A24, 0x004BB055,
+};
+
+// ---- the object pool ------------------------------------------------------
+//
+// CPools::Initialise (0x004A1770) constructs the pools in one run and stores
+// each one immediately after starting the next allocation, so the size that
+// belongs to a pointer is the `push` *before* the store:
+//
+//   004A182E  push 1C2h   then 004A1835  mov [00880E28],eax
+//   004A184B  push 0AF2h  then 004A1852  mov [008F2C18],eax
+//
+// 450 objects and 2802 dummies, which is re3's NUMOBJECTS and NUMDUMMIES
+// exactly - as are the building (5500) and treadable (1214) pools in the same
+// run. The object pool pointer also falls out of CPools::CheckPoolsEmpty's
+// "Objects left %d" at 0x004A191D, independently.
+constexpr uintptr_t CPools__ms_pDummyPool = 0x008F2C18;
+constexpr int32_t   OBJECT_POOL_SIZE      = 450;
+constexpr int32_t   DUMMY_POOL_SIZE       = 2802;
+
+// **The slot stride is 0x19C and sizeof(CObject) is 0x198.** Both numbers are
+// true and using the wrong one walks off the end of an entity. Three
+// independently compiled `GetSlot` sites agree on the stride:
+//
+//   00408529  imul eax,eax,19Ch      (beside `mov esi,[00880E28]`)
+//   00434000  imul ebp,ebp,19Ch      (beside `mov ebx,[00880E28]`)
+//   004F3BF6  imul eax,eax,19Ch      CPopulation::ManagePopulation
+//
+// This looked like a fifth refuted re3 constant and is not one. re3 declares
+// the pool as `CPool<CObject, CCutsceneHead>` and CPool allocates
+// `sizeof(U)`, and `VALIDATE_SIZE(CCutsceneHead, 0x19C)` - the derived type
+// is one RwFrame* longer and that is what the array is made of. re3 was
+// right; what would have been wrong is reading VALIDATE_SIZE(CObject, 0x198)
+// as the stride, which is the mistake this comment exists to stop.
+constexpr size_t OBJECT_POOL_STRIDE = 0x19C;
+
+// CPool's own three fields, from ManagePopulation's inlined walk:
+// `mov esi,[ebx+8]` is the size, `mov esi,[ebx+4]` the flag array,
+// `mov esi,[ebx]` the entry array, and `and eax,80h` on a flag byte is
+// POOLFLAG_ISFREE. Same shape for every pool in the game.
+constexpr size_t  POOL_ENTRIES    = 0x00;
+constexpr size_t  POOL_FLAGS      = 0x04;
+constexpr size_t  POOL_SIZE       = 0x08;
+constexpr uint8_t POOLFLAG_ISFREE = 0x80;
+
+// ---- the 80 m horizon, which is the reason none of this needs a backfill ---
+//
+// CPopulation::ManagePopulation (0x004F3B90) walks 1/32 of the object pool
+// and 1/32 of the dummy pool per frame, keyed off CTimer::m_FrameCounter & 31,
+// and moves objects across the line in both directions:
+//
+//   004F3B99  mov bp,[009412ECh] / and ebp,1Fh     the 1/32 slice
+//   004F3BF6  imul eax,eax,19Ch                    object pool walk
+//   004F3C50  call 004BB010                        CanBeDeleted
+//   004F3C65  lea eax,[esi+34h]                    GetPosition()
+//   004F3C9C  lea eax,[esi+158h]                   m_objectMatrix.GetPosition()
+//   004F3CDA  fcom [005FA890h]                     both against 80.0f
+//
+// 0x005FA890 reads 42A00000 = 80.0f. Past that line a GAME_OBJECT is handed
+// to CPopulation::ConvertToDummyObject, which builds a CDummyObject out of
+// nothing but the model index, the RwObject and m_level (re3
+// DummyObject.cpp:6-13) and places it at m_objectMatrix - so **every flag
+// ObjectDamage wrote is thrown away**, and walking back in builds a brand
+// new, pristine CObject. That is retail single-player behaviour, not a bug:
+// street furniture stands back up once you have left the block.
+//
+// Two consequences the design leans on directly. A broken object is state
+// with an 80 m horizon and a lifetime of one visit - but the horizon is each
+// machine's own, so the server keeps it while anybody is near (docs/objects.md
+// 8.5). And it is the reason
+// roadmap.md 5.8's literal answer - an ownerless world entity is the host's -
+// cannot transplant: an object 80 m from the host is not a CObject on the
+// host at all, so the host has nothing to observe and nothing to report.
+constexpr uintptr_t CPopulation__ManagePopulation = 0x004F3B90;
+constexpr float     OBJECT_DUMMY_RANGE            = 80.0f;
+
+// The other half of that horizon, and the reason the key below is
+// m_objectMatrix rather than the live position: an IPL instance whose model
+// has an object.dat entry becomes a CDummyObject and nothing else, and the
+// matrix it is placed at survives every round trip through the two
+// conversions untouched. CFileLoader::LoadObjectInstance's whole decision is
+// `mi->GetObjectID() == -1`, i.e. the same +0x24 word SetObjectData tests
+// above: -1 makes a CBuilding or a CTreadable, anything else makes a dummy.
+// (ConvertToDummyObject is deliberately not listed: nothing here calls it,
+// and an address nothing uses is an address nobody re-checks.)
+//
+// CPopulation::ConvertToRealObject(CDummyObject *), __cdecl, and the way back
+// in - which is where a machine rebuilds a pristine copy of a lamp post it
+// left broken (docs/objects.md 9). Its dummy walk in ManagePopulation:
+//
+//   004F3DB4  imul esi,esi,70h                 the dummy pool's stride
+//   004F3DF4  lea eax,[ebx+34h]                the dummy's position
+//   004F3E2F  fcomp [005FA890h]                against the same 80.0f
+//   004F3E45  push ebx / call 004F4470 / pop ecx
+//
+// and the body is re3's: `push ebx / push esi / mov esi,[esp+0Ch]` (the
+// dummy), `call 004F4700` (TestSafeForRealObject, al == 0 returns), `push
+// 198h / call 004BAE70` (CObject::operator new, sizeof(CObject)), `call
+// 004BAD50` (CObject::CObject(CDummyObject *)), `call 004AE9D0`
+// (CWorld::Remove on the dummy), the dummy's scalar deleting destructor
+// through its vtable, then `call 004AE930` (CWorld::Add on the object). So
+// the dummy is gone by the time it returns, and its model (+5Ch) and
+// position (+34h) have to be read before the call. The only other caller is
+// 0x0058A640, a script opcode's; the population's is the one redirected.
+constexpr uintptr_t CPopulation__ConvertToRealObject          = 0x004F4470;
+constexpr uintptr_t ManagePopulation_ConvertToRealObjectCall  = 0x004F3E48;
+
+// ---- an explosion breaks objects identically on every machine --------------
+//
+// The object arm of CWorld::TriggerExplosionSectorList (0x004B1340), which is
+// the companion to the vehicle arm this file already records above:
+//
+//   004B15C8  [ebp+175h] &= 0DFh / |= 20h        bHasBeenDamaged = true
+//   004B15D8  [ebp+51h] >> 2 & 1                 GetIsStatic()
+//   004B15E4  fld [esp+0CCh] / fsub [esp+10h]    fRadius - fMagnitude
+//   004B15EF  fmul [005F799Ch]                   * 2.0f
+//   004B15F5  fdiv [esp+0CCh]                    / fRadius
+//   004B15FE  fcomp [005F7994h]                  Min(.., 1.0f)
+//   004B1616  fld [005F79A0h] / fmul             * 300.0f
+//   004B1626  call 004BB240                      CObject::ObjectDamage
+//
+// and the not-static arm at 0x004B1A24 is the same 300.0f multiply. The three
+// constants read 40000000, 3F800000 and 43960000 - 2.0f, 1.0f, 300.0f - so
+// re3 World.cpp:2050-2078 and :2137 are right.
+//
+// **The amount is a pure function of the two positions and the radius.** No
+// RNG, no impulse, no timestep, nothing carried over from a previous frame.
+// ObjectDamage then compares it against a multiplier that came out of
+// object.dat, which is the same file on every install. So an explosion
+// CoopIII already replays at an agreed world position (docs/protocol.md
+// 1.9.3) breaks exactly the same objects on every machine, for free, and
+// sending anything about them would be a duplicate.
+//
+// CWorld::TriggerExplosion (0x004B1140, __cdecl) has **exactly two callers in
+// the whole image**, 0x00559FD3 and 0x0055A185, both inside CExplosion - so
+// it is also the one place a guard has to sit to recognise "this break was an
+// explosion's" and stay quiet about it.
+constexpr uintptr_t CWorld__TriggerExplosion           = 0x004B1140;
+constexpr uintptr_t CWorld__TriggerExplosionSectorList = 0x004B1340;
+
+// ---- uprooting: what it is, where it happens, and how it ends -------------
+//
+// **Uprooting is one bit and one list, and nothing else.** An object goes
+// from standing to lying down when `bIsStatic` (CEntity byte A, +0x51 bit 2 -
+// offs::ENTITY_IS_STATIC) is cleared and the object is handed to
+// CPhysical::AddToMovingList. From that instant CWorld::Process calls its
+// ProcessControl every frame and ordinary physics takes it. There is no
+// second model, no flag on CObject, and no call that means "fall over".
+//
+// It is therefore **orthogonal to breaking**, and CObject::ObjectDamage says
+// so itself: none of its nine arms clears bIsStatic, and the smash arm
+// *sets* it (`[ecx+51h] &= 0FBh / |= 4` at 0x004BB3B0). A lamp post can be
+// bent without coming loose and can come loose without being bent, which is
+// exactly the pair of screens docs/objects.md 8 described.
+//
+// Three places in the image decide it, and all three read m_fUprootLimit
+// (+0x170, the float CObjectData::SetObjectData copies out of object.dat
+// column G at 0x004BC2C8):
+//
+//   1. **A collision.** CPhysical, two arms:
+//        00497559  fld st(1) / fcomp [esi+170h]        impulseA > uprootLimit
+//        00497B6B  fld [eax] / fst st(1) / fcomp [esi+170h]
+//      each followed by the same eight-model `IsFence` chain (the model ids
+//      at 0x005F5ADC..0x005F5AF8) as the `||` arm, and then, at 0x00497E94:
+//        mov al,[ebp+51h] / shr al,2 / and al,1        GetIsStatic()
+//        mov ecx,ebp / call 004958F0                   AddToMovingList()
+//
+//   2. **A blast.** CWorld::TriggerExplosionSectorList:
+//        004B1473  fcomp [ebp+170h]                    fPower > uprootLimit
+//      then AddToMovingList at 0x004B154D and 0x004B163A. The power is the
+//      same pure function of the two positions and the radius that the
+//      damage is, so an explosion uproots the same objects on every machine
+//      for the same reason it breaks them - see the block above.
+//
+//   3. **A bullet, a shotgun pellet or a bat.** Three arms, identical
+//      instruction for instruction, in CWeapon::DoBulletImpact
+//      (0x00560481), CWeapon::FireShotgun (0x005616A2) and CWeapon::FireMelee
+//      (0x00558A64):
+//        mov al,[X+50h] / and al,7 / cmp al,4          ENTITY_TYPE_OBJECT
+//        mov al,[X+122h] / shr al,2 / and al,1         bInfiniteMass
+//        mov al,[X+51h]  / shr al,2 / and al,1         GetIsStatic()
+//        fld [X+170h] / fcomp [const] / fnstsw ax
+//        test ah,4 / jne .. / and ah,45h / test ah,41h / je ..
+//                                                      m_fUprootLimit <= 0.0f
+//        [X+51h] &= 0FBh / call 004958F0               SetIsStatic(false),
+//                                                      AddToMovingList()
+//        then, only if it is already loose, ApplyMoveForce(normal * -k)
+//      The three constants compared against are 0x00603060, 0x00603060 and
+//      0x00602C88, and all three read 00000000 - so the test really is
+//      `<= 0.0f` and not a threshold. The three force factors are 0x0060311C
+//      (C0800000, -4.0f), 0x006030B8 (C0A00000, -5.0f) and 0x00602C98
+//      (C0F00000, -7.5f).
+//
+// **A bullet cannot uproot a lamp post, and object.dat is what says so.**
+// The shipped table gives lamppost1/2/3 and doublestreetlght1 an uproot
+// limit of 400.0, trafficlight1 500.0, parkingmeter/bin1/postbox1/
+// fire_hydrant 100.0, bar_barrier10/12 and the lhouse barriers 350.0,
+// parkbench1 5.0, trafficcone 10.0 and smashbar 1000.0. Every one of them is
+// strictly greater than zero, so arm 3's gate fails - and because the post is
+// still static, the `!GetIsStatic()` that guards the move force fails too.
+// Shooting street furniture in retail 1.0 produces eight sparks and a sound
+// and moves nothing. The breakable models a bullet *can* knock loose are the
+// ones whose uproot limit is 0.0: woodenbox, cardboardbox, cardboardbox2,
+// cardboardbox4, wastebin, dump1, palette, parktable1, papermachn01 and the
+// two fishstalls.
+//
+// **The engine decides when it has stopped.** CPhysical::ProcessControl
+// (0x00495F10, called by CObject::ProcessControl at 0x004BB05C) counts quiet
+// frames and puts the object back to sleep itself:
+//
+//   004960D7  inc byte [ebx+0EDh]                      m_nStaticFrames++
+//   004960DD  cmp byte [ebx+0EDh],0Ah / jbe            > 10
+//   004960F1  [ebx+51h] &= 0FBh / |= 4                 SetIsStatic(true)
+//   004960FB  m_vecMoveSpeed, m_vecTurnSpeed and both frictions zeroed
+//   00496172  m_nStaticFrames = 0                      (the else arm)
+//
+// and CWorld::Process then unlinks it, in its own moving-entity loop:
+//
+//   004B1B99  call [edi+20h]                           ProcessControl
+//   004B1B9C  [ebp+51h] >> 2 & 1                       GetIsStatic()
+//   004B1BA8  call 00495940                            RemoveFromMovingList
+//
+// (again at 0x004B1BF3 for the postponed pass.) That is the reason nothing in
+// CoopIII ever has to touch the moving list to put an object back: setting
+// bIsStatic is enough, and the engine does the unlink on its own next pass.
+// Writing into that list is what client/src/game/movinglist.h exists to clean
+// up after, and this feature deliberately never does it.
+//
+// **m_pDamageEntity is good for exactly one frame, and that is the frame
+// ObjectDamage runs in.** The same CPhysical::ProcessControl clears both
+// halves of the collision record at its top:
+//
+//   00495F78  mov dword [ebx+10Ch],0                   m_fDamageImpulse = 0
+//   00495F82  mov dword [ebx+110h],0                   m_pDamageEntity = nil
+//
+// and CObject::ProcessControl calls ObjectDamage with m_fDamageImpulse
+// immediately *before* that (0x004BB04F/0x004BB055). So the pointer a break
+// detour reads is this frame's, not an arbitrarily old one - which settles
+// docs/objects.md 9's second open question in the safe direction. It also
+// means a bullet leaves it nil, because a bullet never writes it.
+constexpr size_t STATIC_FRAMES = 0x0ED;   // uint8, CPhysical::m_nStaticFrames
+constexpr uint8_t STATIC_FRAMES_ASLEEP = 10;
+
+// eEntityType's fourth value, witnessed by all three weapon object arms
+// (`and al,7 / cmp al,4`) and by CWorld::Add's `cmp al,1 / cmp al,5` pair of
+// exclusions for buildings and dummies. ENTITY_TYPE_VEHICLE and
+// ENTITY_TYPE_PED are already in this file; this is the one that was never
+// needed until something had to recognise a CObject by its type byte.
+constexpr uint8_t ENTITY_TYPE_OBJECT = 4;
+
+// __thiscall void CPhysical::AddToMovingList(void) is CPhysical__AddToMovingList
+// above (0x004958F0). Recorded here as well because it is the one door every
+// uproot in the image goes through - eleven call sites, and the ones that can
+// reach a breakable map object are the CPhysical collision arm (0x00497EB1),
+// the two explosion arms (0x004B154D, 0x004B163A) and the three weapon arms
+// (0x00558AAF, 0x005604BD, 0x005616ED). The other five cannot:
+//
+//   0044D784   a script opcode, so a MISSION_OBJECT
+//   004AE9C0   CWorld::Add, for any entity added already non-static
+//   004F458B   CPopulation::ConvertToRealObject's buoy arm - it is guarded by
+//              `model == [005F5B5Ch]` and the buoy has no damage effect
+//   0053B585   a garage/crusher shove
+//   00564B6D   a weapon nudge with no uproot-limit test at all
+//
+// The three weapon arms and the four *other* call sites of ObjectDamage are
+// the whole reason a break and an uproot need separate treatment.
+constexpr uintptr_t CWeapon__DoBulletImpactObjectArm = 0x00560481;   // for the record
+constexpr uintptr_t CWeapon__FireShotgunObjectArm    = 0x005616A2;
+// Misnamed: the arm is in CBulletInfo::Update, the sniper round, and FireMelee
+// has none ("fists and the bat" above). Kept under this name for the record.
+constexpr uintptr_t CWeapon__FireMeleeObjectArm      = 0x00558A64;
+
+} // namespace object
+
+
+// ---- cheats ---------------------------------------------------------------
+//
+// Verified 2026-09-23 against the retail image. docs/cheats.md is the design
+// and the per-cheat argument; this is the transcription it rests on.
+//
+// **There is one door, and it is the keyboard.** CPad::DoCheats(int16), the
+// pad-button path, is `sub esp,8 / mov [esp+4],ecx / add esp,8 / ret 4` at
+// 0x00492F20 - an empty stub on PC, reached from CGame::Process at 0x0048C8E6
+// through CPad::DoCheats() (0x00492F00). So every cheat in this build comes
+// through CPad::AddToPCCheatString, and a byte scan finds exactly one call to
+// that: 0x005841C7, the default arm of the key-down handler (0x00583F10),
+// which is re3 events.cpp:314 - `if (c < 255) { VK_KEYS[c] = 255;
+// AddToPCCheatString(c); }`. It runs off the window procedure, on the thread
+// that also runs CGame::Process.
+//
+// __thiscall void CPad::AddToPCCheatString(char c).  ret 4.
+//
+//   0x00492450  sub esp,8 / mov [esp+4],ecx
+//   0x00492457  mov edx,12h                          i = 18
+//   0x00492460  mov al,[edx+885B90h]
+//   0x00492466  mov [edx+885B91h],al / dec edx / jge   buf[i+1] = buf[i]
+//   0x00492481  mov [00885B90h],al                   buf[0] = c
+//   then, 23 times:
+//               push <len> / push 885B90h / push <reversed string>
+//               call 0x005A0A10 (strncmp) / add esp,0Ch
+//               test eax,eax / jne <next> / call <handler>
+//   0x00492718  ret 4
+//
+// Twenty-three independent `if`s rather than an else-if chain, re3
+// Pad.cpp:896-1027's shape, so one keystroke could in principle fire two. No
+// retail string is a suffix of another, which is what stops it happening;
+// tools/clienttest types every one of them and checks.
+//
+// The buffer is newest-first, which is why every string in the table is
+// stored backwards. A byte scan finds 0x00885B90 used by this function and by
+// nothing else in the image, so CoopIII keeping it up to date itself (game/
+// cheats.cpp does, in a session) cannot confuse any other reader of it.
+constexpr uintptr_t CPad__AddToPCCheatString  = 0x00492450;
+constexpr uintptr_t CPad__KeyBoardCheatString = 0x00885B90;   // char[20]
+constexpr size_t    KEYBOARD_CHEAT_STRING_LEN = 20;
+constexpr uintptr_t CPad__DoCheatsPad         = 0x00492F20;   // recorded: empty
+
+// Where the rows begin and end, and the strncmp every row calls. The first
+// row is the one with the `mov [00885B90h],al` folded into it, between its
+// last push and its call; the last one's `jne` lands on the epilogue.
+constexpr uintptr_t CPad__CheatRowsBegin = 0x00492475;   // `push 0Ch`, row 0
+constexpr uintptr_t CPad__CheatRowsEnd   = 0x00492715;   // `add esp,8 / ret 4`
+constexpr uintptr_t crt_strncmp          = 0x005A0A10;
+// The function's first seven bytes, `sub esp,8 / mov [esp+4],ecx`. If they
+// are anything else when CoopIII goes to hook it, another mod got there
+// first, and the cheats are left to it.
+constexpr uint8_t CPAD_ADD_TO_PC_CHEAT_STRING_PROLOGUE[] = {
+    0x83, 0xEC, 0x08, 0x89, 0x4C, 0x24, 0x04};
+
+// One row per `if`, in the order the function tests them, which is CheatId's
+// order (protocol.h). `string` is the reversed literal it passes to strncmp,
+// read out of .rdata, and `length` is the `push` in front of it. `handler` is
+// the call inside the `if`; a byte scan finds each one called from that one
+// place and nowhere else, so detouring the dispatch, not the handlers, is
+// enough to see every cheat. tools/clienttest decodes all 23 rows out of the
+// function's bytes and compares them with this table when it is handed the
+// exe (COOPIII_GTA3_EXE), which is how the row below was caught.
+//
+// **`length` is strlen of the literal in every row but one.** BOOOOORING's
+// is `push 10h` (0x004925D6) for a ten-letter string, so strncmp goes on past
+// the string's own NUL and compares it with KeyBoardCheatString[10] - which
+// only matches while that byte is still the zero the buffer starts with in
+// .bss. Nothing else writes the buffer. So in 1.0 the slow-motion cheat works
+// only as the very first thing typed after the game starts, and never again
+// once eleven keys have been pressed. CoopIII compares the same way, so a
+// session keeps it exactly as broken as single player has it.
+struct CheatSite {
+	const char *reversed;
+	uintptr_t   string;
+	uint8_t     length;
+	uintptr_t   handler;
+};
+
+constexpr CheatSite CHEAT_SITES[] = {
+    {"SNUGSNUGSNUG",     0x005F6548, 0x0C, 0x00490D90},   // WeaponCheat
+    {"NAMHCIRAEREWIFI",  0x005F6558, 0x0F, 0x00491430},   // MoneyCheat
+    {"TIEHDNUSEG",       0x005F6568, 0x0A, 0x00490E70},   // HealthCheat
+    {"ESAELPECILOPEROM", 0x005F6574, 0x10, 0x00491490},   // WantedLevelUpCheat
+    {"ESAELPECILOPON",   0x005F6588, 0x0E, 0x004914F0},   // WantedLevelDownCheat
+    {"KNATASUEVIG",      0x005F6598, 0x0B, 0x00490EE0},   // TankCheat
+    {"GNABGNABGNAB",     0x005F65A4, 0x0C, 0x00491040},   // BlowUpCarsCheat
+    {"PUGNISSERDEKILI",  0x005F65B4, 0x0F, 0x004910B0},   // ChangePlayerCheat
+    {"DAAAMGNIOGLLASTI", 0x005F65C4, 0x10, 0x004911C0},   // MayhemCheat
+    {"EMSEKILYDOBON",    0x005F65D8, 0x0D, 0x00491270},   // EverybodyAttacksPlayerCheat
+    {"LLAROFSNOPAEW",    0x005F65E8, 0x0D, 0x00491370},   // WeaponsForAllCheat
+    {"UOYNEHWSEILFEMIT", 0x005F65F8, 0x10, 0x004913A0},   // FastTimeCheat
+    {"GNIROOOOOB",       0x005F660C, 0x10, 0x004913F0},   // SlowTimeCheat - 16, see above
+    {"ESIOTRUT",         0x005F6618, 0x08, 0x00491460},   // ArmourCheat
+    {"EMROFRECNACNIKS",  0x005F6624, 0x0F, 0x00491520},   // SunnyWeatherCheat
+    {"DNALTOCSEKILI",    0x005F6634, 0x0D, 0x00491550},   // CloudyWeatherCheat
+    {"DNALTOCSEVOLI",    0x005F6644, 0x0D, 0x00491580},   // RainyWeatherCheat
+    {"PUOSAEP",          0x005F6654, 0x07, 0x004915B0},   // FoggyWeatherCheat
+    {"REHTAEWDAM",       0x005F665C, 0x0A, 0x004915E0},   // FastWeatherCheat
+    {"SLEEHWFOTESECINA", 0x005F6668, 0x10, 0x00491610},   // OnlyRenderWheelsCheat
+    {"BBYTTIHCYTTIHC",   0x005F667C, 0x0E, 0x00491640},   // ChittyChittyBangBangCheat
+    {"DAMEKILSRENROC",   0x005F668C, 0x0E, 0x00491670},   // StrongGripCheat
+    {"TAEHCSBMILYTSAN",  0x005F669C, 0x0F, 0x004916A0},   // NastyLimbsCheat
+};
+static_assert(sizeof(CHEAT_SITES) / sizeof(CHEAT_SITES[0]) == CHEAT_COUNT,
+              "one row per CheatId, in the order AddToPCCheatString tests them");
+
+// What each handler writes, read off its body. Every one but the last opens
+// on CHud::SetHelpMessage(TheText.Get(key), true) - `mov ecx,941520h /
+// push 1 / push <key> / call 0x0052C5A0 / push eax / call 0x005051E0` - which
+// is the "Cheat activated" line and nothing else. The rest:
+//
+//   0x00490D90  GiveWeapon (0x004CF9B0) on FindPlayerPed eleven times:
+//               bat 0, colt 100, uzi 100, shotgun 20, AK 200, M16 200,
+//               sniper 5, rocket 5, molotov 5, grenade 5, flamethrower 200
+//   0x00491430  add [PlayerInFocus * 13Ch + 0094139Ch], 3D090h   money +250000
+//   0x00490E70  [FindPlayerPed + 2C0h] = 100.0f; then, if FindPlayerVehicle
+//               (0x004A10C0): [veh + 200h] = 1000.0f, and for m_vehType 0
+//               CDamageManager::SetEngineStatus(0) on [veh + 288h] - which is
+//               `mov [ecx+4],al` clamped to 250, i.e. DMG_ENGINE_STATUS
+//   0x00491490  CPlayerPed::SetWantedLevel (0x004F3190) with
+//               min([[ped + 53Ch] + 18h] + 2, 6)          two stars, max six
+//   0x004914F0  CPlayerPed::SetWantedLevel(0)
+//   0x00490EE0  streams model 7Ah (Rhino), finds the car path node nearest the
+//               player within 100 (ThePaths.FindNodeClosestToCoors,
+//               0x0042CC30), `new CAutomobile(7Ah, 2)` - MISSION_VEHICLE, the
+//               bug re3 fixes under FIX_BUGS - at node + 4.0 z, heading
+//               3.490659 (200 degrees), `and al,7 / or al,20h` STATUS_ABANDONED,
+//               m_nDoorLock [+224h] = 1 (unlocked), CWorld::Add. No bIsLocked,
+//               no ClearSpaceForMissionEntity.
+//   0x00491040  walks the vehicle pool from the top slot down and calls
+//               `call [edi+74h]`, vtable slot 29, BlowUpCar(nil), on every
+//               slot whose flag byte is not free
+//   0x004910B0  random model 0..82 (GetRandomNumber * 1/32768 * 83), skipping
+//               unloaded ones, 1Ah-1Dh (the four SPECIALs) and 8 (MI_TAXI_D),
+//               then DeleteRwObject / RequestModel / SetModelIndex, keeping
+//               m_animGroup. Only when IsPedInControl.
+//   0x004911C0  CPedType::ms_apPedType[4..20]->m_threats = 0FFFFFh
+//   0x00491270  CPedType::ms_apPedType[4..20]->m_threats |= 1   (PLAYER1)
+//   0x00491370  toggles CPopulation::ms_bGivePedsWeapons
+//   0x004913A0  ms_fTimeScale *= 2.0 while < 4.0
+//   0x004913F0  ms_fTimeScale *= 0.5 while > 0.25
+//   0x00491460  [FindPlayerPed + 2C4h] = 100.0f                  armour
+//   0x00491520..0x004915B0  CWeather::ForceWeatherNow(0, 1, 2, 3)
+//   0x004915E0  toggles gbFastTime
+//   0x00491610  toggles CVehicle::bWheelsOnlyCheat
+//   0x00491640  toggles CVehicle::bAllDodosCheat
+//   0x00491670  toggles CVehicle::bCheat3
+//   0x004916A0  toggles CPed::bNastyLimbsCheat - and no help message
+//
+// The four float constants the time handlers compare against were read out
+// of the file: 4.0 at 0x005F64CC, 2.0 at 0x005F64E8, 0.25 at 0x005F64EC and
+// 0.5 at 0x005F64F0.
+constexpr uintptr_t CPopulation__ms_bGivePedsWeapons = 0x0095CCF6;   // bool
+constexpr uintptr_t gbFastTime                       = 0x0095CDBB;   // bool
+constexpr uintptr_t CVehicle__bWheelsOnlyCheat       = 0x0095CD78;   // bool
+constexpr uintptr_t CVehicle__bAllDodosCheat         = 0x0095CD75;   // bool
+constexpr uintptr_t CVehicle__bCheat3                = 0x0095CD66;   // bool
+constexpr uintptr_t CPed__bNastyLimbsCheat           = 0x0095CD44;   // bool
+
+// Who reads the toggles, from a byte scan of the image for each address:
+//
+//   gbFastTime             CClock::Update, 0x004734C5 and 0x004734DF - the
+//                          minute ticks every frame instead of every
+//                          ms_nMillisecondsPerGameMinute
+//   ms_bGivePedsWeapons    CPopulation::AddPed, 0x004F532B - a new pedestrian
+//                          only, and only on the machine whose generator
+//                          made it
+//   bWheelsOnlyCheat       thirteen reads in CAutomobile / CBoat rendering
+//   bAllDodosCheat         0x005341DE (ProcessControl's flight arm) and
+//                          0x00589AFF (a script opcode's cheat test)
+//   bCheat3                eight reads in CAutomobile::ProcessControl, and
+//                          0x00589B08 beside the dodo one
+//   bNastyLimbsCheat       **nothing.** Written by its handler and by
+//                          ResetCheats, read by no instruction in the image.
+//                          NASTYLIMBSCHEAT does nothing in 1.0.
+
+// CPad::ResetCheats, called on a new game and a load (0x00582F74,
+// 0x00590AE9). The listing runs the padding before it into its first
+// instruction; decoded from 0x00494450 it is `call 0x005231A0`
+// (CWeather::ReleaseWeather), then zeroes every toggle above and writes
+// 3F800000h - 1.0 - into ms_fTimeScale. It does NOT restore the CPedType
+// threat table, so ITSALLGOINGMAAAD and NOBODYLIKESME outlive a load in
+// single player too.
+constexpr uintptr_t CPad__ResetCheats = 0x00494450;   // recorded, not called
+
+// CPedType's table: 0x00941594 is `ms_apPedType`, one CPedType* per ePedType.
+// Pinned by the two threat handlers above (`mov edx,[eax*4+00941594h] / mov
+// dword [edx+18h],0FFFFFh`, eax running 4..20) and by CPed's constructor
+// below. `[esi]` off an entry is m_flag, the type's own PED_FLAG bit - it is
+// what ScanForThreats ANDs a neighbour against.
+constexpr uintptr_t CPedType__ms_apPedType = 0x00941594;
+namespace offs {
+constexpr size_t PEDTYPE_FLAG    = 0x00;   // uint32, this type's PED_FLAG bit
+constexpr size_t PEDTYPE_THREATS = 0x18;   // uint32
+} // namespace offs
+constexpr int PEDTYPE_CHEAT_FIRST = 4;    // PEDTYPE_CIVMALE
+constexpr int PEDTYPE_CHEAT_LAST  = 20;   // PEDTYPE_PROSTITUTE; SPECIAL (21) is spared
+
+// **Why a riot reaches replicas.** Nothing reads the table when a pedestrian
+// decides; it reads its own copy. CPed's constructor (0x004C41C0) takes it
+// once, at 0x004C4CD4:
+//
+//   mov eax,[ecx+32Ch]            m_nPedType
+//   mov edx,[eax*4+00941594h]     ms_apPedType[type]
+//   mov eax,[edx+18h]             ->m_threats
+//   mov [ebx+188h],eax            m_fearFlags
+//
+// and CPed::ScanForThreats (0x004C5FE0, __thiscall, no arguments, plain
+// `ret`, uint32 in eax) opens on `mov eax,[ebx+188h] / mov [esp+8],eax` and
+// tests everything against that. So a threat cheat changes nobody who
+// already exists and everybody constructed afterwards - CoopIII's replicas
+// and remote players included, since every one of them is built through the
+// same CCivilianPed constructor.
+//
+// And a replica does act on it. CCivilianPed::CivilianAI (0x004C07A0, called
+// once, from CCivilianPed::ProcessControl at 0x004C06D2) opens:
+//
+//   0x004C07AF  cmp esi,[ebx+340h] / jbe out       now <= m_fleeTimer
+//   0x004C07BD  cmp dword [ebx+164h],0 / je 004C07D6    objective NONE: go on
+//   0x004C07C6  test bRespondsToThreats ([ebx+156h] bit 1) / je out
+//   0x004C07D8  call IsPedInControl / je out
+//   0x004C07E7  call ScanForThreats                 the full reaction
+//
+// A replica holds m_objective at NONE (docs/protocol.md 1.13.3), so the
+// bRespondsToThreats test that looks like its off switch is skipped, and the
+// reaction runs: flee, or SetObjective(KILL_CHAR_ON_FOOT) at whatever it
+// found. CPed::RegisterThreatWithGangPeds ORs an attacker's flag into its
+// neighbours' m_fearFlags as well, so this was reachable without a cheat;
+// the riot cheats just make it certain. game/cheats.cpp detours
+// ScanForThreats and answers "nothing" for a ped CoopIII built.
+//
+// ScanForThreats' five callers, each resolved by a byte scan: CivilianAI
+// twice (0x004C07E7, 0x004C1002), 0x004C30C5, and CPed::ProcessObjective
+// (0x004D94E0) at 0x004DA45B plus one more at 0x004D9236 - the last two only
+// with an objective set, which a replica never has.
+constexpr uintptr_t CPed__ScanForThreats       = 0x004C5FE0;
+constexpr uintptr_t CCivilianPed__CivilianAI   = 0x004C07A0;   // recorded
+namespace offs {
+constexpr size_t PED_FEAR_FLAGS = 0x188;   // uint32 m_fearFlags
+// CEntity *m_threatEntity, right after it: CPed::SetDie nils +0x18C (above),
+// and ScanForThreats leaves what it found there, with a RegisterReference.
+constexpr size_t PED_THREAT_ENTITY = 0x18C;
+constexpr size_t PED_FLEE_TIMER = 0x340;   // uint32, recorded
+} // namespace offs
+
+// **Every class in the vehicle pool, and what slot 29 is for it.** BANGBANGBANG
+// calls BlowUpCar through the vtable on everything in the pool, so the
+// question for co-op is whether that can reach a body the two BlowUpCar
+// detours in game/vehicle.cpp do not cover. A byte scan of the image for the
+// three possible slot-29 targets finds six vtables:
+//
+//   0x00600C1C  CAutomobile   0x00600C90 -> 0x0053BC60  detoured
+//   0x00600EA4  CBoat         0x00600F18 -> 0x00541CB0  detoured
+//   0x00601EB0  CHeli         0x00601F24 -> 0x00444B10  empty
+//   0x006021DC  CPlane        0x00602250 -> 0x00444B10  empty - stamped by
+//                             the ctor at 0x0054B18D, InitPlanes' `push 8Ch`
+//   0x0060241C  CTrain        0x00602490 -> 0x00444B10  empty
+//   0x006028A8  CVehicle      0x0060291C -> 0x00444B10  empty
+//
+// and nothing else holds any of the three. "Empty" is the whole body:
+// `sub esp,8 / mov [esp+4],ecx / add esp,8 / ret 4`, thirteen bytes that
+// store `this` in a local and throw it away. So the cheat can only ever reach
+// the two detoured bodies or the empty base, and the detours decide on the
+// car, not on the caller - vehicle.cpp's refusals hold for it unchanged. The
+// police helicopter, the planes and the trains are untouched by it in single
+// player too.
+constexpr uintptr_t CPlane__vtable         = 0x006021DC;
+constexpr uintptr_t CVehicle__BlowUpCarBase = 0x00444B10;   // empty, see above
+
+// The vehicle pool's size. CPools::Initialise (0x004A1770) pushes the size
+// before each store: `push 6Eh` at 0x004A17D5, then `mov [009430DCh],eax` at
+// 0x004A17DE. 110, re3's NUMVEHICLES. It is the most cars one frame can
+// wreck, which is what the unowned-wreck queue has to hold.
+constexpr int32_t VEHICLE_POOL_SIZE = 110;
+
+// The tank's other half. CAutomobile::ProcessControl's model switch sends a
+// Rhino (`cmp eax,7Ah` at 0x00532001) to TankControl (0x0053D530) and then
+// BlowUpCarsInPath (0x0053E000) whatever its status, so an observer's
+// replica runs both:
+//
+//   TankControl        `call FindPlayerVehicle / cmp ebx,eax / jne out` at
+//                      0x0053D5E5 - fires only for the car the local player
+//                      is in, i.e. on the driver's machine. Its shell is
+//                      AddExplosion(nil, FindPlayerPed(), 8, ...) at
+//                      0x0053DA3C, which game/combat.cpp relays like any
+//                      explosion the local player caused.
+//   BlowUpCarsInPath   over m_aCollisionRecords, `call [esi+74h]` with the
+//                      tank as culprit at 0x0053E06E - slot 29 again, so
+//                      again the detour. A replica crushing a car somebody
+//                      else owns is refused like any other observer.
+constexpr uintptr_t CAutomobile__TankControl      = 0x0053D530;   // recorded
+constexpr uintptr_t CAutomobile__BlowUpCarsInPath = 0x0053E000;   // recorded
+
+// ---- the vote before a rampage (game/rampagevote.h) -----------------------
+//
+// Verified 2026-09-24 against the retail image with dumpbin /disasm. re3 was
+// the map for the names only.
+//
+// ---- the help box, top left ----
+//
+// CHud::SetHelpMessage(wchar *text, bool quick), cdecl, `ret` with the two
+// arguments at [esp+4] and [esp+8]. Every cheat handler opens on it (the
+// cheat block above). Its whole body:
+//
+//   005051E0  cmp byte [0095CD5Bh],1 / jne / ret       CReplay::Mode == playback
+//   005051F4  push 100h / push text / push 86B888h / call 005294B0
+//                                                      WideStringCopy(m_HelpMessage)
+//   00505207  push 86B888h / call 0052A490             InsertPlayerControlKeysInString
+//   0050521E  mov word [ecx*2+006E8F28h],0 ...         m_LastHelpMessage zeroed, 256
+//   00505274  mov dword [00880E1Ch],0                  m_HelpMessageState = 0
+//   0050527E  mov [0095CCF7h],al                       m_HelpMessageQuick = quick
+//
+// And what CHud::Draw does with them, from 0x00509056:
+//
+//   cmp word [0086B888h],0 / je skip                   nothing to show
+//   call 00529510 (m_HelpMessage, m_LastHelpMessage, 100h) - WideStringCompare,
+//   and if they differ, a switch on the state through the table at 0x005FDD6C:
+//     state 0   0050909B  FadeTimer (008F6258h) = 0, state = 2, Timer
+//                         (00880FA4h) = 0, WideStringCopy(m_HelpMessageToPrint
+//                         = 00664480h, m_HelpMessage), DisplayTime (008E2C28h)
+//                         = len * 0.05 + 3.0 (005FDCACh, 005FDCB0h), and the
+//                         help beep, PlayFrontEndSound(0A0h), when no bars
+//     1..4      00509123  Timer = 5, state = 4          (fade out, then in)
+//   then m_LastHelpMessage = m_HelpMessage.
+//   state != 0: a second switch, state - 1, table 0x005FDD5C:
+//     1  00509300  shown. FadeTimer = 600; Timer > DisplayTime * 1000, or quick
+//                  and Timer > 1500 (005FDCB8h) -> FadeTimer = 600, state = 3
+//     2  0050917E  fading in; state 1 once FadeTimer > 0
+//     3  005091F6  fading out; state 0 once FadeTimer < 0. m_HelpMessage is
+//                  left as it was, so "showing" is the state, not the text
+//     4  00509271  fading out to switch; state 2, ToPrint = m_LastHelpMessage
+//   Timer += the frame's milliseconds; ToPrint is what gets drawn.
+//
+// So a text written into all three buffers at once while the state is 1 is
+// drawn straight away with no fade and no beep, and holding Timer at 0 keeps
+// it up for as long as it is held. That is how the vote's line counts down.
+constexpr uintptr_t CHud__SetHelpMessage          = 0x005051E0;   // cdecl (wchar*, bool)
+constexpr uintptr_t CHud__m_HelpMessage           = 0x0086B888;   // wchar[256]
+constexpr uintptr_t CHud__m_LastHelpMessage       = 0x006E8F28;   // wchar[256]
+constexpr uintptr_t CHud__m_HelpMessageToPrint    = 0x00664480;   // wchar[256]
+constexpr uintptr_t CHud__m_HelpMessageState      = 0x00880E1C;   // int32, 0..4
+constexpr uintptr_t CHud__m_HelpMessageTimer      = 0x00880FA4;   // int32 ms
+constexpr uintptr_t CHud__m_HelpMessageFadeTimer  = 0x008F6258;   // int32
+constexpr uintptr_t CHud__m_HelpMessageDisplayTime = 0x008E2C28;  // float s
+constexpr uintptr_t CHud__m_HelpMessageQuick      = 0x0095CCF7;   // bool
+constexpr size_t    HUD_HELP_LEN                  = 256;          // the 100h above
+constexpr int32_t   HUD_HELP_STATE_NONE           = 0;
+constexpr int32_t   HUD_HELP_STATE_SHOWN          = 1;
+constexpr int32_t   HUD_HELP_STATE_FADE_IN        = 2;
+
+// ---- the skull's own gate ----
+//
+// What CPickup::Update (0x00430860) asks before it collects anything, read
+// out of the function. A ONCE pickup:
+//
+//   00430D78  cmp [esp+70h],0 / jne             FindPlayerVehicle(): on foot only
+//   00430D83  fabs(player.z - pickup.z) < 2.0   (005EDE50h)
+//   00430DF9  dx * dx + dy * dy < 1.8           (005EDE68h)
+//   00430E81  model == MI_PICKUP_KILLFRENZY ->
+//   00430E8C    call 00439410 / jne out          CTheScripts::IsPlayerOnAMission
+//   00430E99    call 00420E60 / jne out          CDarkel::FrenzyOnGoing
+//   00430EA6    cmp [005F4DD4h],0 / je out       CGame::nastyGame
+//
+// then CPad::StartShake on pad 0 and the award switch through 0x005EE1A0,
+// where type 3 (ONCE) goes to 0x0043117A: GivePlayerGoodiesWithPickUpMI
+// (0x004339F0), which for the skull is PlayFrontEndSound(4Eh) and true
+// (0x00433B30), and on true the tail at 0x00431231 - CWorld::Remove, the
+// deleting destructor, m_bRemoved = 1, m_pObject = 0, m_eType = 0. CPickups::
+// Update then calls AddToCollectedPickupsArray(slot) (0x00430439). The skull
+// is touched by exactly those numbers, and the vote waits for exactly that.
+constexpr float PICKUP_TOUCH_DZ     = 2.0f;
+constexpr float PICKUP_TOUCH_XY_SQ  = 1.8f;
+
+// ---- moving the local player ----
+//
+// COMMAND_WARP_CHAR_FROM_CAR_TO_COORD's handler, 0x0044B346 on, past where
+// the transcription in the getting-out block stops:
+//
+//   0044B359  [car+1F6h] bit 1 (bIsBus) -> [ped+156h] |= 4 (bRenderPedInCar)
+//   0044B45B  CWeaponInfo::GetWeaponInfo(weapon)->m_nModelId ([+4Ch]) ->
+//   0044B467  CPed::AddWeaponModel
+//   0044B46E  CPed::RemoveInCarAnims
+//   0044B490  call 004C5D80  CPed::RestartNonPartialAnims, thiscall, no args:
+//             the first association's flags |= 1 unless it is partial (10h)
+//   0044B499  push 0 / call 004C5A30  CPed::SetMoveState(PEDMOVE_NONE), ret 4
+//   0044B4B1  BlendAnimation(clump [+4Ch], m_animGroup [+1D4h], 3, 100.0f)
+//   0044B4BB  call 004755C0  CEntity::GetDistanceFromCentreOfMassToBaseOfModel,
+//             thiscall -> st0; the whole function is `-colModel->min.z`
+//             (movsx model / ms_modelInfoPtrs[m] / +1Ch col model / fld [+1Ch]
+//             / fchs)
+//   0044B505  call [vtable+2Ch]  Teleport(x, y, z + that), slot 11
+//   0044B53B  CTheScripts::ClearSpaceForMissionEntity(&pos, ped)
+constexpr uintptr_t CPed__RestartNonPartialAnims = 0x004C5D80;
+constexpr uintptr_t CPed__SetMoveState           = 0x004C5A30;
+constexpr uintptr_t CEntity__GetDistanceFromCentreOfMassToBaseOfModel = 0x004755C0;
+namespace offs {
+constexpr size_t    VEH_FLAGS_B_BUS              = 0x1F6;   // bit 1, bIsBus
+constexpr uint8_t   VEH_IS_BUS                   = 0x02;
+constexpr uint8_t   PED_RENDER_IN_CAR            = 0x04;    // PED_FLAGS_C bit 2
+} // namespace offs
+constexpr float     PED_IDLE_BLEND_DELTA         = 100.0f;  // 005EF6C4h
+
+// ---- a seated ped built again ----
+//
+// DeleteRwObject (CPlayerPed's vtable 0x005FA500, the one ~CPlayerPed at
+// 0x004EFB30 stamps before freeing [+53Ch]; slot 6 is CEntity::DeleteRwObject
+// 0x00473F90, slot 3 CPed::SetModelIndex 0x004C52A0) touches the clump, the
+// matrix attachment and the model's ref, and SetModelIndex builds a clump
+// with ANIM_STD_IDLE and nothing else. Neither reads or writes bInVehicle,
+// m_pMyVehicle, m_nPedState or the car's seats: UNDRESS_CHAR / DRESS_CHAR on
+// a seated ped leave it seated, standing up in the seat, with m_pVehicleAnim
+// still pointing at the sitting association the old clump took with it.
+//
+// And the sitting association is what keeps a seated ped in its seat.
+// CPed::LineUpPedWithCar asks for each of the four in turn and, finding one,
+// just places the ped in the car (SetPedPositionInCar, 0x004D4970):
+//
+//   004DF972  test bChangedSeat ([ped+156h] bit 3), phase != 2
+//   004DF98F  push 6Fh / push clump / call 004055C0 (GetAssociation) -> 004D4970
+//   004DF9B4  push 70h ...   004DF9D9  push 71h ...   004DFA03  push 72h ...
+//
+// With none of them it falls through into the line-up phases a ped getting
+// in goes through.
+//
+// The engine seats a freshly built ped in exactly one way, and it's the same
+// four instructions in three places - CREATE_CHAR_INSIDE_CAR (0x0043E7C3),
+// CREATE_CHAR_AS_PASSENGER (0x00441B74) and the end of CPed::PedSetInCarCB:
+//
+//   004CF7AC  cmp [car+1A4h],ped / jne             pDriver == ped?
+//   004CF7B4  mov al,[car+1F6h] / shr al,3 / and 1  bLowVehicle
+//   004CF7C1  push [005F8474h] (100.0f) / push 70h  driver, low
+//   004CF7D0  push [005F8474h]          / push 6Fh  driver
+//   004CF7ED  push [005F8474h]          / push 72h  passenger, low
+//   004CF7F7  push [005F8474h]          / push 71h  passenger
+//   004CF802  push 0 / push [ped+4Ch] / call 00403710   BlendAnimation(clump, STD, id, 100)
+//   004CF80D  mov [ped+1D8h],eax                   m_pVehicleAnim
+//   004CF815  call 004C5D50                        CPed::StopNonPartialAnims
+//
+// The two script handlers push 6Fh/70h for either seat;
+// PedSetInCarCB's four are what an animated entry leaves, so they're the ones
+// used here. Its boat arm (0x004CF31E, `cmp [car+284h],1 / jne 004CF3D0`)
+// blends nothing and stops the entry animation where it is, which nothing
+// could put back after a rebuild - a boat waits.
+//
+// CPed::StopNonPartialAnims, thiscall, no args: every association of the
+// clump that isn't ASSOC_PARTIAL (`and edx,10h`) loses ASSOC_RUNNING
+// (`and dword [eax+30h],0FFFFFFFEh`).
+constexpr uintptr_t CPed__StopNonPartialAnims = 0x004C5D50;
+constexpr uint16_t  ANIM_STD_CAR_SIT          = 0x6F;
+constexpr uint16_t  ANIM_STD_CAR_SIT_LO       = 0x70;
+constexpr uint16_t  ANIM_STD_CAR_SIT_P        = 0x71;
+constexpr uint16_t  ANIM_STD_CAR_SIT_P_LO     = 0x72;
+constexpr float     CAR_SIT_BLEND_DELTA       = 100.0f;  // 005F8474h
+namespace offs {
+constexpr uint8_t   VEH_IS_LOW                = 0x08;    // VEH_FLAGS_B_BUS's byte, bit 3
+} // namespace offs
+
+// CWorld::FindGroundZFor3DCoord(float x, float y, float z, bool *found), cdecl
+// -> st0. ProcessVerticalLine from z down to -1000 (005F79F0h), buildings
+// only (the one `push 1` in seven flags), writes *found, and returns the
+// hit's z or 0.0 (005F79ACh) on a miss. CreateDeadPedMoney calls it at 0x00433606 with four pushes and
+// `add esp,10h`.
+constexpr uintptr_t CWorld__FindGroundZFor3DCoord = 0x004B3AE0;
+
+// COMMAND_LOAD_SCENE, opcode 971 - jump table 0x005EFA14 entry 71, handler
+// 0x0044F0B6: collect three floats, CTimer::Stop, CStreaming::LoadScene(
+// CVector const *) at 0x0040A6D0, CTimer::Update. LoadScene opens on
+// CTheZones::GetLevelFromPosition and ends on LoadAllRequestedModels
+// (0x0040A440) - it streams the models around a point, not collision.
+constexpr uintptr_t CStreaming__LoadScene = 0x0040A6D0;   // cdecl (const CVector *)
+
+// Collision is per island, and the engine changes island on its own. CGame::
+// Process calls CTheZones::Update (0x004B61D0) - m_CurrLevel (0x008F2BC8) =
+// GetLevelFromPosition(FindPlayerCoors) - then, after the script, CCollision::
+// Update (0x0040B3B0): out below 2000 ms or while ms_cutsceneProcessing
+// (0x0095CD9F); CGame::currLevel (0x00941514) = m_CurrLevel; if
+// ms_collisionInMemory differs, LoadCollisionWhenINeedIt (0x0040B5B0), the
+// loading screen and all. Both run before CWorld::Process (0x0048C97A), so a
+// player moved before the frame stands on the new island's collision in the
+// same frame's physics. Which is what the script's own SET_PLAYER_COORDINATES
+// relies on too.
+constexpr uintptr_t CTheZones__m_CurrLevel            = 0x008F2BC8;   // int32
+constexpr uintptr_t CGame__currLevel                  = 0x00941514;   // int32
+constexpr uintptr_t CCollision__Update                = 0x0040B3B0;   // recorded
+constexpr uintptr_t CCollision__LoadCollisionWhenINeedIt = 0x0040B5B0; // recorded
+// The levels are LEVEL_GENERIC..LEVEL_SUBURBAN further up: Portland 1,
+// Staunton 2, Shoreside 3.
+
+// Which islands the story has opened. The two handlers side by side in the
+// 800 table (0x005EF77C, entries 42 and 43):
+//   0044980C  mov [008E2A68h],1 / PlayRadioAnnouncement(0Dh)   034A portland_complete
+//   0044983D  mov [008F4334h],1 / PlayRadioAnnouncement(0Eh)   034B staunton_complete
+// (39_frank4.sc and 62_love3.sc are the missions that run them.) Portland done
+// opens Staunton; Staunton done opens Shoreside.
+constexpr uintptr_t CStats__IndustrialPassed = 0x008E2A68;   // int32
+
+// A cutscene. CCutsceneMgr writes 0x0095CD95 = 1 as it starts one
+// (0x0040485B, three stores before `or [pad+0DFh],80h`) and 0 in the two
+// teardowns (0x004045DC, 0x0040499E); nothing else writes it. 0x0095CD9F is
+// the one CCollision::Update and CGameLogic::Update (0x00421406) test.
+// The name is older than the proof: this is re3's ms_loaded, and re3's
+// ms_running is CCutsceneMgr__ms_started (see "skipping a cutscene").
+constexpr uintptr_t CCutsceneMgr__ms_running             = 0x0095CD95;   // bool
+constexpr uintptr_t CCutsceneMgr__ms_cutsceneProcessing  = 0x0095CD9F;   // bool
+
+// CPlayerInfo::m_WBState, a byte. KillPlayer (0x004A12E0) writes 1,
+// ArrestPlayer (0x004A1330) 2, PlayerFailedCriticalMission (0x004A1380) 3,
+// each behind `cmp byte [ecx+0D8h],0`; CGameLogic::Update switches on it
+// (0x00421429, table 0x005ECDA4).
+namespace offs {
+constexpr size_t  PLAYERINFO_WB_STATE = 0xD8;
+} // namespace offs
+constexpr uint8_t WBSTATE_PLAYING     = 0;
+constexpr uint8_t WBSTATE_WASTED      = 1;
+constexpr uint8_t WBSTATE_BUSTED      = 2;
+
+
+// ---- a replica handed back to the engine (protocol.h, S_AmbientAdopt) -----
+//
+// Verified 2026-09-24. When the player hosting a pedestrian or a traffic car
+// leaves, the machine the server names turns its replica into an ordinary
+// engine-driven one. Two script opcodes already do exactly that to an entity
+// the script built, so both handlers were walked and are copied rather than
+// guessed at: dispatcher 0x00439500, 100..199 table 0x005EEA7C base 100.
+//
+// COMMAND_CHAR_WANDER_DIR (156, entry 56, handler 0x0043BD9B):
+//
+//   0043BDB4  call 0043EB30               CPools::GetPedPool()->GetAt
+//   0043BDBD  mov ecx,ebp / call 004C7F20 CPed::ClearAll
+//   0043BDC7  test eax,eax / jl / cmp eax,7 / jle   a direction 0..7 is kept,
+//             anything else is rolled off CGeneral::GetRandomNumber (005A41D0)
+//   0043BE1E  mov ecx,ebp / push eax / call 004D2750   CPed::SetWanderPath
+//
+// CPed::ClearAll (__thiscall, no args): opens with IsPedInControl (004CE6C0)
+// and `cmp [ebx+224h],31h` (PED_DEAD), then m_nPedState = PED_NONE (+0x224),
+// m_nMoveState = 0 (+0x22C) - re3 Ped.cpp ClearAll, in order.
+//
+// CPed::SetWanderPath(int8) (__thiscall, `ret 4`, bool in al): IsPedInControl
+// first; not in control it only writes m_nPathDir (+0x2B4) and sets
+// bStartWanderPathOnFoot (`or al,8` on +0x15A); bKindaStayInSamePlace (+0x158
+// bit 0) sends it to SetIdle (004D0600); otherwise m_nPathDir and the node
+// search. So it is harmless on a ped in a car, and a direction outside 0..7 is
+// never passed: the handler above bounds it before the call.
+constexpr uintptr_t CPed__ClearAll      = 0x004C7F20;
+constexpr uintptr_t CPed__SetWanderPath = 0x004D2750;
+
+// COMMAND_CAR_WANDER_RANDOMLY (168, entry 68, handler 0x0043C956), the whole
+// body:
+//
+//   0043C977  push esi / call 0041F820         CCarCtrl::JoinCarWithRoadSystem
+//   0043C97C  mov byte [esi+15Ah],1            AutoPilot.m_nCarMission = CRUISE
+//   0043C983  and al,0EFh / or al,10h on +1F5h bEngineOn = true
+//   0043C994  cmp dl,6 / jle -> 6              m_nCruiseSpeed = max(6, it)
+//   0043C9AF  mov eax,[00885B48h]
+//             mov [esi+14Ch],eax               m_nAntiReverseTimer = CTimer ms
+//
+// +0x14C is also where CarHasReasonToStop (0x00415B00) stamps the timer, a
+// second witness (the traffic lights block above).
+//
+// The one input it does not write is m_fMaxTrafficSpeed, and it matters: the
+// driver logic times every curve as `CalcSpeedScaleFactor(...) * (1000.0f /
+// m_fMaxTrafficSpeed)`, and the replica spawn zeroed it. CREATE_CAR's car
+// branch is where a scripted car gets its value, 0x0043C706
+// `mov [edi+160h],41100000h` (9.0f) and the same number cast into the cruise
+// speed at 0x0043C73E - so the adopted car is put back to exactly what
+// CREATE_CAR would have left, and then CAR_WANDER_RANDOMLY is run on it. (The
+// 20.0f at 0x0043C597 is the boat branch.)
+constexpr uint8_t CAR_MISSION_NONE       = 0;
+constexpr uint8_t CAR_MISSION_CRUISE     = 1;
+constexpr uint8_t CAR_WANDER_MIN_CRUISE  = 6;
+constexpr float   CREATE_CAR_CRUISE_SPEED = 9.0f;
+
+namespace offs {
+constexpr size_t AUTOPILOT_ANTI_REVERSE_TIMER = 0x14C;   // uint32, CTimer ms
+static_assert(AUTOPILOT_ANTI_REVERSE_TIMER - VEH_AUTOPILOT == 0x20,
+              "m_nAntiReverseTimer, the ninth dword of CAutoPilot");
+} // namespace offs
+
+// And what a generated pedestrian or car has that a replica does not, all of
+// it off the constructors a generator's entity goes through untouched:
+//
+//   CPed::CPed (0x004C41C0)  mov byte [eax+160h],1          RANDOM_CHAR
+//                            0x004C48EB or al,2 on +156h    bRespondsToThreats
+//                            0x004C4B0B or al,2 on +15Ah    bAllowMedicsToRevive
+//   CPhysical::CPhysical     0x0049511D mov byte [ebx+124h],0   LEVEL_GENERIC,
+//                            its last store before `ret`
+//   CVehicle::CVehicle       clears bIsLocked and bHasBeenOwnedByPlayer
+//                            (VEH_FLAGS_A / VEH_FLAGS_C above)
+//
+// LEVEL_GENERIC and not GetLevelFromPosition, which is what the script uses:
+// CPopulation::MoveCarsAndPedsOutOfAbandonedZones (0x004F5BE0) only looks at
+// entities whose level byte is 0 (`cmp byte [ebx+124h],0` at 0x004F5C61 and
+// 0x004F5E92), and a generator's crowd is exactly those.
+//
+// The reapers the adopted entities rejoin, and the distances in
+// server/core/adopt.h, are CPopulation::ManagePopulation's ped loop
+// (IsPlayer 004D48E0, CanBeDeleted 004CF8B0, `cmp byte [ebx+314h],0` skipping
+// anybody in a car, then the 2D distance at 0x004F3F48 against 65 / 51 / 25 m)
+// and CCarCtrl::PossiblyRemoveVehicle (the 2D distance at 0x004184F2 against
+// 50 / 130 m, x1.5).
+
+// ---- the car radio (docs/radio.md, game/radio.h) ----------------------------
+//
+// Verified 2026-09-24 against the retail image, function by function. None of
+// these is named in the binary; the way in was the station names. FEA_FM0
+// (0x0060D3E8) is pushed once, at 0x0057E80B, inside the function that draws
+// the station's name, cMusicManager::DisplayRadioStationName (0x0057E6D0), and
+// its only caller loads `mov ecx,8F3964h` first (0x0048E3FB): that is the
+// MusicManager object. Everything else was walked out from there and matched
+// against re3's MusicManager.cpp statement by statement.
+constexpr uintptr_t MusicManager  = 0x008F3964;
+// `mov ecx,7341E0h` ahead of every stream call in the music manager.
+constexpr uintptr_t SampleManager = 0x007341E0;
+
+// cMusicManager, from the reads the functions below make of `this`:
+//
+//   +0x00 m_bIsInitialised       Service `cmp byte [ebx],0` (0x0057D45F)
+//   +0x01 m_bDisabled            Service `cmp byte [ebx+1],0`
+//   +0x02 m_nMusicMode           Service `cmp byte [ebx+2],2` (the cutscene
+//                                early-out), then the switch at 0x0057D509
+//                                over table 0x0060D478: 0 front end, 1 game
+//   +0x03 m_nNextTrack           ServiceTrack `mov al,[ebx+3]` before its start
+//   +0x04 m_nPlayingTrack        ServiceGameMode `mov al,[ebp+3] / mov [ebp+4],al`
+//   +0x07 m_bSetNextStation      ServiceGameMode `mov byte [ebp+7],1` when the
+//                                retune counter runs out (0x0057D870)
+//   +0x08 m_nAnnouncement        `cmp byte [ebp+8],0C4h` (0x0057D79C)
+//   +0x09 m_bPreviousPlayerInCar ServiceGameMode's first store (0x0057D6B6)
+//   +0x0A m_bPlayerInCar         PlayerInCar()'s answer (0x0057D6BE)
+//   +0x0B m_bAnnouncementInProgress, `cmp byte [ebp+0Bh],0` (0x0057D7A8)
+//   +0x0C m_aTracks[196], 12 bytes each: length, position, the pause-mode
+//         time the position was taken at. Initialise fills them in that
+//         order (0x0057D081, 0x0057D0AF, 0x0057D0B8); GetTrackStartPos reads
+//         length as `[ecx+ebx+0Ch]` with ebx = track*12 (0x0057E498)
+namespace offs {
+constexpr size_t MUSIC_IS_INITIALISED            = 0x00;
+constexpr size_t MUSIC_DISABLED                  = 0x01;
+constexpr size_t MUSIC_MODE                      = 0x02;
+constexpr size_t MUSIC_NEXT_TRACK                = 0x03;
+constexpr size_t MUSIC_PLAYING_TRACK             = 0x04;
+constexpr size_t MUSIC_ANNOUNCEMENT              = 0x08;
+constexpr size_t MUSIC_PREVIOUS_PLAYER_IN_CAR    = 0x09;
+constexpr size_t MUSIC_PLAYER_IN_CAR             = 0x0A;
+constexpr size_t MUSIC_ANNOUNCEMENT_IN_PROGRESS  = 0x0B;
+constexpr size_t MUSIC_TRACKS                    = 0x0C;
+constexpr size_t MUSIC_TRACK_STRIDE              = 0x0C;
+constexpr size_t MUSIC_TRACK_LENGTH              = 0x00;   // uint32 ms
+constexpr size_t MUSIC_TRACK_POSITION            = 0x04;   // uint32 ms
+
+// CVehicle::m_nRadioStation, a byte. GetCarTuning reads it (`cmp byte
+// [ebp+229h],9` at 0x0057E550), GetNextCarTuning adds the retune presses to
+// it (0x0057E5F4), and the constructor rolls it: CGeneral::GetRandomNumber()
+// % 10 stored at 0x00550F84 - ten, where re3 says USERTRACK, so a new car
+// can come up on the user tracks. CPed::SetRadioStation (0x004D7BC0) moves it
+// to one of four stations by the driver's model when a driver who is not the
+// player takes the seat (its callers 0x004E0782 and 0x004E187C; the table is
+// 0x005F8714, ten rows of four).
+constexpr size_t VEH_RADIO_STATION = 0x229;
+} // namespace offs
+
+// m_nMusicMode values: ChangeMusicMode's first switch (table 0x0060D468)
+// maps 0, 1, 2, 3 to 0, 1, 2, 4.
+constexpr uint8_t MUSICMODE_GAME     = 1;
+constexpr uint8_t MUSICMODE_CUTSCENE = 2;
+// m_nNextTrack's "nothing": ChangeMusicMode writes 0C5h into both track bytes
+// (0x0057D3C0), and 0C4h is the stream count every bounds check uses.
+constexpr uint8_t MUSIC_NO_TRACK         = 0xC5;
+constexpr uint8_t MUSIC_STREAMED_SOUNDS  = 0xC4;
+
+// Two statics of DisplayRadioStationName's file. ServiceGameMode writes 1Eh
+// (30 frames) into the counter and increments the presses on the radio key
+// (0x0057D73F, 0x0057D749); GetNextCarTuning consumes the presses and zeroes
+// them (0x0057E67C).
+constexpr uintptr_t gNumRetunePresses = 0x00650B80;   // int32
+constexpr uintptr_t gRetuneCounter    = 0x00650B84;   // int32
+
+// cMusicManager::Service (__thiscall, no arguments, plain `ret`). ResetTimers'
+// fold, the two early-outs, the 2 s track-service clock at +0x944/+0x948
+// (`add eax,7D0h` at 0x0057D4A1), the stream stop when m_nNextTrack is 0C5h,
+// then the mode switch. Called from exactly one place in the image, the tail
+// of cAudioManager::Service (0x0057A2A0), which is DMAudio.Service's, the
+// call right after CGame::Process in the frame.
+constexpr uintptr_t cMusicManager__Service      = 0x0057D440;
+constexpr uintptr_t MUSIC_SERVICE_CALL          = 0x0057A2FA;   // `mov ecx,8F3964h` at 0x0057A2F5
+// ServiceGameMode, which everything on the radio in a car goes through.
+constexpr uintptr_t cMusicManager__ServiceGameMode = 0x0057D690;
+
+// cMusicManager::GetTrackStartPos(uint8) (__thiscall, `ret 4`): the stored
+// position, plus the pause-mode time since it was stored capped at 90 s
+// (`cmp edx,15F90h` at 0x0057E474), modulo the length. Three callers: the
+// front end's own tracks (0x0057D59C), the ambience (0x0057DDDD) and
+// ChangeRadioChannel (0x0057E19E), which is where a station starts in a car.
+constexpr uintptr_t cMusicManager__GetTrackStartPos = 0x0057E450;
+constexpr uintptr_t CHANGE_RADIO_CHANNEL_START_POS  = 0x0057E19E;   // `push eax` (the track) before
+// cMusicManager::ChangeRadioChannel (__thiscall, no arguments, bool in al):
+// if m_nNextTrack differs from m_nPlayingTrack, store the playing one's
+// position, stop it, and StartStreamedFile(next, GetTrackStartPos(next), 0).
+constexpr uintptr_t cMusicManager__ChangeRadioChannel = 0x0057E130;
+
+// cMusicManager::ServiceTrack (__thiscall, no arguments): on the 2 s service
+// tick, a stream that has stopped playing - a station that reached the end of
+// its file, which Miles plays once (`AIL_set_stream_loop_count(stream, 1)` at
+// 0x00568095) - is started again at position 0.
+constexpr uintptr_t cMusicManager__ServiceTrack = 0x0057E100;
+constexpr uintptr_t SERVICE_TRACK_RESTART       = 0x0057E129;   // `push 0 / push 0 / push eax` before
+
+// cSampleManager, all __thiscall on SampleManager:
+//
+//   StartStreamedFile(uint8 file, uint32 posMs, uint8 stream), `ret 0Ch`:
+//     AIL_open_stream on the name table at 0x006034DC, loop count 1, then
+//     AIL_set_stream_ms_position(stream, posMs) (0x005680A4), unpaused. The
+//     position is milliseconds.
+//   StopStreamedFile(uint8), `ret 4`: pause, close, mp3Stream[n] = 0.
+//   GetStreamedFilePosition(uint8), `ret 4`: AIL_stream_ms_position's
+//     current-ms out parameter (0x005681A8), plus the user-track offset while
+//     the user tracks play.
+//   IsStreamPlaying(uint8), `ret 4`: AIL_stream_status == SMP_PLAYING (4).
+//   GetStreamedFileLength(uint8), `ret 4`: nStreamLength[n] (0x0087FEF0),
+//     measured off each file with AIL_stream_ms_position when the sample
+//     manager starts - so every install with the same files agrees.
+//   IsMP3RadioChannelAvailable(), plain `ret`: nNumMP3s (0x0095CC00) != 0.
+constexpr uintptr_t cSampleManager__StartStreamedFile          = 0x00567D80;
+constexpr uintptr_t cSampleManager__StopStreamedFile           = 0x005680E0;
+constexpr uintptr_t cSampleManager__GetStreamedFilePosition    = 0x00568130;
+constexpr uintptr_t cSampleManager__IsStreamPlaying            = 0x00568290;
+constexpr uintptr_t cSampleManager__GetStreamedFileLength      = 0x00568270;
+constexpr uintptr_t cSampleManager__IsMP3RadioChannelAvailable = 0x00566490;
+
+// cMusicManager::UsesPoliceRadio(CVehicle *) (__thiscall, `ret 4`): true for
+// models 107, 116, 117, 120, 122 and 123 (table 0x0060D560 over model - 6Bh)
+// - FBI car, police, Enforcer, Predator, Rhino, Barracks. Those cars play
+// the scanner whatever m_nRadioStation says, and take no radio key.
+constexpr uintptr_t cMusicManager__UsesPoliceRadio = 0x0057E6A0;
+// cMusicManager::PlayerInCar (__thiscall, bool in al): FindPlayerVehicle, not
+// being dragged out, getting out or arrested (m_nPedState 33h, 36h, 38h), the
+// car not wrecked, and not one of the eight models with no radio at all
+// (table 0x0060D488).
+constexpr uintptr_t cMusicManager__PlayerInCar  = 0x0057E4B0;
+constexpr uintptr_t cMusicManager__GetCarTuning = 0x0057E530;
+
+// ---- a car's alarm, its gun and its taxi light (game/carextras.h) ---------
+//
+// Verified 2026-09-25 against the retail image with dumpbin /disasm and
+// capstone. re3 was the map for the names only.
+//
+// The alarm is CVehicle::m_nAlarmState, offs::VEH_ALARM_STATE (int16). Every
+// word access to +0x1A0 in the image, read:
+//
+//   0x00542884, 0x00542AE2  `or word [ebx+1A0h],0FFFFh`   a car generator
+//                           arming the car it parks (-1)
+//   0x004CF3EF              `cmp word [ebp+1A0h],0FFFFh / jne / mov word
+//                           [ebp+1A0h],3A98h` - a driver seated in an armed
+//                           car, 15000 ms
+//   0x004971BE, 0x004971D1  the same, for each of two vehicles that touch
+//   0x005525A0              CVehicle::ProcessCarAlarm: nothing on 0 or -1,
+//                           else takes ms_fTimeStep * 0.02 * 1000 off it,
+//                           down to 0 (0x005525FA / 0x00552605). Called
+//                           from CAutomobile::ProcessControl at 0x005316B2
+//                           and CBoat's at 0x0053F2D2, both before the
+//                           status switch
+//   0x0056C44F              cAudioManager::ProcessVehicleSirenOrAlarm: with
+//                           the siren byte clear, "not 0 and not -1" goes on
+//                           to the sound; a model without a siren takes the
+//                           alarm path at 0x0056C543, which never reads the
+//                           status
+//   0x00538150              CAutomobile::PreRender: the same test flashes
+//                           the lights on CTimer's 0x100 bit (0x00538175)
+//   0x0053C518, 0x004C26C9  FindPlayerVehicle's alarm near a police car or a
+//                           cop - the local player's own car only
+//   0x00550EF0, 0x00551049  the constructors, 0
+//   0x004A1D60              LoadVehiclePool's copy
+//
+// Nothing else writes it, so a copy CoopIII builds is 0 for good unless it
+// is written.
+constexpr int16_t   VEHICLE_ALARM_ARMED        = -1;
+constexpr uint16_t  VEHICLE_ALARM_SET_MS       = 0x3A98;   // 15000
+constexpr uintptr_t CVehicle__ProcessCarAlarm  = 0x005525A0;
+constexpr uintptr_t ALARM_ARM_ON_SEATING       = 0x004CF3EF;
+constexpr uintptr_t ALARM_ARM_ON_COLLISION     = 0x004971BE;
+constexpr uintptr_t ALARM_READ_BY_AUDIO        = 0x0056C44F;
+constexpr uintptr_t ALARM_READ_BY_PRERENDER    = 0x00538150;
+
+// The gun. CAutomobile::m_fCarGunLR (+0x580) and m_fCarGunUD (+0x584),
+// floats. The constructor (0x0052C6B0) writes 0 and 0.05f there at 0x0052CF82
+// and 0x0052CF90, between the weapon door timers at +0x578/+0x57C and the
+// propeller's +0x588 - re3's order.
+//
+//   TankControl (0x0053D530), sent a Rhino by ProcessControl's `cmp eax,7Ah`
+//   at 0x00532001: `call FindPlayerVehicle / cmp ebx,eax / jne 0x0053DFB5`
+//   (0x0053D5E5), then m_fCarGunLR -= stick * 0.00015f (0x00600810) * step at
+//   0x0053D646, wrapped into 0..2pi (0x00600814). The shell aims off it
+//   (0x0053D72D, 0x0053D751) and the turret frame is turned by it before the
+//   function returns (0x0053DF5C).
+//   FireTruckControl (0x00522590), sent a fire truck by `cmp eax,61h` at
+//   0x00531FEE: the same FindPlayerVehicle test (0x0052259F), then, only while
+//   the fire button is held, LR += stick * 0.00025f (0x005225F0) and UD +=
+//   stick * 0.0001f clamped to 0.05..0.3 (0x0052262A-0x00522669). Any other
+//   fire truck in status PHYSICS aims at the nearest fire on its own
+//   (0x005227E7).
+//   CAutomobile::Render (0x00539EA0), CAutomobile's vtable slot 13
+//   (0x00600C50): for model 7Ah with a turret frame at +0x3C0 it turns that
+//   frame by m_fCarGunLR (`push [ebx+580h]` at 0x00539F33), for every tank,
+//   every frame.
+//
+// So a copy of somebody else's tank is drawn with whatever +0x580 holds, and
+// nothing on this machine ever changes it.
+namespace offs {
+constexpr size_t AUTO_GUN_LR = 0x580;   // float, radians
+constexpr size_t AUTO_GUN_UD = 0x584;   // float, radians
+}
+constexpr uintptr_t CAutomobile__FireTruckControl = 0x00522590;
+constexpr uintptr_t CAutomobile__Render           = 0x00539EA0;
+constexpr uintptr_t CAutomobile__vtable_Render    = 0x00600C50;   // slot 13
+constexpr uintptr_t TANK_TURRET_READ_BY_RENDER    = 0x00539F33;
+constexpr uint16_t  MODEL_RHINO                   = 0x7A;
+
+// Who works the gun. Both functions take `this` into ebx first (`mov ebx,ecx`
+// at 0x00522598 and 0x0053D55B) and then ask FindPlayerVehicle once, before
+// anything reads the pad:
+//
+//   0052259A  call 004A10C0 / cmp ebx,eax / jne 005227E7    FireTruckControl
+//   0053D5E5  call 004A10C0 / cmp ebx,eax / jne 0053DFB5    TankControl
+//
+// FindPlayerVehicle is m_pMyVehicle whenever bInVehicle is set, whatever the
+// seat, so on a passenger's machine the tank he rides in turns and fires off
+// his pad and the fire truck sprays off his fire button. A null here takes
+// the fire truck to its other arm, the STATUS_PHYSICS NPC arm at 0x005227E7
+// (`mov cl,[ebx+50h] / shr cl,3 / cmp eax,3`), and the tank to its epilogue
+// at 0x0053DFB5 (`add esp,1C8h / pop ebp,edi,esi,ebx / ret`): what the two
+// do for any car the player is not in. Each is the first call in its
+// function, ahead of the stick calls a car camera mod writes (0x005225D2,
+// 0x0052260E, 0x0053D628), and each function has one caller,
+// CAutomobile::ProcessControl's model switch (0x00531FF7, 0x0053200A).
+constexpr uintptr_t FIRE_TRUCK_PLAYER_CAR_CALL = 0x0052259A;
+constexpr uintptr_t FIRE_TRUCK_AI_ARM          = 0x005227E7;
+constexpr uintptr_t TANK_PLAYER_CAR_CALL       = 0x0053D5E5;
+constexpr uintptr_t TANK_CONTROL_EPILOGUE      = 0x0053DFB5;
+
+// The taxi light: bit 3 of CAutomobile's flags byte at +0x4D9 (the bomb is
+// bits 0-2, offs::AUTOMOBILE_BOMB). CAutomobile::SetTaxiLight (0x0053C420,
+// `and dl,0F7h / shl al,3 / or dl,al`) is called from one place, the
+// SET_TAXI_LIGHTS handler at 0x00443424 (opcode 0x216, entry 34 of
+// ProcessCommands500To599's table at 0x005EF298). The constructor copies
+// m_sAllTaxiLights (0x0095CD21) into it at 0x0052C78E-0x0052C7BC, and the one
+// writer of that global is CAutomobile::SetAllTaxiLights (0x0053C440, `mov
+// [0095CD21h],al` at 0x0053C444), called only from entry 43 of the same table
+// (opcode 0x21F) at 0x004437E8, which main.scm never uses. So a new car's
+// light is off. BlowUpCar clears it (0x0053BE94). PreRender draws it for the three taxi models at
+// 0x00537D1F: `shr al,3 / and al,1 / je`.
+namespace offs {
+constexpr size_t  AUTOMOBILE_TAXI_LIGHT_BYTE = 0x4D9;
+}
+static_assert(offs::AUTOMOBILE_TAXI_LIGHT_BYTE == offs::AUTOMOBILE_BOMB &&
+                  (offs::AUTOMOBILE_TAXI_LIGHT & offs::AUTOMOBILE_BOMB_MASK) == 0,
+              "the taxi light shares the bomb's byte and none of its bits");
+constexpr uintptr_t CAutomobile__SetTaxiLight   = 0x0053C420;
+constexpr uintptr_t CAutomobile__SetAllTaxiLights = 0x0053C440;
+constexpr uintptr_t CAutomobile__ms_sAllTaxiLights = 0x0095CD21;   // bool
+constexpr uintptr_t TAXI_LIGHT_READ_BY_PRERENDER = 0x00537D1F;
+
+// The handbrake the player's own car is driven with: ProcessControlInputs
+// writes the pad's answer into bit 5 of +0x1F5 at 0x0053B6EB-0x0053B6F8
+// (`shl bl,5 / and al,0DFh / or al,bl`). offs::VEH_HANDBRAKE_ON is the bit.
+constexpr uintptr_t HANDBRAKE_WRITTEN_FROM_PAD = 0x0053B6EB;
+
+// ---- the Import/Export and crane lists (docs/missions.md 6.1) ---------------
+//
+// CGarages::CarTypesCollected, int32[3], one word for each collecting garage
+// (GARAGE_COLLECTCARS_1..3, types 8..10), bit n for the n-th car on its
+// board. Five witnesses in the exe:
+//   0x00421D06/0x00421D1A/0x00421D2E  CGarages::Init zeroes 8E286C, 8E2870, 8E2874
+//   0x00426CCE  HasImportExportGarageCollectedThisCar (03D4's 0x0044F432):
+//               `movzx eax,byte [garage*8Ch+72BCD0h]` (the type), then
+//               `and ebx,[eax*4+8E284Ch]`: the array less 8 words, by type
+//   0x00426E91  MarkThisCarAsCollectedForCraig: `or [eax*4+8E286Ch],ebx`,
+//               then `add [edx+94139Ch],3E8h`, the $1000 reward. Never
+//               called here: the bits are written, the reward is not paid.
+//   0x00428561/0x0042856B/0x00428575  CGarages::Save reads the three words
+//   0x004289AA/0x004289B4/0x004289BE  CGarages::Load writes them
+constexpr uintptr_t CGarages__CarTypesCollected = 0x008E286C;   // int32[3]
+// CCranes::CarsCollectedMilitaryCrane, the emergency crane's seven bits
+// (firetruck, ambulance, enforcer, FBI car, Rhino, Barracks, police):
+//   0x00543364  CCranes::InitCranes zeroes it
+//   0x00544B13.. DoesMilitaryCraneHaveThisOneAlready tests one bit each
+//   0x00544B93.. RegisterCarForMilitaryCrane `or [8F6248h],1` .. 40h
+//   0x00544BE5  HaveAllCarsBeenCollectedByMilitaryCrane (03EC's 0x00588538):
+//               `and eax,[8F6248h] / cmp eax,7Fh`
+constexpr uintptr_t CCranes__CarsCollectedMilitaryCrane = 0x008F6248;   // uint32
+constexpr uint32_t  MILITARY_CRANE_ALL_CARS             = 0x7F;
+
+// ---- a cutscene head's animation (game/cutscenehead.h) ----------------------
+//
+// CCutsceneHead is the one skinned thing in GTA III: its clump carries an
+// RpSkin atomic and an RpHAnim hierarchy, and it is animated by an .anm out
+// of anim\cuts.img, not by the anim-blend associations everything else uses.
+// Its vtable is 0x005F7C08, stamped by the ctor at 0x004BA5F5 and by the two
+// destructor bodies at 0x004BA8C3 / 0x004BA8F3, and by nothing else. Read
+// out of the table itself:
+//   slot 5  +14h  0x004BA650  CreateRwObject: CObject's, then GetFirstAtomic,
+//                             and RpSkinAtomicSetHAnimHierarchy(atomic,
+//                             RpHAnimFrameGetHierarchy(first child frame))
+//   slot 8  +20h  0x004BA760  ProcessControl - what CWorld::Process's walks
+//                             call as `call [edi+20h]` (0x004B1B99, 0x004B1BE4)
+//   slot 13 +34h  0x004BA800  Render
+// and PlayAnimation(name) at 0x004BA6A0, whose only caller is
+// CCutsceneMgr::SetHeadAnim (0x00404D80, `call` at 0x00404DA8), whose only
+// caller is SET_HEAD_ANIM's handler (0x00447586).
+//
+// ProcessControl ends (re3 CutsceneHead.cpp:60-66):
+//   004BA7C8  mov eax,[ebx+4Ch] / push eax / call 00526420   GetFirstAtomic
+//   004BA7D3  call 005B1070                                  RpSkinAtomicGetHAnimHierarchy
+//   004BA7D8  fld [8E2C4Ch] / fmul [5F7BFCh]                 CTimer::ms_fTimeStep / 50
+//   004BA7EC  call 005B1480                                  RpHAnimHierarchyAddAnimTime
+// and Render, just before CObject::Render:
+//   004BA875  call 005B1070 / push eax
+//   004BA87C  call 005B1780                                  RpHAnimUpdateHierarchyMatrices
+//   004BA882  mov ecx,ebx
+//   004BA884  call 004BB1E0                                  CObject::Render
+//
+// Why a head can be in the world with no animation. RpHAnimHierarchyCreate
+// (0x005B10E0) leaves pCurrentAnim (+08h, `mov [esi+8],edi` at 0x005B1114)
+// and the key-frame-to-matrix callback (+40h, `mov [esi+40h],edi` at
+// 0x005B11CE) null, and the frame plugin's copy callback (0x005B2000) makes a
+// fresh one for every clone, so every head starts with neither. Only
+// RpHAnimHierarchySetCurrentAnim (0x005B1200: `mov [eax+8],edx`, then +3Ch..
+// +4Ch from the anim's interpolator info) fills them, and only PlayAnimation
+// calls it - and PlayAnimation does nothing at all when "<scene>_<name>.anm"
+// is not in cuts.dir (`je 004BA754` at 0x004BA6EB) or the chunk is not found
+// (0x004BA733). And CCutsceneMgr::AddCutsceneHead (0x00404CD0) puts the head
+// in the world at once (`call CWorld::Add` at 0x00404CFC), where
+// CreateCutsceneObject (0x00404BE0..0x00404CCE) leaves a body out of it until
+// START_CUTSCENE: a head is on the moving list from CREATE_CUTSCENE_HEAD on,
+// and its anim arrives one instruction later, from SET_HEAD_ANIM. The script
+// runs the two back to back; anything that lets a CWorld::Process in between,
+// or loses the second, leaves a head the next frame walks with nothing set:
+//   005B14AA  mov edx,[ebx+8]       pCurrentAnim
+//   005B14F7  mov eax,[edx+0Ch]     ->duration: the read of 0x0000000C
+// and, had it got that far, 0x005B199D `mov eax,[ebp+40h]` / 0x005B1B1C
+// `call eax`, a call to 0 from Render.
+constexpr uintptr_t CCutsceneHead__vtable          = 0x005F7C08;
+constexpr uintptr_t CCutsceneHead__CreateRwObject  = 0x004BA650;
+constexpr uintptr_t CCutsceneHead__PlayAnimation   = 0x004BA6A0;
+constexpr uintptr_t CCutsceneHead__ProcessControl  = 0x004BA760;
+constexpr uintptr_t CCutsceneHead__Render          = 0x004BA800;
+constexpr uintptr_t CCutsceneMgr__CreateCutsceneObject = 0x00404BE0;
+constexpr uintptr_t CCutsceneMgr__AddCutsceneHead  = 0x00404CD0;
+constexpr uintptr_t CCutsceneMgr__SetHeadAnim      = 0x00404D80;
+constexpr uintptr_t CREATE_CUTSCENE_HEAD_AddCall   = 0x00447505;   // E8 -> AddCutsceneHead
+constexpr uintptr_t SET_HEAD_ANIM_SetCall          = 0x00447586;   // E8 -> SetHeadAnim
+// The scene's objects and heads, as DeleteCutsceneData (0x004048E0) walks
+// them: `mov eax,[edx*4+862170h]` with edx counting 0x00942FA4 down, and
+// `mov [00942FA4h],0` when it is done. 0x32 of them (CWorld::Process's
+// cutscene-only walk, `cmp ebx,32h` at 0x004B1AF9).
+constexpr uintptr_t CCutsceneMgr__ms_pCutsceneObjects = 0x00862170;   // CObject *[50]
+constexpr uintptr_t CCutsceneMgr__ms_numCutsceneObjs  = 0x00942FA4;   // int32
+constexpr int32_t   CUTSCENE_OBJECTS_MAX              = 50;
+// RenderWare, called the way the head's own two functions call them.
+constexpr uintptr_t GetFirstAtomic                  = 0x00526420;   // cdecl (RpClump *)
+constexpr uintptr_t RpSkinAtomicGetHAnimHierarchy   = 0x005B1070;   // cdecl (RpAtomic *)
+constexpr uintptr_t RpHAnimHierarchyAddAnimTime     = 0x005B1480;   // cdecl (hier, float)
+constexpr uintptr_t RpHAnimUpdateHierarchyMatrices  = 0x005B1780;   // cdecl (hier)
+constexpr uintptr_t RpHAnimHierarchySetCurrentAnim  = 0x005B1200;   // cdecl (hier, anim)
+constexpr uintptr_t RpHAnimHierarchyCreate          = 0x005B10E0;
+// The three calls CoopIII takes (game/cutscenehead.cpp).
+constexpr uintptr_t HEAD_ADD_ANIM_TIME_CALL = 0x004BA7EC;   // ProcessControl -> AddAnimTime
+constexpr uintptr_t HEAD_UPDATE_MATRICES_CALL = 0x004BA87C; // Render -> UpdateHierarchyMatrices
+constexpr uintptr_t HEAD_OBJECT_RENDER_CALL = 0x004BA884;   // Render -> CObject::Render
+namespace offs {
+constexpr size_t HANIM_CURRENT_ANIM       = 0x08;   // RpHAnimAnimation *
+constexpr size_t HANIM_KEYFRAME_TO_MATRIX = 0x40;   // callback Update..Matrices calls
+constexpr size_t HANIM_READ_SPAN          = 0x44;   // enough to read both
+} // namespace offs
+
 
 // ---- helpers --------------------------------------------------------------
 

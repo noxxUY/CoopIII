@@ -124,11 +124,9 @@ bool WaitForGameLoop(uint32_t timeoutMs) {
 	// exists for. Untested.
 	//
 	// CoopIII is unaffected either way - it wants a running game, and the
-	// measured behaviour gives it one. agentpad/ can't live with the
-	// ambiguity, since it has to work on the menu, so it uses gGameState
-	// (0x008F5838) instead, which doesn't go through CTimer at all, and logs
-	// both signals side by side so the next in-game run settles this for
-	// free. See agentpad/src/dllmain.cpp.
+	// measured behaviour gives it one. Anything that has to work on the menu
+	// too wants gGameState (0x008F5838) instead, which doesn't go through
+	// CTimer at all.
 	//
 	// What's NOT in doubt: CGame::Process is not called in the frontend. An
 	// earlier version of this comment asserted that and the frame-counter

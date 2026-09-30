@@ -29,6 +29,54 @@ struct Config {
 	// it happens. Turn this on to get stock single-player pause behaviour.
 	bool menuPausesTheGame = false;
 
+	// How big a nametag is drawn, as a multiple of the built-in size. The
+	// built-in one is a fixed fraction of screen height and is the same on
+	// every resolution, so this is a preference about how prominent other
+	// players' names should be, not a correction for a screen. Clamped to
+	// something a person could still read at one end and still see past at
+	// the other.
+	float nametagScale = 1.0f;
+
+	// Which key asks for a passenger seat in somebody else's car. A letter, a
+	// digit or F1 to F12 in the ini, stored as its virtual-key code. GTA III has
+	// no binding of its own for this, so there is nothing to clash with inside
+	// the game - but plenty outside it, which is why it is settable.
+	int seatKey = 'G';
+
+	// Yes and no when somebody wants to start a rampage (game/rampagevote.h).
+	// Only read while a vote is up, so they are free the rest of the time.
+	int voteYesKey = 'Y';
+	int voteNoKey  = 'N';
+
+	// The chat: one key opens a line to type, Enter sends it and Escape drops
+	// it; the other shows or hides the list of who is in the session. Spelled
+	// the way seatKey is.
+	int chatKey = 'T';
+	int listKey = 0x78;   // F9
+
+	// Held to show the scoreboard; the list key above pins it. Tab, which GTA
+	// III has no default binding for (game/scoreboard.h).
+	int scoreboardKey = 0x09;   // VK_TAB
+
+	// The version in the bottom-left corner of the HUD. On by default, since
+	// the first thing anybody reporting a bug gets asked is which build.
+	bool showVersion = true;
+
+	// Whether this machine's missions are the session's (docs/missions.md):
+	// everybody at the start and at every checkpoint, one mission at a time,
+	// a participant's $ONMISSION following it and the death rule. On by
+	// default; `missions = off` makes every mission this machine's own. The
+	// script engine's addresses it needs are in game/missionaddr.h.
+	bool missions = true;
+
+	// The server's password, when it has one (protocol.h, C_Password). Empty
+	// sends nothing, which is what a server without one expects.
+	std::string password;
+
+	// A key as the ini spells it, as a virtual-key code: one letter or digit,
+	// F1 to F12, or Tab. Zero for anything else. Exposed for tests.
+	static int ParseKey(const std::string &value);
+
 	// Parses INI text. Unknown keys are ignored, not fatal, so a config from
 	// a newer build still loads. Returns false only if `text` is empty.
 	bool ParseIni(const std::string &text);

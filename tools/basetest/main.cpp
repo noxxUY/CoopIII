@@ -11,6 +11,8 @@
 #include "queue.h"
 #include "quat.h"
 
+#include <coopiii/version.h>
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -96,6 +98,110 @@ void TestConfigParsing() {
 	Check(crlf.host == "6.6.6.6" && crlf.port == 7, "CRLF line endings");
 
 	Check(!Config().ParseIni(""), "empty text reports false");
+}
+
+void TestConfigKeys() {
+	std::printf("\nconfig keys\n");
+	Config d;
+	Check(d.seatKey == 'G' && d.chatKey == 'T' && d.listKey == 0x78,
+	      "defaults: G for a seat, T to chat, F9 for the list");
+
+	Check(Config::ParseKey("t") == 'T' && Config::ParseKey("7") == '7',
+	      "a letter or digit is its own code, uppercased");
+	Check(Config::ParseKey("F1") == 0x70 && Config::ParseKey("f12") == 0x7B,
+	      "F1 to F12 run from 0x70");
+	Check(Config::ParseKey("F0") == 0 && Config::ParseKey("F13") == 0 &&
+	          Config::ParseKey("F01") == 0 && Config::ParseKey("Fx") == 0,
+	      "an F-number outside 1-12, or not a number, is refused");
+	Check(Config{}.missions, "the missions are the session's unless they are turned off");
+	Config shared;
+	shared.ParseIni("missions = on\n");
+	Check(shared.missions, "and `missions = on` turns them on");
+	Check(Config::ParseKey("Tab") == 0x09 && Config::ParseKey("tab") == 0x09,
+	      "Tab, for the player list the way other games have it");
+	Check(Config::ParseKey("") == 0 && Config::ParseKey("?") == 0 &&
+	          Config::ParseKey("Enter") == 0,
+	      "punctuation and names without a table are refused");
+
+	Config c;
+	c.ParseIni("chatKey = y\nlistKey = F5\nseatKey = F2\n");
+	Check(c.chatKey == 'Y' && c.listKey == 0x74 && c.seatKey == 0x71, "reads all three keys");
+
+	Config bad;
+	bad.ParseIni("chatKey = Enter\nlistKey = F99\n");
+	Check(bad.chatKey == 'T' && bad.listKey == 0x78, "a key it cannot read keeps the default");
+
+	Check(d.scoreboardKey == 0x09, "the scoreboard is on Tab unless the file says otherwise");
+	Check(Config::ParseKey("TAB") == 0x09 && Config::ParseKey("tab") == 0x09,
+	      "Tab is spelled Tab, any case");
+	Config board;
+	board.ParseIni("scoreboardKey = F4\n");
+	Check(board.scoreboardKey == 0x73 && board.listKey == 0x78,
+	      "the scoreboard key is read on its own, and leaves the list key alone");
+	Config boardBad;
+	boardBad.ParseIni("scoreboardKey = Space\n");
+	Check(boardBad.scoreboardKey == 0x09, "and one it cannot read stays on Tab");
+
+	Check(d.showVersion, "the version mark is on by default");
+	Config quiet;
+	quiet.ParseIni("showVersion = off\n");
+	Check(!quiet.showVersion, "and off when the file says so");
+
+	Check(d.password.empty(), "no password unless the file has one");
+	Config locked;
+	locked.ParseIni("password = let me\x01 in\n");
+	Check(locked.password == "let me in", "a password parses, control characters left out");
+	locked.ParseIni(std::string("password = ") + std::string(50, 'p') + "\n");
+	Check(locked.password.size() == PASSWORD_LEN - 1, "and cut to what the packet carries");
+}
+
+// The mark in the corner says the version the build says, read straight out
+// of xmake.lua next to this source. Skipped, not failed, where the tree is not
+// beside the binary.
+std::string ReadFileNear(const char *thisFile, const char *relative) {
+	std::string dir = thisFile;
+	for (int up = 0; up < 3; ++up) {
+		const size_t slash = dir.find_last_of("\\/");
+		if (slash == std::string::npos)
+			return {};
+		dir.resize(slash);
+	}
+	FILE *fh = std::fopen((dir + "/" + relative).c_str(), "rb");
+	if (!fh)
+		return {};
+	std::string text;
+	char        buf[4096];
+	size_t      n;
+	while ((n = std::fread(buf, 1, sizeof buf, fh)) > 0)
+		text.append(buf, n);
+	std::fclose(fh);
+	return text;
+}
+
+void TestTheVersionIsTheBuilds() {
+	std::printf("\nthe version in the corner\n");
+	Check(std::string(COOPIII_VERSION).find('.') != std::string::npos, "it looks like a version");
+
+	const std::string lua = ReadFileNear(__FILE__, "xmake.lua");
+	if (lua.empty()) {
+		std::printf("  (xmake.lua is not beside this build; not compared)\n");
+		return;
+	}
+	const std::string want = std::string("set_version(\"") + COOPIII_VERSION + "\")";
+	Check(lua.find(want) != std::string::npos, "it is the one xmake.lua builds");
+
+	const std::string json = ReadFileNear(__FILE__, "installer/assets/components.json");
+	if (!json.empty()) {
+		const std::string key = "\"version\": \"";
+		const size_t at  = json.find("\"id\": \"coopiii\"");
+		const size_t val = at == std::string::npos ? at : json.find(key, at);
+		std::string shipped;
+		if (val != std::string::npos) {
+			const size_t from = val + key.size();
+			shipped = json.substr(from, json.find('"', from) - from);
+		}
+		Check(shipped == COOPIII_VERSION, "and the one the installer ships");
+	}
 }
 
 void TestNickSanitising() {
@@ -403,9 +509,36 @@ void TestQuatRobustness() {
 
 } // namespace
 
+// Yes and no for the vote before a rampage (game/rampagevote.h).
+void TestVoteKeys() {
+	std::printf("\nthe rampage vote keys\n");
+	const Config d;
+	Check(d.voteYesKey == 'Y' && d.voteNoKey == 'N', "Y and N unless the file says otherwise");
+	Config c;
+	c.ParseIni("voteYesKey = j\nvoteNoKey = F6\n");
+	Check(c.voteYesKey == 'J' && c.voteNoKey == 0x75, "a letter and an F-key");
+	Config bad;
+	bad.ParseIni("voteYesKey = Space\nvoteNoKey = \n");
+	Check(bad.voteYesKey == 'Y' && bad.voteNoKey == 'N', "one it can't read keeps the default");
+
+	const std::string ini = ReadFileNear(__FILE__, "CoopIII.ini");
+	if (ini.empty()) {
+		std::printf("  [skip] CoopIII.ini isn't beside the source\n");
+		return;
+	}
+	Config shipped;
+	shipped.ParseIni(ini);
+	Check(ini.find("voteYesKey") != std::string::npos && ini.find("voteNoKey") != std::string::npos &&
+	          shipped.voteYesKey == 'Y' && shipped.voteNoKey == 'N',
+	      "the ini that ships names both and says Y and N");
+}
+
 int main() {
+	TestVoteKeys();
 	TestConfigDefaults();
 	TestConfigParsing();
+	TestConfigKeys();
+	TestTheVersionIsTheBuilds();
 	TestNickSanitising();
 	TestEnvOverrides();
 	TestLogPathPerProcess();

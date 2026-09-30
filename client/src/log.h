@@ -10,9 +10,9 @@
 // you need it most: after a crash.
 //
 // The log file opens denying other writers, and falls back to a per-pid name
-// if that fails. Running two copies of the game out of one folder (the whole
-// point of AgentPad's multi-instance support) would otherwise leave both
-// processes truncating and interleaving lines into one CoopIII.log, which
+// if that fails. Running two copies of the game out of one folder, which is
+// how a co-op mod gets tested at all, would otherwise leave both processes
+// truncating and interleaving lines into one CoopIII.log, which
 // reads like one confused process instead of two sane ones. Call LogPath()
 // to see which file this process actually got.
 #pragma once

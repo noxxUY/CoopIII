@@ -4,11 +4,35 @@
 #include "hook/hook.h"
 #include "log.h"
 
+#include <windows.h>
+
+#include <cstring>
+
 namespace coopiii::game {
 
 namespace {
 
 Detour g_timer;
+
+// ---- the frame a lost focus skips (pause.h) ----------------------------------
+
+// The wait between two unfocused frames: about the rate the game runs at.
+constexpr DWORD UNFOCUSED_FRAME_MS = 16;
+
+using WaitFn    = BOOL(WINAPI *)();
+using ProcessFn = void(__cdecl *)();
+
+bool       g_inSession    = false;
+bool       g_waitTaken    = false;
+bool       g_saidUnfocus  = false;
+uint32_t   g_unfocusedRun = 0;
+// What the call now reads through: a pointer to our function.
+WaitFn     g_waitVia      = nullptr;
+
+BOOL WINAPI WaitOrRunUnfocused();
+
+// The chat line is open (HoldControlsForChat).
+bool g_chatHolds = false;
 
 // CTimer::Update is a static member (re3 Timer.h), so __cdecl with no
 // arguments - same reasoning as CGame::Process in frame.cpp. Get this wrong
@@ -69,7 +93,89 @@ void __cdecl HookedTimerUpdate() {
 		UserPause() = true;
 }
 
+// WinMain's WaitMessage, in the frame ForegroundApp says to skip. Called
+// through the IAT slot, not the address it held when installed, so a plugin
+// that hooks WaitMessage by its import keeps its hook.
+BOOL WINAPI WaitOrRunUnfocused() {
+	const WaitFn real = *reinterpret_cast<WaitFn *>(IAT_WAITMESSAGE);
+	if (!RunUnfocusedFrame(g_timer.IsInstalled(), InAGame(), g_inSession))
+		return real();
+
+	if (!g_saidUnfocus) {
+		g_saidUnfocus = true;
+		Log("pause: the game lost its display (focus gone, device lost); running the "
+		    "world without drawing until it comes back, so our car and our traffic keep "
+		    "moving on everybody else's screen");
+	}
+	++g_unfocusedRun;
+
+	// Idle's own order, up to the point where it would start drawing.
+	Func<UpdateFn>(CTimer__Update)();
+	Global<int16_t>(CPointLights__NumLights) = 0;
+	Func<ProcessFn>(CGame__Process)();
+
+	// Bounded: back round the loop for its PeekMessage and its own retry of
+	// RwCameraBeginUpdate at least once a frame.
+	MsgWaitForMultipleObjects(0, nullptr, FALSE, UNFOCUSED_FRAME_MS, QS_ALLINPUT);
+	return TRUE;
+}
+
+bool PointWaitAt(const void *target) {
+	uint8_t *const site = reinterpret_cast<uint8_t *>(WINMAIN_WAITMESSAGE_CALL);
+	DWORD          old  = 0;
+	if (!VirtualProtect(site, sizeof WAITMESSAGE_CALL_BYTES, PAGE_EXECUTE_READWRITE, &old))
+		return false;
+	const uint32_t operand = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(target));
+	std::memcpy(site + 2, &operand, sizeof operand);
+	VirtualProtect(site, sizeof WAITMESSAGE_CALL_BYTES, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), site, sizeof WAITMESSAGE_CALL_BYTES);
+	return true;
+}
+
+// Game thread only (dllmain.cpp installs from the first PreFrame), so WinMain
+// is never between fetching this instruction and executing it.
+void TakeUnfocusedWait() {
+	if (g_waitTaken)
+		return;
+	if (std::memcmp(reinterpret_cast<const void *>(WINMAIN_WAITMESSAGE_CALL),
+	                WAITMESSAGE_CALL_BYTES, sizeof WAITMESSAGE_CALL_BYTES) != 0) {
+		Log("pause: WinMain's WaitMessage call at 0x%08X is not the retail `call "
+		    "[0061D558h]`; losing focus will stop the game as it does in single player",
+		    WINMAIN_WAITMESSAGE_CALL);
+		return;
+	}
+	g_waitVia = &WaitOrRunUnfocused;
+	if (!PointWaitAt(&g_waitVia)) {
+		Log("pause: could not unprotect 0x%08X; losing focus will stop the game",
+		    WINMAIN_WAITMESSAGE_CALL);
+		return;
+	}
+	g_waitTaken = true;
+	Log("pause: took WinMain's WaitMessage at 0x%08X; a game that loses its display in a "
+	    "session keeps running",
+	    WINMAIN_WAITMESSAGE_CALL);
+}
+
+void GiveBackUnfocusedWait() {
+	if (!g_waitTaken)
+		return;
+	if (PointWaitAt(reinterpret_cast<const void *>(IAT_WAITMESSAGE)))
+		g_waitTaken = false;
+	if (g_unfocusedRun != 0)
+		Log("pause: ran %u frame(s) without a display", g_unfocusedRun);
+}
+
 } // namespace
+
+bool GameWindowInFront() {
+	HWND front = GetForegroundWindow();
+	return front != nullptr && GetWindowThreadProcessId(front, nullptr) == GetCurrentThreadId() &&
+	       !IsIconic(front);
+}
+
+void SetSessionForUnfocusedFrames(bool inSession) {
+	g_inSession = inSession;
+}
 
 bool InstallPausePolicy() {
 	if (!g_timer.Install("CTimer::Update", reinterpret_cast<void *>(CTimer__Update),
@@ -84,10 +190,12 @@ bool InstallPausePolicy() {
 	Log("pause: hooked CTimer::Update at 0x%08X; the menu no longer stops the "
 	    "world",
 	    CTimer__Update);
+	TakeUnfocusedWait();
 	return true;
 }
 
 void RemovePausePolicy() {
+	GiveBackUnfocusedWait();
 	if (!g_timer.IsInstalled())
 		return;
 	g_timer.Remove();
@@ -125,7 +233,27 @@ void RestorePauseForPresentation() {
 	// Costs the same single frame the pause itself costs: the frame the menu
 	// opens on still moves the player, and the frame it closes on still
 	// ignores them.
-	LockPlayerControls(menu);
+	LockPlayerControls(menu || g_chatHolds);
+}
+
+bool CloseMenuForTheSession(const char *why) {
+	if (!CloseMenuForMission(InAGame(), MenuIsUp(), Global<bool>(CMenuManager__m_bSaveMenuActive)))
+		return false;
+	using ShutDownFn = void(__thiscall *)(void *);
+	Func<ShutDownFn>(CMenuManager__RequestFrontEndShutDown)(
+	    reinterpret_cast<void *>(FrontEndMenuManager));
+	Log("pause: shut the menu for %s", why ? why : "the session's mission");
+	return true;
+}
+
+void HoldControlsForChat(bool hold) {
+	if (hold == g_chatHolds)
+		return;
+	g_chatHolds = hold;
+	// Straight away, and whether or not the pause policy is installed: with
+	// the menu pausing the game as in single player, nothing else ever sets
+	// or clears our bit.
+	LockPlayerControls(hold || (g_timer.IsInstalled() && InAGame() && MenuIsUp()));
 }
 
 } // namespace coopiii::game

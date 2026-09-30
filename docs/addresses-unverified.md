@@ -26,6 +26,11 @@ nobody can miss them.
 |---|---|---|
 | `CStreaming::HasModelLoaded` exists as a callable function | **REFUTED** | re3 declares it inline; the compiler inlined it at 38+ sites. `addresses.h` inlines the comparison instead. |
 | `CRecordDataForChase::StoreInfoForCar` is at `0x00435140` | **REFUTED**, the real address is `0x00435000` | `0x00435140` is the *last byte* of `or byte ptr [esp+5],0Ch`, which starts at `0x0043513C`. Calling it would execute from the middle of an instruction. The region end in the old row (`0x0043525A`) was right (the `ret` is at `0x00435259`), so what got lost was a function *start*, not a bad range. Disassembling from `0x00435000` gives re3 Record.cpp:331-348 statement for statement: `127.0f * GetRight().x` first, then forward, then `pos`, then `16383.5f *` the three move-speed components, then wheel/gas/brake, then the handbrake bit. This is the third hand-derived address in this analysis pass to be flat wrong. |
+| `IS_CAR_IN_MISSION_GARAGE` is opcode `03D4` (`missionaddr.h`, 2026-09-24) | **REFUTED**, it is `021C` | `03D4` is `HAS_IMPORT_GARAGE_SLOT_BEEN_FILLED`: its handler (`0x0044F40E`) collects **two** operands and calls `0x00426CB0`, the import garage's collected-cars mask. `021C`'s handler (`0x00443759`) collects one and calls `0x00426C20`, `aGarages[g].state == 5` (`GS_CLOSEDCONTAINSCAR`). re3's enum and the SCM decompile (`021C: car_inside_garage`, asked by Luigi 2, Joey 3, Toni 3 and Frank 1) agree. With `03D4` the helpers' garages were never heard, and every participant asked the import garage its question with an operand missing. Fixed in `missionaddr.h`; the interception moved to the 500 handler. |
+| `OVERRIDE_NEXT_RESTART` is opcode `016C` (`missionaddr.h`, `replay.h`) | **REFUTED**, it is `016E` | `016C`'s handler calls `0x00436100`, which appends to the hospital restart points with no bound (re3 `ADD_HOSPITAL_RESTART`). `016E`'s calls `0x004366C0`, which sets `bOverrideRestart` (`0x0095CD5D`) to 1, the flag `CANCEL_OVERRIDE_RESTART` (`01F6`, `0x004366F0`) sets to 0. 8-Ball's `016E` was never replayed, and nothing put a participant's restart back. Fixed in both places. |
+| `MISSION_HAS_FINISHED` (`00D8`) clears `bAlreadyRunningAMissionScript` | **REFUTED**, `TERMINATE_THIS_SCRIPT` (`004E`) does | `00D8` (`0x0043D5F2`) removes the floating pickups for `love3` and runs `MissionCleanup.Process`, nothing else. `004E` (`0x0043A533`) clears `0x0095CDB3` when the script's `+0x85` is set, then moves it to the idle list. The address was right; only the comment was wrong. |
+| `ProcessCommands100To199` at `0x0043AEA4` (`addresses.h`'s ped note) | **REFUTED**, it is `0x0043AEA0` | `0x0043AEA4` is the `sub esp,160h` four bytes in. The dispatcher's call at `0x0043956B` lands on `0x0043AEA0`. Nothing called it at the wrong address; the note is fixed. |
+| `CTimer::m_FrameCounter` going back means this machine's game started over (`mission.cpp` `WatchOwnGame`) | **REFUTED** as a witness, the address is right | Only three things write `0x009412EC`: `CTimer::Initialise` zeroes it (`0x004ACF34`), `CTimer::Update` increments it, and `CReplay::RestoreStuffFromMem` (`0x00596FE3`, from `FinishPlayback` `0x00595B20`) puts back the value from before an instant replay. And `GenericLoad` reads it out of the save (`mov edi,9412ECh / movsd` at `0x00590C57`), after `InitialiseWhenRestarting` zeroed it. So a load of a save with a higher count than this session's is not seen, and the end of every instant replay is taken for a start-over. Not changed in code: `WatchOwnGame` still relies on it. |
 
 `CRecordDataForChase::RestoreInfoForCar` at `0x00435330`, from the same row
 pair, is correct: it opens `fld [ebp+0x3C] / [ebp+0x38] / [ebp+0x34]`
@@ -45,7 +50,7 @@ tables, so the section counts below no longer match their headings.
 | `CPed::m_nPedState` `0x224`, `m_nLastPedState` `0x228`, `m_nMoveState` `0x22C` | `CPed::SetStoredState` (`0x004C5DB0`) reads all three in re3's statement order (Ped.cpp:614-623) |
 | `CPed::m_fHealth` `0x2C0` | `CPed::SetDie` does `mov dword [ebx+0x2C0],0` between `ClearAll` and the `PED_DRIVING` test, matching re3 Ped.cpp:6318-6321 exactly |
 | `CPed::bInVehicle` `0x314` | `cmp byte [ebx+0x314],0` in `SetDie`'s tail, where re3 tests `bInVehicle` |
-| `CPed::m_fRotationCur` `0x2DC`, `m_fRotationDest` `0x2E0` | 33 and 55 stores plus 29 loads across `.text`, the profile of a heading the ped AI touches constantly; adjacent, as re3 Ped.h:444-445 declares them |
+| `CPed::m_fRotationCur` `0x2DC`, `m_fRotationDest` `0x2E0` | 33 and 55 stores plus 29 loads across `.text`, the profile of a heading the ped logic touches constantly; adjacent, as re3 Ped.h:444-445 declares them |
 | `CPhysical::m_vecMoveSpeed` `0x78`, `m_vecTurnSpeed` `0x84` | arithmetic from re3: CPlaceable is vtable(4)+CMatrix(0x48), CEntity ends at 0x64, then the CPhysical members in declaration order |
 | `CPlaceable::m_matrix` `0x04`, position `0x34`, `CEntity::m_modelIndex` `0x5C` | same arithmetic, and the RwMatrix layout it implies is self-consistent |
 | `FindPlayerPed` `0x004A1150` | disassembles to `movzx PlayerInFocus` / `imul` by the CPlayerInfo stride / indexed load / `ret`, and is the call target at the head of `CPed::SetDie` |
@@ -55,6 +60,7 @@ tables, so the section counts below no longer match their headings.
 | `CPed::m_pVehicleAnim` `0x1D8` | `CPed::CPed` nils it at `[eax+1D8h]`, between `m_animGroup` (0x1D4) and `m_vecAnimMoveDelta` (0x1DC) |
 | `CPed::m_nPedType` `0x32C` | `CPed::CPed` writes its `pedType` argument to `[ecx+32Ch]` |
 | `CPed::GiveWeapon` `0x004CF9B0` | the whole function is re3 Ped.cpp:4700-4720, including the 99999 ammo cap (`cmp eax,1869Fh`) and the OUT_OF_AMMO → READY reset |
+| `CFont::InitPerFrame` `0x00500BE0` | held. It is re3 Font.cpp:105-112 instruction for instruction: `mov eax,[0095CC04h] / push 1Eh / call 0051EB70 / mov [008F31B4h],eax`, then the same two lines with `push 0Fh` for `Sprite[1]` and `Sprite[2]`, i.e. `Details.bank = CSprite2d::GetBank(30, Sprite[0].m_pTexture)` and two banks of 15. Promoted with the whole of the HUD font and sprite surface it belongs to; see the `---- the HUD ----` section of `addresses.h` |
 
 ### The `CVehicle` layout, verified 2026-09-21 (Area E)
 
@@ -127,7 +133,6 @@ afternoon to them.
 | `HOOK_OUTBOUND_UNCONDITIONAL (Idle, immediately after CGame::Process returns)` | `0x0048E4A0` | function | high | src/core/main.cpp:1594-1599 (CGame::Process(); then DMAudio.Service();) |
 | `CPad::UpdatePads` | `0x00492720` | function | high | src/core/Pad.cpp:1098 |
 | `CPad::GetPad` | `0x00492F60` | function | high | src/core/Pad.h (static CPad *GetPad(int32 pad)) |
-| `FrontendIdle` | `0x0048E700` | function | high | src/core/main.cpp:1753 |
 | `AppEventHandler` | `0x0048E800` | function | high | src/core/main.cpp:1795 |
 | `RsEventHandler` | `0x00584A20` | function | high | src/skel/skeleton.cpp (RsEventHandler) / src/skel/win/win.cpp:1033 |
 | `WinMain` | `0x00582710` | function | high | src/skel/win/win.cpp (WinMain) |
@@ -141,18 +146,15 @@ afternoon to them.
 | `CMenuManager::Process` | `0x00485100` | function | high | src/core/Game.cpp:1018 and src/core/main.cpp:1764 |
 | `CSprite2d::SetRecipNearClip` | `0x0051EA20` | function | high | src/core/main.cpp:1760, src/core/Game.cpp:1025 |
 | `CSprite2d::InitPerFrame` | `0x0051EAE0` | function | high | src/core/main.cpp:1561/1761, src/core/Game.cpp:1026 |
-| `CFont::InitPerFrame` | `0x00500BE0` | function | high | src/core/main.cpp:1562/1762, src/core/Game.cpp:1027 |
 | `CPad::DoCheats` | `0x00492F00` | function | medium | src/core/Game.cpp:1030 |
 | `CClock::Update` | `0x00473460` | function | medium | src/core/Game.cpp:1031 |
 | `CWeather::Update` | `0x00522C10` | function | medium | src/core/Game.cpp:1032 |
-| `CTheScripts::Process` | `0x00439040` | function | medium | src/core/Game.cpp:1035 |
 | `RenderMenus` | `0x0048E450` | function | high | src/core/main.cpp:1525 |
 | `DoFade` | `0x0048D120` | function | medium | src/core/main.cpp:1731 |
 | `Render2dStuffAfterFade` | `0x0048E470` | function | high | src/core/main.cpp:1538 |
 | `g_SlowMode / ProcessSlowMode` | `0x0048DD60` | function | medium | src/core/main.cpp:1745-1746 |
 | `TheCamera` | `0x006FACF8` | global | high | src/core/Game.cpp:1008 (TheCamera.SetMotionBlurAlpha) |
 | `CCamera::m_BlurType` | `0x006FADA0` | field-offset | high | src/core/Game.cpp:1009 |
-| `FrontEndMenuManager` | `0x008F59D8` | global | high | src/core/Game.cpp:1018, src/core/main.cpp:1527/1764 |
 | `DMAudio (cAudioManager instance)` | `0x0095CDBE` | global | high | src/core/main.cpp:1599 |
 | `ControlsManager (CControllerConfigManager)` | `0x008F43A4` | global | high | src/core/Pad.cpp:1100-1104 |
 | `Scene.camera` | `0x0072676C` | global | high | src/core/main.cpp:386-389 (RwCameraEndUpdate(Scene.camera)) |
@@ -245,17 +247,181 @@ afternoon to them.
 | `RECOMMENDED inbound+outbound hook site: the only call to Idle's CGame::Process` | `0x0048E49B` | constant | high | - |
 | `RECOMMENDED one-shot deferred-init hook (install detours after the mod stack settles)` | `0x0048E7F6` | constant | high | - |
 | `House convention in this stack: redirect an existing call's rel32, never splice a prologue` | `` | constant | high | - |
-| `CLEO III's init hook (one-shot, inside CGame::Initialise)` | `0x0048C26B` | constant | high | - |
-| `CLEO III's per-frame work rides inside CTheScripts::Process` | `0x00439040` | constant | high | - |
 | `Mod Loader's hook: the CRT's call to WinMain` | `0x005C1F39` | constant | high | - |
 | `This exe is detected as GTA III 1.0, not 1.1; a 1.1 target assumption is wrong for this install` | `0x005C1E70` | constant | high | - |
 | `CGame::Process` | `0x0048C850` | function | high | src/core/Game.cpp:1002 |
 | `Idle` | `0x0048E480` | function | high | src/core/main.cpp:1551 |
 | `CPad::UpdatePads` | `0x00492720` | function | high | src/core/Game.cpp:1004 |
-| `CTheScripts::Process` | `0x00439040` | function | high | src/core/Game.cpp:1918 |
 | `CGame::Initialise(const char* datFile)` | `0x0048BED0` | function | high | src/core/Game.cpp:392 |
 | `WinMain` | `0x00582710` | function | medium | - |
-| `FrontendIdle` | `0x0048E700` | function | medium | src/core/main.cpp |
 | `Where to physically put CoopIII.asi, and the ordering it buys you` | `` | constant | medium | - |
 | `What NOT to pattern-scan for, concretely` | `` | constant | medium | - |
+
+
+## fire (found 2026-09-21, alongside §5.7 phase two)
+
+The fire work proved `gFireManager`, the table geometry, the `CFire` layout,
+`Update`, `GetNextFreeFire`, both `StartFire` overloads, `StartScriptFire`,
+`ProcessFire`, `Extinguish`, `ReportThisFire`, `CPed::m_pFire` and
+`CVehicle::m_pCarFire`; all of those are in `addresses.h` now with the
+disassembly that carries each one.
+
+Phase three (2026-09-22) promoted two more out of the list below.
+`CPed::IsPedInControl` (`0x004CE6C0`) is in `addresses.h`: its body is three
+tests and two of the three fields are ones this file already had -
+`m_nPedState` at `0x224` and `m_fHealth` at `0x2C0` - which is what identifies
+it rather than its position at a call site. `CPed::IsPlayer` (`0x004D48E0`)
+went the same way, reading `m_nPedType` at `0x32C` and comparing it against
+0..3: it is the function that decides a burning ped's extinguish time, and
+`CShotInfo::Update` uses it to skip the flee block.
+
+These came out of the same pass and are **not** proved. Every one of them was
+identified from a single call site or from re3's statement order alone, which
+is the way the three refuted addresses in this document were arrived at.
+
+| Claim | Address | Kind | Confidence | How far it got |
+|---|---|---|---|---|
+| `CFireManager::FindNearestFire(CVector, float*)` | `0x00479340` | function | medium | Only the argument shape: called from `0x004C3D29` with `push edx / push [eax+8] / push [eax+4] / push [eax]`, which is a `CVector` by value plus an out pointer, and re3 declares exactly one such member. The body was never read. |
+| `CFireManager::FindFurthestFire_NeverMindFireMen` | `0x00479430` | function | high | The body *was* read and it is the right shape - 40 slots, stride `0x30`, skips script fires, 2D distance, keeps the furthest, returns `&m_aFires[i]`. Its loop bound is one of the three witnesses `addresses.h` cites for `NUM_FIRES`, and that part stands on the bound rather than on the name. The name itself is re3's and unconfirmed. |
+| `CPed::RestorePreviousState` | `0x004C5E30` | function | high | The call `CFire::Extinguish` makes on a burning ped immediately before nilling `m_pFire`, which is re3 `Fire.cpp` `Extinguish`'s only ped statement. The body has since been read and every field in it is one this project already had: `CanSetPedState` on `[+224h]`, then `[+314h]`/`[+310h]` -> `m_nPedState = 2Ch` (PED_DRIVING) and `m_nLastPedState = 0`, then a jump table on `[+228h]` (`PED_LAST_STATE`), with the zero arm testing `IsPlayer`, `CharCreatedBy` at `[+160h]` and `m_objective` at `[+164h]`. Not promoted because CoopIII never calls it directly - it reaches it through `CFire::Extinguish`, which is verified. |
+| `CPed::SetMoveState(eMoveState)` | `0x004C5A30` | function | medium | Called `__thiscall` with a single pushed argument from two places that are doing the same thing to a ped: `StartFire`'s NPC arm pushes 4 (`PEDMOVE_SPRINT`) at `0x004796A9` and `CPed::SetFlee` pushes 3 (`PEDMOVE_RUN`) at `0x004D1DC5`, both immediately after touching `[ped+157h]`. The body was never read, and it is not simply `m_nMoveState = arg` - `PED_MOVE_STATE` is a plain dword at `0x22C` that a caller could write inline, so whatever else it does is unknown. |
+| `CPed::SetStoredState` | `0x004C5DB0` | function | medium | The call `CPed::SetFlee` makes immediately before `m_nPedState = 9`, which is where re3 saves `m_nLastPedState`. `CPed::RestorePreviousState` reading `[ped+228h]` (= `PED_LAST_STATE`) is the other half of the same story. Body not read. |
+| `CPed::SetIdle` | `0x004D0600` | function | low | Where `RestorePreviousState` goes for a ped whose `m_nLastPedState` is 0 and whose `CharCreatedBy` is `MISSION_CHAR` - i.e. every remote player whose fire goes out. Identified by position in that function and nothing else. Matters because it is one of the few engine paths that writes a remote ped's `m_nPedState` behind CoopIII's back. |
+| `CEventList::RegisterEvent` | `0x00475C50`, `0x00475E10` | function | low | Two arities, both `cdecl`-ish with `add esp,14h` after five pushes. `0x00475E10` is what `CFire::ReportThisFire` calls with `(7, x, y, z, 1000)`; `0x00475C50` is what `StartFire` calls with `(0Eh or 0Fh, 1, ped, fleeFrom, 10000)`. CoopIII reaches the first one through `ReportThisFire` and never calls either directly. |
+| `CWorld::SetCarsOnFire` / its ped equivalent | `0x004B3D20`-ish, `0x004B3F00`-ish | function | low | Two of the six callers of `StartFire(entity, ...)` sit in these, at `0x004B3E3C` and `0x004B3F9C`. The function *starts* were never located, so the addresses above are the containing region and not entry points. Do not call either. |
+| `CShotInfo::Update` | contains `0x0055C232` | function | low | The flamethrower's own caller of `StartFire(entity, ...)`. Same problem: a call site inside it, not its start. |
+| `CPed::DoStuffToGoOnFire` | - | function | none | Named by re3 as what `ProcessFire` calls before spreading fire to the player. Never looked for. |
+
+## vehicle damage short of destruction (found 2026-09-22, alongside M2's blast)
+
+The destruction work (`protocol.md` §1.11) proved `CAutomobile::BlowUpCar`,
+`CBoat::BlowUpCar`, vtable slot 29, the five-second fire timer,
+`m_fFireBlowUpTimer`, `m_pSetOnFireEntity`, `m_nTimeOfDeath`,
+`bRenderScorched`, `STATUS_WRECKED`, `VEH_WRECK_REMOVAL_MS` and the extras
+mechanism; all of those are in `addresses.h` now with the disassembly that
+carries each one.
+
+These three came out of the same pass and are **not** proved. Each was read
+far enough to know its shape and its call sites, which is a long way short of
+matching a whole body against re3 — and reading a call site and calling it a
+function is precisely how the three refuted addresses at the top of this file
+were arrived at. They are the head start for panels/doors/lights/wheels
+(`roadmap.md` M2), not something to call.
+
+| Claim | Address | Kind | Confidence | How far it got |
+|---|---|---|---|---|
+| `CDamageManager::FuckCarCompletely` | `0x00545B70` | function | medium | `BlowUpCar`'s `lea ecx,[ebx+288h] / call` — so its `this` really is the damage manager. Its first seven instructions write `2` into `[ebx+5]` and `3` into the six consecutive bytes `[ebx+9]`..`[ebx+0Eh]`, then `push 10h / call 0x00545A00`. That is the right shape for "wreck every part" and it pins part of the `CDamageManager` layout, but the rest of the body was never read and neither was `0x00545A00`. |
+| a `CAutomobile` panel/door setter | `0x00530120` | function | medium | `BlowUpCar` calls it four times with `(id, status, 0)`: `(7,5,0)`, `(8,6,0)` and two more. It takes the **vehicle**, not the damage manager — `lea ecx,[ebp+288h] / call 0x005458E0` records the damage and then `[ebp+ebx*4+37Ch]` reaches an array of pointers and hides one. So both halves have to happen or a destroyed panel stays on screen. The name is unknown; re3 has several candidates with this shape. |
+| a `CDamageManager` engine-status setter | `0x00545940` | function | medium | Seven instructions: `mov [ecx+4], min(arg, 0FAh)`. A saturating byte write, so `+4` is the engine byte and 250 is its ceiling. `CVehicle::InflictDamage`'s "set on fire" arm pushes `0E1h` (225) into it at `0x00551BE1`, which is what "this car is burning" means in the engine. Only this function was read; nothing that reads `+4` was. |
+| `CAutomobile::m_aCarNodes` | `+0x37C` | offset | **low** | One subscript, `[ebp+ebx*4+37Ch]`, in the function above. Nothing else. A wrong node array does not crash, it writes into a neighbouring member — which is the failure mode that cost this project the car-on-its-side round. |
+| ~~`CVehicle::InflictDamage` entry point~~ | `0x00551950` | function | **promoted** | This row used to say the start "was never located and is deliberately not recorded anywhere: nothing CoopIII does needs to call it". Both halves are now false. It was located from the `call` at `0x004B18CD`, and on 2026-09-23 it was re-read from the file end to end for the car-hit work, which detours it and calls it: twelve bytes of `0x00` alignment fill in front of it, `push ebx / push esi / mov esi,ecx` at the entry, `ret 0Ch` at all seven exits, arguments at `[esp+20h]`/`[esp+24h]`/`[esp+28h]` and the same three in the same order at the call site. Full transcription in `addresses.h`, including the twenty-entry proof-flag jump table at `0x006026CC` and the four causes that read no flag at all. |
+
+## Ambient peds and traffic
+
+Leads for `population.md`, which needs the engine's own population counters so
+it can tell the generator how crowded the street really is. **None of these is
+proved and none may be used until it is.**
+
+The anchor is `CPopulation::ms_nTotalMissionPeds` at `0x008F5F70`, which *is*
+verified and is in `addresses.h`. Reading re3's `Population.h` declaration
+order outwards from it gives the table below - and declaration order is not
+memory order, which is exactly the assumption that has been wrong four times on
+this project.
+
+| What | Guess | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| `CPopulation::MaxNumberOfPedsInUse` | `0x008F5F74` | **low** | Next after the anchor in re3's declaration order, 4 references. Order alone. |
+| `CPopulation::ms_nNumCivMale` | `0x008F5F78` | **very low** | Would be next again, but it carries **116 references**. A counter for one pedestrian type does not get touched from 116 places; something much more widely used lives there and the order has already broken by this point. Treat the whole outward walk as refuted from here on. |
+| `CPopulation::ms_nNumCivFemale` | `0x008F5F7C` | **very low** | Same walk, 29 references. Same objection. |
+| `CPopulation::ManagePopulation` | — | none | Not located. This is the function to find first: whichever counters it compares before deciding to add a pedestrian *are* the counters, and finding it settles the whole table without guessing at layout. |
+| the other **two** car counters | `0x00885BB0`, `0x009411F0` | **the set is certain, the names are not** | Two of the six terms `GenerateOneRandomCar` adds up before comparing against `MaxNumberOfCarsInUse`. They are `NumFiretrucksOnDuty` and `NumAmbulancesOnDuty` in some order and nothing seen so far says which. **Two of the original four are now proved and gone from this row**: `CCarCtrl::UpdateCarCount` (`0x004202E0`) switches on `VehicleCreatedBy` through two jump tables, and the table index is the enum, so `0x008F1B54` is `NumMissionCars` and `0x008F29E0` is `NumParkedCars` - the second independent witness they needed. `0x008F29F0` is `NumPermanentCars` from the same tables and was never in the sum, which agrees with re3. All three are in `addresses.h` now. |
+| `CPed::m_nCreatedBy` | — | none | Needed to tell an ambient ped from a mission one, so CoopIII does not replicate the campaign's peds as traffic. |
+
+
+## The camera's look direction (2026-09-23, the sniper round)
+
+`client/src/game/combat.cpp`, `RecordLocalShot`, reads this for one thing: the
+line a sniper round of ours goes out along, so everybody else can play its
+report and its impact. A wrong value sends that sound the wrong way and does
+nothing else - it is read, never written, and only ever reaches
+`CWorld::ProcessLineOfSight` through `UnitDirection` and `ClampToWorld`.
+
+| What | Value | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| `TheCamera`'s forward axis, `GetForward()` | `TheCamera + 0x14` (`0x006FAD0C`) | medium | `TheCamera` (`0x006FACF8`) and its position at `+0x34` are in `addresses.h`, and `+0x34` is exactly `CPlaceable`'s `GetPosition()` for every entity, so the camera carries the same `CPlaceable` matrix and the forward axis sits where it does on a ped (`offs::MATRIX_FWD`). That it holds the *look direction* rests on re3's `CCamera::Process`, which ends by writing `GetForward() = CamFront` and `GetPosition() = CamSource` from the active `CCam` - the same `Front` `CWeapon::FireSniper` fires along. Not read in the image. To verify: find the stores into `0x006FAD0C..0x006FAD14` at the tail of `CCamera::Process` and check they come from the active cam's `Front`. |
+
+## A plane and somebody else's rocket (2026-09-23)
+
+| What | Value | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| `CPlane::TestRocketCollision` | `0x0054DE90` | medium, checked at run time | From the report that an observer's copy of a rocket crashes a Dodo and gives the observer stars; re3 has it as `static bool CPlane::TestRocketCollision(CVector *)`, called in `CProjectileInfo::Update` straight after `CHeli::TestRocketCollision`. Not read in the image. `game/heli.cpp` hooks it only when both of the helicopter test's call sites in `addresses.h` (`0x0055B8E2`, `0x0055B9BC`) have a one-argument `call 0x0054DE90` within `0x30` bytes, and logs and leaves it alone otherwise. Both calls are read in the image: `0x0055B8F1` and `0x0055B9CB`, each `push eax / call / test al,al / pop ecx`, straight after the helicopter test. Still to read: the function's own loop over the planes. |
+| the crime it registers | call at `0x0054DF86`, crime 16 | low | From the same report. Not used: refusing the collision for a remote rocket is what keeps it from running. |
+| the crash blasts' culprit | `0x0054C25B`..`0x0054C265` | low | From the same report: the Dodo's crash explosions push `FindPlayerPed()` as culprit, which is why they went out as the observer's. Not used, for the same reason. |
+
+## A window and somebody else's drive-by (2026-09-24)
+
+| What | Value | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| `CGlass::WasGlassHitByBullet` | `0x00504670` | medium, checked at run time | Named in two listings `addresses.h` does prove: `CWeapon::FireInstantHitFromCar`'s `other` arm calls it for a round that ends on anything but a ped or a car, and `CWeapon::DoBulletImpact` calls it "with the col point's three floats" right after its `if (victim)`. The function itself is not read in the image; the signature, `__cdecl(CEntity *, CVector)`, is re3's (`Glass.cpp`) and fits the three floats. `game/combat.cpp` calls it from `DriveByImpact`, for somebody else's round, only when a `call 0x00504670` is found both in `FireInstantHitFromCar` (`0x005624D0` up to `DoDoomAiming`, `0x00562EB0`) and in the first `0x100` bytes of `DoBulletImpact` (`0x0055F950`), and logs and leaves windows alone otherwise. To verify: disassemble both calls and the pushes before them, and the function's own `IsGlass` test on the entity's model. |
+
+## A gear off the wire (2026-09-24)
+
+| What | Value | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| highest gear the transmission table takes | `5` (reverse plus five forward) | low | `CVehicle::m_nCurrentGear` (`+0x204`, in `addresses.h`) is an index into the handling's gear table; re3 has `tTransmissionGear Gears[6]` in `cTransmission`. Not read in the image, and neither is the table's size. `ApplyRemoteVehicle` writes a gear off the wire only when it is `<= 5` and otherwise leaves the copy's own, so a wrong bound costs a gear indicator, never a write past the table. To verify: the `cTransmission` layout in `CHandlingDataMgr::LoadHandlingData`, and the reads of `+0x204` in `CAutomobile::ProcessControl`. |
+
+## The script engine, for the session's mission (2026-09-24)
+
+Everything that was here came from III.CLEO and plugin-sdk, and was read out
+of the exe on 2026-09-24: the script space and its two sizes,
+`pActiveScripts`, `OnAMissionFlag`, `bAlreadyRunningAMissionScript`, the
+eleven range handlers and their tables, the whole `CRunningScript` layout,
+the operand types, the and/or states, `CPool<CPed>::GetAt`, the ground-z
+sentinel, where a new script goes in the list, that a handler's 1 ends the
+script's frame, that a held condition is read again whole, running one
+instruction from a buffer of our own, the garages' and the Cessnas'
+questions, `m_bombType`, `APPLY_BRAKES_TO_PLAYERS_CAR`, the cutscene's
+skip buttons, and the lobby's `CMenuManager::DoSettingsBeforeStartingAGame`.
+All of it is in `addresses.h` with the instruction that proves it, and
+`missionaddr.h` only names it. The `FrontendIdle`, `FrontEndMenuManager`,
+`CTheScripts::Process` and two CLEO rows left the tables above for the same
+reason. Two opcodes, two notes and one witness were wrong; they are in the
+REFUTED table at the top.
+
+`COOPIII_GTA3_EXE=<path> clienttest` reads every one of those instructions
+again ("the script engine's addresses against gta3.exe"), with the operand
+count of every opcode the missions intercept, run or replay, and the prologue
+of each function they detour.
+
+What is left:
+
+| What | Value | Confidence | Why, and what would prove it |
+|---|---|---|---|
+| a load or a new game | changes the player's pool reference or jumps `CTimer::m_snTimeInMilliseconds` | clock proved, pool reference not provable statically | `GenericLoad` reads the clock out of the save (`mov edi,885B48h / movsd` at `0x00590C0B`), and `InitialiseWhenRestarting` (`0x0048C740`) runs `CTimer::Initialise`, which sets it to 1 (`0x004ACEBB`). That the player's ped comes back with another pool reference is the pool's slot counter at work and can only be seen running. The end of an instant replay also moves the clock back (`0x00596FA9`), which costs one look at the campaign. |
+
+## Pickups - what could not be proved statically (2026-09-22)
+
+Everything the pickup work actually uses is in `addresses.h` with its
+disassembly (`docs/pickups.md` is the write-up). Three things did not make it,
+and each is here because of *what* cannot be checked rather than because it was
+not looked at.
+
+| What | Value | Confidence | Why, and what is wrong with it |
+|---|---|---|---|
+| `MI_PICKUP_*`, the eight model-index globals at `0x005F5B10`..`0x005F5B2C` | the addresses | **the addresses are certain, the values are not checkable on disk** | They read `0xFFFF` in the file: `CModelInfo` fills them at load from the IDE, so the numbers belong to that install. The *addresses* are pinned by what the code does with each one - `+0x2C4 = 100.0f` is armour, `+0x2C0 = 100.0f` is health, one takes a wanted star off, one is gated on `CDarkel::FrenzyOnGoing`, one is collectable only from a vehicle - which is a stronger identification than re3's declaration order would have been. But nothing here confirms a *value*, and the only way to is to read them in-process. `pickup.cpp` only ever compares against them, never assumes a number. |
+| `CPickups::RemoveAllFloatingPickups` | `0x004307FF` | high | Named from behaviour, not from a symbol: it walks all 336 slots and removes exactly types 12 and 13. Recorded because it is a third witness for the array bound, and it is never called. |
+| The pickup camera globals at `0x0095CD70`, `0x008F29E8`, `0x009404C8`, `0x008E289C` | - | medium | Written by the `CAMERA` model's arm of the award switch at `0x004310A6`, so **retail 1.0 does have the pickup camera that re3 keeps behind `CAMERA_PICKUP`**. Interesting, unused, and unverified beyond that one write site. |
+
+**Update, same day: the traffic half is done and it went exactly that way.**
+`CCarCtrl::GenerateOneRandomCar`, `CarDensityMultiplier`,
+`MaxNumberOfCarsInUse`, `NumRandomCars` and `NumLawEnforcerCars` are in
+`addresses.h` with their proofs, found by walking opcode 491 to its handler and
+letting the handler name the multiplier, the multiplier name the generator and
+the generator name its own counters. The pedestrian half is still open and the
+same route applies to it.
+
+The right route is the one that has worked every other time here: find the
+function, read what it compares, and let that name the globals. Walking a
+struct or a static block outwards from one known member is how the anim-group
+bound, the node array and `ANIM_STD_NUM` all went wrong.
 

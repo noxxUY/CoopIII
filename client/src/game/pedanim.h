@@ -57,10 +57,16 @@ inline AnimPlan PlanAnim(uint16_t animId, int pedGroup, int pedGroupCount,
 	if (animId == ANIM_NONE || stdGroupCount <= 0)
 		return plan;
 
-	if (animId <= ANIM_STD_IDLE) {
-		// Locomotion. The engine's own CPed::SetMoveAnim uses 1.0 here - a
-		// slow crossfade. A walk that snaps straight into a run looks wrong
-		// in a way that's hard to name and easy to spot.
+	if (animId <= ANIM_STD_STARTWALK) {
+		// Locomotion, the start-walk included: the player's styles and the
+		// six strafe groups hold one each (walk_start_left and so on), and
+		// the one in ASSOCGRP_STD is a forward step, which is what a strafe
+		// used to begin with on everybody else's screen. A style with only
+		// four falls back to ASSOCGRP_STD below, same as any other id past
+		// its end.
+		//
+		// The delta is SetMoveAnim's 1.0, a slow crossfade. Only the one-id
+		// path uses it; ped.cpp's ApplyLegs sets these weights directly.
 		plan.blendDelta = 1.0f;
 		if (ValidAnimGroup(pedGroup) && animId < pedGroupCount) {
 			plan.group = pedGroup;
@@ -83,6 +89,73 @@ inline AnimPlan PlanAnim(uint16_t animId, int pedGroup, int pedGroupCount,
 		plan.valid      = true;
 	}
 	return plan;
+}
+
+// Which animation a received death should actually play.
+//
+// CPed::SetDie passes its animId straight to CAnimManager::BlendAnimation
+// against ASSOCGRP_STD, so the same rule as everywhere else applies: the id
+// becomes a subscript with nothing checking it. The one id that is always
+// safe is ANIM_STD_NUM, the value SetDie tests for and answers by playing
+// nothing at all - which makes it the right fallback when the animations
+// aren't loaded yet.
+//
+// ANIM_NONE on the wire means the sender couldn't capture what its engine
+// picked, usually because the CPed::SetDie detour didn't install. A front
+// knockdown is the engine's own default for that, and it's what InflictDamage
+// starts every hit with.
+inline uint16_t PlanDeathAnim(uint16_t wire, int stdGroupCount) {
+	if (stdGroupCount <= 0)
+		return ANIM_STD_NUM;
+	if (wire == ANIM_STD_NUM)
+		return ANIM_STD_NUM;   // the sender really did die without one
+	if (wire == ANIM_NONE || wire >= stdGroupCount)
+		return ANIM_STD_KO_FRONT < stdGroupCount ? ANIM_STD_KO_FRONT : ANIM_STD_NUM;
+	return wire;
+}
+
+// How many animations CoopIII will leave on a remote ped's clump.
+//
+// The hard limit is the engine's, and it is not a soft one: past
+// MAX_CLUMP_ANIM_ASSOCS, RpAnimBlendClumpUpdateAnimations writes its node
+// array over its own saved registers, its return address and its arguments
+// (addresses.h has the stack map and the crash that proved it). Two are kept
+// back for the engine, which adds its own animations to a ped without asking
+// anybody: CPed::SetMoveAnim alone can blend a locomotion anim and fade three
+// others in the same frame.
+constexpr int MAX_REMOTE_ANIM_ASSOCS = MAX_CLUMP_ANIM_ASSOCS - 2;   // 9
+
+// May another animation be added to a clump that currently has `count`?
+inline bool AnimClumpHasRoom(int count) { return count < MAX_REMOTE_ANIM_ASSOCS; }
+
+// How many have to go before one more can be added. Zero when there is room.
+inline int AnimClumpSurplus(int count) {
+	const int over = count - (MAX_REMOTE_ANIM_ASSOCS - 1);
+	return over > 0 ? over : 0;
+}
+
+// Has a running weapon overlay reached the end of its firing loop?
+//
+// CPed::FireGun's last act, while the trigger is still held, is
+// `weaponAnimAssoc->Start(ourWeapon->m_fAnimLoopStart)` once currentTime
+// passes m_fAnimLoopEnd (re3 PedFight.cpp:712-722). So a firing weapon never
+// plays past the loop end: it cycles over the part of the animation that is
+// the shot, and the draw at the front and the recovery at the back are only
+// seen when the attack starts and stops.
+//
+// An observer that lets the same animation free-run plays the whole thing
+// instead, hits ASSOC_FADEOUTWHENDONE, and starts again from the draw. So
+// the loop gets replicated rather than the phase re-seeded off a snapshot
+// that is only accurate 25 times a second.
+//
+// loopEnd <= loopStart means weapon.dat has nothing useful for this weapon,
+// and then the answer is always no. Reading those two values out of a file
+// the player can edit is exactly the situation where "the data will be
+// sensible" is not an assumption worth making.
+inline bool WeaponAnimShouldLoop(float currentTime, float loopStart, float loopEnd) {
+	if (!(loopEnd > loopStart) || !(loopStart >= 0.0f))
+		return false;
+	return currentTime > loopEnd;
 }
 
 // eMoveState arrives as a byte from a machine we don't control. The engine
@@ -111,8 +184,8 @@ inline bool IsInventoryWeapon(uint8_t weaponType) {
 // is the worst possible thing to diagnose.
 //
 // Vec3 accessors on a game object. Live here rather than in addresses.h
-// because they need the protocol's Vec3, and AgentPad includes addresses.h
-// on purpose without linking the sdk.
+// because they need the protocol's Vec3, and addresses.h is meant to stay
+// includable without linking the sdk.
 inline Vec3 ReadVec3(void *object, size_t offset) {
 	const float *v = &Field<float>(object, offset);
 	return Vec3{v[0], v[1], v[2]};
@@ -154,6 +227,88 @@ inline bool FiniteOr(float value, float fallback, float &out) {
 	return false;
 }
 
+// ---- fire on a remote player's body ---------------------------------------
+//
+// What to do this frame about a remote player's flames, as a decision rather
+// than as memory writes, so tools/clienttest can pin the whole truth table
+// without a running game.
+//
+// Three inputs and they mean three different things:
+//
+//   wantBurning  what the owner said in their last snapshot (PF_ON_FIRE).
+//                Their machine is where their fire actually is, so this is
+//                the only authority on whether that player is alight.
+//   ours         the fire currently on that ped is the one CoopIII lit for
+//                them. Any other fire on it came from the local engine, and
+//                that fire arrives with SetFlee and PED_ON_FIRE attached,
+//                which is the one thing this whole feature is built to keep
+//                out of the pose stream. (Retail cannot actually light a
+//                bFireProof ped - CShotInfo::Update tests the flag at
+//                0x0055C1D9, addresses.h - so this is a seatbelt.)
+//   inControl    CPed::IsPedInControl, the engine's own gate. False for a
+//                seated, dying or dead ped, and the reason this is a loop
+//                and not an event handler.
+//
+// The rule in one line: **a remote ped's fire is ours and is burning a ped
+// the engine still controls, or it is wrong.**
+//
+// inControl gates keeping a fire and not just starting one, and that is not
+// symmetry for its own sake. CFire::ProcessFire's ped arm has a branch for a
+// burning ped who is *in a car*: it reads m_pMyVehicle and writes 75.0f into
+// the car's m_fHealth (`mov [edi+200h], 42960000h` at 0x00479959), which is
+// how getting into a car while alight wrecks it in single player. On an
+// observer that would be this machine deciding the health of somebody else's
+// car from a fire this machine started, which is the one thing this whole
+// feature is not allowed to do. A burning player who gets in a car stops
+// burning here; their own machine wrecks their own car and the result
+// arrives on the vehicle's stream like every other thing about it.
+enum class FireAction : uint8_t {
+	NOTHING,      // leave it alone - includes "asked to burn, can't yet"
+	LIGHT,        // start one, no NPC logic
+	KEEP,         // ours and still wanted: push the extinguish time back
+	EXTINGUISH,   // CFire::Extinguish, and let the engine unwind its own state
+};
+
+inline FireAction PlanRemoteFire(bool wantBurning, bool haveFire, bool ours,
+                                 bool inControl) {
+	if (!haveFire)
+		return (wantBurning && inControl) ? FireAction::LIGHT : FireAction::NOTHING;
+
+	// Not ours, whatever the owner says. Putting it out is also how the
+	// engine's own burning-ped logic gets unwound: CFire::Extinguish calls
+	// CPed::RestorePreviousState, which pops the state CPed::SetFlee stored
+	// on the way in. CoopIII restores nothing by hand.
+	if (!ours)
+		return FireAction::EXTINGUISH;
+
+	return (wantBurning && inControl) ? FireAction::KEEP : FireAction::EXTINGUISH;
+}
+
+// How long an observer's copy of somebody else's fire may outlive the last
+// thing they said about it.
+//
+// Snapshots arrive at 25 Hz and the interpolation buffer extrapolates for at
+// most 250 ms past the newest one, so a burning player re-arms this roughly
+// every frame. It exists for the case where that stops: a stalled
+// connection, a client that went away without saying goodbye. The engine
+// gives a burning civilian ten seconds and a burning player 3333 ms; an
+// observer needs neither, because the owner is going to say so again in
+// 40 ms or not at all.
+constexpr uint32_t REMOTE_FIRE_MS = 1000;
+
+// The wantBurning above, for a pedestrian somebody else hosts.
+//
+// A player restates PF_ON_FIRE 25 times a second for as long as they are
+// connected. A pedestrian's rows come when it is his turn in his host's batch
+// (protocol.h, MAX_PED_STATES), so the last thing said about him can be old
+// news. A burning one gets a turn at least every STREAM_FIRE_DEADLINE ticks
+// (game/streampick.h). It counts for REMOTE_FIRE_MS and then the replica stops
+// burning, which is the same cap the fire itself carries. Unsigned, so a
+// WallClock wrap still reads as a short gap.
+inline bool AmbientPedShouldBurn(bool saidBurning, uint32_t saidAtMs, uint32_t nowMs) {
+	return saidBurning && nowMs - saidAtMs < REMOTE_FIRE_MS;
+}
+
 // A coordinate about to reach the sector grid.
 //
 // Writing a wild position into an entity's matrix is survivable - it's just
@@ -180,6 +335,27 @@ inline float ClampToWorld(float value) {
 	if (v > kMax)
 		return kMax;
 	return v;
+}
+
+// One component of a remote ped's velocity off the wire, in units per step:
+// a number, and no more than a ped could be thrown.
+constexpr float REMOTE_PED_SPEED_MAX = 5.0f;
+
+inline float WireSpeed(float value) {
+	float v = 0.0f;
+	if (!FiniteOr(value, 0.0f, v))
+		return 0.0f;
+	return v > REMOTE_PED_SPEED_MAX ? REMOTE_PED_SPEED_MAX
+	                                : v < -REMOTE_PED_SPEED_MAX ? -REMOTE_PED_SPEED_MAX : v;
+}
+
+// A place off the wire that an entity may be put at as it stands: every
+// coordinate a number, and x and y where ClampToWorld would leave them. One
+// that is not is dropped rather than clamped where moving it would be a
+// different event (a pickup at the edge of the map, a player moved there).
+inline bool InsideWorld(float x, float y, float z) {
+	return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && ClampToWorld(x) == x &&
+	       ClampToWorld(y) == y;
 }
 
 } // namespace coopiii::game

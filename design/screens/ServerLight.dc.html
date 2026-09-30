@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CoopIII Server, running, light</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&amp;family=Fragment+Mono&amp;display=swap">
+<style>
+body{margin:0;background:#E7EAEE;color:#15191E;font-family:'Archivo','Segoe UI',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:#15191E}a:hover{color:#000000}
+button,input{font:inherit;color:inherit}
+button:focus-visible,input:focus-visible{outline:2px solid #14171B;outline-offset:2px}
+@keyframes cq-drift{from{transform:translate(0px,0px)}to{transform:translate(-248.074px,-865.136px)}}
+@keyframes cq-march{to{stroke-dashoffset:-14}}
+@keyframes cq-pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.22)}}
+.cq-drift{animation:cq-drift 320s linear infinite}
+.cq-route{animation:cq-march 3.2s linear infinite}
+.cq-halo{transform-box:fill-box;transform-origin:center;animation:cq-pulse 5.5s ease-in-out infinite}
+@media (prefers-reduced-motion:reduce){.cq-drift,.cq-route,.cq-halo{animation:none!important}}
+</style>
+</helmet>
+<div style="width: 1200px; height: 760px; display: flex; flex-direction: column; overflow: hidden; background: #F4F5F7; color: #15191E; font-family: 'Archivo', 'Segoe UI', system-ui, sans-serif;">
+<header style="height: 40px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: space-between; padding-left: 14px; background: #E9ECEF; border-bottom: 1px solid #DADEE3;">
+<div style="display: flex; align-items: center; gap: 10px;">
+<img src="../assets/logo-mark.png" alt="CoopIII" style="display: block; height: 18px; width: auto;">
+<span style="font-size: 13px; font-weight: 600; color: #4A5360;">Server</span>
+</div>
+<div style="display: flex; align-items: center; gap: 8px;">
+<span style="font-size: 12px; color: #5B6572;">v0.0.1</span>
+<div style="display: flex;">
+<button type="button" aria-label="Minimize" style="width: 46px; height: 39px; display: flex; align-items: center; justify-content: center; padding: 0; background: transparent; border: none; color: #4A5360; cursor: pointer;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 12h12"></path></svg></button>
+<button type="button" aria-label="Maximize" style="width: 46px; height: 39px; display: flex; align-items: center; justify-content: center; padding: 0; background: transparent; border: none; color: #4A5360; cursor: pointer;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="6.5" y="6.5" width="11" height="11" rx="1.5"></rect></svg></button>
+<button type="button" aria-label="Close" style="width: 46px; height: 39px; display: flex; align-items: center; justify-content: center; padding: 0; background: transparent; border: none; color: #4A5360; cursor: pointer;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"></path></svg></button>
+</div>
+</div>
+</header>
+<div style="position: relative; flex-shrink: 0; overflow: hidden; box-sizing: border-box; display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 24px 28px 22px; background: #F4F5F7;">
+<svg aria-hidden="true" width="1200" height="170" viewBox="0 0 1200 170" style="position: absolute; top: 0; left: 0; display: block; pointer-events: none;">
+<defs>
+<linearGradient id="bandFadeX" x1="0" y1="0" x2="1" y2="0">
+<stop offset="0.2" stop-color="#F4F5F7" stop-opacity="1"></stop>
+<stop offset="0.44" stop-color="#F4F5F7" stop-opacity="0"></stop>
+</linearGradient>
+<linearGradient id="bandFadeY" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0.45" stop-color="#F4F5F7" stop-opacity="0"></stop>
+<stop offset="0.78" stop-color="#F4F5F7" stop-opacity="1"></stop>
+</linearGradient>
+<pattern id="cqTile" patternUnits="userSpaceOnUse" width="900" height="900" patternTransform="rotate(-16)">
+<rect x="0" y="0" width="46" height="16" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="20" width="46" height="24" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="53" width="46" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="118" width="46" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="199" width="46" height="22" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="225" width="46" height="18" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="252" width="46" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="305" width="46" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="386" width="46" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="429" width="46" height="34" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="0" y="472" width="46" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="564" width="46" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="629" width="46" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="710" width="46" height="29" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="743" width="46" height="23" rx="2" fill="#E3E6EA"></rect>
+<rect x="0" y="775" width="46" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="0" width="104" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="53" width="104" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="118" width="60" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="119" y="118" width="40" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="199" width="104" height="44" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="55" y="252" width="60" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="119" y="252" width="40" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="305" width="104" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="336" width="104" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="386" width="104" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="429" width="104" height="34" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="55" y="472" width="104" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="564" width="104" height="29" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="597" width="104" height="23" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="629" width="104" height="72" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="55" y="710" width="104" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="55" y="775" width="45" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="104" y="775" width="55" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="0" width="58" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="53" width="58" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="118" width="58" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="199" width="58" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="252" width="58" height="22" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="278" width="58" height="18" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="305" width="58" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="336" width="58" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="386" width="58" height="34" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="168" y="429" width="58" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="472" width="58" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="564" width="58" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="629" width="58" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="671" width="58" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="710" width="58" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="168" y="775" width="58" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="0" width="58" height="22" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="26" width="58" height="18" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="53" width="58" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="118" width="58" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="199" width="58" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="252" width="58" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="305" width="58" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="347" width="58" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="386" width="58" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="429" width="58" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="472" width="58" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="514" width="58" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="564" width="58" height="20" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="588" width="58" height="32" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="629" width="58" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="671" width="58" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="710" width="58" height="20" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="734" width="58" height="32" rx="2" fill="#E3E6EA"></rect>
+<rect x="235" y="775" width="58" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="0" width="88" height="16" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="20" width="88" height="24" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="53" width="88" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="118" width="88" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="160" width="88" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="199" width="88" height="22" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="225" width="88" height="18" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="252" width="88" height="44" rx="2" fill="#DADEE3"></rect>
+<rect x="302" y="305" width="51" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="357" y="305" width="33" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="386" width="38" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="344" y="386" width="46" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="429" width="88" height="34" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="302" y="472" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="564" width="88" height="20" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="588" width="88" height="32" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="629" width="88" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="660" width="88" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="710" width="38" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="344" y="710" width="46" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="302" y="775" width="88" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="0" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="53" width="88" height="29" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="86" width="88" height="23" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="118" width="88" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="160" width="88" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="199" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="252" width="88" height="16" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="272" width="88" height="24" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="305" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="386" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="429" width="38" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="441" y="429" width="46" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="472" width="88" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="503" width="88" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="564" width="88" height="29" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="597" width="88" height="23" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="629" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="399" y="710" width="88" height="56" rx="2" fill="#DADEE3"></rect>
+<rect x="399" y="775" width="88" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="0" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="53" width="88" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="118" width="88" height="72" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="496" y="199" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="252" width="38" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="538" y="252" width="46" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="305" width="88" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="336" width="88" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="386" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="429" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="472" width="88" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="503" width="88" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="564" width="51" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="551" y="564" width="33" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="629" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="710" width="88" height="56" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="496" y="775" width="88" height="62" rx="2" fill="#E3E6EA"></rect>
+<rect x="496" y="841" width="88" height="50" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="0" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="53" width="88" height="56" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="593" y="118" width="88" height="72" rx="2" fill="#DADEE3"></rect>
+<rect x="593" y="199" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="252" width="88" height="44" rx="2" fill="#DADEE3"></rect>
+<rect x="593" y="305" width="88" height="72" rx="2" fill="#DADEE3"></rect>
+<rect x="593" y="386" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="429" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="472" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="564" width="88" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="629" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="710" width="88" height="29" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="743" width="88" height="23" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="775" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="593" y="823" width="88" height="68" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="0" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="53" width="88" height="20" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="77" width="88" height="32" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="118" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="199" width="51" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="756" y="199" width="33" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="252" width="88" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="305" width="88" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="386" width="88" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="429" width="51" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="756" y="429" width="33" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="472" width="88" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="503" width="88" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="564" width="88" height="56" rx="2" fill="#DADEE3"></rect>
+<rect x="701" y="629" width="88" height="38" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="671" width="88" height="30" rx="2" fill="#E3E6EA"></rect>
+<rect x="701" y="710" width="88" height="56" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="701" y="775" width="88" height="116" rx="2" fill="none" stroke="#D3D8DE" stroke-width="1"></rect>
+<rect x="798" y="0" width="54" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="856" y="0" width="35" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="53" width="54" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="856" y="53" width="35" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="118" width="93" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="199" width="93" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="252" width="93" height="44" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="305" width="93" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="386" width="93" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="429" width="40" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="842" y="429" width="49" height="34" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="472" width="93" height="27" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="503" width="93" height="41" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="564" width="54" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="856" y="564" width="35" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="629" width="93" height="72" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="710" width="93" height="56" rx="2" fill="#E3E6EA"></rect>
+<rect x="798" y="775" width="40" height="116" rx="2" fill="#E3E6EA"></rect>
+<rect x="842" y="775" width="49" height="116" rx="2" fill="#E3E6EA"></rect>
+</pattern>
+</defs>
+<g class="cq-drift"><rect x="-900" y="-700" width="3100" height="1870" fill="url(#cqTile)"></rect><g transform="rotate(-16)">
+<path class="cq-route" d="M491.5 -705.5 L491.5 -652.5 L588.5 -652.5" fill="none" stroke="#9AA3AE" stroke-width="2" stroke-dasharray="2 5" stroke-linecap="round"></path>
+<circle class="cq-halo" cx="491.5" cy="-705.5" r="13" fill="#14171B" opacity="0.10"></circle><circle cx="491.5" cy="-705.5" r="4.5" fill="#14171B"></circle>
+<circle class="cq-halo" cx="588.5" cy="-652.5" r="13" fill="#D20000" opacity="0.16"></circle><circle cx="588.5" cy="-652.5" r="4.5" fill="#D20000"></circle>
+<path class="cq-route" d="M491.5 194.5 L491.5 247.5 L588.5 247.5" fill="none" stroke="#9AA3AE" stroke-width="2" stroke-dasharray="2 5" stroke-linecap="round"></path>
+<circle class="cq-halo" cx="491.5" cy="194.5" r="13" fill="#14171B" opacity="0.10"></circle><circle cx="491.5" cy="194.5" r="4.5" fill="#14171B"></circle>
+<circle class="cq-halo" cx="588.5" cy="247.5" r="13" fill="#D20000" opacity="0.16"></circle><circle cx="588.5" cy="247.5" r="4.5" fill="#D20000"></circle>
+<path class="cq-route" d="M491.5 1094.5 L491.5 1147.5 L588.5 1147.5" fill="none" stroke="#9AA3AE" stroke-width="2" stroke-dasharray="2 5" stroke-linecap="round"></path>
+<circle class="cq-halo" cx="491.5" cy="1094.5" r="13" fill="#14171B" opacity="0.10"></circle><circle cx="491.5" cy="1094.5" r="4.5" fill="#14171B"></circle>
+<circle class="cq-halo" cx="588.5" cy="1147.5" r="13" fill="#D20000" opacity="0.16"></circle><circle cx="588.5" cy="1147.5" r="4.5" fill="#D20000"></circle>
+<path class="cq-route" d="M491.5 1994.5 L491.5 2047.5 L588.5 2047.5" fill="none" stroke="#9AA3AE" stroke-width="2" stroke-dasharray="2 5" stroke-linecap="round"></path>
+<circle class="cq-halo" cx="491.5" cy="1994.5" r="13" fill="#14171B" opacity="0.10"></circle><circle cx="491.5" cy="1994.5" r="4.5" fill="#14171B"></circle>
+<circle class="cq-halo" cx="588.5" cy="2047.5" r="13" fill="#D20000" opacity="0.16"></circle><circle cx="588.5" cy="2047.5" r="4.5" fill="#D20000"></circle>
+</g></g>
+<rect x="0" y="0" width="1200" height="170" fill="url(#bandFadeX)"></rect>
+<rect x="0" y="0" width="1200" height="170" fill="url(#bandFadeY)"></rect>
+</svg>
+<div style="position: relative; min-width: 0; display: flex; flex-direction: column; gap: 6px;">
+<div style="display: flex; align-items: center; gap: 14px;">
+<h1 style="margin: 0; font-size: 28px; line-height: 34px; font-weight: 800; font-stretch: 125%; letter-spacing: -0.01em; color: #15191E;">Server</h1>
+<span style="height: 26px; box-sizing: border-box; display: flex; align-items: center; gap: 8px; padding: 0 11px 0 10px; background: #E5F3EB; border: 1px solid #B9DEC9; border-radius: 13px; font-size: 13px; font-weight: 600; color: #166B40;"><span aria-hidden="true" style="width: 8px; height: 8px; flex-shrink: 0; border-radius: 4px; background: #166B40;"></span>Running</span>
+</div>
+<p style="margin: 0; font-size: 13px; line-height: 20px; color: #4A5360;">Listening on UDP port 2001 · 8 slots · protocol v6 · up 1:12:40 · in-game 12:40</p>
+</div>
+<div style="position: relative; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">
+<div style="display: flex; align-items: center; gap: 12px;">
+<div style="display: flex; align-items: center; gap: 16px; padding: 8px 8px 8px 14px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 8px;">
+<div style="display: flex; flex-direction: column; gap: 2px;">
+<span style="font-size: 12px; line-height: 16px; font-weight: 600; color: #5B6572;">Address to share</span>
+<span style="font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 16px; line-height: 22px; color: #15191E;">192.168.1.40:2001</span>
+</div>
+<button type="button" aria-label="Copy address" title="Copy address" style="width: 36px; height: 36px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; padding: 0; background: #E3E6EA; border: 1px solid #CDD2D8; border-radius: 6px; color: #2A3038; cursor: pointer;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: block;"><rect x="8" y="8" width="13" height="13" rx="2"></rect><path d="M4.5 15.5A1.5 1.5 0 0 1 3 14V4.5A1.5 1.5 0 0 1 4.5 3H14a1.5 1.5 0 0 1 1.5 1.5"></path></svg></button>
+</div>
+<button type="button" style="height: 44px; display: flex; align-items: center; gap: 10px; padding: 0 16px; background: #F4F5F7; border: 1px solid #CDD2D8; border-radius: 6px; color: #2A3038; font-size: 14px; font-weight: 600; cursor: pointer;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" style="flex-shrink: 0; color: #D20000;"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"></rect></svg>Stop server</button>
+</div>
+<p style="margin: 0; font-size: 12px; line-height: 16px; color: #5B6572; text-align: right;">For friends outside your network, forward UDP port 2001 on your router.</p>
+</div>
+</div>
+<div style="flex-grow: 1; min-height: 0; box-sizing: border-box; display: grid; grid-template-columns: 420px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); gap: 20px; padding: 4px 28px 24px;">
+<section aria-labelledby="players-title" style="min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 10px;">
+<div style="height: 52px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 16px;">
+<h2 id="players-title" style="margin: 0; font-size: 15px; line-height: 20px; font-weight: 600; color: #15191E;">Players</h2>
+<span style="font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; line-height: 20px; color: #4A5360;">3 / 8</span>
+</div>
+<ul style="margin: 0; padding: 0; list-style: none;">
+<li style="height: 63px; box-sizing: border-box; display: flex; align-items: center; gap: 14px; padding: 0 10px 0 16px; border-top: 1px solid #E1E4E8;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; background: #ECEEF1; border-radius: 6px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; color: #2A3038;">0</span>
+<div style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;">
+<span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; line-height: 20px; font-weight: 600; color: #15191E;">noxx</span>
+<span style="font-size: 13px; line-height: 18px; color: #5B6572;">Driving vehicle 3</span>
+</div>
+<span style="flex-shrink: 0; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; line-height: 20px; color: #4A5360;">38 ms</span>
+<button type="button" aria-label="Kick noxx" title="Kick noxx" style="width: 36px; height: 36px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; padding: 0; background: transparent; border: 1px solid #D3D8DE; border-radius: 6px; color: #4A5360; cursor: pointer;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: block;"><path d="M15 20v-1.5a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4V20"></path><circle cx="9" cy="7.5" r="3.5"></circle><path d="M17 8.5l4 4M21 8.5l-4 4"></path></svg></button>
+</li>
+<li style="height: 63px; box-sizing: border-box; display: flex; align-items: center; gap: 14px; padding: 0 10px 0 16px; border-top: 1px solid #E1E4E8;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; background: #ECEEF1; border-radius: 6px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; color: #2A3038;">1</span>
+<div style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;">
+<span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; line-height: 20px; font-weight: 600; color: #15191E;">marta</span>
+<span style="font-size: 13px; line-height: 18px; color: #5B6572;">On foot</span>
+</div>
+<span style="flex-shrink: 0; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; line-height: 20px; color: #4A5360;">44 ms</span>
+<button type="button" aria-label="Kick marta" title="Kick marta" style="width: 36px; height: 36px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; padding: 0; background: transparent; border: 1px solid #D3D8DE; border-radius: 6px; color: #4A5360; cursor: pointer;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: block;"><path d="M15 20v-1.5a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4V20"></path><circle cx="9" cy="7.5" r="3.5"></circle><path d="M17 8.5l4 4M21 8.5l-4 4"></path></svg></button>
+</li>
+<li style="height: 63px; box-sizing: border-box; display: flex; align-items: center; gap: 14px; padding: 0 10px 0 16px; border-top: 1px solid #E1E4E8;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; background: #ECEEF1; border-radius: 6px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; color: #2A3038;">2</span>
+<div style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;">
+<span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; line-height: 20px; font-weight: 600; color: #15191E;">kiko</span>
+<span style="font-size: 13px; line-height: 18px; color: #5B6572;">On foot</span>
+</div>
+<span style="flex-shrink: 0; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; line-height: 20px; color: #8E5F0A;">162 ms</span>
+<button type="button" aria-label="Kick kiko" title="Kick kiko" style="width: 36px; height: 36px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; padding: 0; background: transparent; border: 1px solid #D3D8DE; border-radius: 6px; color: #4A5360; cursor: pointer;"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: block;"><path d="M15 20v-1.5a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4V20"></path><circle cx="9" cy="7.5" r="3.5"></circle><path d="M17 8.5l4 4M21 8.5l-4 4"></path></svg></button>
+</li>
+<li style="height: 63px; box-sizing: border-box; display: flex; align-items: center; gap: 14px; padding: 0 16px; border-top: 1px solid #E1E4E8;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: center; border: 1px dashed #CDD2D8; border-radius: 6px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; color: #5B6572;">3</span>
+<span style="font-size: 14px; line-height: 20px; color: #5B6572;">Open</span>
+</li>
+<li style="height: 63px; box-sizing: border-box; display: flex; align-items: center; gap: 14px; padding: 0 16px; border-top: 1px solid #E1E4E8;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: center; border: 1px dashed #CDD2D8; border-radius: 6px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; color: #5B6572;">4</span>
+<span style="font-size: 14px; line-height: 20px; color: #5B6572;">Open</span>
+</li>
+<li style="height: 63px; box-sizing: border-box; display: flex; align-items: center; gap: 14px; padding: 0 16px; border-top: 1px solid #E1E4E8;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: center; border: 1px dashed #CDD2D8; border-radius: 6px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; color: #5B6572;">5</span>
+<span style="font-size: 14px; line-height: 20px; color: #5B6572;">Open</span>
+</li>
+<li style="height: 63px; box-sizing: border-box; display: flex; align-items: center; gap: 14px; padding: 0 16px; border-top: 1px solid #E1E4E8;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: center; border: 1px dashed #CDD2D8; border-radius: 6px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; color: #5B6572;">6</span>
+<span style="font-size: 14px; line-height: 20px; color: #5B6572;">Open</span>
+</li>
+<li style="height: 63px; box-sizing: border-box; display: flex; align-items: center; gap: 14px; padding: 0 16px; border-top: 1px solid #E1E4E8;">
+<span style="width: 28px; height: 28px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: center; border: 1px dashed #CDD2D8; border-radius: 6px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 13px; color: #5B6572;">7</span>
+<span style="font-size: 14px; line-height: 20px; color: #5B6572;">Open</span>
+</li>
+</ul>
+</section>
+<div style="min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 16px;">
+<section aria-labelledby="rules-title" style="flex-shrink: 0; display: flex; align-items: center; gap: 22px; padding: 14px 14px 14px 20px; background: #FFFFFF; border: 1px solid #E1E4E8; border-radius: 10px;">
+<h2 id="rules-title" style="margin: 0; width: 64px; flex-shrink: 0; font-size: 15px; line-height: 20px; font-weight: 600; color: #15191E;">Rules</h2>
+<div style="display: flex; flex-direction: column; gap: 4px;">
+<span style="font-size: 12px; line-height: 16px; font-weight: 600; color: #5B6572;">Friendly fire</span>
+<span style="font-size: 16px; line-height: 22px; font-weight: 600; color: #15191E;">Off</span>
+</div>
+<div aria-hidden="true" style="width: 1px; flex-shrink: 0; align-self: stretch; background: #E1E4E8;"></div>
+<div style="display: flex; flex-direction: column; gap: 4px;">
+<span style="font-size: 12px; line-height: 16px; font-weight: 600; color: #5B6572;">Wanted level</span>
+<span style="font-size: 16px; line-height: 22px; font-weight: 600; color: #15191E;">Per player</span>
+</div>
+<div aria-hidden="true" style="width: 1px; flex-shrink: 0; align-self: stretch; background: #E1E4E8;"></div>
+<div style="display: flex; flex-direction: column; gap: 4px;">
+<span style="font-size: 12px; line-height: 16px; font-weight: 600; color: #5B6572;">Mission fails on death</span>
+<span style="font-size: 16px; line-height: 22px; font-weight: 600; color: #15191E;">On</span>
+</div>
+<button type="button" style="margin-left: auto; height: 44px; flex-shrink: 0; display: flex; align-items: center; gap: 9px; padding: 0 16px 0 14px; background: #E3E6EA; border: 1px solid #CDD2D8; border-radius: 6px; color: #2A3038; font-size: 14px; font-weight: 600; cursor: pointer;"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" style="flex-shrink: 0;"><path d="M19.13 11.00 L21.76 11.15 L21.76 12.85 L19.13 13.00 L17.75 16.33 L19.51 18.30 L18.30 19.51 L16.33 17.75 L13.00 19.13 L12.85 21.76 L11.15 21.76 L11.00 19.13 L7.67 17.75 L5.70 19.51 L4.49 18.30 L6.25 16.33 L4.87 13.00 L2.24 12.85 L2.24 11.15 L4.87 11.00 L6.25 7.67 L4.49 5.70 L5.70 4.49 L7.67 6.25 L11.00 4.87 L11.15 2.24 L12.85 2.24 L13.00 4.87 L16.33 6.25 L18.30 4.49 L19.51 5.70 L17.75 7.67 Z"></path><circle cx="12" cy="12" r="3"></circle></svg>Options</button>
+</section>
+<section aria-labelledby="console-title" style="flex-grow: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: #EFF1F4; border: 1px solid #E1E4E8; border-radius: 10px;">
+<div style="height: 52px; flex-shrink: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 10px 0 16px; border-bottom: 1px solid #E1E4E8;">
+<h2 id="console-title" style="margin: 0; font-size: 15px; line-height: 20px; font-weight: 600; color: #15191E;">Console</h2>
+<div role="group" aria-label="Show lines" style="display: flex; gap: 4px;">
+<button type="button" aria-pressed="true" style="height: 32px; padding: 0 12px; background: #FFFFFF; border: none; border-radius: 6px; color: #14171B; font-size: 13px; font-weight: 600; cursor: pointer;">All</button>
+<button type="button" aria-pressed="false" style="height: 32px; padding: 0 12px; background: transparent; border: none; border-radius: 6px; color: #4A5360; font-size: 13px; font-weight: 600; cursor: pointer;">Players</button>
+<button type="button" aria-pressed="false" style="height: 32px; padding: 0 12px; background: transparent; border: none; border-radius: 6px; color: #4A5360; font-size: 13px; font-weight: 600; cursor: pointer;">Chat</button>
+</div>
+</div>
+<div style="flex-grow: 1; min-height: 0; overflow: hidden; box-sizing: border-box; padding: 12px 16px; font-family: 'Fragment Mono', ui-monospace, Consolas, monospace; font-size: 12.5px; line-height: 20px;">
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">21:29:04</span>
+<span style="width: 9ch; flex-shrink: 0; color: #5B6572;">[coopiii]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #4A5360;">listening on 2001, 8 slots</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">21:31:47</span>
+<span style="width: 9ch; flex-shrink: 0; color: #166B40;">[coopiii]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #15191E;">noxx joined (slot 0, net 1)</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">21:33:12</span>
+<span style="width: 9ch; flex-shrink: 0; color: #166B40;">[coopiii]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #15191E;">marta joined (slot 1, net 2)</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">21:35:40</span>
+<span style="width: 9ch; flex-shrink: 0; color: #14171B;">[chat]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #15191E;">marta: meet at the docks</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">21:36:02</span>
+<span style="width: 9ch; flex-shrink: 0; color: #5B6572;">[coopiii]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #2A3038;">vehicle 3 claimed by noxx (model 90)</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">21:36:25</span>
+<span style="width: 9ch; flex-shrink: 0; color: #14171B;">[chat]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #15191E;">noxx: on my way</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">21:44:18</span>
+<span style="width: 9ch; flex-shrink: 0; color: #166B40;">[coopiii]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #15191E;">kiko joined (slot 2, net 4)</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">21:58:51</span>
+<span style="width: 9ch; flex-shrink: 0; color: #8E5F0A;">[coopiii]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #15191E;">rejected peer 3 (reason 1: bad version)</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">22:02:09</span>
+<span style="width: 9ch; flex-shrink: 0; color: #5B6572;">[coopiii]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #4A5360;">kiko left (slot 2)</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">22:03:30</span>
+<span style="width: 9ch; flex-shrink: 0; color: #166B40;">[coopiii]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #15191E;">kiko joined (slot 2, net 5)</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">22:03:41</span>
+<span style="width: 9ch; flex-shrink: 0; color: #14171B;">[chat]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #15191E;">kiko: sorry, router died</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">22:17:26</span>
+<span style="width: 9ch; flex-shrink: 0; color: #5B6572;">[coopiii]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #2A3038;">vehicle 6 claimed by marta (model 110)</span>
+</div>
+<div style="display: flex; gap: 12px; white-space: nowrap;">
+<span style="flex-shrink: 0; color: #636D7A;">22:31:08</span>
+<span style="width: 9ch; flex-shrink: 0; color: #14171B;">[chat]</span>
+<span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #15191E;">marta: parked it by the bridge</span>
+</div>
+</div>
+</section>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1200,"height":760}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>
