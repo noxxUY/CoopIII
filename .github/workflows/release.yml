@@ -1,9 +1,10 @@
 name: Release
 
-# Tag a commit v0.0.2 (or whatever is next) and push the tag; this builds
-# everything on Windows, runs the tests, and attaches CoopIII-Setup.exe to the
-# release under that exact name - which is the name the website's download
-# button links to:
+# Push a tag v0.1.3 (or whatever is next); this builds everything on Windows,
+# runs the tests and stages the release files as a build artifact. It does not
+# publish anything: the release itself is made by hand from those files, with
+# CoopIII-Setup.exe under that exact name - which is the name the website's
+# download button links to:
 #
 #   https://github.com/noxxUY/CoopIII/releases/latest/download/CoopIII-Setup.exe
 #
@@ -16,7 +17,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -85,10 +86,3 @@ jobs:
         with:
           name: CoopIII-release
           path: build/release-staging/*
-
-      - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: build/release-staging/*
-          generate_release_notes: true
