@@ -6018,8 +6018,19 @@ engine's own call:
 
 - if it was our car, driven by us, on a copy of another machine's pedestrian,
   the copy is put down: the knock arm's own `SetFall(1000, dir + 19h, true)`
-  already did it, and the kill arm gets the same fall. `KillPedWithCar`
+  already did it, and the kill arm gets a fall with the animation its death
+  would have played - `InflictDamage`'s car arm, by direction, piece and
+  `rand() & 3` (`0x004EAA1E`, `runover.h`, `RunOverKillAnim`). `KillPedWithCar`
   returns at once for a ped in `PED_FALL`, which ends the pushing;
+- while the copy is down from that hit (`PED_FALL` or `PED_GETUP`, at most
+  `RUN_OVER_HOLD_MS`), his host's rows are not his position or animation: our
+  engine carries the speed either arm gave him, over the bonnet or along the
+  road, as it would a pedestrian of its own. Before this the next row stood
+  him back where his host had him and blended his walk over the fall, so he
+  dropped on the spot. A death from his host that lands while he is still
+  falling plays no new animation (`SetDie` with `ANIM_STD_NUM`, what
+  `InflictDamage` picks for a ped already falling), so he is not stood up to
+  fall twice;
 - the hit goes to his host as `C_PedDamage` with the cause
   `WEAPONTYPE_RAMMEDBYCAR` and the impulse in `amount`, at most once per
   pedestrian per 500 ms. The host, which alone may decide, runs
@@ -6840,3 +6851,34 @@ The engine's reach is 10 m (0x005F6A70), which is for walking to a car to
 take it; the seat key's is 5 m (`SEAT_REACH_M`). The door: on the right side
 of the car, the back door (seat 3) is asked for first when the player stands
 behind the car's middle.
+
+### 1.60 A ped in a car plays the seat
+
+No wire change. Seen in play: other machines' pedestrians driving a replicated
+car, and remote players' copies, lying down in the seat.
+
+The seat is a base animation (`CAR_SIT` 6Fh, `_LO` 70h, `_P` 71h, `_P_LO`
+72h, what `m_pVehicleAnim` holds), and every knockdown (0Dh..1Ch) and every
+get-up, jump and fall (90h..9Ah) is a partial, drawn over it. The engine's
+seating never ends partials: `PedSetInCarCB` blends the sit at 100
+(0x004CF7C1..0x004CF802) and then `StopNonPartialAnims` (0x004C5D50), which
+skips anything with `ASSOC_PARTIAL` (`and edx,10h`). So a copy knocked over on
+this screen, or still holding a knockdown taken off the wire, and then seated
+by a warp or a replayed entry, lies in the seat for as long as it sits there.
+A fall our engine starts on a ped that stays seated does the same with the
+state as well. And `ApplyRemotePose` only left a copy alone in a car when the
+session also said it was seated, so one the engine had in a seat before the
+session caught up got the pose stream's walk and the owner's knockdown.
+
+`KeepSeatedPose` (ped.cpp) runs every frame on every copy our engine has in a
+car: a seated remote player, a seated pedestrian replica, and any copy with
+`bInVehicle` set whatever the session says, which the pose stream now leaves
+to the car. In `PED_DRIVING` (the passenger's state too), or a `PED_FALL` /
+`PED_GETUP` that never left the seat, it takes off everything
+`SeatedPoseForbids` names - the knockdowns, the get-up/jump/fall family and the
+walking animations - puts the state back to `PED_DRIVING` with the three
+get-up bits cleared, and sits the ped back down with the seat's own animation
+the way `PedSetInCarCB` does, when `m_pVehicleAnim` is empty or already a sit.
+Getting in, getting out, being dragged or jacked out, dying and dead are left
+to their own animations. A boat's wheel has no sit animation in the engine,
+so there it only takes the wrong ones off.

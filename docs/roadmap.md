@@ -1175,6 +1175,14 @@ Learned the hard way this far in; worth not relearning.
 - **The instant replay** is taken for the game starting over when it ends,
   because the frame counter it puts back is the witness for that
   (`addresses-unverified.md`, REFUTED).
+- **Ramming a car another machine simulates.** Its copy is put where its
+  owner says after every frame of physics, so our car bounces off it and it
+  does not move; only a session car nobody holds is taken over by the shove
+  (`protocol.md` §1.21.5). A traffic copy now carries its host's speed into
+  the physics step and no spin of its own (`game/vehicle.h`,
+  `AmbientCopyMoveSpeed`), so the bounce is off a moving car, not a parked
+  one. Moving it would need the hit to go to its owner. Not run in-game yet,
+  and neither is the run-over hold (`protocol.md` §1.59.1).
 - **A co-op kill on a pedestrian another machine hosts** reaches the
   shooter's stats screen only when it counts toward a running rampage
   (`protocol.md` §1.52). Any other such kill is the host's

@@ -8410,8 +8410,11 @@ void Client::ApplyAmbientPedPoses() {
 		// the same rule, and the same reason, as ApplyRemotePose's early
 		// return for a seated player. And while our copy is at a door: the
 		// entry's own animation walks him up to it and in.
-		if (ped.Seated() || ped.Entering())
+		if (ped.Seated() || ped.Entering()) {
+			if (ped.Seated() && m_bridge.KeepAmbientSeatedPose)
+				m_bridge.KeepAmbientSeatedPose(ped);
 			continue;
+		}
 		// Dragged out here, still in the car on his host: left where the drag
 		// put him.
 		if (PulledOutHoldsPose(ped.pulledOutOfNetId, ped.seatVehicleNetId))
@@ -9052,6 +9055,7 @@ void Client::OnCarStates(const S_CarStates &pkt) {
 		car->steer = DecodeCarSteer(in.steer);
 		car->gas   = DecodeCarGas(in.gas);
 		car->brake = DecodeCarBrake(in.brake);
+		car->moveSpeed = in.velocity;
 		// Arrival time, as the player's horn does it: the question is how
 		// long ago the host last said anything about this car. Never 0.
 		car->hornOnWire  = CarStateHornSet(pkt.hornMask, i);

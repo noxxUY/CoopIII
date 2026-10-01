@@ -259,7 +259,10 @@ inline bool PedIsLive(void *ped) { return PedState(ped) == EntityState::Live; }
 // Nulls every raw pointer to `entity` the engine keeps without a registered
 // reference: the 32 garages' m_pTarget, the camera's target between a
 // TakeControl and the next CCamera::Process (put on the player instead, as
-// Process would), and a burning boat's culprit. Called by DestroyVehicle and
+// Process would), and a burning boat's culprit. For a car, also the callbacks
+// of the car animations on every ped whose m_pMyVehicle it is, which the
+// car's own reference is about to nil (ped.h, DropCarChainCallbacksOnCar).
+// Called by DestroyVehicle and
 // DestroyPed, and before anything that deletes a car through the engine
 // (DELETE_CAR, a garage's own delivery). How many there were.
 size_t ForgetEngineRawPointersTo(void *entity);

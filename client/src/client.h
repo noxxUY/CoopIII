@@ -1692,6 +1692,11 @@ struct RemoteAmbientCar {
 	float               gas   = 0.0f;
 	float               brake = 0.0f;
 
+	// And its m_vecMoveSpeed, raw, as the newest row said it. The copy carries
+	// it between corrections so a collision with it here is with a car doing
+	// what its host's is doing (game/vehicle.h, AmbientCopyMoveSpeed).
+	Vec3                moveSpeed{};
+
 	// The local player has taken the wheel and we have asked the session to
 	// make this a session car (protocol.h, S_CarPromoted). One claim, not one
 	// per frame: it is reliable, so it gets there, and the row goes away
@@ -2679,6 +2684,11 @@ struct WorldBridge {
 	// seat, and it is the same fire a burning player gets (no NPC logic, no
 	// damage).
 	void (*ApplyAmbientPedFire)(RemoteAmbientPed &ped) = nullptr;
+
+	// A replica sitting in a car plays the seat: anything else found on him
+	// (a knockdown, a get-up, a walk) is taken off and the seat put back.
+	// Every frame for every seated replica.
+	void (*KeepAmbientSeatedPose)(RemoteAmbientPed &ped) = nullptr;
 
 	// ---- and the other direction -------------------------------------------
 

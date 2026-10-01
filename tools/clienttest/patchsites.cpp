@@ -9,6 +9,7 @@
 // here, over all of them at once.
 
 #include "game/addresses.h"
+#include "game/animcb.h"
 #include "game/cargen.h"
 #include "game/carletgo.h"
 #include "game/crowdaddr.h"
@@ -240,6 +241,8 @@ struct Span {
 };
 
 const Span kBytes[] = {
+    {CPlayerPed__ProcessControl_RollingDoorCBPush, 5, "CPlayerPed__ProcessControl_RollingDoorCBPush"},
+    {CPed__SetExitTrain_OutTrainCBPush, 5, "CPed__SetExitTrain_OutTrainCBPush"},
     {SlowCarDown_StatusTest, sizeof SLOWCARDOWN_STATUS_TEST, "the honk's status test"},
     {CFont__PrintChar_CullY, sizeof PRINTCHAR_CULL_Y_HEIGHT, "CFont::PrintChar's y test"},
     {ADRENALINE_SLOWDOWN_STORE, sizeof ADRENALINE_SLOWDOWN_BYTES, "the adrenaline slowdown"},

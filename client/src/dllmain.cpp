@@ -52,6 +52,7 @@
 #include "game/rampagevote.h"
 #include "game/ridecam.h"
 #include "game/runover.h"
+#include "game/animcb.h"
 #include "game/social.h"
 #include "game/replicacalm.h"
 #include "game/stunt.h"
@@ -371,6 +372,11 @@ void InstallOnGameThread() {
 	// A car another player drives, hitting us: priced by its speed, and
 	// friendly fire decides whether it costs health. Not fatal.
 	game::InstallRunOverHooks();
+
+	// The two car animation callbacks that read the car with no test, handed
+	// to the engine through a wrapper that has one (game/animcb.h). Not fatal:
+	// every seat CoopIII changes by hand takes those callbacks off first.
+	game::InstallCarCallbackGuards();
 
 	// Whom the lock-on picks, what a respawn clears, whose honk scatters a
 	// crowd and whose foot the engine sound follows (game/social.h). Not
@@ -790,6 +796,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 			// for somebody else, and that has to happen while the detour
 			// keeping them from exploding is still installed.
 			game::RemoveRunOverHooks();
+			game::RemoveCarCallbackGuards();
 			game::RemoveSocialHooks();
 			game::RemoveReplicaCalm();
 			game::RemoveMineHooks();

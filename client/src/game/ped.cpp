@@ -1,6 +1,7 @@
 #include "ped.h"
 
 #include "addresses.h"
+#include "animcb.h"
 #include "animrevive.h"
 #include "boat.h"
 #include "carremoval.h"
@@ -2363,6 +2364,7 @@ void UnseatRemotePed(RemotePlayer &player);
 bool SeatPedInCar(void *ped, void *car, uint8_t seat);
 int  UnseatPedFromCar(void *ped);
 bool GiveBackExitDoor(void *ped, void *car);
+int  AbandonPedEnterCar(void *ped);
 
 int PassengerSlotOf(void *car, void *ped) {
 	void *const   *seats = &Field<void *>(car, offs::VEH_PASSENGERS);
@@ -2608,6 +2610,11 @@ int SeatPedInCarAs(void *ped, void *car, uint8_t seat, SeatComer who) {
 
 	using ObjectiveFn = void(__thiscall *)(void *, uint32_t, void *);
 	using WarpFn      = void(__thiscall *)(void *, void *);
+
+	// The warp replaces m_pMyVehicle. A door or rolling-close animation still
+	// playing would finish on this car, or on none (game/animcb.h).
+	LetGoOfCarChain(ped);
+
 	Func<ObjectiveFn>(CPed__SetObjective)(ped, objective, car);
 
 	// A boat. SetObjective undoes an ENTER_CAR objective on a boat for any ped
@@ -2709,6 +2716,11 @@ int UnseatPedFromCar(void *ped) {
 	void *const car = Field<bool>(ped, offs::PED_IN_VEHICLE)
 	                      ? Field<void *>(ped, offs::PED_MY_VEHICLE)
 	                      : nullptr;
+
+	// Before anything here touches the seat or m_pMyVehicle, and before the
+	// partial fade below would bring any of their callbacks forward to the
+	// next frame (game/animcb.h).
+	LetGoOfCarChain(ped);
 
 	// Every vehicle CoopIII creates is a CAutomobile or a CBoat (vehicle.cpp,
 	// game/boat.h), so this vtable check is the same net ResolveRemote uses on
@@ -3061,6 +3073,10 @@ int AbandonPedEnterCar(void *ped) {
 	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
 	const bool     wasEntering =
 	    state == PEDSTATE_ENTER_CAR || state == PEDSTATE_CARJACK;
+	// QuitEnteringCar fades m_pVehicleAnim and the partial fade below fades the
+	// rest, and neither takes a callback off: each would fire a frame later, by
+	// then on a ped the caller may have warped into a seat (game/animcb.h).
+	DropCarChainCallbacks(ped);
 	if (wasEntering)
 		Func<void(__thiscall *)(void *)>(CPed__QuitEnteringCar)(ped);
 
@@ -3914,9 +3930,20 @@ void ApplyRemotePose(RemotePlayer &player, const Pose &pose) {
 		Field<float>(ped, offs::PED_HEALTH) = ReplicaHealth(player.last.health, player.deathApplied);
 		Field<float>(ped, offs::PED_ARMOUR) = player.last.armour;
 		ApplySeatedDriveBy(player, ped, pedState);
+		KeepSeatedPose(ped);
 		return;
 	}
 	EndSeatedDriveBy(player, ped);
+
+	// In a seat by our engine's account while the session has not caught up:
+	// the engine places a seated ped from its car every frame, and nothing
+	// the pose stream would play here - a walk, the owner's knockdown - may
+	// go on somebody sitting in a car.
+	if (KeepSeatedPose(ped)) {
+		Field<float>(ped, offs::PED_HEALTH) = ReplicaHealth(player.last.health, player.deathApplied);
+		Field<float>(ped, offs::PED_ARMOUR) = player.last.armour;
+		return;
+	}
 
 	// Position and facing go through PlaceRemotePed, which also pushes the
 	// matrix into the clump's RenderWare frame and re-files the ped in the
@@ -4403,9 +4430,136 @@ int ForgetVehicleAnim(void *ped) {
 	return VEHICLE_ANIM_FADED;
 }
 
+namespace {
+
+bool g_saidDroppedCarCallbacks = false;
+bool g_saidFinishedRollingDoor = false;
+
+// Every live ped in the pool: size at +8, flags at +4 with 0x80 free, entries
+// at +0 strided by sizeof(CPlayerPed), the engine's own walk.
+template <class Fn>
+void ForEachPoolPed(Fn fn) {
+	auto *const pool = Global<uint8_t *>(CPools__ms_pPedPool);
+	if (!pool)
+		return;
+	uint8_t *const entries = Field<uint8_t *>(pool, object::POOL_ENTRIES);
+	uint8_t *const flags   = Field<uint8_t *>(pool, object::POOL_FLAGS);
+	const int32_t  size    = Field<int32_t>(pool, object::POOL_SIZE);
+	if (!entries || !flags || size <= 0 || size > 1024)
+		return;
+	for (int32_t i = 0; i < size; ++i)
+		if (!(flags[i] & object::POOLFLAG_ISFREE))
+			fn(entries + static_cast<size_t>(i) * offs::SIZEOF_PLAYER_PED);
+}
+
+} // namespace
+
+int DropCarChainCallbacks(void *ped) {
+	void *const clump = ped ? ClumpOf(ped) : nullptr;
+	if (!clump)
+		return 0;
+	void *const car        = Field<void *>(ped, offs::PED_MY_VEHICLE);
+	const bool  automobile = car && Field<uintptr_t>(car, offs::VTABLE) == CAutomobile__vtable;
+	void *const vehicleAnim = Field<void *>(ped, offs::PED_VEHICLE_ANIM);
+	const uintptr_t rollingGuard = RollingDoorGuardAddress();
+	const uintptr_t trainGuard   = OutTrainGuardAddress();
+
+	// Collected, and the ones to finish run after the walk: a callback run
+	// from inside it would be free to change the list being walked.
+	constexpr int MAX_FINISH = 4;
+	void *finish[MAX_FINISH];
+	int   finishing = 0;
+	int   dropped   = 0;
+	bool  hadVehicleAnim = false;
+	ForEachAnim(clump, [&](void *assoc) {
+		const int32_t   type = Field<int32_t>(assoc, ANIM_CALLBACK_TYPE);
+		const uintptr_t fn   = EngineCarCallback(Field<uintptr_t>(assoc, ANIM_CALLBACK),
+		                                         rollingGuard, trainGuard);
+		if (!PendingCarCallback(type, fn, Field<void *>(assoc, ANIM_CALLBACK_ARG) == ped))
+			return;
+		const bool now = EndPendingCarCallback(fn, type, automobile) == CarCallbackEnd::FinishNow;
+		Field<int32_t>(assoc, ANIM_CALLBACK_TYPE) = ANIM_CB_NONE;
+		Field<float>(assoc, ANIM_BLEND_DELTA)     = -1000.0f;
+		Field<int32_t>(assoc, ANIM_FLAGS) |= ASSOC_DELETEFADEDOUT;
+		if (now && finishing < MAX_FINISH)
+			finish[finishing++] = assoc;
+		if (assoc == vehicleAnim)
+			hadVehicleAnim = true;
+		++dropped;
+	});
+	// It is deleted on the engine's next pass over the clump, and the ped must
+	// not be left pointing at it - the warp-out handler's own -1000 and nil.
+	if (hadVehicleAnim)
+		Field<void *>(ped, offs::PED_VEHICLE_ANIM) = nullptr;
+
+	// The engine's own end of the rolling close, on the car it was for: the
+	// door shut, its bit in m_nGettingOutFlags cleared, a swinging door OK.
+	for (int i = 0; i < finishing; ++i)
+		Func<void(__cdecl *)(void *, void *)>(CPed__PedAnimDoorCloseRollingCB)(finish[i], ped);
+
+	if (dropped != 0 && !g_saidDroppedCarCallbacks) {
+		g_saidDroppedCarCallbacks = true;
+		Log("animcb: a ped had %d car animation(s) with a callback still to come when "
+		    "CoopIII changed his seat (state %u); taken off and faded out, so none "
+		    "fires on a car he has left (said once)",
+		    dropped, Field<uint32_t>(ped, offs::PED_STATE));
+	}
+	if (finishing != 0 && !g_saidFinishedRollingDoor) {
+		g_saidFinishedRollingDoor = true;
+		Log("animcb: finished a rolling door close now instead, which gives the car its "
+		    "front left door back (said once)");
+	}
+	return dropped;
+}
+
+int LetGoOfCarChain(void *ped) {
+	if (!ped)
+		return 0;
+	// Halfway through a door. Its callbacks used to end the entry for it, a
+	// frame late - every one of them answers a ped who is no longer entering
+	// with QuitEnteringCar - and by then he could be in a seat this caller
+	// gave him. So the engine's own way out of an entry runs now instead:
+	// the car's count, its door's bit, the jack flag and the door itself.
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (state == PEDSTATE_ENTER_CAR || state == PEDSTATE_CARJACK)
+		return AbandonPedEnterCar(ped);
+	return DropCarChainCallbacks(ped);
+}
+
+int DropCarChainCallbacksOnCar(void *vehicle) {
+	if (!vehicle)
+		return 0;
+	int n = 0;
+	ForEachPoolPed([&](void *ped) {
+		if (Field<void *>(ped, offs::PED_MY_VEHICLE) == vehicle)
+			n += DropCarChainCallbacks(ped);
+	});
+	return n;
+}
+
+int RepointAnimCallbacks(uintptr_t from, uintptr_t to) {
+	if (!from)
+		return 0;
+	int n = 0;
+	ForEachPoolPed([&](void *ped) {
+		if (void *const clump = ClumpOf(ped))
+			ForEachAnim(clump, [&](void *assoc) {
+				if (Field<uintptr_t>(assoc, ANIM_CALLBACK) == from) {
+					Field<uintptr_t>(assoc, ANIM_CALLBACK) = to;
+					++n;
+				}
+			});
+	});
+	return n;
+}
+
 void PutPedOnFoot(void *ped, bool leftASeat) {
 	if (!ped)
 		return;
+
+	// While m_pMyVehicle still says which car: a rolling door close still
+	// playing would otherwise finish on nothing (addresses.h, 0x004E4BAB).
+	LetGoOfCarChain(ped);
 
 	Field<bool>(ped, offs::PED_IN_VEHICLE)     = false;
 	Field<void *>(ped, offs::PED_MY_VEHICLE)   = nullptr;
@@ -4793,6 +4947,95 @@ bool BlendReplicaAnim(void *ped, uint16_t animId) {
 	using BlendFn = void *(__cdecl *)(void *, int, int, float);
 	return Func<BlendFn>(CAnimManager__BlendAnimation)(
 	           clump, plan.group, static_cast<int>(animId), plan.blendDelta) != nullptr;
+}
+
+bool g_saidSeatKept = false;
+
+bool KeepSeatedPose(void *ped) {
+	if (!ped || !Field<bool>(ped, offs::PED_IN_VEHICLE))
+		return false;
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	void *const    car   = Field<void *>(ped, offs::PED_MY_VEHICLE);
+	void *const    clump = ClumpOf(ped);
+	if (!car || !clump || !SeatedPoseStateToKeep(state))
+		return true;
+
+	// Off the clump: everything a seat has no business playing. Never the
+	// association m_pVehicleAnim holds, which the engine keeps a raw pointer to.
+	void *const vehicleAnim = VehicleAnimOf(ped);
+	int         dropped     = 0;
+	uint16_t    firstId     = ANIM_NONE;
+	ForEachAnim(clump, [&](void *assoc) {
+		if (assoc == vehicleAnim)
+			return;
+		const int32_t id = Field<int32_t>(assoc, ANIM_ID);
+		if (id < 0 || !SeatedPoseForbids(static_cast<uint16_t>(id)))
+			return;
+		if (Field<float>(assoc, ANIM_BLEND_AMOUNT) <= 0.0f && LifeOf(assoc) != AnimLife::LIVE)
+			return;
+		Field<float>(assoc, ANIM_BLEND_AMOUNT) = 0.0f;
+		Field<float>(assoc, ANIM_BLEND_DELTA)  = -1000.0f;
+		Field<int32_t>(assoc, ANIM_FLAGS) |= ASSOC_DELETEFADEDOUT;
+		if (firstId == ANIM_NONE)
+			firstId = static_cast<uint16_t>(id);
+		++dropped;
+	});
+
+	// A fall or get-up our engine started on a ped that never left the seat.
+	const bool wasDown = state != PEDSTATE_DRIVING;
+	if (wasDown) {
+		Field<uint32_t>(ped, offs::PED_STATE) = PEDSTATE_DRIVING;
+		Field<uint8_t>(ped, offs::PED_FLAGS_C) &= static_cast<uint8_t>(~offs::PED_UPDATE_ANIM_HEADING);
+		Field<uint8_t>(ped, offs::PED_FLAGS_E) &= static_cast<uint8_t>(~offs::PED_GETUP_ANIM_STARTED);
+		Field<uint8_t>(ped, offs::PED_FLAGS_I) &= static_cast<uint8_t>(~offs::PED_FALLEN_DOWN);
+	}
+
+	// And the seat back on, the way PedSetInCarCB sits a ped (addresses.h, "a
+	// seated ped built again"), when it is gone or was never there. Only when
+	// m_pVehicleAnim holds nothing or holds a sit already: anything else in it
+	// is a door or a shuffle whose callback the engine is waiting on. Not in a
+	// boat, where PedSetInCarCB sits nobody in any animation (0x004CF31E).
+	if (Field<int32_t>(car, offs::VEH_TYPE) == VEHICLE_TYPE_BOAT) {
+		if ((dropped > 0 || wasDown) && !g_saidSeatKept) {
+			g_saidSeatKept = true;
+			Log("bridge: a copy at a boat's wheel was playing what a seat does not (%d "
+			    "animation(s), first %02Xh, state %u); taken off (said once)",
+			    dropped, firstId, state);
+		}
+		return true;
+	}
+	const bool     driver = Field<void *>(car, offs::VEH_DRIVER) == ped;
+	const bool     low    = (Field<uint8_t>(car, offs::VEH_FLAGS_B_BUS) & offs::VEH_IS_LOW) != 0;
+	const uint16_t sit    = driver ? (low ? ANIM_STD_CAR_SIT_LO : ANIM_STD_CAR_SIT)
+	                               : (low ? ANIM_STD_CAR_SIT_P_LO : ANIM_STD_CAR_SIT_P);
+	// A pointer to something no longer on the clump counts as nothing.
+	const bool    held   = vehicleAnim && ClumpHoldsAnim(clump, vehicleAnim);
+	const int32_t heldId = held ? Field<int32_t>(vehicleAnim, ANIM_ID) : -1;
+	const bool    heldIsSit =
+	    heldId >= ANIM_STD_CAR_SIT && heldId <= ANIM_STD_CAR_SIT_P_LO;
+	bool resat = false;
+	if (!held || heldIsSit) {
+		const bool live = held && LifeOf(vehicleAnim) == AnimLife::LIVE &&
+		                  Field<float>(vehicleAnim, ANIM_BLEND_AMOUNT) > 0.0f;
+		if (!live || dropped > 0) {
+			using BlendFn = void *(__cdecl *)(void *, int, int, float);
+			if (void *const assoc = Func<BlendFn>(CAnimManager__BlendAnimation)(
+			        clump, ASSOCGRP_STD, sit, CAR_SIT_BLEND_DELTA)) {
+				Field<void *>(ped, offs::PED_VEHICLE_ANIM) = assoc;
+				Func<void(__thiscall *)(void *)>(CPed__StopNonPartialAnims)(ped);
+				resat = true;
+			}
+		}
+	}
+
+	if ((dropped > 0 || wasDown || resat) && !g_saidSeatKept) {
+		g_saidSeatKept = true;
+		Log("bridge: a copy sitting in a car was playing what a seat does not (%d "
+		    "animation(s), first %02Xh, state %u); taken off and sat back down with "
+		    "%02Xh (said once)",
+		    dropped, firstId, state, sit);
+	}
+	return true;
 }
 
 bool g_saidReplicaAnimRevived = false;

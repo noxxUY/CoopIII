@@ -4672,6 +4672,32 @@ constexpr int32_t ASSOC_FADEOUTWHENDONE = 0x008;
 constexpr int32_t ASSOC_PARTIAL         = 0x010;
 constexpr int32_t ASSOC_MOVEMENT        = 0x020;
 
+// The association's callback: its kind, the function and its argument, as
+// SetFinishCallback (0x00401820) and SetDeleteCallback (0x00401800) write
+// them - `mov dword [ecx+34h],1` or `,2`, then [ecx+38h] and [ecx+3Ch].
+//
+// Both kinds fire when a faded-out association is deleted, and that is the
+// part that matters here. CAnimBlendAssociation::UpdateBlend, 0x0040330D:
+//
+//   test [ebp+30h],4 / je          ASSOC_DELETEFADEDOUT?
+//   cmp [ebp+34h],2 / je / cmp 1   finish or delete
+//   push [ebp+3Ch] / push ebp / call [ebp+38h]
+//
+// So fading an animation out does not cancel its callback: it brings it
+// forward to the frame the fade ends. Only a kind of 0 (CB_NONE, which
+// UpdateTime also writes before it calls a finish callback, 0x00403270) does.
+constexpr size_t  ANIM_CALLBACK_TYPE = 0x34;
+constexpr size_t  ANIM_CALLBACK      = 0x38;
+constexpr size_t  ANIM_CALLBACK_ARG  = 0x3C;
+constexpr int32_t ANIM_CB_NONE       = 0;
+constexpr int32_t ANIM_CB_FINISH     = 1;
+constexpr int32_t ANIM_CB_DELETE     = 2;
+constexpr uintptr_t CAnimBlendAssociation__SetDeleteCallback = 0x00401800;
+constexpr uintptr_t CAnimBlendAssociation__SetFinishCallback = 0x00401820;
+
+static_assert(ANIM_CALLBACK_ARG + 4 == SIZEOF_ANIM_ASSOC,
+              "the callback argument is the association's last field");
+
 // CAnimBlendAssociation::SetCurrentTime(float), __thiscall. Seeking by hand
 // isn't equivalent - this one also uncompresses the hierarchy and re-seeks
 // every node's key frame, which a raw write to currentTime would skip.
@@ -5350,6 +5376,31 @@ constexpr uintptr_t CPed__ProcessControl_KillPedWithCar = 0x004C9439;
 constexpr uint16_t  ANIM_STD_HIGHIMPACT_FRONT           = 0x19;
 constexpr int32_t   KILL_PED_WITH_CAR_FALL_MS           = 1000;
 
+// The fall that death is: InflictDamage's arm for the two car causes, on a ped
+// that is not already down. `edi` is the piece ([esp+40h] at 0x004EA444),
+// the switch is on the direction ([esp+44h]), `al` is rand() & 3 (0x004EA9EC):
+//
+//   004EA9F1  bCollisionProof ([+53h] bit 2): refused
+//   004EAA1E  jmp [edx*4+005F9E4Ch]       direction 0..3, else KO_FRONT (0Dh)
+//   dir 0     (piece 2 and r > 1) or (piece 1 and r == 1)      1Ah
+//             (piece 3 and r > 1) or (piece 1 and r == 2)      1Ch, else 19h
+//   dir 1     state 27h (PED_DIVE_AWAY) at 004EAA5C            17h, else 1Ah
+//   dir 2     (piece 2 and r > 1) or (piece 1 and r == 1)      17h
+//             (piece 3 and r > 1) or (piece 1 and r == 2)      18h, else 1Bh
+//   dir 3     state 27h at 004EAAB7                            18h, else 1Ch
+//
+// 17h/18h are SPINFORWARD_LEFT/RIGHT, 19h-1Ch HIGHIMPACT_FRONT/LEFT/BACK/RIGHT
+// (the "ped" block's names table, 0x005EA95C). The kill arm hands it the piece
+// it hit (PED_MID over the bonnet, an arm along the side, the head under the
+// wheels) and its direction, already turned round by two for the bonnet.
+constexpr uint16_t  ANIM_STD_SPINFORWARD_LEFT   = 0x17;
+constexpr uint16_t  ANIM_STD_SPINFORWARD_RIGHT  = 0x18;
+constexpr uint16_t  ANIM_STD_HIGHIMPACT_LEFT    = 0x1A;
+constexpr uint16_t  ANIM_STD_HIGHIMPACT_BACK    = 0x1B;
+constexpr uint16_t  ANIM_STD_HIGHIMPACT_RIGHT   = 0x1C;
+constexpr uint32_t  PEDSTATE_DIVE_AWAY          = 0x27;
+constexpr uintptr_t INFLICT_DAMAGE_CAR_ANIM_TABLE = 0x005F9E4C;
+
 // ---- AimGun, and where a ped's aim pitch comes from -----------------------
 //
 // CPed::AimGun (0x004C6AA0) has three arms, and only its one caller -
@@ -5980,6 +6031,65 @@ constexpr uintptr_t CPed__BeingDraggedFromCar = 0x004E07D0;
 // seat by anything else while in 33h has to have it given back by hand -
 // GettingOutFlagsAfterUnseat below.
 constexpr uintptr_t CPed__PedSetDraggedOutCarCB = 0x004CF000;
+
+// ---- the car chain's callbacks, and a seat changed under them -------------
+//
+// Every callback the engine hangs on a ped's car animations, off the replay's
+// own table of animation callbacks at 0x0061052C (thirty dwords, walked by
+// CReplay::FindCBFunctionID at 0x00584E70), in its order: 8 GetIn, 9 DoorOpen,
+// 10 PullPedOut, 11 DoorClose, 12 SetInCar, 13 SetOutCar, 14 Align,
+// 15 SetDraggedOutCar, 16 StepOutCar, 17 SetInTrain, 18 SetOutTrain,
+// 23 DoorCloseRolling, 28 and 29 the two dragged-out positions. Each one's
+// argument is the ped, and each reads the ped's m_pMyVehicle (+310h).
+//
+// Most test it first. Align (004DE150), DoorOpen (004DE520), GetIn
+// (004DEC80+20h), DoorClose (004DF1C1), SetInCar (004CF230), SetInTrain
+// (004E3295) and StepOutCar (004DF5E0, which hands a null car to SetOutCar)
+// return; PullPedOut tests it once the ped is still entering (004DEB30);
+// SetOutCar (004CE936, 004CE9CD), SetDraggedOutCar and the two positions
+// are written around a ped whose car may be gone. Two are not:
+//
+//   CPed::PedAnimDoorCloseRollingCB, 0x004E4B90
+//     004E4B9B  mov ebx,[eax+310h]
+//     004E4BAB  mov al,[ebx+1F6h]            bLowVehicle, no test before it
+//     004E4BCC  call [ebp+5Ch]               ProcessOpenDoor, as a CAutomobile
+//     004E4BD3  and [ebx+1CBh],0FEh          m_nGettingOutFlags &= ~LF
+//     004E4BDA  add ebx,288h ... 00545920    Damage.SetDoorStatus(LF, OK)
+//   CPed::PedSetOutTrainCB, 0x004E36E0
+//     004E3741  mov eax,[ebx+310h] / fld [eax+14h]   the train's heading
+//     004E384A  mov ecx,[ebx+310h] / call 00551EB0   RemovePassenger
+//
+// The rolling one is the crash at 0x004E4BAB: CPlayerPed::ProcessControl
+// hangs it on the player whenever he sits in a car whose front left door is
+// swinging and the pad is idle (the push at 0x004F0027, re3 PlayerPed.cpp
+// :1302) - a passenger too - and a seat CoopIII took him out of by hand
+// cleared m_pMyVehicle before it finished.
+constexpr uintptr_t CPed__PedAnimDoorCloseCB       = 0x004DF1B0;
+constexpr uintptr_t CPed__PedSetInCarCB            = 0x004CF220;
+constexpr uintptr_t CPed__PedSetOutCarCB           = 0x004CE8F0;
+constexpr uintptr_t CPed__PedAnimStepOutCarCB      = 0x004DF5C0;
+constexpr uintptr_t CPed__PedSetInTrainCB          = 0x004E3290;
+constexpr uintptr_t CPed__PedSetOutTrainCB         = 0x004E36E0;
+constexpr uintptr_t CPed__PedAnimDoorCloseRollingCB = 0x004E4B90;
+constexpr uintptr_t CPed__PedSetQuickDraggedOutCarPositionCB = 0x004E2480;
+constexpr uintptr_t CPed__PedSetDraggedOutCarPositionCB      = 0x004E2920;
+
+constexpr uintptr_t CReplay__CBArray = 0x0061052C;
+constexpr int       REPLAY_CB_COUNT  = 30;   // `cmp eax,1Eh` at 0x00584E81
+
+// Where the two that do not test are handed to SetFinishCallback, each a
+// `push imm32` of the callback straight before `call 00401820`:
+//
+//   004F0026  push esi / 004F0027  push 4E4B90h / 004F002C  call 00401820
+//   004E36AD  push ebp / 004E36AE  push 4E36E0h / 004E36B3  call 00401820
+//
+// The second is CPed::SetExitTrain, after it blends the train get-out (85h)
+// into m_pVehicleAnim. They are the only references to either function in
+// .text; the other is each one's slot in the replay's table (23 and 18).
+constexpr uintptr_t CPlayerPed__ProcessControl_RollingDoorCBPush = 0x004F0027;
+constexpr uintptr_t CPed__SetExitTrain_OutTrainCBPush           = 0x004E36AE;
+constexpr int       REPLAY_CB_ROLLING_DOOR = 23;
+constexpr int       REPLAY_CB_OUT_TRAIN    = 18;
 
 // The jack's animations, in the "ped" block (ped.ifp): the definition at
 // 0x005EB734 is {block "ped", model 1, 0ADh anims, names 0x005EA95C, descs

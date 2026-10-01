@@ -22,6 +22,7 @@
 #include "teardown.h"
 #include "wreck.h"
 #include "wreckqueue.h"
+#include "../clock.h"
 #include "../hook/hook.h"
 #include "../log.h"
 #include "../quat.h"
@@ -2051,6 +2052,10 @@ bool SurrenderVehicleSeat(RemoteVehicle &vehicle) {
 	// next snapshot puts the engine, the lights and the siren back the way its
 	// own machine has them.
 	vehicle.appliedFlags = 0xFF;
+
+	// A driver whose door swung open sits there with a rolling close on him,
+	// and it would finish after the nil below (game/animcb.h).
+	DropCarChainCallbacks(ped);
 
 	// And then the ped, exactly as the warp-out handler leaves one.
 	Field<bool>(ped, offs::PED_IN_VEHICLE)     = false;
@@ -4209,6 +4214,16 @@ void CorrectAmbientCarReplica(RemoteAmbientCar &car, const VehicleTransform &at)
 	}
 
 	PlaceVehicle(v, at.pos, at.rot, /*inWorld=*/true);
+
+	// And its host's speed into the next frame's physics, with no spin of its
+	// own (vehicle.h, AmbientCopyMoveSpeed). Not on a wreck, which its host
+	// has finished with and the engine's own physics lets settle.
+	if (!IsWrecked(v)) {
+		const uint32_t age = car.lastRowAtMs != 0 ? WallClock::NowMs() - car.lastRowAtMs
+		                                          : AMBIENT_COPY_MOVING_MS;
+		WriteVec3(v, offs::MOVE_SPEED, AmbientCopyMoveSpeed(car.moveSpeed, age));
+		WriteVec3(v, offs::TURN_SPEED, Vec3{0.0f, 0.0f, 0.0f});
+	}
 
 	// The host's horn, counted down here (game/horn.h, TrafficHornTimer). After
 	// CGame::Process and every frame for the reason the player's horn gives in

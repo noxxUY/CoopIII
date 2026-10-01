@@ -236,6 +236,27 @@ inline Vec3 HeldMoveSpeed(const Vec3 &v) {
 	return Vec3{v.x * k, v.y * k, v.z * k};
 }
 
+// What our copy of another machine's traffic car carries between corrections.
+//
+// CorrectAmbientCarReplica puts it where its host says after every frame of
+// physics, and nothing ever wrote its speed: the copy came into each frame's
+// physics with whatever this machine's engine had left on it - braked to
+// nothing under a zeroed autopilot, or a bounce off our own car - and was
+// moved on by the snap alone. So a collision with a traffic car doing 60 was
+// a collision with a parked one, and the turn speed a bump gave it stayed on
+// it, spinning it a little inside every physics step until the next snap.
+// Now it carries its host's move speed from the newest row while rows come,
+// none once they stop (the snap holds it on the last one then), and no turn
+// speed of its own. Where it is is still only ever the snap's.
+constexpr uint32_t AMBIENT_COPY_MOVING_MS = 250;
+
+inline Vec3 AmbientCopyMoveSpeed(const Vec3 &wire, uint32_t rowAgeMs) {
+	const float sq = wire.x * wire.x + wire.y * wire.y + wire.z * wire.z;
+	if (rowAgeMs >= AMBIENT_COPY_MOVING_MS || !(sq < 1.0e12f))
+		return Vec3{0.0f, 0.0f, 0.0f};   // stopped, or NaN or infinite off the wire
+	return HeldMoveSpeed(wire);
+}
+
 inline float HeldWithin(float value, float limit) {
 	return value > limit ? limit : value < -limit ? -limit : value;
 }

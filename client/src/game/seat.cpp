@@ -168,6 +168,14 @@ int32_t WarpIntoSeat(void *ped, void *vehicle) {
 	// takes the passenger arm, which walks to the first free slot itself.
 	using ObjFn  = void(__thiscall *)(void *, uint32_t, void *);
 	using WarpFn = void(__thiscall *)(void *, void *);
+
+	// Taken the instant the door will not open, sometimes with the engine's own
+	// entry still hanging on him (the log that found this had him in a jack,
+	// state 52, holding the climb-in): its callbacks would finish on the seat
+	// the warp gives him, and one of his own on no car at all once he gets out
+	// again (game/animcb.h).
+	LetGoOfCarChain(ped);
+
 	Func<ObjFn>(CPed__SetObjective)(ped, OBJECTIVE_ENTER_CAR_AS_PASSENGER, vehicle);
 
 	// The warp makes the car STATUS_PLAYER for the player whichever seat he

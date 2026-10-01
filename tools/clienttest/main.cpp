@@ -17573,6 +17573,9 @@ int RunPassengerAimTests();
 // tools/clienttest/runover.cpp
 int RunRunOverTests();
 
+// tools/clienttest/animcb.cpp
+int RunAnimCallbackTests();
+
 // tools/clienttest/stunt.cpp
 int RunStuntTests();
 int RunMissionCombatTests();
@@ -20421,6 +20424,7 @@ int main() {
 	g_failures += RunDriveByTests();
 	g_failures += RunPassengerAimTests();
 	g_failures += RunRunOverTests();
+	g_failures += RunAnimCallbackTests();
 	g_failures += RunStuntTests();
 	g_failures += RunMissionCombatTests();
 	g_failures += RunPassengerTests();

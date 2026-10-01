@@ -559,6 +559,20 @@ void TestAgainstTheImage() {
 	Check(BytesAt(img, 0x004D0FA1, {0x8A, 0x83, 0x56, 0x01, 0, 0, 0xC0, 0xE8, 0x04}) &&
 	          offs::PED_UPDATE_ANIM_HEADING == 0x10,
 	      "bUpdateAnimHeading is bit 4 of +156h");
+
+	// A seat never ends a partial (SeatedPoseForbids).
+	Check(BytesAt(img, CPed__StopNonPartialAnims, {0x8B, 0x41, 0x4C}) &&
+	          BytesAt(img, 0x004C5D60, {0x8B, 0x50, 0x30, 0x83, 0xE2, 0x10, 0x75, 0x04, 0x83, 0x60,
+	                                    0x30, 0xFE}),
+	      "StopNonPartialAnims only stops what is not a partial");
+	Check(BytesAt(img, 0x004CF7C1, {0xFF, 0x35, 0x74, 0x84, 0x5F, 0x00, 0x6A, 0x70}) &&
+	          BytesAt(img, 0x004CF7D0, {0xFF, 0x35, 0x74, 0x84, 0x5F, 0x00, 0x6A, 0x6F}) &&
+	          BytesAt(img, 0x004CF7ED, {0xFF, 0x35, 0x74, 0x84, 0x5F, 0x00, 0x6A, 0x72}) &&
+	          Dword(img, 0x005F8474) == 0x42C80000u,
+	      "PedSetInCarCB sits a ped with 6Fh/70h/72h at 100");
+	Check(!(DescFlags(img, ANIM_STD_CAR_SIT) & ASSOC_PARTIAL) &&
+	          !(DescFlags(img, ANIM_STD_CAR_SIT_P) & ASSOC_PARTIAL),
+	      "and the sit is a base, so a partial draws over it");
 }
 
 // A copy that went down on our screen while its owner stayed up, or was left
@@ -602,6 +616,30 @@ void TestACopyLeftLyingDown() {
 	      "across the millisecond clock wrapping");
 }
 
+// A copy lying down in a driver's seat. The seat is a base animation, the
+// knockdown a partial, and the engine's seating never ends partials.
+void TestASeatPlaysTheSeat() {
+	std::printf("\na ped in a seat plays the seat\n");
+	Check(SeatedPoseForbids(ANIM_STD_KO_FRONT) && SeatedPoseForbids(0x1C) &&
+	          SeatedPoseForbids(ANIM_STD_GET_UP) && SeatedPoseForbids(ANIM_STD_FALL_COLLAPSE) &&
+	          SeatedPoseForbids(ANIM_STD_JUMP_LAUNCH),
+	      "no knockdown, get-up, jump or fall in a seat");
+	Check(SeatedPoseForbids(0) && SeatedPoseForbids(1) && SeatedPoseForbids(3) &&
+	          SeatedPoseForbids(4) && SeatedPoseForbids(6) && SeatedPoseForbids(9),
+	      "and no walking, running or standing about either");
+	Check(!SeatedPoseForbids(ANIM_STD_CAR_SIT) && !SeatedPoseForbids(ANIM_STD_CAR_SIT_P_LO) &&
+	          !SeatedPoseForbids(0x77) && !SeatedPoseForbids(0x78) && !SeatedPoseForbids(0x1D) &&
+	          !SeatedPoseForbids(0x0A),
+	      "the sit, the drive-by, a flinch and the armed idle stay");
+	Check(SeatedPoseStateToKeep(PEDSTATE_DRIVING) && SeatedPoseStateToKeep(PEDSTATE_FALL) &&
+	          SeatedPoseStateToKeep(PEDSTATE_GETUP),
+	      "sitting, and a fall or get-up that never left the seat, are put right");
+	Check(!SeatedPoseStateToKeep(PEDSTATE_EXIT_CAR) && !SeatedPoseStateToKeep(PEDSTATE_DRAG_FROM_CAR) &&
+	          !SeatedPoseStateToKeep(PEDSTATE_CARJACK) && !SeatedPoseStateToKeep(PEDSTATE_DIE) &&
+	          !SeatedPoseStateToKeep(PEDSTATE_DEAD),
+	      "getting out, being dragged or jacked, dying and dead are left to their own animations");
+}
+
 } // namespace
 
 int RunAnimReviveTests() {
@@ -615,6 +653,7 @@ int RunAnimReviveTests() {
 	TestAGetUp();
 	TestTheBase();
 	TestACopyLeftLyingDown();
+	TestASeatPlaysTheSeat();
 	TestAgainstTheImage();
 	return g_reviveFailures;
 }

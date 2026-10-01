@@ -179,6 +179,14 @@ bool BlendReplicaAnim(void *ped, uint16_t animId);
 // along the street on its idle (docs/protocol.md 1.54.2).
 bool ReplicaAnimNeedsBlend(void *ped, uint16_t want, uint16_t applied);
 
+// A copy in a car seat, a remote player's or a pedestrian replica's, plays
+// the seat and nothing else (animrevive.h, SeatedPoseForbids): a knockdown,
+// get-up, fall or walk found on it is taken off, a fall or get-up state our
+// engine started is put back to PED_DRIVING, and the sitting animation is put
+// back on the way PedSetInCarCB puts it. True when the engine has the ped in
+// a vehicle at all, which is when nothing else may animate or place it.
+bool KeepSeatedPose(void *ped);
+
 // CPed::SetObjective then CPed::WarpPedIntoCar, in that order, because
 // WarpPedIntoCar branches on m_objective and silently assigns no seat at all
 // given anything else. Into `seat` when seatplan.h gives it, another free
@@ -232,6 +240,27 @@ constexpr int VEHICLE_ANIM_NONE     = 0;
 constexpr int VEHICLE_ANIM_FADED    = 1;
 constexpr int VEHICLE_ANIM_DANGLING = 2;
 int     ForgetVehicleAnim(void *ped);
+
+// Take the callbacks off a ped's car animations before CoopIII seats him,
+// unseats him or nils his m_pMyVehicle by hand, and fade those animations out
+// (game/animcb.h). A rolling door close still to finish is finished now, on
+// the car it was for. Call while m_pMyVehicle still names the car he was in.
+// How many there were.
+int     DropCarChainCallbacks(void *ped);
+
+// What every seat CoopIII changes by hand calls first: a ped halfway through
+// a door has the entry ended the engine's way (CancelCarEntry, whose
+// QuitEnteringCar gives the car its door and count back, then the above);
+// anybody else just has the callbacks dropped.
+int     LetGoOfCarChain(void *ped);
+
+// The same for every ped whose m_pMyVehicle is `vehicle`, which is about to
+// be deleted: the engine's reference will nil that pointer under them.
+int     DropCarChainCallbacksOnCar(void *vehicle);
+
+// Every association in the ped pool whose callback is `from` gets `to`, for
+// taking a guard wrapper away while an animation still names it.
+int     RepointAnimCallbacks(uintptr_t from, uintptr_t to);
 
 // The ped half of COMMAND_WARP_CHAR_FROM_CAR_TO_COORD's handler, with no
 // teleport and no car: on foot, idle, colliding, no objective, no car

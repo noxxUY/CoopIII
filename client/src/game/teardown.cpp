@@ -1,6 +1,7 @@
 // The engine half of game/teardown.h.
 #include "teardown.h"
 
+#include "ped.h"
 #include "../log.h"
 
 namespace coopiii::game {
@@ -175,7 +176,14 @@ size_t ForgetEngineRawPointersTo(void *entity) {
 		Log("teardown: a burning boat here named something we are taking away as the one "
 		    "who set it alight; it blows up blaming nobody instead of a freed slot (said once)");
 	}
-	return garages + camera + boats;
+
+	// Peds whose m_pMyVehicle is this car: the engine's reference nils it under
+	// them when the car goes, and a car animation of theirs still playing
+	// would finish on no car (game/animcb.h).
+	size_t peds = 0;
+	if ((Field<uint8_t>(entity, offs::ENTITY_FLAGS) & 7) == ENTITY_TYPE_VEHICLE)
+		peds = static_cast<size_t>(DropCarChainCallbacksOnCar(entity));
+	return garages + camera + boats + peds;
 }
 
 bool DestroyVehicle(void *vehicle, const char *who) {

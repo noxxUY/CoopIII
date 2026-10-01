@@ -72,6 +72,7 @@ struct RunOverSeen {
 	void    *ped       = nullptr;
 	bool     ours      = false;
 	uint32_t direction = 0;
+	uint32_t piece     = 0;
 };
 RunOverSeen g_runOverSeen;
 
@@ -165,6 +166,7 @@ bool __fastcall CarHitDamage(void *ped, void * /*edx*/, void *car, uint32_t meth
 		if (!victimPlayer && g_runOverSeen.ped == ped) {
 			g_runOverSeen.ours      = true;
 			g_runOverSeen.direction = direction;
+			g_runOverSeen.piece     = piece;
 		}
 		if (!g_saidOurCar) {
 			g_saidOurCar = true;
@@ -193,6 +195,30 @@ bool __fastcall CarHitDamage(void *ped, void * /*edx*/, void *car, uint32_t meth
 	return engine();
 }
 
+// The copies our car has put down, and when (RunOverHoldsPose). A handful at
+// once is already a lot of people under one car; past that the oldest goes.
+struct RunOverHold {
+	uint16_t netId = INVALID_NETID;
+	uint32_t atMs  = 0;
+};
+constexpr size_t RUN_OVER_HOLDS = 8;
+RunOverHold      g_holds[RUN_OVER_HOLDS];
+bool             g_saidHeld = false;
+
+void NoteRunOverHold(uint16_t netId, uint32_t nowMs) {
+	RunOverHold *slot = &g_holds[0];
+	for (RunOverHold &h : g_holds) {
+		if (h.netId == netId) {
+			slot = &h;
+			break;
+		}
+		if (h.netId == INVALID_NETID || h.atMs - slot->atMs > 0x80000000u)
+			slot = &h;   // free, or older than the one picked so far
+	}
+	slot->netId = netId;
+	slot->atMs  = nowMs != 0 ? nowMs : 1;
+}
+
 using KillWithCarFn = void(__thiscall *)(void *, void *, float);
 using SetFallFn     = void(__thiscall *)(void *, int32_t, uint32_t, uint8_t);
 
@@ -212,11 +238,20 @@ void __fastcall KillPedWithCarHook(void *ped, void * /*edx*/, void *car, float i
 		return;
 
 	// The kill arm left him standing: the fall single player gets from his
-	// death, here from SetFall like the knock arm's. It is also what stops
-	// KillPedWithCar pushing our car back on every frame of contact.
-	if (RunOverLeftStanding(Field<uint32_t>(ped, offs::PED_STATE)))
-		Func<SetFallFn>(CPed__SetFall)(ped, KILL_PED_WITH_CAR_FALL_MS,
-		                               RunOverFallAnim(seen.direction), 1);
+	// death, with the animation that death would have played, here from
+	// SetFall like the knock arm's. It is also what stops KillPedWithCar
+	// pushing our car back on every frame of contact.
+	const uint32_t state = Field<uint32_t>(ped, offs::PED_STATE);
+	if (RunOverLeftStanding(state)) {
+		const uint32_t random = static_cast<uint32_t>(
+		    Func<int(__cdecl *)()>(CGeneral__GetRandomNumber)());
+		Func<SetFallFn>(CPed__SetFall)(
+		    ped, KILL_PED_WITH_CAR_FALL_MS,
+		    RunOverKillAnim(seen.direction, random, seen.piece, state), 1);
+	}
+	// Either arm: from here our engine carries him until he is up again,
+	// not his host's rows (RunOverHoldsPose).
+	NoteRunOverHold(netId, WallClock::NowMs());
 
 	const uint32_t now = WallClock::NowMs();
 	if (!RunOverForwardDue(g_lastRunOverNet, g_lastRunOverMs, netId, now))
@@ -309,6 +344,28 @@ void ApplyRunOverOnHostedPed(RemotePlayer *attacker, void *ped, uint16_t netId,
 		    attacker->nick.c_str(), netId, bounded, before,
 		    Field<uint32_t>(ped, offs::PED_STATE));
 	}
+}
+
+bool RunOverHoldsReplica(uint16_t netId, uint32_t pedState) {
+	if (netId == INVALID_NETID)
+		return false;
+	const uint32_t now = WallClock::NowMs();
+	for (RunOverHold &h : g_holds) {
+		if (h.netId != netId)
+			continue;
+		if (RunOverHoldsPose(true, h.atMs, now, pedState)) {
+			if (!g_saidHeld) {
+				g_saidHeld = true;
+				Log("runover: pedestrian net %u's copy is down from our car; our engine "
+				    "carries his fall and his host's rows wait until he is up (said once)",
+				    netId);
+			}
+			return true;
+		}
+		h.netId = INVALID_NETID;   // up again, or long enough
+		return false;
+	}
+	return false;
 }
 
 bool InstallRunOverHooks() {

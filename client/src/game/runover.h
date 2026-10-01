@@ -102,16 +102,43 @@ inline bool CarHitMayLand(CarHit hit, bool friendlyFire) {
 // copy of our car, a snapshot late, usually missed him.
 //
 // So both halves happen now. Our copy goes down at once - the knock arm's own
-// SetFall already does that, the kill arm gets the same fall - which also
-// ends the pushing, since KillPedWithCar returns early for a ped in PED_FALL.
+// SetFall already does that, the kill arm gets the fall its death would have
+// been (RunOverKillAnim) - which also ends the pushing, since KillPedWithCar
+// returns early for a ped in PED_FALL.
 // And the hit goes to his host as C_PedDamage with the cause
 // WEAPONTYPE_RAMMEDBYCAR and the impulse, where the real ped goes through the
 // same KillPedWithCar with the host's copy of our car.
 
-// The fall our copy is put in when the kill arm left him standing. `direction`
-// is the one the arm handed InflictDamage; the knock arm uses the same sum.
-inline uint16_t RunOverFallAnim(uint32_t direction) {
-	return static_cast<uint16_t>(ANIM_STD_HIGHIMPACT_FRONT + (direction & 3u));
+// The fall the kill arm's death would have been on a ped of ours: the
+// animation InflictDamage picks for a car (addresses.h, 0x004EAA1E), from the
+// direction and piece the arm handed it and rand() & 3. The arm's flight -
+// over the bonnet, or carried along at nine tenths of the car's speed - is
+// already in the copy's m_vecMoveSpeed by then; this is only how he turns in
+// the air.
+inline uint16_t RunOverKillAnim(uint32_t direction, uint32_t random, uint32_t piece,
+                                uint32_t pedState) {
+	const uint32_t r          = random & 3u;
+	const bool     leftHit    = (piece == PEDPIECE_LEFTARM && r > 1) ||
+	                         (piece == PEDPIECE_MID && r == 1);
+	const bool     rightHit   = (piece == PEDPIECE_RIGHTARM && r > 1) ||
+	                          (piece == PEDPIECE_MID && r == 2);
+	const bool     divingAway = pedState == PEDSTATE_DIVE_AWAY;
+	switch (direction) {
+	case 0:
+		return leftHit ? ANIM_STD_HIGHIMPACT_LEFT
+		       : rightHit ? ANIM_STD_HIGHIMPACT_RIGHT
+		                  : ANIM_STD_HIGHIMPACT_FRONT;
+	case 1:
+		return divingAway ? ANIM_STD_SPINFORWARD_LEFT : ANIM_STD_HIGHIMPACT_LEFT;
+	case 2:
+		return leftHit ? ANIM_STD_SPINFORWARD_LEFT
+		       : rightHit ? ANIM_STD_SPINFORWARD_RIGHT
+		                  : ANIM_STD_HIGHIMPACT_BACK;
+	case 3:
+		return divingAway ? ANIM_STD_SPINFORWARD_RIGHT : ANIM_STD_HIGHIMPACT_RIGHT;
+	default:
+		return ANIM_STD_KO_FRONT;
+	}
 }
 
 // Does the copy still need putting down after the engine's call?
@@ -138,6 +165,36 @@ inline bool RunOverImpulseFromWire(float wire, float &out) {
 	out = wire > MAX_RUN_OVER_IMPULSE ? MAX_RUN_OVER_IMPULSE : wire;
 	return true;
 }
+
+// How the copy goes down, and why it used to look wrong. The engine's own
+// reaction was there - the kill arm's speed over the bonnet, the knock arm's
+// three quarters of the car's - but his host's rows kept arriving, and every
+// frame ApplyAmbientPedState put him back where his host had him standing and
+// blended the walk his host was playing over the fall. So he dropped where he
+// stood. While he is down from a hit of ours, those rows are not his position
+// or his animation; our engine carries him the way it carries a ped of its
+// own, until he is back on his feet or this long has passed. The rows still
+// go into his buffer, and he goes on from wherever his host has him then.
+constexpr uint32_t RUN_OVER_HOLD_MS = 6000;
+
+inline bool RunOverHoldsPose(bool hitByUs, uint32_t hitAtMs, uint32_t nowMs, uint32_t pedState) {
+	if (!hitByUs || nowMs - hitAtMs >= RUN_OVER_HOLD_MS)
+		return false;
+	return pedState == PEDSTATE_FALL || pedState == PEDSTATE_GETUP;
+}
+
+// The death his host sends while he is still falling from our hit: SetDie
+// with no animation, so the fall goes on into it. InflictDamage itself picks
+// nothing new for a ped already in PED_FALL with his head up (state 24h,
+// then `mov ebx,0ADh` at 0x004EA589; lying flat it plays the floor hit, 25h,
+// which this leaves out). The host's own pick would stand him up to fall a
+// second time.
+inline uint16_t RunOverDeathAnim(bool held, uint32_t pedState, uint16_t hostAnim) {
+	return held && pedState == PEDSTATE_FALL ? ANIM_STD_NUM : hostAnim;
+}
+
+// Whether our run-over is holding this replica's pose, for population.cpp.
+bool RunOverHoldsReplica(uint16_t netId, uint32_t pedState);
 
 // Is a C_PedDamage a run-over rather than a hit?
 inline bool IsRunOverForward(uint8_t weapon) { return weapon == WEAPONTYPE_RAMMEDBYCAR; }

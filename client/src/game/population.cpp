@@ -9,6 +9,7 @@
 #include "ped.h"
 #include "pedanim.h"
 #include "pedspeech.h"
+#include "runover.h"
 #include "social.h"
 #include "streampick.h"
 #include "teardown.h"
@@ -2729,7 +2730,12 @@ bool KillAmbientReplica(RemoteAmbientPed &ped, uint16_t animId) {
 	// same reason: the id becomes a subscript and nothing in the engine
 	// checks it.
 	using SetDieThisFn = void(__thiscall *)(void *, uint32_t, float, float);
-	const uint16_t anim = PlanDeathAnim(animId, StdAnimGroupCount());
+	//
+	// Still falling from our car, he dies into that fall and is not stood up
+	// for his host's (game/runover.h, RunOverDeathAnim).
+	const uint16_t anim = PlanDeathAnim(
+	    RunOverDeathAnim(RunOverHoldsReplica(ped.netId, state), state, animId),
+	    StdAnimGroupCount());
 	{
 		// Through the engine's own address, so through game/combat.cpp's own
 		// CPed::SetDie detour - which now refuses that call for a replica.
@@ -3263,6 +3269,17 @@ void ApplyAmbientPedState(RemoteAmbientPed &ped, const Pose &at) {
 	if (state == PEDSTATE_DIE || state == PEDSTATE_DEAD)
 		return;
 
+	// In a car on our engine's account: the car places him and he plays the
+	// seat (ped.h, KeepSeatedPose), whatever the row says.
+	if (KeepSeatedPose(mem))
+		return;
+
+	// Down from our car: our engine is carrying his fall the way it would its
+	// own pedestrian's, and his host's row would stand him back up where his
+	// host has him (game/runover.h, RunOverHoldsPose).
+	if (RunOverHoldsReplica(ped.netId, state))
+		return;
+
 	// Measured before the write, because the write is what the measurement is
 	// about. Half a centimetre: a pedestrian at 1.5 m/s covers 2.5 cm in a
 	// 60 Hz frame, and a replica being held at one coordinate covers exactly
@@ -3325,6 +3342,8 @@ void ApplyAmbientPedState(RemoteAmbientPed &ped, const Pose &at) {
 // The decision is ped.cpp's PlanRemoteFire, unchanged.
 bool g_saidReplicaFireLit    = false;
 bool g_saidReplicaFireNoSlot = false;
+
+void KeepAmbientSeatedPose(RemoteAmbientPed &ped) { KeepSeatedPose(AmbientReplicaPed(ped)); }
 
 void ApplyAmbientPedFire(RemoteAmbientPed &ped) {
 	if (ped.poolHandle < 0)
@@ -4491,6 +4510,7 @@ void AddPopulationToBridge(WorldBridge &bridge) {
 	// A burning pedestrian. Only the receiving half needs an entry here; the
 	// host's half is the bit SampleHostedPeds already writes.
 	bridge.ApplyAmbientPedFire = &ApplyAmbientPedFire;
+	bridge.KeepAmbientSeatedPose = &KeepAmbientSeatedPose;
 
 	// And the traffic half. Same door, same handshake, same all-or-nothing
 	// rule about installing it: a machine that replicated other people's

@@ -193,4 +193,31 @@ inline bool StandUpDue(bool &timing, uint32_t &sinceMs, bool copyDown, bool owne
 	return true;
 }
 
+// ---- a ped in a seat plays the seat (docs/protocol.md 1.60) -----------------
+//
+// A replica in a car, a remote player's copy or another machine's pedestrian,
+// was seen lying in the driver's seat. The seat is a base animation
+// (CAR_SIT and its three siblings, which m_pVehicleAnim holds), and every
+// knockdown, get-up, jump and fall is a partial, drawn over it. The engine's
+// seating never ends partials: PedSetInCarCB and WarpPedIntoCar blend the sit
+// at 100 and call StopNonPartialAnims (0x004C5D50, `and edx,10h`: partials are
+// skipped). So a copy knocked over on our screen, or holding a knockdown off
+// the wire, and then seated, keeps lying down in the seat for good.
+
+// Nothing a ped sitting in a car may have on its clump: the knockdowns, the
+// get-up, jump and fall family (90h..9Ah), and the walking animations
+// (walk, run, sprint, idle, start-walk, the two stops, the tired idle).
+inline bool SeatedPoseForbids(uint16_t id) {
+	return IsKnockdownAnim(id) || IsEngineMoveAnim(id) || id <= 6 || id == 9;
+}
+
+// The states a seated copy is put right in: sitting (PED_DRIVING, which is
+// the passenger's too), and a fall or get-up our engine started on a ped that
+// never left the seat. Getting in, getting out and being dragged out play
+// animations of their own and are left to them.
+inline bool SeatedPoseStateToKeep(uint32_t pedState) {
+	return pedState == PEDSTATE_DRIVING || pedState == PEDSTATE_FALL ||
+	       pedState == PEDSTATE_GETUP;
+}
+
 } // namespace coopiii::game
