@@ -1180,6 +1180,12 @@ void ReplayRemoteShot(RemotePlayer &player, const ShotBody &shot);
 // from one it is only watching. docs/objects.md 5.
 bool ReplayingRemoteShot();
 
+// Is DriveByImpact handing somebody else's drive-by or sniper round to
+// CGlass::WasGlassHitByBullet right now? Those rounds are drawn without
+// CWeapon::Fire, so ReplayingRemoteShot is false for them, and the window
+// they hit still has to leave its one in four to the shooter (game/glass.h).
+bool DrawingRemoteRoundOnGlass();
+
 // One round of the local passenger's gun (game/passengeraim.h), through
 // CWeapon::Fire like a round on foot, so every sampler and the C_Shot are the
 // on-foot ones. CWorld::pIgnoreEntity holds `car` for the call, and `aim`

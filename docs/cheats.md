@@ -31,7 +31,8 @@ KANGAROO and PEDDEBUG, which re3 lists, are not in 1.0.
   NUL and compares it against `KeyBoardCheatString[10]`, which only matches
   while that byte is still the zero the buffer starts with in `.bss`. Nothing
   else writes the buffer. So slow motion works only as the very first thing
-  typed after the game starts. CoopIII compares the same way.
+  typed after the game starts. CoopIII compares the same way (and where
+  SilentPatch has fixed it, as fixed: §8).
 - **NASTYLIMBSCHEAT does nothing.** Its handler toggles `CPed::bNastyLimbsCheat`
   (`0x0095CD44`), and a byte scan of the whole image finds that byte written by
   the handler and by `CPad::ResetCheats` and read by nothing.
@@ -199,9 +200,163 @@ with the host's world packet anyway. An emptied session forgets them.
   `CPad::ResetCheats` and nobody else's.
 - **A replica still runs the rest of `CivilianAI`.** Only the threat scan is
   closed. The replicas' positions are the stream's either way.
-- **Nothing on screen says a cheat was refused.** The log does.
+- **Nothing on screen says one of the game's cheats was refused.** The log
+  does. CoopIII's own say why in the chat feed (§7).
 
 ## 6. Checking it in the game
 
 Not run in-game. Everything above is covered by `tools/clienttest` and
 `tools/sessiontest` except the moment each handler actually runs.
+
+## 7. CoopIII's own cheats
+
+CoopIII has typed cheats of its own, typed in play the way the game's are, with
+no Enter. `client/src/game/cheats.h` holds the table (`COOP_CHEATS`): a word
+in capitals and, for one that takes it, one digit after it.
+`client/src/game/tpto.h` decides what the first one does and
+`client/src/game/tpto.cpp` does it.
+
+| Typed | What it does |
+|---|---|
+| `TPTO1` .. `TPTO8` | puts you beside the player with that number |
+
+**The number is the one the Tab list puts before every name**, the slot plus
+one (`chatfeed.h`, `ListNumber`). `/kick` takes the same number. TPTO9
+and TPTO0 are nobody.
+
+**How they are read.** Nothing is hooked for them. After every key-down the
+game's own window procedure has handled, `game/chat.cpp` hands the engine's
+`KeyBoardCheatString` to `NoticeTypedKeys`. When it has changed and now ends
+in one of ours, the cheat is queued, and `TickCoopCheats` does it on the next
+frame, before `CGame::Process`. This works whether or not the
+`AddToPCCheatString` detour is in, and it only sees the digit row: the
+handler turns the numeric keypad into codes of its own, 0x400 and up
+(`VK_NUMPAD0` is `mov [ebx],40Eh` at `0x00583C61`), which it never pushes.
+TPTO starts with the chat key, so it is nearly always finished through the
+chat line (§8).
+
+**On foot** it is the move the rampage vote and the session's mission already
+make (`rampagevote.h`, `MovePlayerBeside`). That is out of any car another
+player sits in, on the ground near his, in sight of him and facing him, with
+`CStreaming::LoadScene` round the spot first. For another island the player is
+held where the target is until `CCollision::Update` has loaded it, then put
+down.
+
+**At the wheel the car comes along.** That is `SET_PLAYER_COORDINATES`' car
+half, the car's own `Teleport` through vtable slot 11 at the ground plus
+`GetDistanceFromCentreOfMassToBaseOfModel`. Only a `CAutomobile`, whose slot
+11 is `CAutomobile::Teleport` (`0x00535180`): it takes the car out of the
+world, puts it there level and still, resets the suspension and adds it back.
+The spot is the first of eight directions on a 7 m ring, then a 10 m one,
+with ground near the target's, in sight of him, and nothing in the car's
+bounding sphere (`CWorld::TestSphereAgainstWorld`). The script's
+`ClearSpaceForMissionEntity` is left out because it makes room by deleting
+cars, and the car beside a player is as likely as not somebody's session car.
+
+**What it refuses**, each with one line in the chat feed:
+
+| Why | Line |
+|---|---|
+| the server's `coopCheats = off` | TPTO is switched off on this server |
+| on a mission (a rampage counts), unless `coopCheats = always` | TPTO: not during a mission |
+| no player with that number | TPTO: nobody is number 5 |
+| your own number | TPTO: number 1 is you |
+| busted, being arrested | TPTO: not while busted |
+| wasted | TPTO: not while wasted |
+| a cutscene | TPTO: not during a cutscene |
+| already being moved | TPTO: already on the way |
+| nothing has said where he is yet | TPTO: nobody knows where bob is yet |
+| his island is not open in your story | TPTO: bob is on an island your story has not opened |
+| a passenger | TPTO: get out of the car first |
+| a boat, a plane, a heli, a train | TPTO: cannot take this vehicle along |
+| driving, and he is on another island | TPTO: bob is on another island, leave the car first |
+| driving, and no empty spot for the car | TPTO: no room for the car beside bob |
+
+On success the game's own "Cheat activated" line comes up, through the same
+call its handlers make: `CHud::SetHelpMessage(TheText.Get("CHEAT1"), true)`,
+with the key at `0x005F64C0`. With no session TPTO does nothing and says so
+only in the log, and anything typed with the pause menu up is dropped.
+
+**The switch.** `coopCheats = outsidemissions | always | off` in
+`CoopIII-Server.ini` and the server's options, default `outsidemissions`. It
+is not `cheats`, which is about the game's 23. It travels in
+`S_SessionRules.coopCheats` (protocol.md 1.61). The server cannot refuse a
+teleport, which is the player's own position going out as it always does, so
+each client keeps the rule itself.
+
+**Adding one.** A `CoopCheatId` before `COOP_CHEAT_COUNT`, its row in
+`COOP_CHEATS`, and a case in `tpto.cpp`'s `RunCoopCheat`. `tools/clienttest`
+types every row past the chat key and checks that no word ends one of the
+game's 23, or is ended by one, which would fire both on one key.
+
+## 8. The chat key, and a game another plugin has changed
+
+**Why typing a cheat with a T in it still opened the chat in noxx's game.**
+The rule that rescues a cheat from the chat line (`cheats.h`, "the chat key
+inside a cheat") compared what was typed against `CHEAT_SITES`, which is
+retail 1.0. noxx's game runs SilentPatch III, and reading the two running
+games' `CPad::AddToPCCheatString` on 2026-09-30 showed it rewrites two rows:
+
+| Row | Retail | SilentPatch |
+|---|---|---|
+| 12 BOOOOORING | `push 10h` (`0x004925D6`) | `push 0Ah` |
+| 13 armour | `push 5F6618h`, "TURTOISE" | `push 61E98EF4h`, its own "TORTOISE" |
+
+In that game TORTOISE is the armour cheat and TURTOISE is nothing. Typed with
+T as the chat key, TORTOISE was never recognised: the line stayed open and
+the keys never reached the game. The same mismatch is what every log there
+says at start, `row 12 (BOOOOORING) of CPad::AddToPCCheatString is not the
+one CoopIII has on record`. So the detour is never installed there, and none
+of §2's routing runs in that game. The chat-line rule did not depend on the
+detour, so that alone did not break it.
+
+**Now** the rule goes by the table the running code compares
+(`TypedCheatTable`). At start `game/cheats.cpp` decodes the 23 rows out of the
+code in memory with the same decoder `tools/clienttest` runs over the exe,
+and reads each string where its `push` points, after checking with
+`VirtualQuery` that it can be read. It logs every row another plugin has
+changed. If the code is not in the shape `addresses.h` has, it falls back to
+retail's table. CoopIII's own cheats are part of the same check, and so is
+the digit row. After every key typed into an open line, if the chat key and
+the line finish a cheat, the line is shut at once, unsent, and the keys go to
+the game. If they do not, it stays chat. `tools/clienttest` types TURTOISE,
+ITSALLGOINGMAAAD, NOBODYLIKESME and TPTO3 straight through, and both
+spellings against both tables. It also checks that a line starting with T, or
+one about TPTO3, is sent whole.
+
+**The detour now goes in there too.** Its check used to want retail's table
+row for row, so in a game with SilentPatch it stayed out and the game's
+cheats ran as in single player. Now `CheckCheatImage` (`cheats.h`) checks
+only what the detour depends on, on the code that is running:
+
+- the prologue it moves aside (`CPAD_ADD_TO_PC_CHEAT_STRING_PROLOGUE`) and the
+  shift it does itself (`CPAD_CHEAT_SHIFT`, `0x00492457`, 30 bytes);
+- every row's shape and handler, which must be retail's;
+- each row's pushed length and the string bytes its `strncmp` can reach (up
+  to the length, or a shared NUL), which must be retail's or one of
+  `KNOWN_CHEAT_ROWS`;
+- the epilogue's `ret 4`.
+
+`KNOWN_CHEAT_ROWS` has SilentPatch's two: BOOOOORING with length 10 at
+retail's string, and the armour row with length 8 pointing at "ESIOTROT"
+anywhere, since its address is wherever SilentPatch's module was loaded.
+Anything else (a third rewrite, a different length, another string, a changed
+handler, a hooked prologue, a string that cannot be read) and the detour stays
+out as before. The log names the row, and says for each changed row whether
+it is a rewrite CoopIII knows.
+
+Once in, the detour compares with the table read off the running code, not
+`CHEAT_SITES`. So in a session in that game TORTOISE is armour and TURTOISE
+is nothing, and BOOOOORING works after other keys, as in that game's single
+player. The rows are matched by position, which is the `CheatId` on the wire,
+so nothing on the wire changes. The log lines name each cheat the way that
+game spells it.
+
+`tools/clienttest` builds the function byte by byte in both shapes (the
+retail one checked against the exe, byte for byte), and checks that both go
+in, that each of the refusals above stays out, and what the detour then
+matches.
+
+**Not proven:** none of §2's routing has run in a game with SilentPatch yet.
+It needs a session there: the log should say the function was hooked, and the
+sky cheats should go to the host.

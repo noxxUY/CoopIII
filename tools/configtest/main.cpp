@@ -181,6 +181,54 @@ void TestCheats() {
 	Check(read == written, "and reads back the same");
 }
 
+void TestCoopCheats() {
+	std::printf("CoopIII's own cheats (cheats.md 7)\n");
+
+	ServerConfig c;
+	Check(c.coopCheats == CoopCheatMode::OutsideMissions,
+	      "by default they work, but not during a mission");
+	Check(c.Parse("coopCheats = always\n") && c.coopCheats == CoopCheatMode::Always,
+	      "\"always\" parses");
+	Check(c.Parse("COOPCHEATS = OFF\n") && c.coopCheats == CoopCheatMode::Off,
+	      "\"OFF\" parses, key and value both without case");
+	Check(c.Parse("coopCheats = outsidemissions\n") &&
+	          c.coopCheats == CoopCheatMode::OutsideMissions,
+	      "\"outsidemissions\" parses");
+	Check(c.Parse("coopCheats = false\n") && c.coopCheats == CoopCheatMode::Off &&
+	          c.Parse("coopCheats = on\n") && c.coopCheats == CoopCheatMode::OutsideMissions,
+	      "and false and on mean off and the default");
+	c.coopCheats = CoopCheatMode::Always;
+	c.Parse("coopCheats = sometimes\n");
+	Check(c.coopCheats == CoopCheatMode::Always, "an unknown value leaves it where it was");
+	c.Parse("cheats = off\n");
+	Check(c.coopCheats == CoopCheatMode::Always, "and `cheats` is a setting of its own");
+
+	Check(std::string(Name(CoopCheatMode::OutsideMissions)) == "outsidemissions" &&
+	          std::string(Name(CoopCheatMode::Always)) == "always" &&
+	          std::string(Name(CoopCheatMode::Off)) == "off",
+	      "the three names are the three values the file takes");
+	Check(WireValue(CoopCheatMode::OutsideMissions) == COOP_CHEATS_OUTSIDE_MISSIONS &&
+	          WireValue(CoopCheatMode::Always) == COOP_CHEATS_ALWAYS &&
+	          WireValue(CoopCheatMode::Off) == COOP_CHEATS_OFF,
+	      "and each one is the rule S_SessionRules carries");
+	Check(SaneCoopCheatRule(7) == COOP_CHEATS_OUTSIDE_MISSIONS &&
+	          SaneCoopCheatRule(COOP_CHEATS_OFF) == COOP_CHEATS_OFF,
+	      "a byte that is no rule reads as the default");
+
+	ServerConfig defaults;
+	Check(defaults.ToIni().find("coopCheats = outsidemissions") != std::string::npos,
+	      "a fresh file says coopCheats = outsidemissions");
+	ServerConfig written;
+	written.coopCheats = CoopCheatMode::Always;
+	const std::string ini = written.ToIni();
+	Check(ini.find("coopCheats = always") != std::string::npos, "the file says coopCheats = always");
+	Check(ini.find("cheats = shared") != std::string::npos, "beside cheats = shared, whole");
+	ServerConfig read;
+	read.Parse(ini);
+	Check(read == written, "and reads back the same");
+	Check(read != defaults, "and a different rule is a different config");
+}
+
 void TestParse() {
 	std::printf("parsing\n");
 
@@ -448,6 +496,25 @@ void TestKeepProgress() {
 	Check(read == changed && changed != ServerConfig{}, "and it reads back as itself");
 }
 
+// The players' custom skins (docs/protocol.md 1.72). On by default: the skin
+// somebody picked is theirs to show.
+void TestCustomSkins() {
+	std::printf("custom skins\n");
+	const ServerConfig c;
+	Check(c.syncCustomSkins, "sent by default");
+	Check(c.ToIni().find("syncCustomSkins = true") != std::string::npos, "the file says so");
+	ServerConfig off;
+	Check(off.Parse("syncCustomSkins = false\n") && !off.syncCustomSkins,
+	      "syncCustomSkins = false turns it off");
+	off.Parse("SYNCCUSTOMSKINS = on\n");
+	Check(off.syncCustomSkins, "and the key is read in any case");
+	ServerConfig changed;
+	changed.syncCustomSkins = false;
+	ServerConfig read;
+	read.Parse(changed.ToIni());
+	Check(read == changed && changed != ServerConfig{}, "and it reads back as itself");
+}
+
 int main() {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -457,11 +524,13 @@ int main() {
 	TestNames();
 	TestTheSettingsThatWereBuiltIn();
 	TestCheats();
+	TestCoopCheats();
 	TestMoney();
 	TestHiddenPackages();
 	TestPassword();
 	TestTheRouterAndThePublicAddress();
 	TestKeepProgress();
+	TestCustomSkins();
 
 	std::printf("\n%s\n", g_failures == 0 ? "all server config checks passed"
 	                                      : "server config checks FAILED");

@@ -56,6 +56,8 @@ struct State {
 	std::string startError;
 	bool        launched = false;
 	float       checkedAt = -10.0f;   // when the list was last re-run
+	// discordPresence in CoopIII.ini: the game shown as CoopIII in Discord.
+	bool        discord   = true;
 
 	// The lobby (docs/protocol.md 1.31): the right column shows it instead
 	// of the form while this is set.
@@ -212,7 +214,7 @@ void FindGameAndLoadConfig(const Startup &startup) {
 		std::string host = g_state.host;
 		std::string nick = g_state.nick;
 		uint16_t    port = 2001;
-		ReadIni(Join(found, "CoopIII.ini"), &host, &port, &nick);
+		ReadIni(Join(found, "CoopIII.ini"), &host, &port, &nick, nullptr, &g_state.discord);
 		CopyInto(g_state.host, sizeof(g_state.host), host);
 		CopyInto(g_state.nick, sizeof(g_state.nick), SanitizeNick(nick));
 		std::snprintf(g_state.port, sizeof(g_state.port), "%u", port);
@@ -248,7 +250,8 @@ bool StartGame(bool newGame) {
 	const std::string nick = SanitizeNick(g_state.nick);
 	CopyInto(g_state.nick, sizeof(g_state.nick), nick);
 	g_state.startError.clear();
-	if (!UpdateIni(Join(g_state.gameDir, "CoopIII.ini"), g_state.host, port, nick)) {
+	if (!UpdateIni(Join(g_state.gameDir, "CoopIII.ini"), g_state.host, port, nick) ||
+	    !UpdateIniDiscord(Join(g_state.gameDir, "CoopIII.ini"), g_state.discord)) {
 		g_state.startError = "Could not write CoopIII.ini in the game folder.";
 		return false;
 	}
@@ -619,6 +622,17 @@ int RunWindow(const Startup &startup) {
 					CopyInto(g_state.gameDir, sizeof(g_state.gameDir), picked);
 					Recheck();
 				}
+			}
+
+			// Discord: "Playing CoopIII" on the profile, or the game as Discord
+			// finds it. Into an ini that is there straight away, so it holds
+			// whether or not the game is started from here this time; a start
+			// writes it either way.
+			if (Checkbox("##discord", ImVec2(rightX, dirBox.Max().y + 18.0f), &g_state.discord,
+			             "Show CoopIII in Discord", theme)) {
+				const std::string ini = Join(g_state.gameDir, "CoopIII.ini");
+				if (FileExists(ini))
+					UpdateIniDiscord(ini, g_state.discord);
 			}
 
 			// ---- the lobby button, pinned to the bottom -----------------------

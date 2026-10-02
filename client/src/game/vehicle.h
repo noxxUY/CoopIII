@@ -394,6 +394,12 @@ void SetVehicleObserved(void *vehicle, bool observed);
 // session has no name for here.
 bool SessionCarFor(const void *vehicle, uint16_t &netId, bool &othersMoveIt);
 
+// A car the session already names here other than as this machine's own
+// traffic: a session car, whoever's (the local player's claimed car among
+// them), or a copy of somebody else's traffic. Never the session's mission's
+// new car, whatever adds it to the world (game/missiontake.h).
+bool SessionAlreadyHasCar(const void *vehicle, uint16_t &netId);
+
 // This machine's copy of a session car or of somebody else's traffic, or
 // null. Never this machine's own traffic.
 void *CopyOfCar(uint16_t netId);
@@ -464,6 +470,9 @@ bool AdoptAmbientCarReplica(RemoteAmbientCar &car);
 // roster can act on - getting into somebody else's traffic is an ownership
 // change now, not just a reason to stop correcting. protocol.h, S_CarPromoted.
 bool LocalDrivesAmbientCar(const RemoteAmbientCar &car);
+// The local player in this copy, or on his way in or out of it: teardown.h,
+// LocalPlayerAboard.
+bool LocalAboardAmbientCar(const RemoteAmbientCar &car);
 
 // Reads one hosted car's transform and velocity out of the engine. False when
 // the pool no longer has it, which is the caller's cue to drop the row.

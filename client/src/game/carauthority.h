@@ -87,4 +87,13 @@ inline constexpr CarWordTo WhereTheWordGoes(CarSimulator sim) {
 	}
 }
 
+// The mission blowing a car up (EXPLODE_CAR) is a wreck, and a wreck is
+// decided once: by the machine simulating the car, whose blow-up the session
+// then carries to everybody (game/vehicle.h, MayBlowUpCar). Somebody else's
+// car goes to them; one nobody holds is the owner's own engine's to blow up
+// here, and is never sent, or every machine would make a wreck of its own.
+inline constexpr CarWordTo WhereTheWreckGoes(CarSimulator sim) {
+	return sim.where == CarSim::Player ? CarWordTo::OnePlayer : CarWordTo::Nobody;
+}
+
 } // namespace coopiii::game

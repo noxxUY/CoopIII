@@ -3,6 +3,7 @@
 
 #include "cargen.h"
 #include "carlife.h"
+#include "crane.h"
 #include "garage.h"
 #include "leadcheck.h"
 #include "teardown.h"
@@ -289,6 +290,8 @@ Site g_sites[] = {
      reinterpret_cast<uintptr_t>(&FindCarSkippingOthers), "the crane's search, overlap list", false},
     {CRANE_MILITARY_REMOVE_CALL, CWorld__Remove,
      reinterpret_cast<uintptr_t>(&CraneRemoves), "the military crane's delivery", false},
+    {CRANE_UPDATE_CALL, CCrane__Update,
+     reinterpret_cast<uintptr_t>(&CraneUpdateHere), "each crane's update", false},
 };
 
 bool RedirectCall(uintptr_t site, uintptr_t from, uintptr_t to) {
@@ -332,6 +335,28 @@ uint8_t DrainVehicleRemovalsImpl(VehicleRemoval *out, uint8_t max) {
 
 
 } // namespace
+
+void *SessionCarHere(uint16_t netId) {
+	if (netId == INVALID_NETID)
+		return nullptr;
+	for (uint8_t i = 0; i < g_rowCount; ++i)
+		if (g_rows[i].netId == netId)
+			return CarAt(g_rows[i].poolHandle);
+	return nullptr;
+}
+
+uint16_t SessionNetIdHere(void *vehicle) {
+	const VehicleRemover *r = RowFor(vehicle);
+	return r ? r->netId : INVALID_NETID;
+}
+
+bool EngineMayTakeCar(void *vehicle) {
+	uint16_t netId   = INVALID_NETID;
+	bool     session = false;
+	return MayTake(vehicle, netId, session);
+}
+
+void NoteCarTakenAway(uint16_t netId, uint8_t reason) { PushRemoval(netId, reason); }
 
 bool EngineTookCarAway(uint16_t netId) {
 	if (netId == INVALID_NETID)
@@ -438,6 +463,7 @@ void RemoveCarRemovalHooks() {
 		if (s.taken && RedirectCall(s.at, s.ours, s.engine))
 			s.taken = false;
 	RemoveCarGenSeed();
+	ForgetCranes();
 	g_rowCount     = 0;
 	g_pendingCount = 0;
 }
@@ -447,6 +473,7 @@ void AddCarRemovalToBridge(WorldBridge &bridge) {
 	bridge.DrainVehicleRemovals = &DrainVehicleRemovalsImpl;
 	bridge.TakeOverParkedCar    = &TakeOverParkedCar;
 	AddCarGenToBridge(bridge);
+	AddCranesToBridge(bridge);
 }
 
 } // namespace coopiii::game

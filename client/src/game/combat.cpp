@@ -1768,6 +1768,7 @@ void PlayOn(void *entity, uint16_t sound, float volume) {
 // `own` is the shooter's own car or ped here, which is never the hit.
 bool g_glassLead = false;
 bool g_saidGlass = false;
+bool g_drawingRemoteRound = false;
 
 using GlassHitFn = void(__cdecl *)(void *, float, float, float);
 
@@ -1786,12 +1787,16 @@ void DriveByImpact(const float *source, const float *end, const Vec3 &dir, void 
 	// The window, before the sound, in the engine's own order. The function
 	// looks at the model and does nothing to anything that is not glass.
 	if (g_glassLead && DriveByReachesGlass(type)) {
+		// Somebody else's round, so a cracked window's one in four is the
+		// shooter's roll, not ours (game/glass.h).
+		g_drawingRemoteRound = true;
 		Func<GlassHitFn>(GLASS_HIT_BY_BULLET_LEAD)(victim, point[0], point[1], point[2]);
+		g_drawingRemoteRound = false;
 		if (!g_saidGlass) {
 			g_saidGlass = true;
 			Log("combat: somebody else's drive-by round ended on a building, object or "
 			    "dummy here; handed to CGlass the way their engine did, so a window it "
-			    "hit breaks on this screen too");
+			    "hit cracks on this screen too, and shatters when theirs says it did");
 		}
 	}
 	switch (type) {
@@ -2879,6 +2884,8 @@ uint8_t DrainLocalCombat(CombatEvent *out, uint8_t max) {
 // ---- replaying somebody else's shot ---------------------------------------
 
 bool ReplayingRemoteShot() { return g_replaying; }
+
+bool DrawingRemoteRoundOnGlass() { return g_drawingRemoteRound; }
 
 bool LocalPlayerFiring() { return g_localFiring; }
 

@@ -144,6 +144,16 @@ bool Config::ParseIni(const std::string &text) {
 			showVersion = ParseBool(value, showVersion);
 		} else if (IEquals(key, "missions")) {
 			missions = ParseBool(value, missions);
+		} else if (IEquals(key, "discordpresence")) {
+			discordPresence = ParseBool(value, discordPresence);
+		} else if (IEquals(key, "discordappid")) {
+			// Digits only: an id is a snowflake, and anything else is a typo
+			// better left at the built-in one.
+			bool digits = !value.empty() && value.size() <= 20;
+			for (const char c : value)
+				digits = digits && c >= '0' && c <= '9';
+			if (digits)
+				discordAppId = std::strtoull(value.c_str(), nullptr, 10);
 		} else if (IEquals(key, "password")) {
 			// Control characters out and no longer than the packet carries,
 			// the way the server cleans its own.

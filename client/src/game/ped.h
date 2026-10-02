@@ -170,6 +170,16 @@ uint16_t ReadPedBaseAnim(void *ped);
 // m_nMoveState, is what makes a non-player ped walk (§1.13.4).
 bool BlendReplicaAnim(void *ped, uint16_t animId);
 
+// The talk or wait-state overlay (chat, hail a taxi, hands up, cower, duck) on
+// a ped's clump, or ANIM_NONE. What C_PedOverlay says; the whole-body animId
+// above cannot, these are ASSOC_PARTIAL.
+uint16_t ReadPedOverlayAnim(void *ped);
+
+// Plays that overlay on a replica, or fades it for ANIM_NONE; `applied` is what
+// this machine last put there. Safe to call every frame. False when it could
+// not be played (no room on the clump, an id the animations do not have).
+bool ApplyReplicaOverlay(void *ped, uint16_t animId, uint16_t &applied);
+
 // Should the replica's base animation be blended this frame: the id changed,
 // or it is one of the four looping locomotion ids (walk, run, sprint, idle)
 // and nothing with it is live on the clump any more. Our engine takes a

@@ -440,7 +440,8 @@ private:
 // The blips that are made by an instruction naming a car, a char or an object:
 // put back for the same one, or it is another blip.
 inline bool AddNamesEntity(uint16_t opcode) {
-	return opcode == 0x0186 || opcode == 0x0187 || opcode == 0x0188 || opcode == 0x0162;
+	return opcode == 0x0186 || opcode == 0x0187 || opcode == 0x0188 || opcode == 0x0162 ||
+	       opcode == 0x0161;
 }
 
 class BlipAliases {

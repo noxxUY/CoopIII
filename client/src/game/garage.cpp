@@ -533,7 +533,26 @@ bool InstallGarageHook() {
 	return ok;
 }
 
+// The mission garage our script has pointed at this car (SET_TARGET_CAR_FOR_
+// MISSION_GARAGE), or -1: the garage that takes it away when somebody else's
+// copy of it is delivered there (GARAGE_MISSION's GS_CLOSING arm, the one
+// whose delivery is DestroyVehicleAndDriverAndPassengers, carremoval.h).
+// Read off aGarages alone, so it answers with the Update detour off too.
+static int MissionGarageWaitingForImpl(int32_t poolHandle) {
+	void *const car = Func<void *(__cdecl *)(int32_t)>(CPools__GetVehicle)(poolHandle);
+	if (!car)
+		return -1;
+	for (size_t i = 0; i < NUM_GARAGES; ++i) {
+		const uint8_t *g = Ptr<uint8_t>(CGarages__aGarages + i * SIZEOF_GARAGE);
+		if (g[offs::GARAGE_TYPE] == GARAGE_MISSION &&
+		    *reinterpret_cast<void *const *>(g + offs::GARAGE_TARGET) == car)
+			return static_cast<int>(i);
+	}
+	return -1;
+}
+
 void AddGaragesToBridge(WorldBridge &bridge) {
+	bridge.MissionGarageWaitingFor = &MissionGarageWaitingForImpl;
 	if (!g_garageUpdate.IsInstalled())
 		return;
 	bridge.SampleLocalGarages  = &SampleLocalGaragesImpl;

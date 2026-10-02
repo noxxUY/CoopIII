@@ -451,7 +451,17 @@ public:
 	// `garage` now, and a respray there, or a plane of `shotDown` brought
 	// down, nobody has asked about yet, which asking takes.
 	bool GarageHasCarElsewhere(uint8_t garage) const;
+	// The owner's side: participant `playerId`'s mission garage `garage` has
+	// just taken the car away (C_VehicleRemoved, VEHICLE_REMOVED_MISSION, for
+	// the car our garage of that number is waiting for). That garage holds
+	// the car there from now on, and is counted so at once, ahead of the
+	// answers that will say it: the removal deletes our copy of the car, and
+	// the script asks IS_CAR_DEAD of it right after the garage question. The
+	// participant's next answers overwrite it as any of theirs do.
+	void CarDeliveredElsewhere(uint8_t playerId, uint8_t garage, uint8_t localPlayerId);
 	bool TakeResprayElsewhere(uint8_t garage);
+	// The same respray, looked at and left for a later Take.
+	bool ResprayElsewhere(uint8_t garage) const;
 	bool TakeShotDownElsewhere(uint16_t plane);
 	// This machine is in somebody else's running mission, its game in none
 	// of its own: what asks its garages for the owner.
@@ -523,6 +533,9 @@ public:
 	// Missions of the log this game's own save had passed already, and so
 	// left as it has them (protocol.h, CAMPAIGN_VALUE_LATCH).
 	uint32_t CampaignKeptOwn() const { return m_campaignKeptOwn; }
+	// Side jobs' values and progress points left out here because this
+	// game's own were further on (sideprogress.h).
+	uint32_t CampaignSideKept() const { return m_sideKept; }
 	// The text key of the session's newest passed mission: the
 	// REGISTER_MISSION_PASSED (0318) of the newest delta from main.scm `hash`
 	// that carries one, applied here or not. `key` gets the eight bytes and a
@@ -579,6 +592,8 @@ private:
 	// This game's own save has passed that mission: it holds every latch the
 	// mission's parts set, and there is one at least.
 	bool PassedHere(size_t start, size_t end, uint32_t hash) const;
+	// A side job's progress points count in this game (sideprogress.h).
+	bool SideProgressHere(size_t start, size_t end, uint32_t hash) const;
 
 	template <class T>
 	void Out(const T &pkt, Channel ch) {
@@ -725,6 +740,7 @@ private:
 	uint32_t m_life            = 0;
 	uint32_t m_campaignApplied = 0;
 	uint32_t m_campaignKeptOwn = 0;
+	uint32_t m_sideKept        = 0;
 	bool     m_saidOtherScript = false;
 
 	// The session's Import/Export and crane lists as the server last said,

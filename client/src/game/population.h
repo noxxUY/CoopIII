@@ -147,6 +147,19 @@ void KeepMissionEntitiesHosted(uint32_t nowMs);
 // of them are cars.
 size_t MissionEntitiesKept(size_t *cars);
 
+// What the mission lets go of (game/missionclear.h, protocol.h
+// C_MissionRelease). Once a frame on the owner: every pedestrian and car
+// hosted here as the mission's that its engine no longer holds as created by
+// the mission (marked no longer needed, the mission's cleanup) stops being the
+// mission's here, and its row is queued for the session. NoteOwnMissionOver
+// is called when this machine's own session mission ends: everything still
+// hosted as the mission's then goes in a last batch, flagged final once
+// every one of them has a name or MISSION_FINAL_WAIT_MS has passed. Returns
+// how many rows went into `out`; `final` is set on the call that empties the
+// queue of that last batch.
+void     NoteOwnMissionOver(uint32_t nowMs);
+uint32_t DrainMissionRelease(MissionReleaseRow *out, uint32_t max, bool &final);
+
 // Every live pedestrian the session's mission made here, at most `max` of
 // them: HostedPedFor's liveness test, named by the session or not yet.
 size_t HostedMissionPeds(void **out, size_t max);

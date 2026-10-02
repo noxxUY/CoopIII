@@ -211,8 +211,14 @@ LRESULT CALLBACK ChatWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		if (static_cast<int>(wp) == g_listKey && InAGame())
 			ToggleScoreboardPin();
 	}
-	return g_wide ? CallWindowProcW(g_prevProc, hwnd, msg, wp, lp)
-	              : CallWindowProcA(g_prevProc, hwnd, msg, wp, lp);
+	const LRESULT result = g_wide ? CallWindowProcW(g_prevProc, hwnd, msg, wp, lp)
+	                              : CallWindowProcA(g_prevProc, hwnd, msg, wp, lp);
+	// The game's key handler has had the key and pushed it into its cheat
+	// buffer, or not: one of CoopIII's own cheats is read off that buffer
+	// (cheats.h, NoticeTypedKeys).
+	if (msg == WM_KEYDOWN)
+		NoticeTypedKeys();
+	return result;
 }
 
 // The game's window, once it is active and belongs to this thread - the one

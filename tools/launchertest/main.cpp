@@ -160,6 +160,34 @@ void TestIni() {
 	          ReadWhole(path).find("password = open") != std::string::npos,
 	      "and the launcher's own writes leave it as it was");
 
+	// The Discord switch: read the way the client reads it, written on its own.
+	bool discord = true;
+	ReadIni(path, nullptr, nullptr, nullptr, nullptr, &discord);
+	Check(discord, "no discordPresence in the file leaves it on");
+	Check(UpdateIniDiscord(path, false), "discordPresence is written");
+	const std::string offText = ReadWhole(path);
+	Check(offText.find("discordPresence = false") != std::string::npos, "as false");
+	Check(offText.find("host = 192.168.1.40") != std::string::npos &&
+	          offText.find("nametagScale = 2.0") != std::string::npos,
+	      "and nothing else moves");
+	ReadIni(path, nullptr, nullptr, nullptr, nullptr, &discord);
+	Check(!discord, "and reads back off");
+	Check(UpdateIniDiscord(path, true), "and on again");
+	const std::string onText = ReadWhole(path);
+	Check(onText.find("discordPresence = true") != std::string::npos &&
+	          onText.find("discordPresence = false") == std::string::npos,
+	      "in the same line rather than a second one");
+	Write(path, "discordPresence = OFF\n");
+	discord = true;
+	ReadIni(path, nullptr, nullptr, nullptr, nullptr, &discord);
+	Check(!discord, "any spelling the client takes, any case");
+	Write(path, "discordPresence = maybe\n");
+	ReadIni(path, nullptr, nullptr, nullptr, nullptr, &discord);
+	Check(!discord, "and one it does not leaves it as it was");
+	Check(UpdateIni(path, "1.2.3.4", 1234, "kiko") &&
+	          ReadWhole(path).find("discordPresence = maybe") != std::string::npos,
+	      "the form's own write leaves it alone");
+
 	// A missing file is created, and reads like a config rather than three
 	// bare lines.
 	DeleteFileA(path.c_str());

@@ -76,12 +76,17 @@ Checks RunChecks(const std::string &gameDir);
 bool UpdateIni(const std::string &path, const std::string &host, int port,
                const std::string &nick);
 
+// The same, for `discordPresence`: whether the game shows as CoopIII in
+// Discord (client/src/presence.h).
+bool UpdateIniDiscord(const std::string &path, bool on);
+
 // Reads host, port and nick back out, for filling the form in, and the
 // server's password, for the lobby. Missing keys leave their argument alone.
 // The password is cleaned the way the client cleans it: control characters
-// out, and no longer than C_Password carries.
+// out, and no longer than C_Password carries. `discordPresence` is read the
+// way the client reads it, and a value it cannot read leaves it alone too.
 void ReadIni(const std::string &path, std::string *host, uint16_t *port, std::string *nick,
-             std::string *password = nullptr);
+             std::string *password = nullptr, bool *discordPresence = nullptr);
 
 // ---- validation -----------------------------------------------------------
 

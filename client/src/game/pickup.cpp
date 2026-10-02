@@ -163,12 +163,16 @@ bool IsSkull(size_t slot) {
 // hospital's "i" started the scene on the machine of whoever was in Portland
 // View next, and put the help box up on everybody's screen; and a ONCE one
 // taken by somebody else was gone for good here.
+//
+// And a safehouse's reward rack, each save's own (pickup.h, OnHideoutRack).
 bool IsPersonal(size_t slot) {
-	return ModelOf(slot) == ModelIndexGlobal(MI_PICKUP_INFO);
+	const float *p = PosOf(slot);
+	return ModelOf(slot) == ModelIndexGlobal(MI_PICKUP_INFO) || OnHideoutRack(p[0], p[1], p[2]);
 }
 
 bool IsPersonalIdent(const PickupIdent &ident) {
-	return ident.modelIndex == ModelIndexGlobal(MI_PICKUP_INFO);
+	return ident.modelIndex == ModelIndexGlobal(MI_PICKUP_INFO) ||
+	       OnHideoutRack(ident.pos.x, ident.pos.y, ident.pos.z);
 }
 
 // The skull's own gate out of CPickup::Update, asked with the engine's own
@@ -1275,6 +1279,14 @@ bool PickupStillUp(int32_t handle) {
 	if (slot >= NUM_PICKUPS || GenerationOf(slot) != static_cast<uint16_t>(bits >> 16))
 		return false;
 	return PickupType(slot) != PICKUP_NONE && Removed(slot) == 0;
+}
+
+bool PickupObjectUp(int32_t handle) {
+	if (!PickupStillUp(handle))
+		return false;
+	const size_t slot = static_cast<uint32_t>(handle) & 0xFFFFu;
+	return Field<void *>(Ptr<uint8_t>(CPickups__aPickUps + slot * SIZEOF_PICKUP),
+	                     offs::PICKUP_OBJECT) != nullptr;
 }
 
 bool PickupInUse(int32_t handle) {

@@ -1633,6 +1633,48 @@ void TestObjectRecordsLiveWhileSomebodyIsNear() {
 	Check(r.Find(newest) && !r.Find(oldest), "and the oldest report makes room");
 }
 
+void TestAShatteredWindowIsKeptAsItsRecord() {
+	std::printf("a shattered window is kept as an object record\n");
+	GlassBreakBody glass{};
+	glass.ident.pos        = {-21.5f, -1180.25f, 26.0f};
+	glass.ident.modelIndex = 1390;
+	glass.ident.pad0       = 9;
+	glass.amount           = 10000.0f;
+	glass.speed            = {0.3f, 0.0f, 0.0f};
+	glass.flags            = GLASS_BREAK_EXPLOSION;
+	const ObjectBreakBody body = GlassRecordBody(glass);
+	Check(body.state == OBJ_BREAK_GLASS && body.amount == 10000.0f &&
+	          body.ident.modelIndex == 1390 && body.ident.pos.y == -1180.25f &&
+	          body.ident.pad0 == 0,
+	      "the window's ident and amount, and the glass bit for a state");
+
+	glass.amount = std::numeric_limits<float>::quiet_NaN();
+	Check(GlassRecordBody(glass).amount == 0.0f, "an amount that is not a number is kept as 0");
+
+	ObjectRecords r;
+	r.NoteBroken(1, body, 10);
+	r.NoteBroken(2, GlassRecordBody(glass), 20);
+	const ObjectRecord *got = r.Find(glass.ident);
+	Check(got && r.Count() == 1 && got->breakBody.state == OBJ_BREAK_GLASS &&
+	          got->breakBody.amount == 10000.0f && !got->hasRest,
+	      "two machines that both shattered it are one record, with nowhere it lies");
+
+	C_GlassBroken in{};
+	in.hdr.opcode = C_GlassBroken::OPCODE;
+	in.body       = glass;
+	Message m;
+	m.opcode  = C_GlassBroken::OPCODE;
+	m.channel = CH_EVENT;
+	m.data.assign(reinterpret_cast<const uint8_t *>(&in),
+	              reinterpret_cast<const uint8_t *>(&in) + sizeof in);
+	Check(m.as<C_GlassBroken>() != nullptr && m.as<C_ObjectBroken>() == nullptr,
+	      "the server reads a shatter as a shatter and never as a street object's break");
+	m.data.pop_back();
+	Check(m.as<C_GlassBroken>() == nullptr, "a byte short is not a packet");
+	Check(sizeof(S_GlassBroken) == sizeof(C_GlassBroken) + 1,
+	      "the relay is the shatter plus the sender's id and nothing else");
+}
+
 void TestARespawningPickupComesBackAndAOnceDoesNot() {
 	std::printf("the server owns availability, and the window is the type's\n");
 	Session s;
@@ -2340,6 +2382,61 @@ void TestAHitOnACarNobodyHoldsMakesTheShooterItsCustodian() {
 	Check(s.CustodyForHit(car2->netId, 7) == HC::NotTheirs &&
 	          s.CustodianOf(car2->netId) == INVALID_PLAYER,
 	      "nor a player there isn't");
+}
+
+// ---- ramming somebody else's car (docs/protocol.md §1.71) ------------------
+void TestARamGoesToWhoeverSimulatesTheCar() {
+	std::printf("\na ram goes to the machine simulating the car that was hit\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	Player *carol = Join(s, 3, "carol");
+	alice->alive = bob->alive = carol->alive = true;
+	// By netId: the table moves as cars are added.
+	const uint16_t alices = Claim(s, *alice, 90)->netId;
+	const uint16_t bobs   = Claim(s, *bob, 91)->netId;
+	const uint32_t now = 1000;
+
+	Check(s.VehicleBumpRecipient(alices, bobs, bob->id, now) == alice,
+	      "bob's car into alice's goes to alice");
+	Check(s.VehicleBumpRecipient(alices, bobs, carol->id, now) == nullptr,
+	      "only from the driver of the car that did it");
+	Check(s.VehicleBumpRecipient(bobs, bobs, bob->id, now) == nullptr,
+	      "a car does not ram itself");
+	bob->alive = false;
+	Check(s.VehicleBumpRecipient(alices, bobs, bob->id, now) == nullptr,
+	      "nor from a dead driver");
+	bob->alive = true;
+
+	// Nobody holds it: the shove's business, not this.
+	const uint16_t parked =
+	    s.AddVehicle(92, 1, 1, Vec3{12.0f, 10.0f, 1.0f}, Quat{0.0f, 0.0f, 0.0f, 1.0f})->netId;
+	Check(s.VehicleBumpRecipient(parked, bobs, bob->id, now) == nullptr,
+	      "a car nobody holds is not bumped");
+
+	// Traffic goes to its host.
+	AmbientCar *traffic = s.AddCar(carol->id, CarBody(93, 11.0f));
+	traffic->body.pos   = Vec3{11.0f, 12.0f, 1.0f};
+	Check(s.VehicleBumpRecipient(traffic->netId, bobs, bob->id, now) == carol,
+	      "carol's traffic goes to carol");
+	Check(s.VehicleBumpRecipient(traffic->netId, alices, alice->id, now) == carol,
+	      "whoever rams it");
+	traffic->body.pos = Vec3{11.0f, 10.0f + VEHICLE_BUMP_RANGE_M + 5.0f, 1.0f};
+	Check(s.VehicleBumpRecipient(traffic->netId, bobs, bob->id, now) == nullptr,
+	      "but not from across the street");
+
+	// And a player's rams are counted.
+	Player *dave  = Join(s, 4, "dave");
+	dave->alive   = true;
+	const uint16_t daves = Claim(s, *dave, 94)->netId;
+	uint32_t passed = 0;
+	for (int i = 0; i < 2 * VEHICLE_BUMP_MAX_PER_S; ++i)
+		passed += s.VehicleBumpRecipient(alices, daves, dave->id, 5000 + i) ? 1 : 0;
+	Check(passed == VEHICLE_BUMP_MAX_PER_S, "at most VEHICLE_BUMP_MAX_PER_S a second");
+	Check(s.VehicleBumpRecipient(alices, daves, dave->id, 6000) == alice,
+	      "and the next second starts again");
+	Check(s.VehicleBumpRecipient(alices, bobs, bob->id, 5100) == alice,
+	      "each player with his own count");
 }
 
 // ---- shooting somebody else's traffic (docs/protocol.md §1.23) -------------
@@ -4565,6 +4662,9 @@ int RunCarExtrasTests();
 int RunAdoptTests();
 // tools/sessiontest/stuntcam.cpp
 int RunStuntCameraTests();
+int RunSkinRelayTests();
+// tools/sessiontest/cranes.cpp
+int RunCraneWorkerTests();
 // tools/sessiontest/progress.cpp
 int RunProgressTests();
 // tools/sessiontest/publicip.cpp
@@ -4671,10 +4771,10 @@ void TestAMissionStartsWithEverybodyThere() {
 	Check(busy.verdict == MISSION_CLAIM_BUSY && busy.ownerId == alice,
 	      "bob's own marker is refused while alice is waited for");
 
-	Place(s, carol, 140.0f, 130.0f, 10.0f);
+	Place(s, carol, 104.0f, 102.0f, 10.0f);
 	a = ClaimFor(s, alice, marker, 2000);
 	Check(a.verdict == MISSION_CLAIM_GRANTED && a.missing == 0,
-	      "carol 40 m along the street and 30 m across, in a car of her own, is at the start: granted");
+	      "carol a few steps from the marker is at the start: granted");
 	Check(s.Mission().TakeWaitingChange(&w) && w.what == MISSION_WAIT_NONE,
 	      "and the wait is over for everybody");
 
@@ -5020,10 +5120,49 @@ void TestTheOddJobsStartBesideTheOwner() {
 	      "bob in a car of their own beside alice's ambulance is there");
 	s.Mission().SetMarginCm(0);
 	Check(ClaimFor(s, alice, around, 1200).verdict == MISSION_CLAIM_GRANTED,
-	      "with no margin, the start's own 50 m still has him");
+	      "with no margin, the start's own 30 m still has him");
 	Place(s, bob, 50.0f, 110.0f, 5.0f);
 	Check(ClaimFor(s, alice, around, 1400).verdict == MISSION_CLAIM_WAITING,
 	      "60 m up the road is not in it");
+}
+
+void TestAStoryStartWaitsForAnybodyInACar() {
+	std::printf("\na story start waits for anybody still in a car\n");
+	Session       s;
+	const uint8_t alice = Join(s, 1, "alice")->id;
+	const uint8_t bob   = Join(s, 2, "bob")->id;
+	Place(s, alice, 50.0f, 50.0f, 5.0f);
+	Place(s, bob, 55.0f, 50.0f, 5.0f);
+	const MissionArea marker = MissionAreaLocate3D(50.0f, 50.0f, 5.0f, 1.5f, 1.5f, 2.0f);
+	Vehicle *bobsCar = s.AddVehicle(91, 1, 2, Vec3{55.0f, 50.0f, 5.0f}, Quat{0.0f, 0.0f, 0.0f, 1.0f});
+	s.FindById(bob)->vehicleNetId = bobsCar->netId;
+	Check(ClaimFor(s, alice, marker, 1000).verdict == MISSION_CLAIM_WAITING,
+	      "bob parked 5 m from the marker is waited for");
+	s.FindById(bob)->vehicleNetId = INVALID_NETID;
+	Check(ClaimFor(s, alice, marker, 1300).verdict == MISSION_CLAIM_GRANTED,
+	      "once he is out the story starts");
+	Place(s, bob, 50.0f, 60.0f, 5.0f);
+	Check(ClaimFor(s, alice, marker, 1400).verdict == MISSION_CLAIM_WAITING,
+	      "10 m off on foot is past the start's 5 m");
+	bobsCar->pos = Vec3{200.0f, 200.0f, 5.0f};
+	s.FindById(bob)->vehicleNetId = bobsCar->netId;
+	Place(s, bob, 52.0f, 50.0f, 5.0f);
+	Check(ClaimFor(s, alice, marker, 1500).verdict == MISSION_CLAIM_GRANTED,
+	      "a seat in a car far from him is a stale record, not a car he sits in");
+
+	Session       o;
+	const uint8_t carol = Join(o, 1, "carol")->id;
+	const uint8_t dave  = Join(o, 2, "dave")->id;
+	Place(o, carol, 50.0f, 50.0f, 5.0f);
+	Place(o, dave, 55.0f, 50.0f, 5.0f);
+	Vehicle *davesCar = o.AddVehicle(91, 1, 2, Vec3{55.0f, 50.0f, 5.0f}, Quat{0.0f, 0.0f, 0.0f, 1.0f});
+	o.FindById(dave)->vehicleNetId = davesCar->netId;
+	C_MissionClaim job = ClaimAt(MissionAreaAround({50.0f, 50.0f, 5.0f}), 0x5555);
+	job.kind           = MISSION_KIND_ODDJOB;
+	MissionPresence present[MAX_PLAYERS];
+	const size_t    n = o.MissionPresences(present);
+	Check(o.Mission().Claim(carol, job, present, n, 1000).verdict == MISSION_CLAIM_GRANTED,
+	      "an odd job does not care who sits in a car");
 }
 
 // A retry of Give Me Liberty, as the owner's run on 2026-09-24 found it: the
@@ -5095,6 +5234,48 @@ void TestAFinishedMissionsCarsGo() {
 	Check(a && !a->missionMade, "a car still flagged the mission's, taken with none running, is nobody's");
 }
 
+// What the owner's mission lets go of (C_MissionRelease): a row it names loses
+// its mission bit, and after the mission ended what it did not name is gone.
+void TestAMissionLetsGo() {
+	std::printf("\nwhat the owner's mission lets go of\n");
+	Session s;
+	Player *alice = Join(s, 1, "alice");
+	Player *bob   = Join(s, 2, "bob");
+	AmbientCarBody made = CarBody(111, 5.0f);
+	made.flags          = AMBIENT_MISSION;
+	s.Mission().Start(alice->id, 19, s.ConnectedMask());
+	const uint16_t one   = s.AddCar(alice->id, made)->netId;
+	const uint16_t two   = s.AddCar(alice->id, made)->netId;
+	const uint16_t three = s.AddCar(alice->id, made)->netId;
+	const uint16_t his   = s.AddCar(bob->id, made)->netId;
+
+	MissionReleaseRow rows[3] = {{one, AMBIENT_ADOPT_CAR, 0}, {his, AMBIENT_ADOPT_CAR, 0},
+	                             {777, AMBIENT_ADOPT_CAR, 0}};
+	std::vector<MissionReleaseRow> out = s.ReleaseMissionEntities(alice->id, rows, 3, false);
+	Check(out.size() == 1 && out[0].netId == one && out[0].gone == 0 &&
+	          (s.FindCar(one)->body.flags & AMBIENT_MISSION) == 0,
+	      "a car of hers she names is crowd now; bob's and an unknown one are left out");
+	Check((s.FindCar(two)->body.flags & AMBIENT_MISSION) != 0,
+	      "what she did not name is still the mission's");
+
+	out = s.ReleaseMissionEntities(alice->id, nullptr, 0, true);
+	Check(out.empty() && s.FindCar(two) != nullptr,
+	      "a last batch while her mission runs takes nothing");
+
+	s.Mission().End(alice->id, 19, MISSION_OUTCOME_FAILED);
+	out = s.ReleaseMissionEntities(alice->id, nullptr, 0, true);
+	bool twoGone = false, threeGone = false;
+	for (const MissionReleaseRow &r : out) {
+		twoGone   = twoGone || (r.netId == two && r.gone == 1);
+		threeGone = threeGone || (r.netId == three && r.gone == 1);
+	}
+	Check(out.size() == 2 && twoGone && threeGone && s.FindCar(two) == nullptr &&
+	          s.FindCar(three) == nullptr,
+	      "after it ended, the two she holds no more are gone");
+	Check(s.FindCar(one) != nullptr && s.FindCar(his) != nullptr,
+	      "the one let go of and bob's stay");
+}
+
 void TestTheCampaignLogKeepsEveryMission() {
 	std::printf("\nthe campaign log keeps what every mission left\n");
 	CampaignLog log;
@@ -5149,6 +5330,8 @@ int main() {
 	g_failures += RunCarExtrasTests();
 	g_failures += RunAdoptTests();
 	g_failures += RunStuntCameraTests();
+	g_failures += RunSkinRelayTests();
+	g_failures += RunCraneWorkerTests();
 	g_failures += RunProgressTests();
 	g_failures += RunPublicAddressTests();
 	TestAJoinerIsToldWhatEverybodyIsWearing();
@@ -5167,8 +5350,10 @@ int main() {
 	TestTheLobbysOwnBookkeeping();
 	TestACheckpointWaitsForEverybody();
 	TestTheOddJobsStartBesideTheOwner();
+	TestAStoryStartWaitsForAnybodyInACar();
 	TestADeadPlayerIsNotAtTheStart();
 	TestAFinishedMissionsCarsGo();
+	TestAMissionLetsGo();
 	TestTheCampaignLogKeepsEveryMission();
 	TestAJoinerNeverTakesTheHostFromSomeoneStillHere();
 	TestTheLastPlayerOutTakesItWithThem();
@@ -5221,6 +5406,7 @@ int main() {
 	TestARespawningPickupComesBackAndAOnceDoesNot();
 	TestAMovedReservationNamesItsOldHolder();
 	TestObjectRecordsLiveWhileSomebodyIsNear();
+	TestAShatteredWindowIsKeptAsItsRecord();
 	TestABribeGetsItsOwnWindow();
 	TestExpiryDropsOnlyWhatCanComeBack();
 	TestACollectedDropIsForgotten();
@@ -5252,6 +5438,7 @@ int main() {
 	TestFriendlyFireHasNoSayOverCars();
 	TestAHitIsTheInverseOfEveryOtherCarPacket();
 	TestAHitOnTrafficIsRoutedToItsHost();
+	TestARamGoesToWhoeverSimulatesTheCar();
 	TestTrafficThatIsGoneTakesNoHits();
 	TestTrafficAndDrivenHitsDoNotCross();
 	TestARespraysClearTravelsAsADamageReport();

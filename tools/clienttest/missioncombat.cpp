@@ -302,10 +302,56 @@ void TestKeepingQuiet() {
 	Check(SpotsDecoy(walking, 230.0f, -30.0f, 25.0f, 25.0f) &&
 	          !SpotsDecoy(walking, 300.0f, -30.0f, 25.0f, 25.0f),
 	      "the decoy sees anybody within its 25 m, and nobody past it");
+	Check(DecoyMayWidenUnder(SCRIPT_ANDOR_NONE) && DecoyMayWidenUnder(1) && DecoyMayWidenUnder(8) &&
+	          !DecoyMayWidenUnder(SCRIPT_ANDOR_ORS_1) && !DecoyMayWidenUnder(SCRIPT_ANDOR_ORS_1 + 1),
+	      "the decoy's 25 m is anybody's alone and beside its flag in an `if and`");
 	Check(MayForceTrueUnder(SCRIPT_ANDOR_NONE) && MayForceTrueUnder(SCRIPT_ANDOR_ORS_1) &&
 	          MayForceTrueUnder(SCRIPT_ANDOR_ORS_1 + 1) && !MayForceTrueUnder(1) &&
 	          !MayForceTrueUnder(8),
 	      "a condition is only made true alone or in an OR group, never under AND");
+}
+
+void TestTheCarPark() {
+	std::printf("\nWaka-Gashira Wipeout!'s car park, given away by any participant\n");
+	using namespace stealth;
+	Check(CarparkOf(265.5f, -610.5f, 32.5f, 345.5f, -479.5f, 50.0f) == Carpark::Whole &&
+	          CarparkOf(265.5f, -610.5f, 35.0f, 345.5f, -479.5f, 50.0f) == Carpark::Upper,
+	      "the car park and its upper floors are known by their corners");
+	Check(CarparkOf(317.1875f, -603.5f, 33.0f, 332.0f, -593.0625f, 35.0f) == Carpark::None,
+	      "the ramp that starts Kenji's scene is neither");
+	CarparkAsk ask = CarparkAsk::NotColombian;
+	Check(CarparkAskOf(0x00E0, true, -1, &ask) && ask == CarparkAsk::OnFoot,
+	      "NOT IS_PLAYER_IN_ANY_CAR before it: on foot");
+	Check(CarparkAskOf(0x00DE, true, COLOMBIAN_CAR, &ask) && ask == CarparkAsk::NotColombian,
+	      "NOT IS_PLAYER_IN_MODEL #COLUMB before it: not in a Colombian car");
+	Check(!CarparkAskOf(0x00DE, false, COLOMBIAN_CAR, &ask) && !CarparkAskOf(0x0038, false, 0, &ask) &&
+	          !CarparkAskOf(0x00DE, true, 135, &ask),
+	      "anything else before it (a flag, the model without NOT) is not one of them");
+
+	Watcher walking;
+	walking.x = 300.0f, walking.y = -550.0f, walking.z = 37.0f;
+	Check(BlowsCarparkCover(walking, Carpark::Whole, CarparkAsk::OnFoot),
+	      "on foot on the top floor gives it away");
+	Watcher colombian = walking;
+	colombian.seated = true, colombian.carModel = COLOMBIAN_CAR;
+	Check(!BlowsCarparkCover(colombian, Carpark::Whole, CarparkAsk::OnFoot) &&
+	          !BlowsCarparkCover(colombian, Carpark::Upper, CarparkAsk::NotColombian),
+	      "in a Colombian car up there does not");
+	Watcher other = colombian;
+	other.carModel = 90;
+	Check(BlowsCarparkCover(other, Carpark::Upper, CarparkAsk::NotColombian) &&
+	          !BlowsCarparkCover(other, Carpark::Whole, CarparkAsk::OnFoot),
+	      "another car upstairs does, though it is not on foot");
+	Watcher below = other;
+	below.z = 33.0f;
+	Check(!BlowsCarparkCover(below, Carpark::Upper, CarparkAsk::NotColombian) &&
+	          BlowsCarparkCover(below, Carpark::Whole, CarparkAsk::NotColombian),
+	      "on the ground floor only the whole car park's check counts");
+	Watcher outside = walking;
+	outside.x = 250.0f;
+	Check(!BlowsCarparkCover(outside, Carpark::Whole, CarparkAsk::OnFoot) &&
+	          !BlowsCarparkCover(walking, Carpark::None, CarparkAsk::OnFoot),
+	      "nobody outside the car park, and no other box");
 }
 
 void TestSomebodyElsesBlast() {
@@ -407,6 +453,33 @@ void TestTheEngineMachinesAgainstTheImage() {
 	      "gaExplosion: 0x30 of 0x3C at 0x0064E208, live at +24h, place +4, radius +10h, creator +18h");
 }
 
+void TestTheBodycast() {
+	std::printf("\nPlaster Blaster's bodycast, smashed on another machine\n");
+	using namespace game::object;
+	Check(BodyCastHealthForBreak(1000) == 199 && BodyCastHealthForBreak(200) == 199,
+	      "a replayed break leaves the bodycast's health under the 200 its effect waits for");
+	Check(BodyCastHealthForBreak(150) == 150 && BodyCastHealthForBreak(0) == 0,
+	      "and never raises one already lower");
+	std::vector<uint8_t> img;
+	std::string          from;
+	if (!LoadExe(img, from)) {
+		std::printf("  [skipped] no retail gta3.exe; set COOPIII_GTA3_EXE to check it\n");
+		return;
+	}
+	Check(Bytes(img, OBJECT_DAMAGE_READS_MI_BODYCAST, {0x0F, 0xB7, 0x35}) &&
+	          Dword(img, OBJECT_DAMAGE_READS_MI_BODYCAST + 3) == MI_BODYCAST &&
+	          Bytes(img, MI_BODYCAST, {0xFF, 0xFF}),
+	      "ObjectDamage reads MI_BODYCAST, a word at 0x005F5B50, -1 until start-up names it");
+	Check(Bytes(img, OBJECT_DAMAGE_READS_CAST_HEALTH, {0x0F, 0xBF, 0x05}) &&
+	          Dword(img, OBJECT_DAMAGE_READS_CAST_HEALTH + 3) == CObject__nBodyCastHealth &&
+	          Bytes(img, CObject__nBodyCastHealth, {0xE8, 0x03}) && BODYCAST_HEALTH_START == 1000,
+	      "and then nBodyCastHealth, a signed word at 0x005F7D4C that starts at 1000");
+	Check(OBJECT_DAMAGE_READS_MI_BODYCAST > CObject__ObjectDamage &&
+	          OBJECT_DAMAGE_READS_CAST_HEALTH > OBJECT_DAMAGE_READS_MI_BODYCAST &&
+	          Bytes(img, 0x004BB2C2, {0xD9, 0x05, 0x80, 0x7D, 0x5F, 0x00}),
+	      "both inside ObjectDamage's bodycast arm, before its 0.5f");
+}
+
 } // namespace
 
 int RunMissionCombatTests() {
@@ -418,8 +491,10 @@ int RunMissionCombatTests() {
 	TestWhatItIsDoing();
 	TestAgainstTheImage();
 	TestKeepingQuiet();
+	TestTheCarPark();
 	TestSomebodyElsesBlast();
 	TestThePowerPills();
 	TestTheEngineMachinesAgainstTheImage();
+	TestTheBodycast();
 	return g_mcFailures;
 }

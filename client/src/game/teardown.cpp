@@ -1,6 +1,7 @@
 // The engine half of game/teardown.h.
 #include "teardown.h"
 
+#include "missionclear.h"
 #include "ped.h"
 #include "../log.h"
 
@@ -69,9 +70,11 @@ void *LocalPlayerPed() { return Func<void *(__cdecl *)()>(FindPlayerPed)(); }
 bool EndOccupants(void *vehicle) {
 	void *const  me    = LocalPlayerPed();
 	const size_t seats = 1 + offs::VEH_MAX_PASSENGERS;
-	// m_pMyVehicle is set on the way in and on the way out as well as in a
-	// seat, so it is the wider of the two tests.
-	if (me && Field<void *>(me, offs::PED_MY_VEHICLE) == vehicle)
+	// In it, or on the way in or out. Not the last car he got out of, which
+	// m_pMyVehicle goes on naming: its own reference nils that pointer when the
+	// car is deleted, and keeping the car for it left every car a player had
+	// left behind on his screen for ever (game/missionclear.h).
+	if (LocalPlayerAboard(vehicle))
 		return false;
 	for (size_t i = 0; i < seats; ++i)
 		if (me && Field<void *>(vehicle, offs::VEH_DRIVER + i * 4) == me)
@@ -81,19 +84,31 @@ bool EndOccupants(void *vehicle) {
 		void *&seat     = Field<void *>(vehicle, offs::VEH_DRIVER + i * 4);
 		void *const ped = seat;
 		const bool live = ped && PedIsLive(ped);
+		// A mission's character riding in it (a girl following a player's copy
+		// into his car): deleted, the script's next instruction on his handle
+		// reads through the null GetAt gives it.
+		const uint32_t state = live ? Field<uint32_t>(ped, offs::PED_STATE) : 0;
+		const bool aliveMissionChar =
+		    live && Field<uint8_t>(ped, offs::PED_CHAR_CREATED_BY) == CHAR_CREATED_BY_MISSION &&
+		    state != PEDSTATE_DIE && state != PEDSTATE_DEAD;
 		const OccupantEnd end =
 		    HowToEndOccupant(ped != nullptr, false, live,
-		                     live && Field<void *>(ped, offs::PED_MY_VEHICLE) == vehicle);
+		                     live && Field<void *>(ped, offs::PED_MY_VEHICLE) == vehicle,
+		                     aliveMissionChar);
 		if (end == OccupantEnd::None)
 			continue;
 		if (!g_saidOccupant) {
 			g_saidOccupant = true;
 			Log("teardown: a car we are taking away still had somebody in seat %u; %s",
 			    static_cast<unsigned>(i),
-			    end == OccupantEnd::FlagPed ? "handed them to the engine the way its own "
-			                                  "garage delivery does"
-			                                : "emptied the seat, the ped in it is gone");
+			    end == OccupantEnd::FlagPed     ? "handed them to the engine the way its own "
+			                                      "garage delivery does"
+			    : end == OccupantEnd::PutOnFoot ? "a mission's character, put on foot where "
+			                                      "he sat, alive"
+			                                    : "emptied the seat, the ped in it is gone");
 		}
+		if (end == OccupantEnd::PutOnFoot)
+			PutPedOnFoot(ped, /*leftASeat=*/true);
 		if (end == OccupantEnd::FlagPed) {
 			void *const *vt = *reinterpret_cast<void *const *const *>(ped);
 			reinterpret_cast<ThisFn>(vt[VTABLE_FLAG_TO_DESTROY])(ped);
@@ -126,8 +141,23 @@ void DeleteThroughVtable(void *entity) {
 
 } // namespace
 
+bool LocalPlayerAboard(const void *vehicle) {
+	void *const me = LocalPlayerPed();
+	if (!me || !vehicle)
+		return false;
+	return LocalAboardCar(Field<void *>(me, offs::PED_MY_VEHICLE) == vehicle,
+	                      Field<uint8_t>(me, offs::PED_IN_VEHICLE) != 0,
+	                      Field<uint32_t>(me, offs::PED_STATE));
+}
+
 EntityState VehicleState(void *vehicle) {
 	return StateIn(CPools__ms_pVehiclePool, offs::SIZEOF_AUTOMOBILE, vehicle);
+}
+
+bool PedPoolHasRoom() {
+	auto *const pool = Global<uint8_t *>(CPools__ms_pPedPool);
+	return pool && PoolHasFreeSlot(Field<uint8_t *>(pool, object::POOL_FLAGS),
+	                               Field<int32_t>(pool, object::POOL_SIZE));
 }
 
 EntityState PedState(void *ped) {

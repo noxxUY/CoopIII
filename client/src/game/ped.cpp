@@ -4,6 +4,7 @@
 #include "animcb.h"
 #include "animrevive.h"
 #include "boat.h"
+#include "bump.h"
 #include "carremoval.h"
 #include "carstatus.h"
 #include "clock.h"
@@ -3478,7 +3479,11 @@ bool BeginJackRemotePed(RemotePlayer &player, int32_t carHandle, uint8_t doorSea
 		// there, and every other screen puts him where his seat is.
 		uint16_t hostedNet = INVALID_NETID;
 		if (victim && victim != PlayerPed() && HostedPedNetIdFor(victim, hostedNet) &&
-		    Field<uint32_t>(victim, offs::PED_STATE) == PEDSTATE_DRIVING) {
+		    Field<uint32_t>(victim, offs::PED_STATE) == PEDSTATE_DRIVING &&
+		    Field<bool>(victim, offs::PED_IN_VEHICLE) &&
+		    Field<void *>(victim, offs::PED_MY_VEHICLE) == car && DoorForSeat(doorSeat) != 0) {
+			// BeingDraggedFromCar reads m_pMyVehicle with no test, and a
+			// door outside the four calls SetFinishCallback on a null anim.
 			using DragFn = void(__thiscall *)(void *, void *, uint32_t, uint8_t);
 			Func<DragFn>(CPed__SetBeingDraggedFromCar)(victim, car, DoorForSeat(doorSeat), 0);
 			static bool saidDragged = false;
@@ -4949,6 +4954,78 @@ bool BlendReplicaAnim(void *ped, uint16_t animId) {
 	           clump, plan.group, static_cast<int>(animId), plan.blendDelta) != nullptr;
 }
 
+// The talk or wait-state overlay on a ped's clump (protocol.h,
+// IsPedOverlayAnim), or ANIM_NONE: the strongest one that is still blended in.
+// ReadPedBaseAnim cannot see these, they are ASSOC_PARTIAL.
+uint16_t ReadPedOverlayAnim(void *ped) {
+	if (!ped)
+		return ANIM_NONE;
+	void *const clump = ClumpOf(ped);
+	if (!clump)
+		return ANIM_NONE;
+	uint16_t best      = ANIM_NONE;
+	float    bestBlend = 0.0f;
+	ForEachAnim(clump, [&](void *assoc) {
+		const int32_t id    = Field<int32_t>(assoc, ANIM_ID);
+		const float   blend = Field<float>(assoc, ANIM_BLEND_AMOUNT);
+		if (id < 0 || id >= ANIM_NONE || !IsPedOverlayAnim(static_cast<uint16_t>(id)))
+			return;
+		if (blend > bestBlend) {   // not NaN, not faded out
+			bestBlend = blend;
+			best      = static_cast<uint16_t>(id);
+		}
+	});
+	return best;
+}
+
+// Puts a talk or wait-state overlay on a replica, or takes it off for
+// ANIM_NONE. Does nothing when it is already playing, so it can be called every
+// frame: blending a live one again would keep restarting its crossfade. The
+// blend is CPed::SetWaitState's own (ASSOCGRP_STD, 4.0), the animation's flags
+// from its definition (chat repeats), and the clump's room is checked as
+// BlendReplicaAnim does.
+bool ApplyReplicaOverlay(void *ped, uint16_t animId, uint16_t &applied) {
+	if (!ped)
+		return false;
+	void *const clump = ClumpOf(ped);
+	if (!clump)
+		return false;
+
+	if (animId == ANIM_NONE) {
+		if (applied == ANIM_NONE)
+			return true;
+		if (void *const assoc = FindAnimById(clump, applied)) {
+			Field<float>(assoc, ANIM_BLEND_DELTA) = -4.0f;
+			Field<int32_t>(assoc, ANIM_FLAGS) |= ASSOC_DELETEFADEDOUT;
+		}
+		applied = ANIM_NONE;
+		return true;
+	}
+
+	if (!IsPedOverlayAnim(animId) || AnimGroupCount(ASSOCGRP_STD) <= animId)
+		return false;
+	if (applied != ANIM_NONE && applied != animId)
+		ApplyReplicaOverlay(ped, ANIM_NONE, applied);
+	if (LookForAnim(clump, animId).life == AnimLife::LIVE) {
+		applied = animId;
+		return true;
+	}
+	if (!FindAnimById(clump, animId)) {
+		const int count = CountAnims(clump);
+		if (!AnimClumpHasRoom(count)) {
+			const int dropped =
+			    PruneAnims(clump, animId, ANIM_NONE, VehicleAnimOf(ped), AnimClumpSurplus(count));
+			if (!AnimClumpHasRoom(count - dropped))
+				return false;
+		}
+	}
+	using BlendFn = void *(__cdecl *)(void *, int, int, float);
+	if (!Func<BlendFn>(CAnimManager__BlendAnimation)(clump, ASSOCGRP_STD, static_cast<int>(animId), 4.0f))
+		return false;
+	applied = animId;
+	return true;
+}
+
 bool g_saidSeatKept = false;
 
 bool KeepSeatedPose(void *ped) {
@@ -5103,6 +5180,10 @@ WorldBridge MakeWorldBridge() {
 	b.VehicleAtRest         = &VehicleAtRest;
 	b.VehicleBurning        = &VehicleBurning;
 	b.VehiclePushedByUs     = &VehiclePushedByUs;
+	// Ramming somebody else's car (game/bump.h).
+	b.ReadCopyContact       = &ReadCopyContact;
+	b.ReadVehiclePose       = &ReadVehiclePose;
+	b.ApplyVehicleBump      = &ApplyVehicleBump;
 	b.VehicleSinking        = &VehicleSinking;
 	b.VehicleOnItsRoof      = &VehicleOnItsRoof;
 	b.ReadVehicleColours    = &ReadVehicleColours;

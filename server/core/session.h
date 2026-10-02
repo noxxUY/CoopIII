@@ -86,6 +86,11 @@ struct Player {
 	bool        saidDesync     = false;
 	uint32_t    desyncSaidAtMs = 0;
 
+	// How many rams this player's car has reported in the current second
+	// (VehicleBumpRecipient), against VEHICLE_BUMP_MAX_PER_S.
+	uint32_t    bumpSecondMs = 0;
+	uint8_t     bumpsThisSecond = 0;
+
 	// Which garages this player's own machine has away from rest, one bit
 	// per garage (docs/protocol.md §1.16).
 	//
@@ -991,6 +996,18 @@ public:
 	// starts with none of the last try's cars on anybody's screen.
 	std::vector<uint16_t> ReleaseMissionCars();
 
+	// What `ownerId`'s mission lets go of (protocol.h, C_MissionRelease).
+	// Each row of the owner's that is still AMBIENT_MISSION has the bit
+	// cleared and comes back with `gone` 0; a row that is somebody else's, or
+	// not the mission's, or unknown is left out. With `final`, and unless a
+	// mission of the owner's runs again already, every row of the owner's
+	// still marked AMBIENT_MISSION after that is removed and comes back with
+	// `gone` 1: the owner no longer holds it. What comes back is what
+	// everybody else is told.
+	std::vector<MissionReleaseRow> ReleaseMissionEntities(uint8_t ownerId,
+	                                                      const MissionReleaseRow *rows,
+	                                                      size_t count, bool final);
+
 	// ---- ambient peds ------------------------------------------------------
 	//
 	// docs/population.md §1.2. The server's whole job here is naming: a
@@ -1164,6 +1181,21 @@ public:
 	// table, so a hit that was in flight across the promotion is dropped
 	// rather than rerouted. docs/protocol.md §1.23.
 	Player *CarHitRecipient(uint16_t netId, uint8_t byPlayerId);
+
+	// Who should hear that the car `byNetId`, at whose wheel `byPlayerId` is,
+	// rammed car `netId` (protocol.h, C_VehicleBump), or null.
+	//
+	// The sender has to be alive and the recorded driver of `byNetId`: what
+	// happened in the collision is his engine's say only because it was his
+	// car. The car that was hit goes by the rule a hit on it goes by - a
+	// session car to its driver or custodian (VehicleHitRecipient), traffic to
+	// its host (CarHitRecipient) - so never to the sender, never for a wreck,
+	// and never for a car nobody holds, which the shove already settles. Both
+	// cars have to be within VEHICLE_BUMP_RANGE_M of each other where the
+	// session last had them, and a player gets VEHICLE_BUMP_MAX_PER_S a
+	// second; one that passes is counted against that.
+	Player *VehicleBumpRecipient(uint16_t netId, uint16_t byNetId, uint8_t byPlayerId,
+	                             uint32_t nowMs);
 
 	const std::vector<AmbientCar> &Cars() const { return m_cars; }
 

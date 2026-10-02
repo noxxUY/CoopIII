@@ -7,13 +7,17 @@
 // run, what a receiver calls to arrive where the typist's machine was left,
 // and that the car refusals BANGBANGBANG runs into are decided on the car.
 
+#include "chatfeed.h"
 #include "client.h"
 #include "game/cheats.h"
+#include "game/nametag.h"
+#include "game/tpto.h"
 #include "game/vehicle.h"
 #include "game/wreckqueue.h"
 
 #include <coopiii/protocol.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -163,20 +167,32 @@ void TestNoCheatFiresAnotherOnTheWay() {
 // sends. Letters arrive in the line in lower case, the way ToUnicode gives
 // them without Shift.
 struct ChatKeyboard {
-	Keyboard                 engine;
+	// The game's cheats as the running code compares them (cheats.h,
+	// TypedCheatTable), retail's unless a test hands another plugin's.
+	TypedCheatTable          table = TableFromSites();
+	char                     buffer[KEYBOARD_CHEAT_STRING_LEN] = {};
 	bool                     open = false;
 	std::string              line;
-	std::vector<uint8_t>     fired;
+	std::vector<uint8_t>     fired;   // the game's, by CheatId
+	std::vector<std::string> coop;    // CoopIII's own, as typed: "TPTO3"
 	std::vector<std::string> sent;
 
+	ChatKeyboard() = default;
+	explicit ChatKeyboard(const TypedCheatTable &t) : table(t) {}
+
+	// A key the engine pushes, and what the buffer then completes: the game's
+	// rows fire, and ours are read off the buffer as NoticeTypedKeys does.
 	void Engine(char c) {
-		const std::vector<uint8_t> f = engine.Key(c);
-		fired.insert(fired.end(), f.begin(), f.end());
+		PushCheatChar(buffer, c);
+		const TypedMatch m = MatchTyped(table, buffer);
+		fired.insert(fired.end(), m.engine, m.engine + m.engineCount);
+		if (m.hasCoop)
+			coop.push_back(std::string(COOP_CHEATS[m.coop.id].word) + m.coop.arg);
 	}
 
 	void Key(char c) {
 		if (!open) {
-			if (c == 'T' && !ChatKeyFinishesCheat(engine.buffer, 'T')) {
+			if (c == 'T' && !ChatKeyFinishesCheat(table, buffer, 'T')) {
 				open = true;
 				line.clear();
 				return;
@@ -187,8 +203,7 @@ struct ChatKeyboard {
 		line += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
 		char    keys[KEYBOARD_CHEAT_STRING_LEN];
 		uint8_t count = 0;
-		if (CheatFinishedInChatLine(engine.buffer, 'T', line.c_str(), keys, &count) <
-		    CHEAT_COUNT) {
+		if (CheatFinishedInChatLine(table, buffer, 'T', line.c_str(), keys, &count)) {
 			for (uint8_t i = 0; i < count; ++i)
 				Engine(keys[i]);
 			open = false;
@@ -259,12 +274,12 @@ void TestEveryCheatCanBeTypedPastTheChatKey() {
 
 	ChatKeyboard gesundheit;
 	gesundheit.Type("GESUNDHEI");
-	Check(ChatKeyFinishesCheat(gesundheit.engine.buffer, 'T'),
+	Check(ChatKeyFinishesCheat(gesundheit.table, gesundheit.buffer, 'T'),
 	      "the T after GESUNDHEI finishes a cheat, so it goes to the game");
 	ChatKeyboard fresh;
-	Check(!ChatKeyFinishesCheat(fresh.engine.buffer, 'T'),
+	Check(!ChatKeyFinishesCheat(fresh.table, fresh.buffer, 'T'),
 	      "a T on its own finishes nothing and opens the line");
-	Check(!ChatKeyFinishesCheat(gesundheit.engine.buffer, '\0'),
+	Check(!ChatKeyFinishesCheat(gesundheit.table, gesundheit.buffer, '\0'),
 	      "a chat key the engine pushes nothing for never finishes a cheat");
 
 	ChatKeyboard scotland;
@@ -317,22 +332,317 @@ void TestChatTextNeverStartsACheat() {
 	Check(urtoise.fired == std::vector<uint8_t>{CHEAT_ARMOUR} && !urtoise.open,
 	      "TURTOISE finishes on its E, before anything after it can join the line");
 
-	char    keys[KEYBOARD_CHEAT_STRING_LEN];
-	uint8_t count = 0;
-	char    buffer[KEYBOARD_CHEAT_STRING_LEN] = {};
-	Check(CheatFinishedInChatLine(buffer, 'T', "urtoise", keys, &count) == CHEAT_ARMOUR &&
+	const TypedCheatTable retail = TableFromSites();
+	char                  keys[KEYBOARD_CHEAT_STRING_LEN];
+	uint8_t               count = 0;
+	char                  buffer[KEYBOARD_CHEAT_STRING_LEN] = {};
+	TypedMatch            what;
+	Check(CheatFinishedInChatLine(retail, buffer, 'T', "urtoise", keys, &count, &what) &&
+	          what.engineCount == 1 && what.engine[0] == CHEAT_ARMOUR && !what.hasCoop &&
 	          count == 8 && std::memcmp(keys, "TURTOISE", 8) == 0,
 	      "the keys handed to the game are the chat key and the line, in capitals");
-	Check(CheatFinishedInChatLine(buffer, 'T', "Ur ToIse", keys, &count) == CHEAT_COUNT &&
-	          count == 0,
+	Check(!CheatFinishedInChatLine(retail, buffer, 'T', "Ur ToIse", keys, &count) && count == 0,
 	      "a space is not a letter of any cheat");
-	Check(CheatFinishedInChatLine(buffer, 'T', "", keys, &count) == CHEAT_COUNT,
+	Check(!CheatFinishedInChatLine(retail, buffer, 'T', "", keys, &count),
 	      "an empty line is nothing");
-	Check(CheatFinishedInChatLine(buffer, '\0', "urtoise", keys, &count) == CHEAT_COUNT,
+	Check(!CheatFinishedInChatLine(retail, buffer, '\0', "urtoise", keys, &count),
 	      "and a chat key the engine never sees rescues nothing");
-	Check(CheatFinishedInChatLine(buffer, 'T', "urtoiseurtoiseurtoise", keys, &count) ==
-	          CHEAT_COUNT,
+	Check(!CheatFinishedInChatLine(retail, buffer, 'T', "urtoiseurtoiseurtoise", keys, &count),
 	      "a line longer than the buffer is never a cheat");
+}
+
+// ---- what the running game compares, not what retail does ----------------------------
+
+// SilentPatch III's two rows, as read out of a running game with it in
+// (2026-09-30, both processes): the armour row's `push` points at its own
+// "ESIOTROT" and BOOOOORING's length is 0Ah. Everything else is retail's.
+TypedCheatTable SilentPatchTable() {
+	TypedCheatTable t = TableFromSites();
+	std::memset(t.rows[CHEAT_ARMOUR].reversed, 0, sizeof t.rows[CHEAT_ARMOUR].reversed);
+	std::memcpy(t.rows[CHEAT_ARMOUR].reversed, "ESIOTROT", 8);
+	t.rows[CHEAT_ARMOUR].length = 8;
+	t.rows[CHEAT_SLOW_TIME].length = 10;
+	return t;
+}
+
+// Why typing armour past the chat key did nothing in noxx's game: the rule
+// went by retail's table, which has TURTOISE, while the game with SilentPatch
+// in only answers to TORTOISE. Read off the running code, each game's own
+// spelling is the one that is rescued.
+void TestTheChatKeyGoesByTheRunningGamesTable() {
+	std::printf("\nthe chat key goes by the table the running game has\n");
+
+	ChatKeyboard retailOnly;   // the rule on retail's table, the game SilentPatched
+	retailOnly.table = TableFromSites();
+	retailOnly.Type("TORTOISE");
+	Check(retailOnly.fired.empty() && retailOnly.open,
+	      "with retail's table, TORTOISE is chat: the line stays open and nothing fires "
+	      "(what noxx saw)");
+
+	ChatKeyboard patched(SilentPatchTable());
+	patched.Type("TORTOISE");
+	Check(patched.fired == std::vector<uint8_t>{CHEAT_ARMOUR} && !patched.open &&
+	          patched.sent.empty(),
+	      "with SilentPatch's table, TORTOISE is armour, fired on its E with the line shut");
+	ChatKeyboard patchedOld(SilentPatchTable());
+	patchedOld.Type("TURTOISE");
+	Check(patchedOld.fired.empty() && patchedOld.open,
+	      "and TURTOISE, which that game no longer has, stays chat");
+
+	ChatKeyboard slow(SilentPatchTable());
+	slow.Type("WWWW");
+	slow.Type("BOOOOORING");
+	Check(slow.fired == std::vector<uint8_t>{CHEAT_SLOW_TIME},
+	      "SilentPatch's BOOOOORING works after other keys, as its ten says");
+
+	int wrong = 0;
+	for (uint8_t id = 0; id < CHEAT_COUNT; ++id) {
+		if (id == CHEAT_SLOW_TIME)
+			continue;
+		const TypedCheatTable t = SilentPatchTable();
+		const TypedRow       &r = t.rows[id];
+		std::string           word;
+		for (int i = RowTypedLength(r) - 1; i >= 0; --i)
+			word += r.reversed[i];
+		ChatKeyboard kb(t);
+		kb.Type("WWASD");
+		kb.Type(word);
+		if (kb.fired != std::vector<uint8_t>{id} || kb.open || !kb.sent.empty())
+			++wrong;
+	}
+	Check(wrong == 0, "every row of that game fires as itself past the chat key");
+}
+
+// The cases noxx named: straight through, no Enter.
+void TestTheCheatsNoxxTypes() {
+	std::printf("\nTURTOISE, ITSALLGOINGMAAAD, NOBODYLIKESME and TPTO3, typed straight through\n");
+
+	ChatKeyboard turtoise;
+	turtoise.Type("WWW");
+	turtoise.Type("TURTOISE");
+	Check(turtoise.fired == std::vector<uint8_t>{CHEAT_ARMOUR} && !turtoise.open &&
+	          turtoise.sent.empty(),
+	      "TURTOISE: T opens the line, E shuts it and the armour fires, nothing sent");
+
+	ChatKeyboard mad;
+	mad.Type("ITSALLGOINGMAAAD");
+	Check(mad.fired == std::vector<uint8_t>{CHEAT_MAYHEM} && !mad.open && mad.sent.empty(),
+	      "ITSALLGOINGMAAAD: I goes to the game, T opens the line, D finishes it");
+
+	ChatKeyboard nobody;
+	nobody.Type("NOBODYLIKESME");
+	Check(nobody.fired == std::vector<uint8_t>{CHEAT_EVERYBODY_ATTACKS} && !nobody.open,
+	      "NOBODYLIKESME has no T and never meets the chat line");
+
+	ChatKeyboard tpto;
+	tpto.Type("SD");
+	tpto.Type("TPTO3");
+	Check(tpto.coop == std::vector<std::string>{"TPTO3"} && tpto.fired.empty() && !tpto.open &&
+	          tpto.sent.empty(),
+	      "TPTO3: the line shuts on the 3, nothing is sent, and the buffer ends in TPTO3");
+
+	ChatKeyboard hello;
+	hello.Key('T');
+	hello.Type("Thanks for the lift");
+	hello.Enter();
+	Check(hello.fired.empty() && hello.coop.empty() &&
+	          hello.sent == std::vector<std::string>{"thanks for the lift"},
+	      "a chat line that starts with T stays chat and goes out whole when Enter is pressed");
+
+	ChatKeyboard about;
+	about.Key('T');
+	about.Type("tpto3 takes you to player 3");
+	about.Enter();
+	Check(about.coop.empty() && about.fired.empty() &&
+	          about.sent == std::vector<std::string>{"tpto3 takes you to player 3"},
+	      "and one about TPTO3 is chat too: the line's own T is not the cheat's first");
+
+	ChatKeyboard tpt;
+	tpt.Type("TPTO hi");
+	tpt.Enter();
+	Check(tpt.coop.empty() && tpt.sent == std::vector<std::string>{"pto hi"},
+	      "\"TPTO hi\" is chat: a space is no player's number");
+
+	ChatKeyboard nine;
+	nine.Type("TPTO9");
+	Check(nine.coop.empty() && nine.open, "TPTO9 is nobody's number on an eight-player list");
+}
+
+// CoopIII's table.
+void TestOurOwnCheats() {
+	std::printf("\nCoopIII's own cheats\n");
+
+	char    buffer[KEYBOARD_CHEAT_STRING_LEN] = {};
+	CoopCheatHit hit;
+	for (char c : std::string("TPTO1"))
+		PushCheatChar(buffer, c);
+	Check(MatchCoopCheat(buffer, &hit) && hit.id == COOP_CHEAT_TPTO && hit.arg == '1',
+	      "TPTO1 is TPTO with 1");
+	for (char c : std::string("TPTO8"))
+		PushCheatChar(buffer, c);
+	Check(MatchCoopCheat(buffer, &hit) && hit.arg == '8', "TPTO8 with 8");
+	for (char c : std::string("TPTO0"))
+		PushCheatChar(buffer, c);
+	Check(!MatchCoopCheat(buffer, &hit), "TPTO0 is nothing: the list starts at 1");
+	for (char c : std::string("TPTO"))
+		PushCheatChar(buffer, c);
+	Check(!MatchCoopCheat(buffer, &hit), "and TPTO alone waits for its digit");
+	Check(CoopCheatTypedLength(COOP_CHEAT_TPTO) == 5, "five keys");
+
+	// No word of ours ends one of the game's or is ended by one, so one key
+	// never fires both.
+	bool apart = true;
+	const TypedCheatTable t = TableFromSites();
+	for (uint8_t c = 0; c < COOP_CHEAT_COUNT; ++c) {
+		const std::string ours = COOP_CHEATS[c].word;
+		for (uint8_t id = 0; id < CHEAT_COUNT; ++id) {
+			std::string game;
+			for (int i = RowTypedLength(t.rows[id]) - 1; i >= 0; --i)
+				game += t.rows[id].reversed[i];
+			const bool oursEndsGame =
+			    game.size() >= ours.size() && game.compare(game.size() - ours.size(), ours.size(), ours) == 0;
+			const bool gameEndsOurs =
+			    ours.size() >= game.size() && ours.compare(ours.size() - game.size(), game.size(), game) == 0;
+			if (oursEndsGame || gameEndsOurs)
+				apart = false;
+		}
+	}
+	Check(apart, "no word of ours ends one of the game's 23, nor the other way round");
+
+	int wrong = 0;
+	for (char d = '1'; d <= '8'; ++d) {
+		ChatKeyboard kb;
+		kb.Type("WWWW");
+		kb.Type(std::string("TPTO") + d);
+		if (kb.coop != std::vector<std::string>{std::string("TPTO") + d} || kb.open ||
+		    !kb.fired.empty())
+			++wrong;
+	}
+	Check(wrong == 0, "TPTO1 to TPTO8 each shut the line on the digit and come out as typed");
+
+	ChatKeyboard twice;
+	twice.Type("TPTO2");
+	twice.Type("TPTO4");
+	Check(twice.coop == (std::vector<std::string>{"TPTO2", "TPTO4"}),
+	      "two in a row are two");
+
+	ChatKeyboard shut;   // a chat key that is not T: nothing opens
+	for (char c : std::string("TPTO5"))
+		shut.Engine(c);
+	Check(shut.coop == std::vector<std::string>{"TPTO5"},
+	      "typed with the line shut, the buffer gives it all the same");
+}
+
+// Who TPTO goes to, and why it does not.
+void TestTptoDecides() {
+	std::printf("\nTPTO decides\n");
+
+	Check(TptoTargetOf('1') == 0 && TptoTargetOf('8') == 7 && TptoTargetOf('9') == INVALID_PLAYER &&
+	          TptoTargetOf('0') == INVALID_PLAYER,
+	      "the digit is the Tab list's number, the slot plus one");
+	Check(ListNumber(TptoTargetOf('3')) == 3 && PlayerIdFromListNumber(ListNumber(5)) == 5,
+	      "the same number both ways");
+
+	TptoFacts go;
+	go.inSession    = true;
+	go.localId      = 0;
+	go.targetId     = 2;
+	go.targetHere   = true;
+	go.targetPlaced = true;
+	go.self.havePed = true;
+	Check(DecideTpto(go) == Tpto::OnFoot, "on foot, to somebody here: go");
+
+	TptoFacts f = go;
+	f.inSession = false;
+	Check(DecideTpto(f) == Tpto::NotInSession, "no session: nothing");
+	f      = go;
+	f.rule = COOP_CHEATS_OFF;
+	Check(DecideTpto(f) == Tpto::Off, "the server switched them off");
+	f          = go;
+	f.targetId = 0;
+	Check(DecideTpto(f) == Tpto::Self, "yourself");
+	f            = go;
+	f.targetHere = false;
+	Check(DecideTpto(f) == Tpto::NoSuchPlayer, "nobody in that slot");
+	f          = go;
+	f.targetId = INVALID_PLAYER;
+	Check(DecideTpto(f) == Tpto::NoSuchPlayer, "or no slot at all");
+
+	f              = go;
+	f.self.havePed = false;
+	Check(DecideTpto(f) == Tpto::NoPed, "no player in the world");
+	f              = go;
+	f.self.wbState = 2;
+	Check(DecideTpto(f) == Tpto::Busted, "busted");
+	f               = go;
+	f.self.pedState = 56;
+	Check(DecideTpto(f) == Tpto::Busted, "being arrested");
+	f             = go;
+	f.self.health = 0.0f;
+	Check(DecideTpto(f) == Tpto::Wasted, "wasted");
+	f               = go;
+	f.self.cutscene = true;
+	Check(DecideTpto(f) == Tpto::Cutscene, "a cutscene");
+
+	f                = go;
+	f.self.onMission = true;
+	Check(DecideTpto(f) == Tpto::Mission, "a mission, by default");
+	f.self.frenzyOngoing = true;
+	Check(DecideTpto(f) == Tpto::Mission, "a rampage counts as one");
+	f.rule = COOP_CHEATS_ALWAYS;
+	Check(DecideTpto(f) == Tpto::OnFoot, "unless the server allows them always");
+
+	f        = go;
+	f.moving = true;
+	Check(DecideTpto(f) == Tpto::Busy, "already on the way");
+	f              = go;
+	f.targetPlaced = false;
+	Check(DecideTpto(f) == Tpto::NoPlace, "nothing says where he is");
+	f            = go;
+	f.islandOpen = false;
+	Check(DecideTpto(f) == Tpto::IslandShut, "an island the story has not opened");
+	f             = go;
+	f.otherIsland = true;
+	Check(DecideTpto(f) == Tpto::OnFoot, "another island on foot is the vote's move, which loads it");
+
+	f            = go;
+	f.inCar      = true;
+	f.driver     = true;
+	f.carMovable = true;
+	Check(DecideTpto(f) == Tpto::InCar, "at the wheel of a car: the car comes along");
+	f.otherIsland = true;
+	Check(DecideTpto(f) == Tpto::IslandInCar, "but not onto another island");
+	f.otherIsland = false;
+	f.carMovable  = false;
+	Check(DecideTpto(f) == Tpto::Vehicle, "nor in a boat, a plane or a train");
+	f.driver = false;
+	Check(DecideTpto(f) == Tpto::Passenger, "and a passenger gets out first");
+
+	char line[FEED_MESSAGE];
+	TptoMessage(Tpto::NoSuchPlayer, 5, nullptr, line, sizeof line);
+	Check(std::strcmp(line, "TPTO: nobody is number 5") == 0, "\"TPTO: nobody is number 5\"");
+	TptoMessage(Tpto::IslandInCar, 2, "bob", line, sizeof line);
+	Check(std::strcmp(line, "TPTO: bob is on another island, leave the car first") == 0,
+	      "the island in a car names him");
+	TptoMessage(Tpto::OnFoot, 2, "bob", line, sizeof line);
+	Check(line[0] == '\0', "and going says nothing in the feed: the game's own line says it");
+	int unsaid = 0;
+	for (uint8_t v = static_cast<uint8_t>(Tpto::Off); v <= static_cast<uint8_t>(Tpto::NoRoom); ++v) {
+		TptoMessage(static_cast<Tpto>(v), 3, "bob", line, sizeof line);
+		if (line[0] == '\0' || std::strlen(line) >= FEED_MESSAGE - 1)
+			++unsaid;
+	}
+	Check(unsaid == 0, "every refusal has a line, and each fits the feed");
+
+	float dx = 0.0f, dy = 0.0f;
+	bool  ring = true;
+	for (int a = 0; a < TPTO_CAR_TRIES; ++a) {
+		TptoCarSpot(a, &dx, &dy);
+		const float r = std::sqrt(dx * dx + dy * dy);
+		if (std::fabs(r - TPTO_CAR_RADII_M[a < TPTO_CAR_DIRECTIONS ? 0 : 1]) > 0.01f)
+			ring = false;
+	}
+	Check(ring, "the car ring is 7 m, then 10 m, eight ways each");
 }
 
 // The retail bug, kept. Sixteen compared for ten letters means the eleventh
@@ -948,6 +1258,11 @@ void TestTheTableAgainstTheImage() {
 	Check(Dword(img, 0x00492462) == CPad__KeyBoardCheatString &&
 	          Dword(img, 0x00492468) == CPad__KeyBoardCheatString + 1,
 	      "and moves KeyBoardCheatString[i] to [i+1]");
+	Check(std::memcmp(&img[CPad__CheatShiftBegin - IMAGE_BASE], CPAD_CHEAT_SHIFT,
+	                  sizeof(CPAD_CHEAT_SHIFT)) == 0 &&
+	          CPad__CheatShiftBegin ==
+	              CPad__AddToPCCheatString + sizeof(CPAD_ADD_TO_PC_CHEAT_STRING_PROLOGUE),
+	      "CPAD_CHEAT_SHIFT is the shift's bytes, from the end of the prologue to row 0");
 
 	// Then every row, through the same decoder game/cheats.cpp runs over the
 	// live process before it hooks anything.
@@ -971,6 +1286,37 @@ void TestTheTableAgainstTheImage() {
 	if (bad < CHEAT_COUNT)
 		std::printf("    first bad row: %u (%s)\n", bad, Forward(bad).c_str());
 
+	// The table the chat key goes by, read the way game/cheats.cpp reads the
+	// running code: from retail it is retail's.
+	TypedCheatTable fromImage;
+	const TypedCheatTable retail = TableFromSites();
+	bool            same = TableFromRows(rows, fromFile, &img, &fromImage, &bad);
+	for (uint8_t id = 0; same && id < CHEAT_COUNT; ++id)
+		same = fromImage.rows[id].length == retail.rows[id].length &&
+		       std::memcmp(fromImage.rows[id].reversed, retail.rows[id].reversed,
+		                   sizeof retail.rows[id].reversed) == 0;
+	Check(same, "the typed table read off the image is retail's, row for row");
+
+	// TPTO's two addresses.
+	Check(std::memcmp(&img[CHEAT_ACTIVATED_KEY - IMAGE_BASE], "CHEAT1\0", 7) == 0 &&
+	          Dword(img, 0x00490EEE) == CHEAT_ACTIVATED_KEY &&
+	          Dword(img, 0x0049104C) == CHEAT_ACTIVATED_KEY,
+	      "5F64C0h is \"CHEAT1\", the key the tank and BANGBANGBANG push for their line");
+	Check(Dword(img, CAutomobile__vtable + ENTITY_VT_TELEPORT) == CAutomobile__Teleport,
+	      "CAutomobile's slot 11 is CAutomobile::Teleport, 0x00535180");
+	Check(Dword(img, CVehicle__vtable + ENTITY_VT_TELEPORT) == 0x00405930 &&
+	          Dword(img, CBoat__vtable + ENTITY_VT_TELEPORT) != CAutomobile__Teleport,
+	      "and nothing else's is: CVehicle's is the empty one, a boat's its own");
+	const uint8_t teleport[] = {0x56, 0x57, 0x55, 0x89, 0xCD, 0x83, 0xEC, 0x18};
+	Check(std::memcmp(&img[CAutomobile__Teleport - IMAGE_BASE], teleport, sizeof teleport) == 0 &&
+	          Byte(img, 0x00535199) == 0xE8 && Dword(img, 0x0053519A) + 0x0053519E == CWorld__Remove &&
+	          Byte(img, 0x00535236) == 0xE8 && Dword(img, 0x00535237) + 0x0053523B == CWorld__Add &&
+	          Byte(img, 0x00535242) == 0xC2 && Byte(img, 0x00535243) == 0x0C,
+	      "which takes the car out of the world, puts it back and returns `ret 0Ch`");
+	const uint8_t still[] = {0xC7, 0x45, 0x78, 0x00, 0x00, 0x00, 0x00};
+	Check(std::memcmp(&img[0x005351FA - IMAGE_BASE], still, sizeof still) == 0,
+	      "and stops it on the way: `mov [ebp+78h],0`, the first of the six speeds");
+
 	// Slot 29 of every vehicle-pool vtable.
 	Check(Dword(img, 0x00600C1C + 0x74) == CAutomobile__BlowUpCar &&
 	          Dword(img, 0x00600EA4 + 0x74) == CBoat__BlowUpCar,
@@ -993,6 +1339,260 @@ void TestTheTableAgainstTheImage() {
 	      "and ScanForThreats reads +0x188, not the table");
 }
 
+// ---- may the detour go in: both shapes of the function, built byte by byte ----
+
+// A sparse image: only the bytes put in it exist, and only those can be read.
+struct SparseImage {
+	std::vector<uint32_t> at;
+	std::vector<uint8_t>  bytes;
+
+	void Put(uint32_t va, uint8_t b) {
+		for (size_t i = 0; i < at.size(); ++i)
+			if (at[i] == va) {
+				bytes[i] = b;
+				return;
+			}
+		at.push_back(va);
+		bytes.push_back(b);
+	}
+	void PutDword(uint32_t va, uint32_t v) {
+		for (uint32_t i = 0; i < 4; ++i)
+			Put(va + i, static_cast<uint8_t>(v >> (8 * i)));
+	}
+	void PutString(uint32_t va, const char *s) {
+		for (uint32_t i = 0;; ++i) {
+			Put(va + i, static_cast<uint8_t>(s[i]));
+			if (s[i] == '\0')
+				break;
+		}
+	}
+	bool Has(uint32_t va) const {
+		for (uint32_t a : at)
+			if (a == va)
+				return true;
+		return false;
+	}
+	uint8_t Get(uint32_t va) const {
+		for (size_t i = 0; i < at.size(); ++i)
+			if (at[i] == va)
+				return bytes[i];
+		return 0xCC;
+	}
+};
+
+uint8_t SparseByte(const void *ctx, uint32_t va) {
+	return static_cast<const SparseImage *>(ctx)->Get(va);
+}
+
+bool SparseReadable(const void *ctx, uint32_t va, size_t n) {
+	const SparseImage *img = static_cast<const SparseImage *>(ctx);
+	for (size_t i = 0; i < n; ++i)
+		if (!img->Has(va + static_cast<uint32_t>(i)))
+			return false;
+	return true;
+}
+
+// Where SilentPatch's own "TORTOISE" was in noxx's game. Its module's load
+// decides it, so any address has to do.
+constexpr uint32_t SP_TORTOISE = 0x61E98EF4;
+
+// CPad::AddToPCCheatString as retail has it: the prologue, the shift, the 23
+// rows (`A2 <buffer>` folded into row 0), the epilogue, and every string in
+// .rdata. With `silentPatch`, rows 12 and 13 the way SilentPatch III
+// rewrites them.
+SparseImage BuildCheatFunction(bool silentPatch) {
+	SparseImage img;
+	uint32_t    pc = static_cast<uint32_t>(CPad__AddToPCCheatString);
+	for (uint8_t b : CPAD_ADD_TO_PC_CHEAT_STRING_PROLOGUE)
+		img.Put(pc++, b);
+	for (uint8_t b : CPAD_CHEAT_SHIFT)
+		img.Put(pc++, b);
+	const uint32_t buffer = static_cast<uint32_t>(CPad__KeyBoardCheatString);
+	for (uint8_t id = 0; id < CHEAT_COUNT; ++id) {
+		const CheatSite &s      = CHEAT_SITES[id];
+		uint8_t          length = s.length;
+		uint32_t         string = static_cast<uint32_t>(s.string);
+		if (silentPatch && id == CHEAT_SLOW_TIME)
+			length = 0x0A;
+		if (silentPatch && id == CHEAT_ARMOUR)
+			string = SP_TORTOISE;
+		img.Put(pc, 0x6A);
+		img.Put(pc + 1, length);
+		img.Put(pc + 2, 0x68);
+		img.PutDword(pc + 3, buffer);
+		img.Put(pc + 7, 0x68);
+		img.PutDword(pc + 8, string);
+		pc += 12;
+		if (id == 0) {
+			img.Put(pc, 0xA2);
+			img.PutDword(pc + 1, buffer);
+			pc += 5;
+		}
+		img.Put(pc, 0xE8);
+		img.PutDword(pc + 1, static_cast<uint32_t>(crt_strncmp) - (pc + 5));
+		pc += 5;
+		const uint8_t test[] = {0x83, 0xC4, 0x0C, 0x85, 0xC0, 0x75, 0x05};
+		for (uint8_t b : test)
+			img.Put(pc++, b);
+		img.Put(pc, 0xE8);
+		img.PutDword(pc + 1, static_cast<uint32_t>(s.handler) - (pc + 5));
+		pc += 5;
+		// .rdata pads each string with zeros to four bytes, and BOOOOORING's
+		// sixteen reach into that and the next string.
+		img.PutString(static_cast<uint32_t>(s.string), s.reversed);
+		for (uint32_t at = static_cast<uint32_t>(s.string + std::strlen(s.reversed) + 1); at % 4 != 0; ++at)
+			img.Put(at, 0);
+	}
+	const uint8_t epilogue[] = {0x83, 0xC4, 0x08, 0xC2, 0x04, 0x00};
+	for (uint8_t b : epilogue)
+		img.Put(pc++, b);
+	if (silentPatch)
+		img.PutString(SP_TORTOISE, "ESIOTROT");
+	return img;
+}
+
+// Where row `id`'s first byte is in the built function.
+uint32_t RowAt(uint8_t id) {
+	return static_cast<uint32_t>(CPad__CheatRowsBegin) + 29u * id + (id > 0 ? 5u : 0u);
+}
+
+bool SameTable(const TypedCheatTable &a, const TypedCheatTable &b) {
+	for (uint8_t id = 0; id < CHEAT_COUNT; ++id)
+		if (a.rows[id].length != b.rows[id].length ||
+		    std::memcmp(a.rows[id].reversed, b.rows[id].reversed, sizeof a.rows[id].reversed) != 0)
+			return false;
+	return true;
+}
+
+// The decision game/cheats.cpp makes before it hooks, on the two shapes the
+// function is known to have and on the rewrites it must still refuse.
+void TestTheDetourGoesInOnlyOnCodeItKnows() {
+	std::printf("\nthe detour goes in on retail's code and SilentPatch's, and nothing else\n");
+
+	const SparseImage retail = BuildCheatFunction(false);
+	const CheatImageCheck r  = CheckCheatImage(&SparseByte, &SparseReadable, &retail);
+	Check(r.MayHook() && r.verdict == CheatImageVerdict::Retail && r.tableRead &&
+	          SameTable(r.table, TableFromSites()),
+	      "retail's function: the detour goes in, and the table it goes by is retail's");
+
+	const SparseImage sp = BuildCheatFunction(true);
+	const CheatImageCheck s = CheckCheatImage(&SparseByte, &SparseReadable, &sp);
+	Check(s.MayHook() && s.verdict == CheatImageVerdict::Known && s.tableRead &&
+	          SameTable(s.table, SilentPatchTable()),
+	      "SilentPatch's: it goes in too, and goes by TORTOISE and BOOOOORING's ten");
+	int marked = 0;
+	for (uint8_t id = 0; id < CHEAT_COUNT; ++id)
+		if (s.rewritten[id] != 0)
+			++marked;
+	Check(marked == 2 && s.rewritten[CHEAT_SLOW_TIME] != 0 && s.rewritten[CHEAT_ARMOUR] != 0,
+	      "with exactly those two rows put down as SilentPatch's");
+
+	SparseImage moved = BuildCheatFunction(true);
+	moved.PutString(0x7FFE0000, "ESIOTROT");
+	moved.PutDword(RowAt(CHEAT_ARMOUR) + 8, 0x7FFE0000);
+	Check(CheckCheatImage(&SparseByte, &SparseReadable, &moved).MayHook(),
+	      "its TORTOISE is taken wherever its module was loaded");
+
+	// Each row on its own: one of SilentPatch's two is as good as both.
+	SparseImage onlyLength = BuildCheatFunction(false);
+	onlyLength.Put(RowAt(CHEAT_SLOW_TIME) + 1, 0x0A);
+	const CheatImageCheck ol = CheckCheatImage(&SparseByte, &SparseReadable, &onlyLength);
+	Check(ol.MayHook() && ol.verdict == CheatImageVerdict::Known,
+	      "BOOOOORING's ten alone goes in");
+
+	struct Refusal {
+		const char     *what;
+		CheatImageFault fault;
+		uint8_t         row;
+		SparseImage     img;
+	};
+	std::vector<Refusal> refusals;
+	auto add = [&](const char *what, CheatImageFault fault, uint8_t row) -> SparseImage & {
+		refusals.push_back({what, fault, row, BuildCheatFunction(true)});
+		return refusals.back().img;
+	};
+
+	add("a jump over the prologue (another plugin's hook) stays out", CheatImageFault::Prologue,
+	    CHEAT_COUNT)
+	    .Put(static_cast<uint32_t>(CPad__AddToPCCheatString), 0xE9);
+	add("a shift that starts at 17, not 18, stays out", CheatImageFault::Shift, CHEAT_COUNT)
+	    .Put(static_cast<uint32_t>(CPad__CheatShiftBegin) + 1, 0x11);
+	{
+		SparseImage &img = add("an armour row whose string reads ESIOTRAT stays out",
+		                       CheatImageFault::Row, CHEAT_ARMOUR);
+		img.PutString(SP_TORTOISE, "ESIOTRAT");
+	}
+	add("an armour row comparing nine bytes stays out", CheatImageFault::Row, CHEAT_ARMOUR)
+	    .Put(RowAt(CHEAT_ARMOUR) + 1, 0x09);
+	add("BOOOOORING comparing eleven stays out", CheatImageFault::Row, CHEAT_SLOW_TIME)
+	    .Put(RowAt(CHEAT_SLOW_TIME) + 1, 0x0B);
+	{
+		// The ten is only known at retail's string; elsewhere it is somebody else's.
+		SparseImage &img = add("BOOOOORING's ten pointed at a copy of its string stays out",
+		                       CheatImageFault::Row, CHEAT_SLOW_TIME);
+		img.PutString(0x7FFE0100, "GNIROOOOOB");
+		img.PutDword(RowAt(CHEAT_SLOW_TIME) + 8, 0x7FFE0100);
+	}
+	{
+		SparseImage &img = add("SilentPatch's TORTOISE on another row stays out",
+		                       CheatImageFault::Row, CHEAT_HEALTH);
+		img.Put(RowAt(CHEAT_HEALTH) + 1, 0x08);
+		img.PutDword(RowAt(CHEAT_HEALTH) + 8, SP_TORTOISE);
+	}
+	{
+		SparseImage   &img  = add("a handler that is not retail's stays out", CheatImageFault::Row,
+		                          CHEAT_SUNNY);
+		const uint32_t call = RowAt(CHEAT_SUNNY) + 12 + 5 + 7;
+		img.PutDword(call + 1, 0x00401000 - (call + 5));
+	}
+	add("a string that cannot be read stays out", CheatImageFault::Unreadable, CHEAT_ARMOUR)
+	    .PutDword(RowAt(CHEAT_ARMOUR) + 8, 0x7FFF0000);
+	add("a row that asks for more than the buffer stays out", CheatImageFault::Length,
+	    CHEAT_MONEY)
+	    .Put(RowAt(CHEAT_MONEY) + 1, 0x15);
+	add("a row that is not a row any more stays out", CheatImageFault::Shape, CHEAT_TANK)
+	    .Put(RowAt(CHEAT_TANK), 0x90);
+
+	for (const Refusal &x : refusals) {
+		const CheatImageCheck c = CheckCheatImage(&SparseByte, &SparseReadable, &x.img);
+		Check(!c.MayHook() && c.fault == x.fault && c.row == x.row, x.what);
+	}
+
+	// What the detour then compares, in a session: the running table.
+	const TypedCheatTable t = s.table;
+	auto fired = [&](const char *prefix, const char *word) {
+		char buffer[KEYBOARD_CHEAT_STRING_LEN] = {};
+		std::vector<uint8_t> all;
+		for (const char *p = prefix; *p; ++p)
+			PushCheatChar(buffer, *p);
+		for (const char *p = word; *p; ++p) {
+			PushCheatChar(buffer, *p);
+			uint8_t       ids[CHEAT_COUNT];
+			const uint8_t n = MatchTypedCheats(t, buffer, ids, CHEAT_COUNT);
+			all.insert(all.end(), ids, ids + n);
+		}
+		return all;
+	};
+	Check(fired("", "TORTOISE") == std::vector<uint8_t>{CHEAT_ARMOUR},
+	      "in a SilentPatched session the detour runs TORTOISE as armour");
+	Check(fired("", "TURTOISE").empty(), "and TURTOISE as nothing, the way that game does");
+	Check(fired("WASDWASD", "BOOOOORING") == std::vector<uint8_t>{CHEAT_SLOW_TIME},
+	      "and BOOOOORING after other keys, as its ten says");
+	Check(fired("", "ILIKESCOTLAND") == std::vector<uint8_t>{CHEAT_CLOUDY},
+	      "while the rows it left alone still fire as themselves");
+
+	// The builder is the exe, byte for byte, when there is one to compare.
+	std::vector<uint8_t> exe;
+	std::string          from;
+	if (LoadExe(exe, from)) {
+		bool same = true;
+		for (size_t i = 0; i < retail.at.size(); ++i)
+			if (exe[retail.at[i] - IMAGE_BASE] != retail.bytes[i])
+				same = false;
+		Check(same, "the retail shape built here is gta3.exe's, every byte of it");
+	}
+}
+
 } // namespace
 
 int RunCheatTests() {
@@ -1002,6 +1602,10 @@ int RunCheatTests() {
 	TestBoooooringOnlyWorksAsTheFirstThingTyped();
 	TestEveryCheatCanBeTypedPastTheChatKey();
 	TestChatTextNeverStartsACheat();
+	TestTheChatKeyGoesByTheRunningGamesTable();
+	TestTheCheatsNoxxTypes();
+	TestOurOwnCheats();
+	TestTptoDecides();
 	TestTheBufferKeepsTheLastTwentyNewestFirst();
 	TestWhatEachCheatTouches();
 	TestTheRuleDecidesWhatIsAllowed();
@@ -1020,5 +1624,6 @@ int RunCheatTests() {
 	TestASkyCheatGoesWhereTheSkyIs();
 	TestTheRuleIsKeptEvenIfTheServerDoesNot();
 	TestTheTableAgainstTheImage();
+	TestTheDetourGoesInOnlyOnCodeItKnows();
 	return g_cheatFailures;
 }

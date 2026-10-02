@@ -165,7 +165,7 @@ pack (`essentials-mod-pack_1741967254_825844`).
 
 | Component | Version | Source (primary) | Licence | Ours to rehost? | Where it lands | Tested |
 |---|---|---|---|---|---|---|
-| CoopIII | 0.1.2 | inside the Setup | CoopIII's | yes | `CoopIII.asi`, `CoopIII.ini`, `coopiii-launcher.exe` | - |
+| CoopIII | 0.1.3 | inside the Setup | CoopIII's | yes | `CoopIII.asi`, `CoopIII.ini`, `coopiii-launcher.exe` | - |
 | Ultimate ASI Loader (ThirteenAG) | v7.8.0 | github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/v7.8.0/Ultimate-ASI-Loader.zip | MIT | mirror | `dinput8.dll`; `scripts\global.ini` if absent | newer than the pack's (its exact build is not a published release) |
 | SilentPatch III (Silent) | 1.1.9.1 (release 1.1-BUILD33.1-SA) | github.com/CookiePLMonster/SilentPatch/releases/download/1.1-BUILD33.1-SA/SilentPatchIII.zip | MIT | mirror | `SilentPatchIII.asi`, `.ini` | identical |
 | SilentPatch DDraw (Silent) | 1.1.6.0 (same release) | .../1.1-BUILD33.1-SA/SilentPatchDDraw.zip | MIT | mirror | `ddraw.dll` | identical |

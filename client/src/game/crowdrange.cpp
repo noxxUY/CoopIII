@@ -5,6 +5,7 @@
 #include "crowdrange.h"
 
 #include "crowdaddr.h"
+#include "crowdfade.h"
 #include "leadcheck.h"
 #include "pedspeech.h"
 #include "population.h"
@@ -96,7 +97,23 @@ ReplicaTraffic CountReplicaTraffic() {
 // the count, the count is lowered for the one call and put back by exactly as
 // much after it - whatever the call itself made or took away is the engine's
 // own and stays.
+// Which generator is running, for the spot test's view rule below: the traffic
+// generator's three tests and the pedestrian generator's one are told apart by
+// which of our two wrappers they are inside, since the spot test itself has
+// the same shape for both. Neither: the view rule stays out of it.
+enum class Generating : uint8_t { Nothing, Car, Ped };
+Generating g_generating = Generating::Nothing;
+
+struct GeneratingScope {
+	Generating outer;
+	explicit GeneratingScope(Generating g) : outer(g_generating) { g_generating = g; }
+	~GeneratingScope() { g_generating = outer; }
+	GeneratingScope(const GeneratingScope &)            = delete;
+	GeneratingScope &operator=(const GeneratingScope &) = delete;
+};
+
 void __cdecl GenerateOneRandomCarWithRoom() {
+	GeneratingScope generating(Generating::Car);
 	void *const ped = PlayerPed();
 	TrafficRoom room;
 	if (ped != nullptr && g_handleCount != 0) {
@@ -145,6 +162,7 @@ uint32_t g_copGateRaised    = 0;
 // the engine's own count and stays.
 void __cdecl AddToPopulationCountingCopReplicas(float minDist, float maxDist,
                                                 float minOffScreen, float maxOffScreen) {
+	GeneratingScope generating(Generating::Ped);
 	const uint32_t replicas = CopReplicasBuiltHere();
 	if (replicas == 0) {
 		Func<AddToPopulationFn>(CPopulation__AddToPopulation)(minDist, maxDist, minOffScreen,
@@ -178,6 +196,29 @@ bool     g_spotCallsTaken[4] = {false, false, false, false};
 uint32_t g_spotsRefused      = 0;   // since the last line
 uint32_t g_spotsSaidMs       = 0;
 
+// The other players' cameras (game/crowdfade.h), noted every frame.
+PlayerViewBody g_views[MAX_PLAYERS];
+uint32_t       g_viewCount   = 0;
+uint32_t       g_viewRefused = 0;   // since the last line
+uint32_t       g_viewSaidMs  = 0;
+
+void NoteRemoteViews(const PlayerViewBody *views, uint32_t count) {
+	g_viewCount = 0;
+	for (uint32_t i = 0; views && i < count && g_viewCount < MAX_PLAYERS; ++i)
+		if (PlayerViewSane(views[i]))
+			g_views[g_viewCount++] = views[i];
+
+	const uint32_t now = GetTickCount();
+	if (g_viewRefused != 0 && (g_viewSaidMs == 0 || now - g_viewSaidMs >= 30000)) {
+		Log("crowd: over the last %us our generators passed over %u spot(s) inside another "
+		    "player's view at close range",
+		    g_viewSaidMs == 0 ? 0u : static_cast<unsigned>((now - g_viewSaidMs) / 1000),
+		    g_viewRefused);
+		g_viewRefused = 0;
+		g_viewSaidMs  = now;
+	}
+}
+
 void NoteUnbuiltCrowd(const Vec3 *cars, uint32_t carCount, const Vec3 *peds, uint32_t pedCount) {
 	g_unbuiltCarCount = carCount < MAX_UNBUILT_NOTED ? carCount : MAX_UNBUILT_NOTED;
 	g_unbuiltPedCount = pedCount < MAX_UNBUILT_NOTED ? pedCount : MAX_UNBUILT_NOTED;
@@ -210,9 +251,24 @@ void __cdecl FindObjectsKindaCollidingAtSpawn(const float *pos, float radius, in
 	    pos, radius, only2d, count, max, list, buildings, vehicles, peds, objects, dummies);
 	if (!pos || !count || *count != 0 || list != nullptr)
 		return;
+	const Vec3 at{pos[0], pos[1], pos[2]};
+	// Inside another player's view at the range the engine keeps out of its
+	// own: our generator passes over it, so nothing it makes appears out of
+	// nothing in front of him (game/crowdfade.h).
+	if (g_generating != Generating::Nothing && g_viewCount != 0 &&
+	    SpotInSomebodysView(at, g_generating == Generating::Car, g_views, g_viewCount)) {
+		*count = 1;
+		if (g_viewRefused++ == 0 && g_viewSaidMs == 0)
+			Log("crowd: our %s generator picked a spot inside another player's view at close "
+			    "range, at (%.0f %.0f %.0f); it picks another, as it does in its own",
+			    g_generating == Generating::Car ? "traffic" : "pedestrian",
+			    static_cast<double>(at.x), static_cast<double>(at.y),
+			    static_cast<double>(at.z));
+		return;
+	}
 	if (g_unbuiltCarCount == 0 && g_unbuiltPedCount == 0)
 		return;
-	if (!SpotTakenByUnbuilt(Vec3{pos[0], pos[1], pos[2]}, radius, (vehicles & 0xFF) != 0,
+	if (!SpotTakenByUnbuilt(at, radius, (vehicles & 0xFF) != 0,
 	                        (peds & 0xFF) != 0, g_unbuiltCars, g_unbuiltCarCount,
 	                        g_unbuiltPeds, g_unbuiltPedCount))
 		return;
@@ -347,12 +403,14 @@ void RemoveCrowdRange() {
 	g_handleCount     = 0;
 	g_unbuiltCarCount = 0;
 	g_unbuiltPedCount = 0;
+	g_viewCount       = 0;
 }
 
 void AddCrowdRangeToBridge(WorldBridge &bridge) {
 	bridge.SampleCrowdCentre    = &SampleCrowdCentre;
 	bridge.NoteBuiltCarReplicas = &NoteBuiltCarReplicas;
 	bridge.NoteUnbuiltCrowd     = &NoteUnbuiltCrowd;
+	bridge.NoteRemoteViews      = &NoteRemoteViews;
 	bridge.HoldAdrenalineClock  = &HoldAdrenalineClock;
 }
 

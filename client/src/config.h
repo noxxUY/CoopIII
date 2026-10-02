@@ -73,6 +73,14 @@ struct Config {
 	// sends nothing, which is what a server without one expects.
 	std::string password;
 
+	// Discord Rich Presence (presence.h): "Playing CoopIII" on the profile, with
+	// whether this is a session, its mission and how many are in it. On by
+	// default and does nothing without Discord running. discordAppId is the
+	// Discord application to show as; 0 keeps the built-in one
+	// (discordapp.h).
+	bool     discordPresence = true;
+	uint64_t discordAppId    = 0;
+
 	// A key as the ini spells it, as a virtual-key code: one letter or digit,
 	// F1 to F12, or Tab. Zero for anything else. Exposed for tests.
 	static int ParseKey(const std::string &value);

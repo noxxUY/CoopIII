@@ -85,6 +85,26 @@ const char *Name(CheatMode rule);                  // "shared" / "personal" / "o
 const char *Label(CheatMode rule);                 // "Shared" / "Personal only" / "Off"
 bool        ParseCheats(const std::string &text, CheatMode *out);
 
+// What CoopIII's own typed cheats - TPTO1 to TPTO8 so far - may do (protocol.h,
+// CoopCheatRule; docs/cheats.md 7). They move a player about, so by default
+// they work outside missions only; `always` lets them into missions too. Not
+// tied to `cheats`: that one is about the game's own 23.
+enum class CoopCheatMode : uint8_t {
+	OutsideMissions = 0,
+	Always          = 1,
+	Off             = 2,
+};
+
+static_assert(static_cast<uint8_t>(CoopCheatMode::OutsideMissions) == COOP_CHEATS_OUTSIDE_MISSIONS, "");
+static_assert(static_cast<uint8_t>(CoopCheatMode::Always)          == COOP_CHEATS_ALWAYS, "");
+static_assert(static_cast<uint8_t>(CoopCheatMode::Off)             == COOP_CHEATS_OFF, "");
+
+inline uint8_t WireValue(CoopCheatMode rule) { return static_cast<uint8_t>(rule); }
+
+const char *Name(CoopCheatMode rule);              // "outsidemissions" / "always" / "off"
+const char *Label(CoopCheatMode rule);             // "Outside missions" / "Always" / "Off"
+bool        ParseCoopCheats(const std::string &text, CoopCheatMode *out);
+
 // What happens to the players' cash (protocol.h, MoneyRule). Off by default,
 // which is what every build before this did: each machine pays its own player
 // for whatever its own engine saw.
@@ -153,7 +173,7 @@ struct ServerConfig {
 	// How far outside one of a mission's checkpoints still counts as there,
 	// in centimetres: everybody has to be there before a mission moves on
 	// (docs/missions.md 5.6 and 9). 5 m, the number settled on, so a friend
-	// parked beside you counts. A start counts 50 m (MISSION_START_RADIUS_M),
+	// parked beside you counts. A start counts 5 m (MISSION_START_RADIUS_M),
 	// or this when it is wider. The file says it in metres.
 	uint16_t        missionMarginCm    = MISSION_MARGIN_CM_DEFAULT;
 
@@ -172,6 +192,11 @@ struct ServerConfig {
 	// this decides is whether their own counts are honest on other screens.
 	bool            ammoSync           = false;
 
+	// Whether each player's custom skin from Player Setup is sent to everybody
+	// else (docs/protocol.md 1.72). On by default; off, every remote player
+	// wears the game's default skin.
+	bool            syncCustomSkins    = true;
+
 	// How a rampage behaves (§5.10). `shared` is the decision and the
 	// default; `scaled` multiplies the kill target by the number of players
 	// so that a group does not finish a two-minute rampage in twenty
@@ -184,6 +209,10 @@ struct ServerConfig {
 	// change; `personal` keeps only the ones about the player who typed them;
 	// `off` refuses all of them while connected.
 	CheatMode       cheats             = CheatMode::Shared;
+
+	// CoopIII's own typed cheats (TPTO1..TPTO8, a teleport to a player).
+	// Outside missions by default; `always` lets them work during one too.
+	CoopCheatMode   coopCheats         = CoopCheatMode::OutsideMissions;
 
 	// What happens to the players' cash. `off`, the default, leaves every
 	// machine paying its own player for whatever its engine saw; `own` pays
@@ -286,8 +315,10 @@ struct ServerConfig {
 		       missionFailOnDeath == other.missionFailOnDeath &&
 		       missionMarginCm == other.missionMarginCm &&
 		       missionEnemies == other.missionEnemies && missionScale == other.missionScale &&
-		       ammoSync == other.ammoSync && rampage == other.rampage &&
-		       cheats == other.cheats && money == other.money &&
+		       ammoSync == other.ammoSync && syncCustomSkins == other.syncCustomSkins &&
+		       rampage == other.rampage &&
+		       cheats == other.cheats && coopCheats == other.coopCheats &&
+		       money == other.money &&
 		       hiddenPackages == other.hiddenPackages && keepProgress == other.keepProgress &&
 		       password == other.password &&
 		       maxPlayers == other.maxPlayers && maxWanted == other.maxWanted &&

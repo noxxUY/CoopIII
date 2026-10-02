@@ -135,6 +135,43 @@ bool ParseCheats(const std::string &text, CheatMode *out) {
 	return false;
 }
 
+const char *Name(CoopCheatMode rule) {
+	switch (rule) {
+	case CoopCheatMode::OutsideMissions: return "outsidemissions";
+	case CoopCheatMode::Always:          return "always";
+	case CoopCheatMode::Off:             return "off";
+	}
+	return "outsidemissions";
+}
+
+const char *Label(CoopCheatMode rule) {
+	switch (rule) {
+	case CoopCheatMode::OutsideMissions: return "Outside missions";
+	case CoopCheatMode::Always:          return "Always";
+	case CoopCheatMode::Off:             return "Off";
+	}
+	return "Outside missions";
+}
+
+bool ParseCoopCheats(const std::string &text, CoopCheatMode *out) {
+	const std::string t = Trim(text);
+	if (_stricmp(t.c_str(), "outsidemissions") == 0 || _stricmp(t.c_str(), "on") == 0 ||
+	    _stricmp(t.c_str(), "true") == 0) {
+		*out = CoopCheatMode::OutsideMissions;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "always") == 0 || _stricmp(t.c_str(), "missions") == 0) {
+		*out = CoopCheatMode::Always;
+		return true;
+	}
+	if (_stricmp(t.c_str(), "off") == 0 || _stricmp(t.c_str(), "false") == 0 ||
+	    _stricmp(t.c_str(), "none") == 0) {
+		*out = CoopCheatMode::Off;
+		return true;
+	}
+	return false;
+}
+
 const char *Name(MoneyMode rule) {
 	switch (rule) {
 	case MoneyMode::Off:    return "off";
@@ -324,6 +361,8 @@ bool ServerConfig::Parse(const std::string &text) {
 				missionScale = static_cast<uint16_t>(pct);
 		} else if (_stricmp(key.c_str(), "ammosync") == 0) {
 			ammoSync = TruthY(value);
+		} else if (_stricmp(key.c_str(), "synccustomskins") == 0) {
+			syncCustomSkins = TruthY(value);
 		} else if (_stricmp(key.c_str(), "rampages") == 0) {
 			RampageMode rule = rampage;
 			if (ParseRampage(value, &rule))
@@ -332,6 +371,10 @@ bool ServerConfig::Parse(const std::string &text) {
 			CheatMode rule = cheats;
 			if (ParseCheats(value, &rule))
 				cheats = rule;
+		} else if (_stricmp(key.c_str(), "coopcheats") == 0) {
+			CoopCheatMode rule = coopCheats;
+			if (ParseCoopCheats(value, &rule))
+				coopCheats = rule;
 		} else if (_stricmp(key.c_str(), "money") == 0) {
 			MoneyMode rule = money;
 			if (ParseMoney(value, &rule))
@@ -487,6 +530,9 @@ std::string ServerConfig::ToIni() const {
 	       "; your screen. It does not share weapons - players still carry\n"
 	       "; whatever they picked up, this only makes the counts honest.\n";
 	Appendf(out, "ammoSync = %s\n", YesNo(ammoSync));
+	out += "\n"
+	       "; Whether everybody sees everybody else's custom skin from Player Setup.\n";
+	Appendf(out, "syncCustomSkins = %s\n", YesNo(syncCustomSkins));
 
 	// ---- wanted level ----
 	out += "\n"
@@ -515,7 +561,7 @@ std::string ServerConfig::ToIni() const {
 	       "; How far outside one of a mission's checkpoints still counts as\n"
 	       "; being there, in metres, up to 50. Everybody has to be there before\n"
 	       "; a mission moves on; 5 lets a friend parked beside you count. Its\n"
-	       "; start counts anybody within 50 m, or within this when it is wider.\n";
+	       "; start counts anybody on foot within 5 m, or within this when wider.\n";
 	Appendf(out, "missionMargin = %g\n", MarginMetres(missionMarginCm));
 	out += "\n"
 	       "; How long a checkpoint waits for the players who are not at it before\n"
@@ -625,6 +671,14 @@ std::string ServerConfig::ToIni() const {
 	       ";             handling ones\n"
 	       ";   off       no cheats at all while connected\n";
 	Appendf(out, "cheats = %s\n", Name(cheats));
+	out += "\n"
+	       "; CoopIII's own cheats, typed the same way: TPTO and a player's number\n"
+	       "; from the Tab list (TPTO1 to TPTO8) puts you beside that player, in\n"
+	       "; your car if you are driving one.\n"
+	       ";   outsidemissions  they work, but not during a mission (the default)\n"
+	       ";   always           they work during a mission too\n"
+	       ";   off              they never work\n";
+	Appendf(out, "coopCheats = %s\n", Name(coopCheats));
 	out += "\n"
 	       "; How long a car the players have used stays once nobody is in it or\n"
 	       "; within 200 m of it, in seconds, 10 to 600.\n";

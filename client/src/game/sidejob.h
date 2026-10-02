@@ -55,6 +55,24 @@ inline VehicleStart VehicleStartGate(bool inCar, bool passenger, bool missionRun
 	return passenger ? VehicleStart::Hold : VehicleStart::Ask;
 }
 
+// A start given up goes on past START_MISSION, and every odd job's trigger
+// marks its job as begun in the instruction straight after it: Taxi Driver's
+// `0004 $ON_TAXI_MISSION = 1`, the other three a help flag they have set
+// already. The taxi's is the one that matters: its loop starts a shift only
+// while $ON_TAXI_MISSION is 0, and only the shift's own cleanup puts it back.
+// A driver held at the start (a teammate further than 50 m) who got out of
+// the taxi left that machine's taxi trigger dead until a load. So a given-up
+// odd job skips that SET_VAR_INT global to 1 with it: how many bytes, 0 when
+// what follows is anything else.
+inline uint32_t GivenUpSequelLength(const uint8_t *space, uint32_t size, uint32_t at,
+                                    int32_t missionNumber) {
+	constexpr uint32_t LENGTH = 7;   // 04 00, 02 global, 04 int8 1
+	if (missionNumber < 11 || missionNumber > 14 || at + LENGTH > size)
+		return 0;
+	const uint8_t *p = space + at;
+	return p[0] == 0x04 && p[1] == 0x00 && p[2] == 0x02 && p[5] == 0x04 && p[6] == 0x01 ? LENGTH : 0;
+}
+
 // Takes IS_BUTTON_PRESSED's call to GetPadState. Not fatal: without it a
 // passenger's key reaches START_MISSION, and with `missions = on` is held
 // there by VehicleStartGate.

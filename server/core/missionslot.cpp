@@ -43,7 +43,9 @@ MissionSlot::ClaimAnswer MissionSlot::Claim(uint8_t playerId, const C_MissionCla
 		const MissionPresence &p = players[i];
 		if (p.playerId == playerId || p.playerId >= MAX_PLAYERS)
 			continue;
-		if (!p.havePos || !InMissionArea(p.pos, m_claimArea, margin)) {
+		// A story start also waits for anybody still sitting in a car.
+		const bool seated = claim.kind == MISSION_KIND_STORY && p.inCar;
+		if (!p.havePos || seated || !InMissionArea(p.pos, m_claimArea, margin)) {
 			missing |= PlayerBit(p.playerId);
 			if (p.busy)
 				busy |= PlayerBit(p.playerId);

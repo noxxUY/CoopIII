@@ -1029,6 +1029,18 @@ bool g_saidExtraRefused = false;
 
 } // namespace
 
+bool SessionAlreadyHasCar(const void *vehicle, uint16_t &netId) {
+	if (const Observed *const o = FindObserved(vehicle)) {
+		netId = o->netId;
+		return true;
+	}
+	if (const ReplicaRow *const r = FindReplica(vehicle)) {
+		netId = r->netId;
+		return true;
+	}
+	return false;
+}
+
 bool SessionCarFor(const void *vehicle, uint16_t &netId, bool &othersMoveIt) {
 	if (const Observed *const o = FindObserved(vehicle)) {
 		netId        = o->netId;
@@ -1873,13 +1885,14 @@ void DespawnRemoteVehicle(RemoteVehicle &vehicle) {
 	ForgetObserved(vehicle.netId);
 
 	// Not with the local player in it, on his way in or on his way out.
-	// m_pMyVehicle is set for all three (see LocalDrivesVehicle). The session
-	// never releases a car anybody is in, so this is the dropped connection
+	// m_pMyVehicle is set for all three, and for the last car he left too, so
+	// the state says which (game/missionclear.h). The session never releases a
+	// car anybody is in, so this is the dropped connection
 	// with the player driving somebody else's car, or a release that raced
 	// him getting in. Deleting it would leave him with bInVehicle set and a
 	// nulled m_pMyVehicle. game/carlife.h, CopyEnd::HandToEngine.
 	void *const ped = PlayerPed();
-	const bool aboard = ped != nullptr && Field<void *>(ped, offs::PED_MY_VEHICLE) == v;
+	const bool aboard = ped != nullptr && LocalPlayerAboard(v);
 	if (HowToEndCopy(vehicle.ours && !vehicle.removed, aboard) == CopyEnd::HandToEngine) {
 		HandCopyToEngine(v);
 		Log("bridge: vehicle %u was let go of with us in it; it's this engine's "
@@ -2071,10 +2084,9 @@ bool SurrenderVehicleSeat(RemoteVehicle &vehicle) {
 	float *const vel = &Field<float>(ped, offs::MOVE_SPEED);
 	vel[0] = vel[1] = vel[2] = 0.0f;
 
-	if (void *const anim = Field<void *>(ped, offs::PED_VEHICLE_ANIM)) {
-		Field<float>(anim, ANIM_BLEND_DELTA)       = -1000.0f;
-		Field<void *>(ped, offs::PED_VEHICLE_ANIM) = nullptr;
-	}
+	// Faded only while the clump still holds it: a kept pointer can be freed
+	// memory by now (ped.h, ForgetVehicleAnim).
+	ForgetVehicleAnim(ped);
 
 	Func<void(__thiscall *)(void *)>(CPed__RemoveInCarAnims)(ped);
 
@@ -2272,8 +2284,12 @@ void ApplyRemoteVehicle(RemoteVehicle &vehicle, const VehicleStateBody &body) {
 	turn.x = HeldWithin(turn.x, WIRE_TURN_MAX);
 	turn.y = HeldWithin(turn.y, WIRE_TURN_MAX);
 	turn.z = HeldWithin(turn.z, WIRE_TURN_MAX);
-	WriteVec3(v, offs::MOVE_SPEED, move);
-	WriteVec3(v, offs::TURN_SPEED, turn);
+	// Not while our car's hit is carrying it (bumpsync.h): writing the
+	// owner's speed back would be the wall again, one frame earlier.
+	if (!vehicle.looseLocally) {
+		WriteVec3(v, offs::MOVE_SPEED, move);
+		WriteVec3(v, offs::TURN_SPEED, turn);
+	}
 
 	// Controls - so the front wheels turn and the brake lights come on. For a
 	// copy with its driver in the seat (STATUS_PHYSICS, game/carstatus.h)
@@ -4112,14 +4128,15 @@ void DespawnAmbientCarReplica(RemoteAmbientCar &car) {
 		return;   // the engine already took it
 
 	// Not with the local player in it, on the way in or on the way out:
-	// m_pMyVehicle is set for all three. Its host can reap it, or the session
+	// m_pMyVehicle is set for all three (and for the last car he left, which is
+	// why the state is asked too: game/missionclear.h). Its host can reap it, or the session
 	// end, while we sit at its wheel waiting for the promotion, and deleted
 	// then it leaves the player with bInVehicle set and a nulled m_pMyVehicle
 	// (game/carlife.h, CopyEnd::HandToEngine), or kills them half way through
 	// the door. It becomes this engine's own car instead, the way a session
 	// car does in DespawnRemoteVehicle.
 	void *const ped = PlayerPed();
-	if (ped != nullptr && Field<void *>(ped, offs::PED_MY_VEHICLE) == v) {
+	if (ped != nullptr && LocalPlayerAboard(v)) {
 		HandCopyToEngine(v);
 		Log("population: ambient car %u was let go of with us in it; it's this "
 		    "engine's car now instead of being destroyed", car.netId);
@@ -4213,12 +4230,15 @@ void CorrectAmbientCarReplica(RemoteAmbientCar &car, const VehicleTransform &at)
 		Field<float>(v, offs::AUTO_FIRE_BLOWUP_TIMER) = 0.0f;
 	}
 
-	PlaceVehicle(v, at.pos, at.rot, /*inWorld=*/true);
+	// Neither placed nor given its host's speed while our car's hit is
+	// carrying it (bumpsync.h): our engine has it for that window.
+	if (!car.looseLocally)
+		PlaceVehicle(v, at.pos, at.rot, /*inWorld=*/true);
 
 	// And its host's speed into the next frame's physics, with no spin of its
 	// own (vehicle.h, AmbientCopyMoveSpeed). Not on a wreck, which its host
 	// has finished with and the engine's own physics lets settle.
-	if (!IsWrecked(v)) {
+	if (!IsWrecked(v) && !car.looseLocally) {
 		const uint32_t age = car.lastRowAtMs != 0 ? WallClock::NowMs() - car.lastRowAtMs
 		                                          : AMBIENT_COPY_MOVING_MS;
 		WriteVec3(v, offs::MOVE_SPEED, AmbientCopyMoveSpeed(car.moveSpeed, age));
@@ -4337,6 +4357,13 @@ bool LocalDrivesAmbientCar(const RemoteAmbientCar &car) {
 		return false;
 	void *const player = PlayerPed();
 	return player != nullptr && Field<void *>(v, offs::VEH_DRIVER) == player;
+}
+
+bool LocalAboardAmbientCar(const RemoteAmbientCar &car) {
+	if (car.poolHandle < 0)
+		return false;
+	void *const v = VehicleFromRef(car.poolHandle);
+	return v != nullptr && LocalPlayerAboard(v);
 }
 
 bool SampleHostedCar(int32_t poolHandle, AmbientCarState &out) {

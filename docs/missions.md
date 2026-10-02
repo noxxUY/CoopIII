@@ -483,7 +483,7 @@ interception at all. It needs one condition answered by the session.
 
 > **2026-09-30** (`protocol.md` §1.55). A guest standing in the host's
 > contact's marker answers the host's own locate for it, with the host
-> within 50 m, so anybody walking in starts the host's trigger (§5.8). And a
+> within 5 m, so anybody walking in starts the host's trigger (§5.8). And a
 > start that is still waiting is held for as long as somebody stands in the
 > marker: it used to be let go after ten seconds, or when our last mission's
 > end had not reached the server yet, and the trigger then waited for its
@@ -506,6 +506,13 @@ interception at all. It needs one condition answered by the session.
   forwards an NPC's hit on another player's copy, so pointing the objective at
   the nearest participant's ped (on the owner's machine that's a replica) is
   the Tier 3 half, and nothing new is needed for it.
+- **What the owner's mission lets go of.** The owner says when its engine no
+  longer holds one as created by the mission (marked no longer needed, the
+  mission's cleanup), and after its mission ends what it still hosts: every
+  other machine then makes the copy ordinary crowd, or fades it out and
+  removes it when the owner holds it no more, a retry included. A car a player
+  sits in is never removed this way. `protocol.md` §1.75,
+  `client/src/game/missionclear.h`.
 
 ### 5.4 Effects are replayed through the engine's own interpreter
 
@@ -612,14 +619,22 @@ there.**
 
 - **At the start**, everybody has to be at the start's area before a mission
   launches. Each launch's start gate is answered false until they are.
-  "At" is within 50 m of the area (`MISSION_START_RADIUS_M`, or the
-  server's margin when that is wider; 2026-09-30, `protocol.md` §1.55), not
-  the checkpoints' 5 m: a friend in his own car across the street or on
-  foot round the corner is in the mission, and one a block away is waited
-  for. An odd job's is 50 m round its owner.
+  "At" is within 5 m of the area (`MISSION_START_RADIUS_M`, or the
+  server's margin when that is wider; 2026-09-30, `protocol.md` §1.55, and
+  50 m, then 30 m, until 2026-10-01), the same as a checkpoint's: a friend
+  standing by the marker is in the mission, and one across the street is
+  waited for. So is anybody still sitting in a car at a story start: the
+  start waits until they get out. An odd job's is 5 m round its owner, car
+  or not.
 - **At every checkpoint**, everybody has to be inside the area before the
   mission moves on. A checkpoint is a location check whose area holds one of
   the mission's coordinate blips, the owner satisfying it as written.
+- **A place is anybody's, the owner nearby** (2026-10-01, `mission-audit.md`
+  R4d). A location condition the owner fails is yes when a participant is
+  there as it asks (on foot, in a car, stopped) and the owner is within 60 m
+  of it; at a checkpoint the owner then only has to be nearby, everybody
+  else still inside. Scenes, the mission's stored car, a car condition
+  beside it in its block and a short list of sites stay the owner's.
 - **Inside allows 5 m.** A participant no more than 5 m outside the area
   counts as there, so a friend parked beside the owner does.
 - **Not against the clock** (decided 2026-09-25). A checkpoint that waits
@@ -639,9 +654,13 @@ there.**
   (`mission-audit.md` R13).
 - **Getting into the mission car** is anybody's (2026-09-30,
   `mission-audit.md` R4b): `IS_PLAYER_IN_CAR` is yes for any participant in
-  it, at the wheel or riding, except in an `if and` that first asked where the
-  owner is. The owner can still do the driving from the passenger seat,
-  because the vehicle conditions test "in the car", not "driving"
+  it, at the wheel or riding, the owner or a guest. In an `if and` that first
+  asked where the owner is, it is yes when the car itself stands at that
+  place with a participant in it. Every "get back in the vehicle" message of
+  the story (50 `IN_VEH`, Chaperone's 7 `FM1_1`, Uzi Rider's `YD2_N`) is
+  behind that one condition, so none of them goes up while anybody is in the
+  car. The owner can still do the driving from the passenger seat, because
+  the vehicle conditions test "in the car", not "driving"
   (`mission-audit.md` §1.4).
 - **Everything else** is the owner's, as protagonist: reaching a character,
   lifting a phone, getting a car of his own (`IS_PLAYER_IN_ANY_CAR`, whose
@@ -752,9 +771,9 @@ marker, so a guest standing in it used to count for nothing until the host
 walked in too (Farewell 'Chunky' Lee Chong, in a playtest). Now the host's
 machine answers that locate yes for a guest: when the locate is one of the
 host's contacts' (its box, 3 m round, holds a contact the host sent), the
-host's player is within 50 m of it, and a guest in the session is inside
+host's player is within 5 m of it, and a guest in the session is inside
 it. The rest is the host's own start, unchanged: its 03EE, its claim, which
-waits for everybody within 50 m, its fade and title, and the mission on the
+waits for everybody within 5 m, its fade and title, and the mission on the
 host's machine. The guests' own triggers still start nothing. Marty's
 payphone and Give Me Liberty's starts have no contact on the radar, and
 still need the host there. The host a block away starts nothing: the
@@ -794,10 +813,12 @@ marked latch means holding that mission's own; and every mission that
 registers a pass marks one, except the four RC runs, whose flag only their own
 mission reads (as does the odd jobs' siren help, which two missions set, and
 from one mission's code the two can't be told apart). What is not covered,
-and applied as before: the RC runs' first pass, a repeat of an odd job, RC,
-4x4 or Mayhem run (a record the guest beat is overwritten by the host's), a
-failed mission's delta, and deltas kept from a build before this one
-(`roadmap.md`, known issues).
+and applied as before: a failed mission's delta, and deltas kept from a build
+before this one (`roadmap.md`, known issues). The side jobs, the RC runs'
+first pass and a repeat of an odd job, RC, 4x4 or Mayhem run among them, have
+a rule of their own since 2026-10-01: their counts, records and reward flags
+only move a save on, and their progress points count only where a reward
+flag goes up (`mission-audit.md` §3, "Side jobs, step by step").
 
 **Leaving.** Out of the session there is no host: the guest's own contacts
 are drawn again at once, and its triggers start its own missions, as before
@@ -1632,6 +1653,41 @@ parked-car generators, the building swaps and hidden objects, the roads, the
 garages' types). Each is replayed through the participant's own interpreter,
 with the blips translated.
 
+**What the mission takes that is already there** (`client/src/game/missiontake.h`,
+a test run on 2026-10-01). Whatever an instruction of the owner's mission
+adds to the world is announced as the mission's own (§5.3), and an
+instruction can add back something it never made. Taking Out The Laundry
+opens with `SET_PLAYER_COORDINATES`; the owner, started from a guest in the
+marker, was still riding in the guest's car, so the engine
+teleported the car, and `CAutomobile::Teleport` is `CWorld::Remove` and
+`CWorld::Add`. On the owner's machine that car is a replica, a
+`MISSION_VEHICLE` like every session car, so it went out as a new mission
+car under a new netId, and the guest saw his own car twice. Now:
+
+- a car the session already names (anybody's session car, the owner's own
+  claimed car, or a copy of somebody else's traffic) is never hosted as the
+  mission's, nor as traffic, whatever adds it; nor is a remote player or a
+  copy of somebody else's pedestrian. The log says once that the mission
+  put that car or ped back, and it stays what it was;
+- the mission keeps reaching it by the name it already has (`NetIdForCar`
+  finds the session car), so a blip or `IS_CAR_DEAD` on it means that car on
+  every machine, and a failed mission's cleanup, which only takes the cars
+  its `CREATE_CAR` made, never takes it;
+- a machine that hears of such a mission car anyway (an owner without this)
+  never builds one that stands within 1 m of a session car of the same
+  model, and takes its copy down when its host's rows put it there; the
+  mission's netId for it reaches that session car instead (`CarForNetId`).
+
+**A car the mission clears away** (mission-audit.md R4c, `protocol.md`
+§1.63): a `CLEAR_AREA` of the owner's mission takes every session car in its
+circle that is not the mission's own, and its `DELETE_CAR` the session car it
+names, from every machine. Each participant first gets its own player out of
+the car, or off its roof, beside it; the owner's mission waits at the
+instruction while another player still sits in it, 3 s at most, and then the
+owner's machine takes the car away through the session. A car still occupied
+then is left. Cipriani's Chauffeur's opening clear takes the car the players
+came in from in front of Joey's door again, so Toni's car can drive out.
+
 **The streets, the lines and what is drawn** (mission-audit.md R15,
 `protocol.md` §1.29, `client/src/game/missionworld.h`): `CLEAR_AREA` and the
 two density multipliers are replayed, so every machine clears and thins the
@@ -1873,6 +1929,16 @@ the owner drives his own. Not in an `if and` that asked where the owner is
 first. `IS_PLAYER_IN_ANY_CAR`, `IS_PLAYER_IN_MODEL` and
 `STORE_CAR_PLAYER_IS_IN` stay the owner's; the checkpoints were already
 everybody's, in whatever car.
+
+**Marty's passengers and the Pay'n'Spray** (mission-audit.md §3, "Marty and
+Luigi, read again", `game/standin.h`): in Marty Chonks' four jobs a
+participant in Marty's car, or in the car the passenger rides in, is the
+player near the passenger, so a guest can pick him up and the owner following
+further back no longer fails "left behind". A participant's respray answers
+The Thieves and Don't Spank Ma Bitch Up inside their `if or`, held until the
+block goes its way, and the car with him in it at the Pay'n'Spray answers the
+owner's "stopped in the shop" asked after it. Give Me Liberty tells the owner
+to get into the Kuruma when a guest has driven it to the hideout.
 
 **A respray of a car somebody rides in** (`game/garage.h`,
 `PassengerKeepsPaint`): the Pay'n'Spray acts on `FindPlayerVehicle()`, which

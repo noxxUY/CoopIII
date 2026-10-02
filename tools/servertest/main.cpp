@@ -930,12 +930,21 @@ void TestATrafficCarLetGoIsHandedOn(Rig &rig) {
 		r->box.clear();
 	letGo.hdr.sendTimeMs = 300;
 	bob.net.Send(letGo, CH_EVENT);
-	pump(1500, [&] { return Last<S_CarDespawn>(alice.box) && Last<S_CarDespawn>(carol.box); });
-	Check(Last<S_CarDespawn>(alice.box) && Last<S_CarDespawn>(alice.box)->netId == carId &&
-	          Last<S_PedDespawn>(alice.box) && Last<S_PedDespawn>(alice.box)->netId == pedId &&
-	          Last<S_CarDespawn>(carol.box) && !Last<S_CarDespawn>(bob.box),
+	pump(1500, [&] { return Last<S_CrowdGone>(alice.box) && Last<S_CrowdGone>(carol.box); });
+	const auto names = [](const S_CrowdGone *g, uint16_t netId, uint8_t kind) {
+		for (uint8_t i = 0; g && i < g->count && i < MAX_CROWD_GONE; ++i)
+			if (g->rows[i].netId == netId && g->rows[i].kind == kind)
+				return true;
+		return false;
+	};
+	Check(names(Last<S_CrowdGone>(alice.box), carId, AMBIENT_ADOPT_CAR) &&
+	          names(Last<S_CrowdGone>(alice.box), pedId, AMBIENT_ADOPT_PED) &&
+	          names(Last<S_CrowdGone>(carol.box), carId, AMBIENT_ADOPT_CAR) &&
+	          !Last<S_CrowdGone>(bob.box) && !Last<S_CarDespawn>(alice.box) &&
+	          !Last<S_PedDespawn>(alice.box),
 	      "bob's engine drops it too: alice let go of it a moment ago and carol is a "
-	      "kilometre off, so it goes, with its driver, and not back to alice");
+	      "kilometre off, so it goes, with its driver, and not back to alice; as a crowd "
+	      "gone, so a copy on anybody's screen fades out rather than popping");
 	Check(!Last<S_AmbientAdopt>(alice.box) && !Last<S_AmbientAdopt>(carol.box),
 	      "and nobody is handed it");
 
@@ -1000,7 +1009,7 @@ void TestPedestriansLetGoAreHandedOn(Rig &rig) {
 	letGo.peds[1] = ids[1];
 	alice.net.Send(letGo, CH_EVENT);
 	pump(1500, [&] {
-		return Last<S_AmbientAdopt>(bob.box) && Last<S_PedDespawn>(bob.box) &&
+		return Last<S_AmbientAdopt>(bob.box) && Last<S_CrowdGone>(bob.box) &&
 		       Last<S_PedSpawn>(alice.box);
 	});
 	const S_AmbientAdopt *toBob = Last<S_AmbientAdopt>(bob.box);
@@ -1008,12 +1017,169 @@ void TestPedestriansLetGoAreHandedOn(Rig &rig) {
 	          toBob->rows[0].netId == ids[0] && toBob->rows[0].newOwnerPlayerId == bobId &&
 	          toBob->rows[0].kind == AMBIENT_ADOPT_PED,
 	      "bob, 30 m from the first, is handed him as a let-go of alice's");
-	Check(Last<S_PedDespawn>(bob.box) && Last<S_PedDespawn>(bob.box)->netId == ids[1],
-	      "the one 250 m from bob goes");
+	const S_CrowdGone *gone = Last<S_CrowdGone>(bob.box);
+	Check(gone && gone->count == 1 && gone->rows[0].netId == ids[1] &&
+	          gone->rows[0].kind == AMBIENT_ADOPT_PED && !Last<S_PedDespawn>(bob.box),
+	      "the one 250 m from bob goes, as a crowd gone bob's copy may fade out");
 	const S_PedSpawn *back = Last<S_PedSpawn>(alice.box);
 	Check(back && back->netId == ids[0] && back->ownerPlayerId == bobId && back->tempId == 0 &&
-	          !Last<S_AmbientAdopt>(alice.box) && !Last<S_PedDespawn>(alice.box),
+	          !Last<S_AmbientAdopt>(alice.box) && !Last<S_PedDespawn>(alice.box) &&
+	          !Last<S_CrowdGone>(alice.box),
 	      "alice is sent him as bob's to watch, and told nothing else");
+
+	for (Raw *r : raws)
+		r->net.Disconnect();
+	rig.Settle(300);
+}
+
+// What an engine gave up on with nobody to take it (C_CrowdGone): taken from
+// its owner only, row by row, and told to everybody else as S_CrowdGone; a
+// player's camera (C_PlayerView) relayed with his id when it is sane; and a
+// leaver's crowd nobody is near goes as S_CrowdGone too.
+void TestTheCrowdGoesWhereItIsSeen(Rig &rig) {
+	std::printf("\nthe crowd going where somebody may be looking, and where everybody looks\n");
+	std::vector<Raw *> raws;
+	const auto pump = [&](uint32_t ms, const std::function<bool()> &done) {
+		rig.Pump(ms, [&] {
+			for (Raw *r : raws)
+				r->net.Service(r->box);
+			return done && done();
+		});
+	};
+	Raw alice, bob, carol;
+	raws = {&alice, &bob, &carol};
+	for (Raw *r : raws)
+		r->net.Connect("127.0.0.1", rig.port);
+	pump(3000, [&] {
+		return alice.net.IsConnected() && bob.net.IsConnected() && carol.net.IsConnected();
+	});
+	alice.net.Send(Hello("alice"), CH_EVENT);
+	pump(3000, [&] { return Last<S_Welcome>(alice.box) != nullptr; });
+	bob.net.Send(Hello("bob"), CH_EVENT);
+	pump(3000, [&] { return Last<S_Welcome>(bob.box) != nullptr; });
+	carol.net.Send(Hello("carol"), CH_EVENT);
+	pump(3000, [&] { return Last<S_Welcome>(carol.box) != nullptr; });
+	const uint8_t aliceId = Last<S_Welcome>(alice.box) ? Last<S_Welcome>(alice.box)->playerId
+	                                                   : INVALID_PLAYER;
+	alice.net.Send(StateAt(0.0f, 0.0f, 0.0f), CH_SNAPSHOT);
+	bob.net.Send(StateAt(30.0f, 0.0f, 0.0f), CH_SNAPSHOT);
+	carol.net.Send(StateAt(2000.0f, 0.0f, 0.0f), CH_SNAPSHOT);
+	pump(300, nullptr);
+
+	// Alice's car and two pedestrians, and one of bob's.
+	C_CarSpawn car{};
+	InitHeader(car, 100);
+	car.tempId       = 31;
+	car.body.modelId = 91;
+	car.body.extra1 = car.body.extra2 = -1;
+	car.body.pos     = {20.0f, 0.0f, 0.0f};
+	car.body.rot     = {0.0f, 0.0f, 0.0f, 1.0f};
+	alice.net.Send(car, CH_EVENT);
+	pump(1500, [&] { return Last<S_CarSpawn>(bob.box) != nullptr; });
+	const uint16_t carId = Last<S_CarSpawn>(bob.box) ? Last<S_CarSpawn>(bob.box)->netId
+	                                                 : INVALID_NETID;
+	uint16_t peds[3] = {INVALID_NETID, INVALID_NETID, INVALID_NETID};
+	for (int i = 0; i < 3; ++i) {
+		for (Raw *r : raws)
+			r->box.clear();
+		C_PedSpawn ped{};
+		InitHeader(ped, 100);
+		ped.tempId       = static_cast<uint32_t>(40 + i);
+		ped.body.modelId = 30;
+		ped.body.pedType = AMBIENT_PEDTYPE_CIVMALE;
+		ped.body.pos     = {10.0f * i, 5.0f, 0.0f};
+		(i < 2 ? alice : bob).net.Send(ped, CH_EVENT);
+		Raw &watcher = i < 2 ? bob : alice;
+		pump(1500, [&] { return Last<S_PedSpawn>(watcher.box) != nullptr; });
+		peds[i] = Last<S_PedSpawn>(watcher.box) ? Last<S_PedSpawn>(watcher.box)->netId
+		                                        : INVALID_NETID;
+	}
+	Check(carId != INVALID_NETID && peds[0] != INVALID_NETID && peds[1] != INVALID_NETID &&
+	          peds[2] != INVALID_NETID && aliceId != INVALID_PLAYER,
+	      "alice's car and two pedestrians, and bob's pedestrian, are the session's");
+
+	for (Raw *r : raws)
+		r->box.clear();
+	C_CrowdGone gone{};
+	InitHeader(gone, 200);
+	gone.count   = 3;
+	gone.rows[0] = CrowdGoneRow{carId, AMBIENT_ADOPT_CAR, 0};
+	gone.rows[1] = CrowdGoneRow{peds[0], AMBIENT_ADOPT_PED, 0};
+	gone.rows[2] = CrowdGoneRow{peds[2], AMBIENT_ADOPT_PED, 0};   // bob's, not hers
+	alice.net.Send(gone, CH_EVENT);
+	pump(1500, [&] { return Last<S_CrowdGone>(bob.box) && Last<S_CrowdGone>(carol.box); });
+	const S_CrowdGone *toBob = Last<S_CrowdGone>(bob.box);
+	Check(toBob && toBob->count == 2 && toBob->rows[0].netId == carId &&
+	          toBob->rows[0].kind == AMBIENT_ADOPT_CAR && toBob->rows[1].netId == peds[0] &&
+	          toBob->rows[1].kind == AMBIENT_ADOPT_PED,
+	      "bob is told her car and her pedestrian are gone, and not his own pedestrian");
+	Check(Last<S_CrowdGone>(carol.box) && !Last<S_CrowdGone>(alice.box) &&
+	          !Last<S_CarDespawn>(bob.box) && !Last<S_PedDespawn>(bob.box),
+	      "carol too, alice not, and nobody gets a plain despawn for them");
+
+	for (Raw *r : raws)
+		r->box.clear();
+	C_PedDespawn again{};
+	InitHeader(again, 250);
+	again.netId = peds[2];
+	bob.net.Send(again, CH_EVENT);
+	again.netId = peds[0];
+	alice.net.Send(again, CH_EVENT);
+	pump(1500, [&] { return Last<S_PedDespawn>(alice.box) != nullptr; });
+	Check(Last<S_PedDespawn>(alice.box) && Last<S_PedDespawn>(alice.box)->netId == peds[2],
+	      "bob's pedestrian was still the session's for bob to despawn");
+	pump(200, nullptr);
+	bool aliceRowStill = false;
+	for (const Message &m : carol.box)
+		if (const S_PedDespawn *d = m.as<S_PedDespawn>())
+			aliceRowStill = aliceRowStill || d->netId == peds[0];
+	Check(!aliceRowStill, "and alice's, already gone, cannot be despawned twice");
+
+	// A camera, sane and not.
+	for (Raw *r : raws)
+		r->box.clear();
+	C_PlayerView view{};
+	InitHeader(view, 300);
+	view.body.pos = {1.0f, 2.0f, 3.0f};
+	view.body.fwd = {0.0f, 1.0f, 0.0f};
+	alice.net.Send(view, CH_SNAPSHOT);
+	pump(1500, [&] { return Last<S_PlayerView>(bob.box) && Last<S_PlayerView>(carol.box); });
+	const S_PlayerView *seen = Last<S_PlayerView>(bob.box);
+	Check(seen && seen->playerId == aliceId && seen->body.pos.y == 2.0f &&
+	          seen->body.fwd.y == 1.0f && !Last<S_PlayerView>(alice.box),
+	      "alice's camera reaches bob and carol with her id, and not alice");
+	for (Raw *r : raws)
+		r->box.clear();
+	view.body.fwd = {0.0f, 0.0f, 0.0f};
+	alice.net.Send(view, CH_SNAPSHOT);
+	view.body.fwd = {0.0f, 1.0f, 0.0f};
+	view.body.pos = {std::nanf(""), 0.0f, 0.0f};
+	alice.net.Send(view, CH_SNAPSHOT);
+	pump(400, nullptr);
+	Check(!Last<S_PlayerView>(bob.box), "a camera looking nowhere, or from nowhere, is dropped");
+
+	// Alice leaves with her other pedestrian beside bob: bob takes him. Then
+	// bob walks a kilometre off and leaves too, and carol, the only one left,
+	// is nowhere near: the pedestrian goes as a crowd gone, not a despawn.
+	for (Raw *r : raws)
+		r->box.clear();
+	alice.net.Disconnect();
+	pump(2000, [&] { return Last<S_PlayerLeave>(bob.box) != nullptr; });
+	const S_AmbientAdopt *took = Last<S_AmbientAdopt>(bob.box);
+	Check(took && took->count == 1 && took->rows[0].netId == peds[1] &&
+	          !Last<S_PedDespawn>(bob.box),
+	      "the pedestrian alice left beside bob is his; nothing is despawned");
+
+	for (Raw *r : raws)
+		r->box.clear();
+	bob.net.Send(StateAt(3000.0f, 0.0f, 0.0f), CH_SNAPSHOT);
+	pump(300, nullptr);
+	bob.net.Disconnect();
+	pump(2000, [&] { return Last<S_PlayerLeave>(carol.box) != nullptr; });
+	const S_CrowdGone *leftover = Last<S_CrowdGone>(carol.box);
+	Check(leftover && leftover->count == 1 && leftover->rows[0].netId == peds[1] &&
+	          !Last<S_PedDespawn>(carol.box),
+	      "bob leaves with him 1 km from carol: he goes, as a crowd gone, not a despawn");
 
 	for (Raw *r : raws)
 		r->net.Disconnect();
@@ -1748,6 +1914,81 @@ void TestACarsPaintTravels(Rig &rig) {
 	rig.Settle(300);
 }
 
+// A ram (protocol.h, C_VehicleBump): from the driver of the car that did it to
+// the driver of the car it hit, and to nobody else.
+void TestARamReachesTheCarsDriver(Rig &rig) {
+	std::printf("\na ram, to the driver of the car that was hit\n");
+	std::vector<Raw *> raws;
+	const auto pump = [&](uint32_t ms, const std::function<bool()> &done) {
+		rig.Pump(ms, [&] {
+			for (Raw *r : raws)
+				r->net.Service(r->box);
+			return done && done();
+		});
+	};
+	Raw alice, bob, carol;
+	raws = {&alice, &bob, &carol};
+	for (Raw *r : raws)
+		r->net.Connect("127.0.0.1", rig.port);
+	pump(3000, [&] {
+		return alice.net.IsConnected() && bob.net.IsConnected() && carol.net.IsConnected();
+	});
+	alice.net.Send(Hello("alice"), CH_EVENT);
+	pump(3000, [&] { return Last<S_Welcome>(alice.box) != nullptr; });
+	bob.net.Send(Hello("bob"), CH_EVENT);
+	pump(3000, [&] { return Last<S_Welcome>(bob.box) != nullptr; });
+	carol.net.Send(Hello("carol"), CH_EVENT);
+	pump(3000, [&] { return Last<S_Welcome>(carol.box) != nullptr; });
+	const S_Welcome *bobWelcome = Last<S_Welcome>(bob.box);
+	const uint8_t    bobId      = bobWelcome ? bobWelcome->playerId : INVALID_PLAYER;
+
+	const auto claim = [&](Raw &who, float x) {
+		for (Raw *r : raws)
+			r->box.clear();
+		C_EnterVehicle c{};
+		InitHeader(c, 100);
+		c.body.netId   = INVALID_NETID;
+		c.body.seat    = 0;
+		c.body.modelId = 91;
+		c.body.pos     = Vec3{x, 0.0f, 0.0f};
+		c.body.rot     = Quat{0.0f, 0.0f, 0.0f, 1.0f};
+		who.net.Send(c, CH_EVENT);
+		pump(3000, [&] { return Last<S_EnterVehicle>(who.box) != nullptr; });
+		const S_EnterVehicle *seat = Last<S_EnterVehicle>(who.box);
+		return seat ? seat->body.netId : INVALID_NETID;
+	};
+	const uint16_t alices = claim(alice, 0.0f);
+	const uint16_t bobs   = claim(bob, 4.0f);
+	Check(alices != INVALID_NETID && bobs != INVALID_NETID, "alice and bob each drive a car");
+
+	for (Raw *r : raws)
+		r->box.clear();
+	C_VehicleBump ram{};
+	InitHeader(ram, 200);
+	ram.body.netId   = alices;
+	ram.body.byNetId = bobs;
+	ram.body.move[0] = 512;
+	ram.body.impulse = 300;
+	ram.body.piece   = 4;
+	carol.net.Send(ram, CH_EVENT);
+	pump(600, [] { return false; });
+	Check(!Last<S_VehicleBump>(alice.box), "carol, who is not driving bob's car, cannot say it rammed");
+
+	bob.net.Send(ram, CH_EVENT);
+	pump(1500, [&] { return Last<S_VehicleBump>(alice.box) != nullptr; });
+	const S_VehicleBump *heard = Last<S_VehicleBump>(alice.box);
+	Check(heard && heard->attackerId == bobId && heard->body.netId == alices &&
+	          heard->body.byNetId == bobs && heard->body.move[0] == 512 &&
+	          heard->body.impulse == 300 && heard->body.piece == 4,
+	      "bob's ram reaches alice as it was sent");
+	Check(!Last<S_VehicleBump>(bob.box) && !Last<S_VehicleBump>(carol.box),
+	      "and nobody else");
+
+	for (Raw *r : raws)
+		r->net.Disconnect();
+	rig.Settle(300);
+}
+
 // A unique jump's shot, from the car's driver to whoever rides with him, and
 // to nobody else (stuntcam.h).
 // A driver whose snapshots have been on foot for SEAT_RELEASE_ON_FOOT_MS is
@@ -1909,6 +2150,97 @@ void TestAJumpShotReachesTheRiders(Rig &rig) {
 	rig.Settle(300);
 }
 
+// A crane's hook: from the one machine working it to everybody else, and from
+// nobody else while it works (server/core/cranes.h).
+void TestACraneTravels(Rig &rig) {
+	std::printf("\na crane, from the machine working it to everybody else\n");
+	std::vector<Raw *> raws;
+	const auto pump = [&](uint32_t ms, const std::function<bool()> &done) {
+		rig.Pump(ms, [&] {
+			for (Raw *r : raws)
+				r->net.Service(r->box);
+			return done && done();
+		});
+	};
+	Raw alice, bob, carol;
+	raws = {&alice, &bob, &carol};
+	for (Raw *r : raws)
+		r->net.Connect("127.0.0.1", rig.port);
+	pump(3000, [&] {
+		return alice.net.IsConnected() && bob.net.IsConnected() && carol.net.IsConnected();
+	});
+	alice.net.Send(Hello("alice"), CH_EVENT);
+	pump(3000, [&] { return Last<S_Welcome>(alice.box) != nullptr; });
+	bob.net.Send(Hello("bob"), CH_EVENT);
+	pump(3000, [&] { return Last<S_Welcome>(bob.box) != nullptr; });
+	carol.net.Send(Hello("carol"), CH_EVENT);
+	pump(3000, [&] { return Last<S_Welcome>(carol.box) != nullptr; });
+	const S_Welcome *welcome = Last<S_Welcome>(alice.box);
+	const uint8_t    aliceId = welcome ? welcome->playerId : INVALID_PLAYER;
+
+	for (Raw *r : raws)
+		r->box.clear();
+	C_CraneState busy{};
+	InitHeader(busy, 200);
+	busy.body.craneX     = 1119.0f;
+	busy.body.craneY     = 48.0f;
+	busy.body.active     = 1;
+	busy.body.state      = 2;
+	busy.body.netId      = 77;
+	busy.body.hookAngle  = 0.5f;
+	busy.body.hookOffset = 20.0f;
+	busy.body.hookHeight = 12.0f;
+	alice.net.Send(busy, CH_SNAPSHOT);
+	pump(1500, [&] { return Last<S_CraneState>(bob.box) && Last<S_CraneState>(carol.box); });
+	const S_CraneState *heard = Last<S_CraneState>(bob.box);
+	Check(heard && heard->playerId == aliceId && heard->body.state == 2 &&
+	          heard->body.netId == 77 && heard->body.hookOffset == 20.0f &&
+	          Last<S_CraneState>(carol.box) != nullptr,
+	      "alice's crane, lifting car 77, reaches bob and carol with her name on it");
+	Check(!Last<S_CraneState>(alice.box), "and not alice herself");
+
+	for (Raw *r : raws)
+		r->box.clear();
+	C_CraneState rival = busy;
+	rival.body.netId   = 78;
+	bob.net.Send(rival, CH_SNAPSHOT);
+	pump(600, nullptr);
+	Check(!Last<S_CraneState>(alice.box) && !Last<S_CraneState>(carol.box),
+	      "bob's crane busy on the same one while she works it goes nowhere");
+
+	busy.body.active = 0;
+	busy.body.state  = 0;
+	busy.body.netId  = INVALID_NETID;
+	alice.net.Send(busy, CH_EVENT);
+	pump(1500, [&] { return Last<S_CraneState>(bob.box) && Last<S_CraneState>(carol.box); });
+	const S_CraneState *end = Last<S_CraneState>(carol.box);
+	Check(end && end->body.active == 0 && end->playerId == aliceId,
+	      "her end reaches everybody");
+
+	for (Raw *r : raws)
+		r->box.clear();
+	bob.net.Send(rival, CH_SNAPSHOT);
+	pump(1500, [&] { return Last<S_CraneState>(alice.box) && Last<S_CraneState>(carol.box); });
+	Check(Last<S_CraneState>(alice.box) && Last<S_CraneState>(alice.box)->body.netId == 78,
+	      "then bob's crane takes it");
+
+	for (Raw *r : raws)
+		r->box.clear();
+	bob.net.Disconnect();
+	pump(3000, [&] {
+		const S_CraneState *s = Last<S_CraneState>(carol.box);
+		return s && s->body.active == 0;
+	});
+	const S_CraneState *left = Last<S_CraneState>(carol.box);
+	Check(left && left->body.active == 0 && SameCrane(left->body.craneX, left->body.craneY,
+	                                                   1119.0f, 48.0f),
+	      "and when bob leaves, everybody is told his crane is nobody's");
+
+	for (Raw *r : raws)
+		r->net.Disconnect();
+	rig.Settle(300);
+}
+
 // A wreck: settled by the machine whose car it was, followed by everybody
 // else, and handed to a joiner as a wreck where it came to rest
 // (client/src/game/wreck.h).
@@ -2034,26 +2366,27 @@ void TestAWreckIsSettledAndHandedToAJoiner(Rig &rig) {
 // and still lets somebody in. Mostly the small values and edges a field is
 // checked against, otherwise random, from a fixed seed.
 #define COOPIII_SERVER_PACKETS(X)                                                                  \
-	X(C_CampaignDelta) X(C_CampaignSince) X(C_ContactMarkers) X(C_PlaceBlips) X(C_CarDespawn) X(C_CarHit) X(C_CarLetGo) X(C_CarLists)  \
+	X(C_CampaignDelta) X(C_CampaignSince) X(C_ContactMarkers) X(C_PlaceBlips) X(C_CarDespawn) X(C_CraneState) X(C_CarHit) X(C_CarLetGo) X(C_CarLists)  \
+	X(C_CrowdGone) X(C_MissionRelease) X(C_PlayerView) X(C_PedLetGo)                                                   \
 	X(C_CarSpawn) X(C_CarStates) X(C_Chat) X(C_Cheat) X(C_CopHandover) X(C_CutsceneState)          \
 	X(C_Damage) X(C_Death)                                                                         \
 	X(C_DesyncProbe) X(C_EnterVehicle) X(C_EnteringVehicle) X(C_ExitVehicle) X(C_Explosion)        \
-	X(C_GarageState) X(C_GateState) X(C_HeliGone) X(C_HeliHit) X(C_HeliShot) X(C_HeliState)        \
+	X(C_GarageState) X(C_GlassBroken) X(C_GateState) X(C_HeliGone) X(C_HeliHit) X(C_HeliShot) X(C_HeliState)        \
 	X(C_Hello) X(C_JackingVehicle) X(C_Kick) X(C_LobbyJoin) X(C_LobbyStart) X(C_MineBlast)         \
 	X(C_MissionAnswers) X(C_MissionBoard) X(C_MissionBomb) X(C_MissionBusy) X(C_MissionCatchUp)    \
 	X(C_MissionCheckpoint) X(C_MissionClaim) X(C_MissionEffect) X(C_MissionEnded) X(C_MissionKill) \
 	X(C_MissionObjectBreak) X(C_MissionPickup) X(C_MissionReady) X(C_MissionSeats)                 \
 	X(C_MissionStarted) X(C_MissionWidget) X(C_MoneyAward) X(C_MoneyChange) X(C_NpcDamage)         \
 	X(C_NpcShot) X(C_NpcVehicleHit) X(C_ObjectBroken) X(C_ObjectRebuilt) X(C_ObjectSettled)        \
-	X(C_Password) X(C_PedBodyPart) X(C_PedDamage) X(C_PedDeath) X(C_PedDespawn) X(C_PedRevive)     \
+	X(C_Password) X(C_PedOverlay) X(C_PedBodyPart) X(C_PedDamage) X(C_PedDeath) X(C_PedDespawn) X(C_PedRevive)     \
 	X(C_PedSpeech) X(C_PackagesLive)                                                               \
 	X(C_PedSpawn) X(C_PedStates) X(C_PickupClaim) X(C_PickupCollected) X(C_PickupDrop)             \
 	X(C_PickupRelease) X(C_PlayerAmmo) X(C_PlayerAway) X(C_PlayerLook) X(C_PlayerModel)            \
-	X(C_PlayerMoney)                                                                               \
+	X(C_PlayerMoney) X(C_PlayerSkin)                                                               \
 	X(C_PlayerState) X(C_PlayerStateRide) X(C_RampageArrived) X(C_RampageCar) X(C_RampageEnd)      \
 	X(C_RampageKill) X(C_RampageStart) X(C_RampageVote) X(C_Respawn) X(C_Respray) X(C_Shot)        \
 	X(C_StuntCamera) X(C_UnownedBlowUp) X(C_VehicleAim) X(C_VehicleAlarm) X(C_VehicleBlowUp)       \
-	X(C_VehicleColour)                                                                             \
+	X(C_VehicleColour) X(C_VehicleBump)                                                            \
 	X(C_VehicleBomb) X(C_VehicleDamage) X(C_VehicleHit) X(C_VehicleRadio) X(C_VehicleRemoved)      \
 	X(C_VehicleSettled) X(C_VehicleState) X(C_WaterCannon) X(C_WorldState)
 
@@ -3111,6 +3444,100 @@ void TestGatesAndBrokenObjectsReachEverybody() {
 	rig.server.Stop();
 }
 
+// A shop window shattered on one machine (docs/objects.md 10): relayed with
+// what the engine was handed, and kept as the window's object record so a
+// player who builds it again and a joiner are told it is gone.
+void TestAShatteredWindowReachesEverybody() {
+	std::printf("\na shattered window, as the clients hear it\n");
+	Rig rig;
+	rig.server.SetLogSink([](LogKind, const char *line) {
+		if (g_verbose)
+			std::printf("    | %s\n", line);
+	});
+	bool listening = false;
+	for (uint16_t port = 24440; port < 24460 && !listening; ++port) {
+		listening = rig.server.Start(port, false);
+		if (listening)
+			rig.port = port;
+	}
+	if (!listening) {
+		std::printf("  [skipped] no port to listen on\n");
+		return;
+	}
+	NetClient first, second, third;
+	rig.clients = {&first, &second, &third};
+	rig.inbox.resize(3);
+	const uint8_t alice = Join(rig, 0, "alice");
+	const uint8_t bob   = Join(rig, 1, "bob");
+	Check(alice != INVALID_PLAYER && bob != INVALID_PLAYER, "two players in");
+	rig.clients[0]->Send(StateAt(100.0f, 200.0f, 10.0f), CH_SNAPSHOT);
+	rig.clients[1]->Send(StateAt(110.0f, 200.0f, 10.0f), CH_SNAPSHOT);
+	rig.Settle();
+	rig.ClearInboxes();
+
+	// Alice drives through a shop window.
+	C_GlassBroken glass{};
+	InitHeader(glass, 100);
+	glass.body.ident.pos        = {104.0f, 202.0f, 11.0f};
+	glass.body.ident.modelIndex = 1390;
+	glass.body.amount           = 640.0f;
+	glass.body.speed            = {0.7f, 0.1f, 0.0f};
+	glass.body.point            = {104.5f, 202.0f, 11.5f};
+	rig.clients[0]->Send(glass, CH_EVENT);
+	rig.Pump(1500, [&] { return Last<S_GlassBroken>(rig.inbox[1]) != nullptr; });
+	const S_GlassBroken *heard = Last<S_GlassBroken>(rig.inbox[1]);
+	Check(heard && heard->playerId == alice && heard->body.amount == 640.0f &&
+	          heard->body.speed.x == 0.7f && heard->body.point.z == 11.5f &&
+	          heard->body.ident.modelIndex == 1390,
+	      "bob hears alice's window with everything her engine was handed");
+	Check(Last<S_GlassBroken>(rig.inbox[0]) == nullptr, "and alice is not told her own");
+
+	// Bob's engine shattered the same window too, and says so: one more relay,
+	// still one record.
+	rig.clients[1]->Send(glass, CH_EVENT);
+	rig.Pump(1500, [&] { return Last<S_GlassBroken>(rig.inbox[0]) != nullptr; });
+	Check(Last<S_GlassBroken>(rig.inbox[0]) != nullptr &&
+	          Last<S_GlassBroken>(rig.inbox[0])->playerId == bob,
+	      "a second machine that shattered it is relayed as well, a no-op where it lands");
+	rig.Settle();
+	rig.ClearInboxes();
+
+	// Alice drove off and came back: her engine built the window whole.
+	C_ObjectRebuilt rebuilt{};
+	InitHeader(rebuilt, 100);
+	rebuilt.ident = glass.body.ident;
+	rig.clients[0]->Send(rebuilt, CH_EVENT);
+	rig.Pump(1500, [&] { return Last<S_ObjectBroken>(rig.inbox[0]) != nullptr; });
+	const S_ObjectBroken *again = Last<S_ObjectBroken>(rig.inbox[0]);
+	Check(again && again->playerId == INVALID_PLAYER && again->body.state == OBJ_BREAK_GLASS &&
+	          again->body.ident.modelIndex == 1390 && again->body.amount == 640.0f,
+	      "a machine that builds it again is told it is a shattered window, stamped with nobody");
+	Check(Last<S_ObjectSettled>(rig.inbox[0]) == nullptr, "and nothing about a resting place");
+
+	// A joiner hears it.
+	rig.ClearInboxes();
+	const uint8_t carol = Join(rig, 2, "carol");
+	rig.Settle();
+	const S_ObjectBroken *told = Last<S_ObjectBroken>(rig.inbox[2]);
+	Check(carol != INVALID_PLAYER && told && told->body.state == OBJ_BREAK_GLASS,
+	      "carol, joining, is handed the shattered window");
+
+	// Everybody drives off: every copy is a dummy again, whole, and the record goes.
+	for (size_t i = 0; i < 3; ++i)
+		rig.clients[i]->Send(StateAt(900.0f, 200.0f, 10.0f), CH_SNAPSHOT);
+	rig.Pump(1600, nullptr);
+	rig.ClearInboxes();
+	rig.clients[0]->Send(rebuilt, CH_EVENT);
+	rig.Pump(500, nullptr);
+	Check(Last<S_ObjectBroken>(rig.inbox[0]) == nullptr,
+	      "once nobody is near it, a rebuild is told nothing and the window is whole");
+
+	for (NetClient *client : rig.clients)
+		client->Disconnect();
+	rig.Settle();
+	rig.server.Stop();
+}
+
 // The host changing the rules while two players are in: what the window's Save
 // does, through Server::Configure.
 void TestTheHostsRulesReachEverybody() {
@@ -3145,6 +3572,8 @@ void TestTheHostsRulesReachEverybody() {
 	      "the rules follow the welcome");
 	Check(welcome && rules && rules->flags == welcome->flags && rules->maxWanted == 6,
 	      "with the welcome's flags and six stars");
+	Check(rules && rules->coopCheats == COOP_CHEATS_OUTSIDE_MISSIONS,
+	      "and CoopIII's own cheats outside missions, the default");
 	const uint8_t bob = Join(rig, 1, "bob");
 	Check(alice == 0 && bob == 1, "alice and bob are in");
 	rig.Pump(1000, [&] {
@@ -3199,6 +3628,21 @@ void TestTheHostsRulesReachEverybody() {
 	Check(Count<S_SessionRules>(rig.inbox[1]) == 0 && Count<S_MissionState>(rig.inbox[1]) == 0 &&
 	          Count<S_Money>(rig.inbox[1]) == 0,
 	      "saving without a change sends nothing");
+
+	// CoopIII's own cheats, and nothing else, changed: that alone is news.
+	cfg.coopCheats = CoopCheatMode::Always;
+	rig.server.Configure(cfg);
+	rig.Pump(1500, [&] { return Last<S_SessionRules>(rig.inbox[1]) != nullptr; });
+	rules = Last<S_SessionRules>(rig.inbox[1]);
+	Check(rules && rules->coopCheats == COOP_CHEATS_ALWAYS && rig.server.CoopCheats() == COOP_CHEATS_ALWAYS,
+	      "letting CoopIII's cheats into missions tells bob at once, in S_SessionRules");
+	rig.ClearInboxes();
+	cfg.coopCheats = CoopCheatMode::Off;
+	rig.server.Configure(cfg);
+	rig.Pump(1500, [&] { return Last<S_SessionRules>(rig.inbox[1]) != nullptr; });
+	rules = Last<S_SessionRules>(rig.inbox[1]);
+	Check(rules && rules->coopCheats == COOP_CHEATS_OFF, "and switching them off does too");
+	rig.ClearInboxes();
 
 	// Only the owner is paid: the server keeps a mission's reward from the
 	// helpers, and passes everything else on.
@@ -3279,6 +3723,165 @@ void TestTheHostsRulesReachEverybody() {
 	rig.server.Stop();
 }
 
+// Custom skins (docs/protocol.md 1.72): a whole skin goes on to everybody
+// else and to a joiner, a piece out of place goes nowhere, and with
+// syncCustomSkins off nothing goes at all.
+std::vector<SkinChunk> SkinPieces(const Skin &skin) {
+	std::vector<SkinChunk> out;
+	uint32_t               at = 0;
+	SkinChunk              piece;
+	while (CutSkinPiece(skin, at, piece))
+		out.push_back(piece);
+	return out;
+}
+
+void SendSkin(NetClient &c, const std::vector<SkinChunk> &pieces) {
+	for (const SkinChunk &piece : pieces) {
+		C_PlayerSkin out;
+		InitHeader(out, 100);
+		out.chunk = piece;
+		c.Send(out, CH_EVENT);
+	}
+}
+
+// Every S_PlayerSkin from `from` in a box, put back together: the last skin
+// completed, if any.
+bool HeardSkin(const std::vector<Message> &box, uint8_t from, Skin &out) {
+	SkinAssembly in;
+	bool         whole = false;
+	for (const Message &m : box)
+		if (const S_PlayerSkin *p = m.as<S_PlayerSkin>())
+			if (p->playerId == from && in.Take(p->chunk) == SkinAssembly::Step::Complete) {
+				out   = in.Finished();
+				whole = true;
+			}
+	return whole;
+}
+
+void TestSkinsReachEverybody() {
+	std::printf("\ncustom skins, to everybody else and to a joiner\n");
+	Rig rig;
+	rig.server.SetLogSink([](LogKind, const char *line) {
+		if (g_verbose)
+			std::printf("    | %s\n", line);
+	});
+	bool listening = false;
+	for (uint16_t port = 24400; port < 24420 && !listening; ++port) {
+		listening = rig.server.Start(port, false);
+		if (listening)
+			rig.port = port;
+	}
+	if (!listening) {
+		std::printf("  [skipped] no port to listen on\n");
+		return;
+	}
+	ServerConfig cfg;
+	rig.server.Configure(cfg);
+
+	NetClient first, second, third;
+	rig.clients = {&first, &second, &third};
+	rig.inbox.resize(3);
+	const uint8_t alice = Join(rig, 0, "alice");
+	const uint8_t bob   = Join(rig, 1, "bob");
+	rig.Pump(1000, [&] { return Last<S_SessionRules>(rig.inbox[1]) != nullptr; });
+	const S_SessionRules *rules = Last<S_SessionRules>(rig.inbox[1]);
+	Check(alice == 0 && bob == 1 && rules && rules->skins == SKIN_RULE_SYNC &&
+	          rig.server.SyncsSkins(),
+	      "alice and bob are in, and custom skins travel by default");
+
+	std::vector<uint8_t> rgba(256 * 256 * 4);
+	for (size_t i = 0; i < 256 * 256; ++i) {
+		rgba[i * 4]     = uint8_t(i % 97);
+		rgba[i * 4 + 1] = uint8_t(i % 89);
+		rgba[i * 4 + 2] = uint8_t(i / 256);
+	}
+	Skin playa;
+	EncodeSkin(256, 256, rgba.data(), 1, "playa", playa);
+	const std::vector<SkinChunk> pieces = SkinPieces(playa);
+	rig.ClearInboxes();
+	SendSkin(first, pieces);
+	Skin heard;
+	rig.Pump(5000, [&] { return HeardSkin(rig.inbox[1], alice, heard); });
+	Check(HeardSkin(rig.inbox[1], alice, heard) && heard.payload == playa.payload &&
+	          Count<S_PlayerSkin>(rig.inbox[1]) == pieces.size(),
+	      "alice's skin reaches bob whole, every piece once");
+	Check(Count<S_PlayerSkin>(rig.inbox[0]) == 0, "and none of it goes back to alice");
+	const SkinInfo *held = rig.server.SkinOf(alice);
+	Check(held && held->width == 256 && std::strcmp(held->name, "playa") == 0,
+	      "the server keeps it as hers");
+
+	// A joiner gets it after he has been told who alice is.
+	rig.ClearInboxes();
+	const uint8_t carol = Join(rig, 2, "carol");
+	rig.Pump(5000, [&] { return HeardSkin(rig.inbox[2], alice, heard); });
+	size_t joinAt = rig.inbox[2].size();
+	for (size_t i = 0; i < rig.inbox[2].size(); ++i)
+		if (const S_PlayerJoin *j = rig.inbox[2][i].as<S_PlayerJoin>())
+			if (j->playerId == alice && joinAt == rig.inbox[2].size())
+				joinAt = i;
+	Check(carol == 2 && HeardSkin(rig.inbox[2], alice, heard) && heard.payload == playa.payload &&
+	          IndexOf(rig.inbox[2], OP_S_PLAYER_SKIN) > joinAt,
+	      "carol, joining later, is sent it whole, after alice's join");
+
+	// A piece out of place goes nowhere.
+	rig.ClearInboxes();
+	std::vector<SkinChunk> skipped = SkinPieces(playa);
+	skipped.erase(skipped.begin() + 3);
+	for (SkinChunk &c : skipped)
+		c.info.serial = 2;
+	SendSkin(second, skipped);
+	rig.Pump(1500, nullptr);
+	Check(rig.server.SkinOf(bob) == nullptr && Count<S_PlayerSkin>(rig.inbox[0]) == 0 &&
+	          Count<S_PlayerSkin>(rig.inbox[2]) == 0,
+	      "bob's skin with a piece missing is thrown away, and nobody hears of it");
+
+	// Changed: the new one goes.
+	rig.ClearInboxes();
+	const Skin def = DefaultSkin(3, "$$\"\"");
+	SendSkin(first, SkinPieces(def));
+	rig.Pump(1500, [&] { return HeardSkin(rig.inbox[1], alice, heard); });
+	Check(HeardSkin(rig.inbox[1], alice, heard) && heard.info.format == SKIN_FORMAT_DEFAULT &&
+	          HeardSkin(rig.inbox[2], alice, heard),
+	      "alice going back to the default skin reaches both");
+
+	// Off: everybody hears, and nothing travels.
+	SendSkin(first, pieces);
+	rig.Pump(1500, [&] { return rig.server.SkinOf(alice) && rig.server.SkinOf(alice)->bytes != 0; });
+	rig.ClearInboxes();
+	cfg.syncCustomSkins = false;
+	rig.server.Configure(cfg);
+	rig.Pump(1000, [&] { return Last<S_SessionRules>(rig.inbox[2]) != nullptr; });
+	rules = Last<S_SessionRules>(rig.inbox[2]);
+	Check(rules && rules->skins == SKIN_RULE_OFF && rig.server.SkinOf(alice) == nullptr,
+	      "syncCustomSkins off is told to everybody, and the server forgets every skin");
+	rig.ClearInboxes();
+	SendSkin(first, pieces);
+	rig.Pump(1000, nullptr);
+	Check(Count<S_PlayerSkin>(rig.inbox[1]) == 0 && rig.server.SkinOf(alice) == nullptr,
+	      "and a skin sent while it is off is neither kept nor sent on");
+	cfg.syncCustomSkins = true;
+	rig.server.Configure(cfg);
+	rig.Pump(1000, [&] {
+		const S_SessionRules *r = Last<S_SessionRules>(rig.inbox[1]);
+		return r && r->skins == SKIN_RULE_SYNC;
+	});
+	Check(Last<S_SessionRules>(rig.inbox[1]) &&
+	          Last<S_SessionRules>(rig.inbox[1])->skins == SKIN_RULE_SYNC,
+	      "and on again, everybody hears that too");
+
+	// Leaving takes it away.
+	SendSkin(first, pieces);
+	rig.Pump(2000, [&] { return rig.server.SkinOf(alice) != nullptr; });
+	first.Disconnect();
+	rig.Pump(2000, [&] { return rig.server.SkinOf(alice) == nullptr; });
+	Check(rig.server.SkinOf(alice) == nullptr, "alice leaving takes her skin with her");
+
+	for (NetClient *client : rig.clients)
+		client->Disconnect();
+	rig.Settle(300);
+	rig.server.Stop();
+}
+
 int main(int argc, char **argv) {
 	g_verbose = argc > 1 && std::strcmp(argv[1], "-v") == 0;
 	Rig rig;
@@ -3312,9 +3915,12 @@ int main(int argc, char **argv) {
 	TestAWreckIsSettledAndHandedToAJoiner(rig);
 	TestACarsAlarmAndGunTravel(rig);
 	TestACarsPaintTravels(rig);
+	TestARamReachesTheCarsDriver(rig);
 	TestAJumpShotReachesTheRiders(rig);
+	TestACraneTravels(rig);
 	TestATrafficCarLetGoIsHandedOn(rig);
 	TestPedestriansLetGoAreHandedOn(rig);
+	TestTheCrowdGoesWhereItIsSeen(rig);
 	TestPoliceAndSpeechTravel(rig);
 	TestTheHostsContactsTravel(rig);
 	TestTheHostsPlacesTravel(rig);
@@ -3333,9 +3939,11 @@ int main(int argc, char **argv) {
 	TestACutsceneIsSkippedTogether();
 	TestAnOwnerWhoDroppedOffIsTakenUpAgain();
 	TestGatesAndBrokenObjectsReachEverybody();
+	TestAShatteredWindowReachesEverybody();
 	TestTheHostsRulesReachEverybody();
 	TestProgressOutlivesTheServer();
 	TestARampagePassNamesItsPayer();
+	TestSkinsReachEverybody();
 	TestNoPacketCrashesTheServer();
 	g_failures += RunEmergencyTests();
 

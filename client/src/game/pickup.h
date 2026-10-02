@@ -551,6 +551,11 @@ bool PickupStillUp(int32_t handle);
 // used again since, names none.
 bool PickupInUse(int32_t handle);
 
+// PickupStillUp, and with the object the engine draws it as: what
+// ADD_BLIP_FOR_PICKUP and ADD_SPRITE_BLIP_FOR_PICKUP (0x0044F600, 0x0044F696)
+// put their blip on, read out of aPickUps with no test of either.
+bool PickupObjectUp(int32_t handle);
+
 // One of the session's mission's floating packages, taken on somebody else's
 // machine (docs/missions.md 5.3): gone here the way the engine takes one and,
 // with `tellTheScript`, pushed into the ring HAS_PICKUP_BEEN_COLLECTED reads,
@@ -585,6 +590,76 @@ struct PickupStats {
 };
 
 const PickupStats &GetPickupStats();
+
+// ---------------------------------------------------------------------------
+// The safehouses' reward racks: each player's own
+// ---------------------------------------------------------------------------
+//
+// rewards.sc lays out a rack at the safehouse whenever its player walks in:
+// the bat, the weapons the hidden packages earned, the flamethrower, the
+// Vigilante's bribes and the Paramedic's health and adrenaline, each from
+// that save's own flags and counts. Every machine lays out its own rack, and
+// in single player the rack is the player's. As session pickups the two racks
+// were one: whoever took the flamethrower first took it off the other's rack
+// for twelve minutes (pickups.md 5), and a gun only one save had earned was
+// claimed like any other. So a rack spot is each player's own, the way an
+// info pickup is: never claimed, never taken off anybody else's screen.
+//
+// The spots are the CREATE_PICKUP and CREATE_PICKUP_WITH_AMMO coordinates of
+// rewards.sc, x and y, which tools/clienttest finds in the retail main.scm.
+struct RackSpot {
+	float x, y, z;
+};
+
+inline const RackSpot *HideoutRack(size_t *count) {
+	static const RackSpot kRack[] = {
+	    // Portland, Saint Mark's.
+	    {883.5f, -302.0625f, 8.0f},
+	    {876.75f, -317.0625f, 10.0f}, {874.75f, -317.0625f, 10.0f}, {872.75f, -317.0625f, 10.0f},
+	    {870.75f, -317.0625f, 10.0f}, {868.75f, -317.0625f, 10.0f}, {866.75f, -317.0625f, 10.0f},
+	    {864.75f, -317.0625f, 10.0f}, {862.75f, -317.0625f, 10.0f}, {860.75f, -317.0625f, 10.0f},
+	    {858.75f, -317.0625f, 10.0f}, {856.75f, -317.0625f, 10.0f},
+	    {877.5625f, -313.75f, 8.5f}, {875.5625f, -313.75f, 8.5f}, {873.5625f, -313.75f, 8.5f},
+	    {871.5625f, -313.75f, 8.5f}, {869.5625f, -313.75f, 8.5f}, {867.5625f, -313.75f, 8.5f},
+	    {878.875f, -299.0f, 8.1875f}, {876.875f, -299.0f, 8.1875f},
+	    // Staunton, Belleville Park.
+	    {99.0625f, -478.6875f, 15.875f},
+	    {132.6875f, -477.875f, 15.875f}, {132.6875f, -479.875f, 15.875f},
+	    {129.0625f, -477.875f, 15.875f}, {129.0625f, -479.875f, 15.875f},
+	    {125.5625f, -477.875f, 15.875f}, {125.5625f, -479.875f, 15.875f},
+	    {122.0625f, -477.875f, 15.875f}, {122.0625f, -479.875f, 15.875f},
+	    {118.6875f, -477.875f, 15.875f}, {118.6875f, -479.875f, 15.875f},
+	    {125.5625f, -475.875f, 15.875f},
+	    {114.5f, -458.0f, 15.5f}, {112.5f, -458.0f, 15.5f}, {110.5f, -458.0f, 15.5f},
+	    {108.5f, -458.0f, 15.5f}, {106.5f, -458.0f, 15.5f}, {104.5f, -458.0f, 15.5f},
+	    {94.5625f, -472.5f, 15.5f}, {92.5625f, -472.5f, 15.5f},
+	    // Shoreside Vale, Wichita Gardens.
+	    {-661.0625f, -3.75f, 18.75f},
+	    {-650.5f, -24.75f, 18.75f}, {-648.5f, -24.75f, 18.75f}, {-646.5f, -24.75f, 18.75f},
+	    {-644.5f, -24.75f, 18.75f}, {-642.5f, -24.75f, 18.75f}, {-640.5f, -24.75f, 18.75f},
+	    {-638.5f, -24.75f, 18.75f}, {-636.5f, -24.75f, 18.75f}, {-634.5f, -24.75f, 18.75f},
+	    {-632.5f, -24.75f, 18.75f}, {-630.5f, -24.75f, 18.75f},
+	    {-663.0f, -28.0f, 18.25f}, {-665.0f, -28.0f, 18.25f}, {-667.0f, -28.0f, 18.25f},
+	    {-669.0f, -28.0f, 18.25f}, {-671.0f, -28.0f, 18.25f}, {-673.0f, -28.0f, 18.25f},
+	    {-654.25f, -21.6875f, 18.25f}, {-654.25f, -19.6875f, 18.25f},
+	};
+	*count = sizeof kRack / sizeof kRack[0];
+	return kRack;
+}
+
+// Whether a pickup at (x, y, z) stands on one of the racks: within the
+// identity tolerance of a spot, which no other pickup of the script comes
+// near (the nearest two spots are 2 m apart).
+inline bool OnHideoutRack(float x, float y, float z) {
+	size_t          n    = 0;
+	const RackSpot *rack = HideoutRack(&n);
+	for (size_t i = 0; i < n; ++i) {
+		const float dx = x - rack[i].x, dy = y - rack[i].y, dz = z - rack[i].z;
+		if (dx * dx + dy * dy <= kIdentToleranceSq && dz * dz <= 4.0f)
+			return true;
+	}
+	return false;
+}
 
 // Adds the three inbound functions to a bridge that has already been built.
 // Called from dllmain, the same way worldstate.h and seat.h do it, so this

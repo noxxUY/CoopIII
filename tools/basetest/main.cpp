@@ -147,6 +147,18 @@ void TestConfigKeys() {
 	quiet.ParseIni("showVersion = off\n");
 	Check(!quiet.showVersion, "and off when the file says so");
 
+	Check(d.discordPresence && d.discordAppId == 0,
+	      "Discord presence is on by default, with the built-in application");
+	Config discord;
+	discord.ParseIni("discordPresence = off\ndiscordAppId = 123456789012345678\n");
+	Check(!discord.discordPresence && discord.discordAppId == 123456789012345678ull,
+	      "and the file can turn it off or name another application");
+	Config discordBad;
+	discordBad.ParseIni("discordAppId = 12ab\n");
+	Check(discordBad.discordAppId == 0, "an id that is not all digits is ignored");
+	discordBad.ParseIni("discordAppId = 123456789012345678901\n");
+	Check(discordBad.discordAppId == 0, "and so is one too long to be one");
+
 	Check(d.password.empty(), "no password unless the file has one");
 	Config locked;
 	locked.ParseIni("password = let me\x01 in\n");

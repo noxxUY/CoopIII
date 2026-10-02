@@ -3133,6 +3133,27 @@ constexpr uintptr_t cAudioManager__ProcessVehicleSirenOrAlarm = 0x0056C420;
 // traffic pulls over for it.
 constexpr uintptr_t CAutomobile__PreRender          = 0x00535B40;
 constexpr uintptr_t CAutomobile__ProcessControl     = 0x00531470;
+
+// ---- what a collision did to a car (game/bump.h, protocol.md 1.71) ------------
+//
+// CWorld::Process (0x004B1A60) runs every moving entity's ProcessControl
+// (`call [edi+20h]` at 0x004B1B99, and again for the postponed at 0x004B1BE4),
+// and only after the whole list has had it, the collision passes (`call
+// [edi+24h]`, 0x004B1C34 on). There is no direct call between the two loops to
+// take, so the boundary is had per car: CAutomobile's slot 8 is swapped for a
+// function that calls the slot's own value and then notes the car's move and
+// turn speed. What a car's speed is after physics less what it was there is
+// what the frame's collisions did to it, with its own driving, gravity and
+// suspension (all ProcessControl) already counted. A pointer swap in .rdata,
+// not a detour: ProcessControl's own bytes are never touched.
+//
+// The damage record ProcessControl opens on is this frame's for the same
+// reason: CPhysical::ProcessControl clears m_fDamageImpulse, m_pDamageEntity
+// and m_nDamagePieceType inside slot 8, and the collision passes after it are
+// what fill them again (re3 Physical.cpp, SetDamagedPieceRecord).
+constexpr uintptr_t CAutomobile__vtable_ProcessControl = 0x00600C3C;   // CAutomobile__vtable + 0x20
+static_assert(CAutomobile__vtable_ProcessControl == CAutomobile__vtable + 0x20,
+              "slot 8 of CAutomobile's vtable");
 constexpr uintptr_t CAutomobile__PreRender_SirenBar = 0x005373F0;
 constexpr uintptr_t CAutomobile__PreRender_FbiLight = 0x00537E4F;
 
@@ -4967,6 +4988,62 @@ constexpr uintptr_t CVisibilityPlugins__SetClumpAlpha        = 0x00528F50;
 constexpr uintptr_t CVisibilityPlugins__ms_clumpPluginOffset = 0x0060012C;
 constexpr size_t    CLUMPEXT_VISIBILITY_CB                   = 0x00;
 constexpr size_t    CLUMPEXT_ALPHA                           = 0x04;
+
+// ---- how the engine keeps its own crowd from popping (game/crowdfade.h) ------
+//
+// Read 2026-10-01 against re3 CarCtrl.cpp:544-555, Population.cpp:708-734,
+// Automobile.cpp:307-318 and Ped.cpp:1700-1714. Nothing the engine makes
+// appears or vanishes on its own player's screen:
+//
+//   CCarCtrl::GenerateOneRandomCar
+//     00417A76  push 0 / push [ebx+4Ch] / 00417A79 call 00528F50
+//                                       SetClumpAlpha(clump, 0): it fades in
+//     00417A82  call 00474CC0           GetIsOnScreen; off screen past 50 m it
+//                                       goes, on screen outside 110..130 m too
+//     00417B4C  fld [005EC928] / fmul [006FADE8]
+//                                       on screen and nearer the camera than
+//                                       90 m times GenerationDistMultiplier:
+//                                       deleted before anybody sees it
+//   CPopulation::AddToPopulation
+//     004F50E5  call 0042C760           TheCamera.IsSphereVisible(pos, 2.0)
+//     004F5132  call 004F6410 / 004F5137 fmul [005FA88C]
+//                                       in view and nearer than 40 m times
+//                                       PedCreationDistMultiplier: not added
+//     004F5209  push 0 / push [ebx+4Ch] / 004F520C call 00528F50
+//                                       the new pedestrian fades in
+//   CAutomobile::ProcessControl (0x00531470), its one early return the
+//   m_nZoneLevel test at 0x005314E6:
+//     00531849  call 00528F70           GetClumpAlpha
+//     0053184E  mov dl,[ebp+1F7h] / shr dl,3 / and dl,1
+//                                       bFadeOut ? alpha-8 : alpha+16, 0..255
+//     00531883  call 00528F50           SetClumpAlpha
+//   CPed::ProcessControl does the same at 0x004C8948 with [+15Ah] bit 7
+//   (offs::PED_FADE_OUT, below the ped flags).
+//
+// And the reapers take what is off the screen at once and set bFadeOut on what
+// is on it, removing it when the alpha has run out (game/carletgo.h).
+constexpr uintptr_t CAR_GEN_INVIEW_MIN_M_AT = 0x005EC928;   // 90.0f
+constexpr uintptr_t PED_GEN_INVIEW_MIN_M_AT = 0x005FA88C;   // 40.0f
+constexpr uintptr_t CAR_GEN_FADE_IN_CALL    = 0x00417A79;
+constexpr uintptr_t PED_GEN_FADE_IN_CALL    = 0x004F520C;
+constexpr uintptr_t CAR_PROCESS_ALPHA_GET   = 0x00531849;
+constexpr uintptr_t CAR_PROCESS_ALPHA_SET   = 0x00531883;
+constexpr uintptr_t CAR_PROCESS_FADE_TEST   = 0x0053184E;
+namespace offs {
+// CVehicle::bFadeOut, bit 3 of VEH_FLAGS_C (+0x1F7): the `shr dl,3 / and dl,1`
+// above, and what CCarCtrl::PossiblyRemoveVehicle sets on a car in view.
+constexpr uint8_t VEH_FADE_OUT = 0x08;
+} // namespace offs
+
+// TheCamera's own CPlaceable matrix, laid out as every entity's is. The
+// position at +0x34 is in the trains block above; the forward axis at +0x14 is
+// what the renderer turns into a heading (0x004A5207: `fld [006FAD0C] / fchs /
+// fld [006FAD10] / fpatan`), and what the camera writes from a normalised
+// vector, with the up axis after it at +0x24 (0x00595DD9..0x00595E01).
+constexpr uintptr_t TheCamera__Forward  = 0x006FAD0C;
+constexpr uintptr_t TheCamera__Position = 0x006FAD2C;
+constexpr uintptr_t CAMERA_FORWARD_READ = 0x004A5207;
+constexpr uintptr_t CAMERA_FORWARD_WRITE = 0x00595DD9;
 
 // CWorld::ms_nCurrentScanCode (uint16) and CEntity::m_scanCode (uint16, +0x58).
 constexpr uintptr_t CWorld__ms_nCurrentScanCode = 0x0095CC64;
@@ -7530,6 +7607,27 @@ constexpr float PED_DIE_SPEED = 0.0f;   // 0x005F9A88
 // runtime (ped.cpp AnimGroupCount) and never a count taken from re3.
 constexpr uint16_t ANIM_STD_KO_FRONT = 13;
 constexpr uint16_t ANIM_STD_NUM      = 173;
+
+// The animations CPed::SetWaitState plays for the wait states that are
+// animations, as it loads them into edi before the BlendAnimation call (the
+// "cmp edi,0ADh / jne / mov edi,N" pairs: the default id is ANIM_STD_NUM).
+// protocol.h's IsPedOverlayAnim lists the same five ids, which is what lets a
+// pedestrian's host say them on the wire (C_PedOverlay):
+//   004D5C26  mov edi,0A8h   WAITSTATE_PLAYANIM_COWER / _HANDSCOWER
+//   004D5C33  mov edi,0A7h   WAITSTATE_PLAYANIM_HANDSUP
+//   004D5C9F  mov edi,0A3h   WAITSTATE_PLAYANIM_DUCK
+//   004D5CAC  mov edi,0Ch    WAITSTATE_PLAYANIM_TAXI
+//   004D5CB9  mov edi,0Bh    WAITSTATE_PLAYANIM_CHAT
+// The chat and taxi ones are ASSOC_PARTIAL (re3's AnimManager table; chat also
+// ASSOC_REPEAT), which is why the ped stream's whole-body animId never held
+// them. Verified 2026-10-01 against the retail image.
+constexpr uint16_t ANIM_STD_CHAT        = 0x0B;
+constexpr uint16_t ANIM_STD_HAILTAXI    = 0x0C;
+constexpr uint16_t ANIM_STD_DUCK_DOWN   = 0xA3;
+constexpr uint16_t ANIM_STD_HANDSUP     = 0xA7;
+constexpr uint16_t ANIM_STD_HANDSCOWER  = 0xA8;
+constexpr uintptr_t WAIT_STATE_ANIM_LOADS[5] = {0x004D5C26, 0x004D5C33, 0x004D5C9F,
+                                                0x004D5CAC, 0x004D5CB9};
 
 // eWeaponType past the inventory range. These aren't weapons, they're damage
 // *causes*, and they never have a CPed::m_weapons slot - IsInventoryWeapon in
@@ -10911,6 +11009,72 @@ constexpr uintptr_t CRANE_FIND_OVERLAP_CALL     = 0x00544007;
 constexpr uintptr_t CRANE_MILITARY_REMOVE_CALL = 0x005442A6;
 // (CCranes__CarsCollectedMilitaryCrane is declared with the lists, below.)
 
+// The cranes themselves (game/crane.h, docs/protocol.md 1.62). CCrane is re3's
+// 0x80 bytes member for member; the offsets below are each read by an
+// instruction of the retail image:
+//   0x0054344E  AddThisOneCrane: `cmp [008E28ACh],8 / jge` (NumCranes against
+//               NUM_CRANES), `shl edi,7 / add edi,6FA4E0h / rep stos` 20h
+//               dwords: aCranes, 0x80 each, eight of them
+//   0x00545190  IsThisCarBeingCarriedByAnyCrane: `cmp [ebx+6FA550h],ecx`
+//               (+70h m_pVehiclePickedUp), `movzx eax,[ebx+6FA559h]`
+//               (+79h m_nCraneState) and states 2..4
+//   0x00543E16  GOING_TOWARDS_TARGET's pick-up: `mov byte [ebx+79h],3`, the
+//               hook velocity at +68h/+6Ch times 0.4, the car's
+//               bUsesCollision off (`and [esi+51h],0FEh`) and, for the crusher
+//               (`cmp byte [ebx+7Bh],0`), bCollisionProof on
+//   0x005443A3  the hook's swing: m_vecHookCurPos at +5Ch/+60h from the
+//               velocity, +64h from the target height
+//   0x005445F6  the tail every Update runs: cos and sin of m_fHookAngle (+44h)
+//               into the crane building's right.x/forward.y (+04h/+18h) and
+//               right.y/-forward.x (+08h/+14h), `call 004B8EC0`
+//               (CMatrix::UpdateRW on +4), `call 00474330` (UpdateRwFrame) and
+//               `call 00545000` (SetHookMatrix, ecx the crane)
+// CCranes::UpdateCranes (0x005439E0, called once from CGame::Process at
+// 0x0048C95C) calls CCrane::Update at one place, `mov ecx,[esp+4] / call`,
+// with the x87 stack empty; it is the only caller.
+constexpr uintptr_t CCranes__UpdateCranes   = 0x005439E0;
+constexpr uintptr_t CCrane__Update          = 0x00543AC0;
+constexpr uintptr_t CRANE_UPDATE_CALL       = 0x00543A7F;
+constexpr uintptr_t CCrane__SetHookMatrix   = 0x00545000;
+constexpr uintptr_t CCranes__IsThisCarBeingCarriedByAnyCrane = 0x00545190;
+constexpr uintptr_t CCranes__aCranes        = 0x006FA4E0;   // CCrane[8]
+constexpr uintptr_t CCranes__NumCranes      = 0x008E28AC;   // int32
+constexpr int32_t   NUM_CRANES              = 8;
+constexpr size_t    SIZEOF_CRANE            = 0x80;
+namespace offs {
+constexpr size_t CRANE_ENTITY        = 0x00;   // CBuilding *
+constexpr size_t CRANE_HOOK          = 0x04;   // CObject *, null for a crane with none
+constexpr size_t CRANE_HOOK_ANGLE    = 0x44;
+constexpr size_t CRANE_HOOK_OFFSET   = 0x48;
+constexpr size_t CRANE_HOOK_HEIGHT   = 0x4C;
+constexpr size_t CRANE_HOOK_POS      = 0x5C;   // CVector m_vecHookCurPos
+constexpr size_t CRANE_HOOK_VELOCITY = 0x68;   // CVector2D
+constexpr size_t CRANE_CAR           = 0x70;   // CVehicle *m_pVehiclePickedUp
+constexpr size_t CRANE_STATUS        = 0x78;   // NONE, ACTIVATED, DEACTIVATED
+constexpr size_t CRANE_STATE         = 0x79;   // IDLE .. DROPPING_TARGET
+constexpr size_t CRANE_IS_CRUSHER    = 0x7B;
+} // namespace offs
+// The crane building's matrix members the tail writes, from CEntity's +4.
+constexpr size_t CRANE_ENTITY_RIGHT_X = 0x04;
+constexpr size_t CRANE_ENTITY_RIGHT_Y = 0x08;
+constexpr size_t CRANE_ENTITY_FWD_X   = 0x14;
+constexpr size_t CRANE_ENTITY_FWD_Y   = 0x18;
+enum CraneState : uint8_t {
+	CRANE_IDLE                            = 0,
+	CRANE_GOING_TOWARDS_TARGET            = 1,
+	CRANE_LIFTING_TARGET                  = 2,
+	CRANE_GOING_TOWARDS_TARGET_ONLY_HEIGHT = 3,
+	CRANE_ROTATING_TARGET                 = 4,
+	CRANE_DROPPING_TARGET                 = 5,
+};
+// CGarages::CrushedCarId, the handle IS_CAR_CRUSHED (0149) compares against
+// in CGarages::HasCarBeenCrushed (0x004275A0: `mov ecx,[00943060h] / cmp
+// ecx,eax`). The crusher writes it from CPool::GetIndex at 0x004240D9
+// (`mov [00943060h],eax`), which is the script's own handle for the car.
+constexpr uintptr_t CGarages__CrushedCarId       = 0x00943060;   // int32
+constexpr uintptr_t CGarages__HasCarBeenCrushed  = 0x004275A0;
+constexpr uintptr_t CRUSHER_CRUSHED_ID_WRITE     = 0x004240D9;
+
 // CCarGenerator::Process (0x00542BB0) on a car whose status reads 0
 // (STATUS_PLAYER): `add [ebx+20h],0EA60h` (the timer, a minute on),
 // `or [ebx+24h],-1` (the handle), `mov byte [ebx+2Ah],1` (blocking) and
@@ -11247,6 +11411,34 @@ constexpr float OBJECT_DAMAGE_THRESHOLD = 150.0f;
 // are two visible states, and case 4 is the only thing that needs both.
 constexpr uintptr_t CObject__ObjectDamage   = 0x004BB240;
 
+// The bodycast arm's two globals, read by the instructions that open it:
+//
+//   004BB29D  movzx esi,word [005F5B50h]   MI_BODYCAST, int16, -1 in the image
+//                                          and filled in by name at start-up
+//   004BB2BB  movsx eax,word [005F7D4Ch]   CObject::nBodyCastHealth, int16,
+//                                          1000 in the image
+//
+// One health for every bodycast in the world, which ObjectDamage lowers by
+// half of any amount above 50 and the car wheel arm by the car's mass and
+// speed, and which has to be under 200 before the damage effect runs at all
+// (re3 Object.cpp:163-169). So a replayed break (ApplyMissionObjectBreak)
+// does nothing to a bodycast whose health on this machine is still high:
+// Plaster Blaster's HAS_OBJECT_BEEN_DAMAGED never saw a guest smash it.
+constexpr uintptr_t MI_BODYCAST                = 0x005F5B50;   // int16
+constexpr uintptr_t CObject__nBodyCastHealth   = 0x005F7D4C;   // int16
+constexpr uintptr_t OBJECT_DAMAGE_READS_MI_BODYCAST = 0x004BB29D;
+constexpr uintptr_t OBJECT_DAMAGE_READS_CAST_HEALTH = 0x004BB2BB;
+constexpr int16_t   BODYCAST_HEALTH_START      = 1000;
+constexpr int16_t   BODYCAST_HEALTH_BREAKS     = 200;   // the effect runs below this
+
+// The bodycast's health to leave on this machine before a break somebody
+// else's machine reported is replayed on it: under the 200 its damage effect
+// waits for. Never raised.
+constexpr int16_t BodyCastHealthForBreak(int16_t current) {
+	return current < BODYCAST_HEALTH_BREAKS ? current
+	                                        : static_cast<int16_t>(BODYCAST_HEALTH_BREAKS - 1);
+}
+
 // The rest of the CObject block, for orientation and because two of them are
 // how the offsets above were confirmed a second time.
 constexpr uintptr_t CObject__CObject        = 0x004BABD0;   // CObject::CObject(void)
@@ -11438,8 +11630,11 @@ constexpr uintptr_t CWorld__TriggerExplosionSectorList = 0x004B1340;
 //   1. **A collision.** CPhysical, two arms:
 //        00497559  fld st(1) / fcomp [esi+170h]        impulseA > uprootLimit
 //        00497B6B  fld [eax] / fst st(1) / fcomp [esi+170h]
-//      each followed by the same eight-model `IsFence` chain (the model ids
-//      at 0x005F5ADC..0x005F5AF8) as the `||` arm, and then, at 0x00497E94:
+//      each followed by the same eight-model chain over the model ids at
+//      0x005F5ADC..0x005F5AF8. That chain is IsGlass, not a fence test: a
+//      match goes to CGlass::WindowRespondsToCollision (the "glass" block
+//      below) and only a miss is uprooted. The second arm's `||` is the
+//      collider's bIsStuck ([ebx+51h] bit 5). Then, at 0x00497E94:
 //        mov al,[ebp+51h] / shr al,2 / and al,1        GetIsStatic()
 //        mov ecx,ebp / call 004958F0                   AddToMovingList()
 //
@@ -11548,6 +11743,90 @@ constexpr uintptr_t CWeapon__FireShotgunObjectArm    = 0x005616A2;
 // has none ("fists and the bat" above). Kept under this name for the record.
 constexpr uintptr_t CWeapon__FireMeleeObjectArm      = 0x00558A64;
 
+// ---- glass: shop windows and the other panes that shatter ------------------
+//
+// A breakable window is a map object like a lamp post: an IPL instance of one
+// of eight models (glassfx1..4, glassfx55, glassfxsub1/2, glassfx_composh)
+// that object.dat lists, so it becomes a CDummyObject and, inside 80 m, a
+// CObject with ObjectCreatedBy == GAME_OBJECT. object.dat gives all eight a
+// damage effect of 0, so CObject::ObjectDamage never touches one: glass is
+// CGlass's and nothing in the street object seam above sees it.
+//
+// IsGlass is the engine's own eight compares against these model ids, int16
+// at a four byte stride, -1 in the image and filled in at load. Read the same
+// way by CGlass::WasGlassHitByBullet at 0x0050467D and by both collision arms
+// (0x0049756E, 0x00497B9C):
+//
+//   66 8B 45 5C / 66 3B 05 DC 5A 5F 00      mov ax,[ebp+5Ch] / cmp ax,[5F5ADCh]
+//   ... 5F5AE0h, 5F5AE4h, 5F5AE8h, 5F5AECh, 5F5AF0h, 5F5AF4h, 5F5AF8h
+constexpr uintptr_t MI_GLASS_FIRST  = 0x005F5ADC;
+constexpr size_t    MI_GLASS_STRIDE = 4;
+constexpr size_t    MI_GLASS_COUNT  = 8;
+
+// CGlass::WindowRespondsToCollision(CEntity *, float amount, CVector speed,
+// CVector point, bool explosion), __cdecl, nine dwords (every caller ends
+// `add esp,24h`). The one function that shatters a window, and it is a latch
+// on the object's own bitfield byte (+0x175, OBJ_GLASS_* above):
+//
+//   00503F10  53 / 56 / 55 / 81 EC E8 00 00 00    push ebx/esi/ebp, sub esp,0E8h
+//   00503F20  lea esi,[ebp+175h]
+//   00503F2D  mov al,[esi] / shr al,4 / and al,1 / je   bGlassBroken? return
+//   00503F40  [esi] &= 0F7h / |= 8                        bGlassCracked = true
+//   ...       the col model's first four vertices, the panes, the sound
+//   00504617  [esi] &= 0EFh / |= 10h                      bGlassBroken = true
+//   0050461F  mov dword [ebp+3Ch],0C2C80000h              GetPosition().z = -100.0f
+//
+// So the window is moved, not removed: its own matrix goes 100 m under the
+// map, without UpdateRW or RemoveAndAdd, and m_objectMatrix (the IPL
+// placement, +0x158) is left alone. That is why a shattered window is still
+// named by the same ident a lamp post is, and why putting one back is the
+// engine's job alone: ConvertToDummyObject builds the dummy from
+// m_objectMatrix, and the next CObject out of it is a whole window.
+constexpr uintptr_t CGlass__WindowRespondsToCollision = 0x00503F10;
+constexpr float     GLASS_GONE_Z                      = -100.0f;
+
+// Its four callers, all __cdecl with the nine dwords, and the only calls to it
+// anywhere in the image:
+//
+//   0049761C  CPhysical::ApplyCollision, the collider has ped physics: after
+//             `impulseA > m_fUprootLimit` (0x00497559) and IsGlass. Pushes
+//             0, the col point (from [esp+218h]), the collider's
+//             m_vecMoveSpeed ([ebx+78h..80h]), the impulse, esi (the window).
+//   00497C4A  the same function's other arm, a car or anything else: after
+//             `(impulseA > m_fUprootLimit || bIsStuck) && !bInfiniteMass`
+//             (0x00497B6B) and IsGlass. Same pushes.
+//   00504779  CGlass::WasGlassHitByBullet, a round on a window that is
+//             already cracked: `call 005A41D0` (CGeneral::GetRandomNumber),
+//             `and eax,3 / cmp eax,2 / jne` (one round in four), then
+//             amount 0.0f ([005FD8D4h]), a zero speed and the hit point.
+//   0050483D  CGlass::WindowRespondsToExplosion (0x00504790), nearer than
+//             10.0f ([005FD904h]): amount 10000.0f ([005FD90Ch]), the
+//             direction out of the blast times 0.3, the window's own
+//             position, explosion = 1. Its one caller is the object arm of
+//             CWorld::TriggerExplosionSectorList (0x004B1536), after the same
+//             `fPower > m_fUprootLimit` test that uproots a lamp post.
+//
+// The two collision sites are the only ones whose window can break without a
+// shot or a blast every machine replays, and the bullet site is the only one
+// with a dice roll in front of it. All four are redirected at the call, never
+// detoured (game/glass.h).
+constexpr uintptr_t GLASS_COLLISION_PED_CALL = 0x0049761C;
+constexpr uintptr_t GLASS_COLLISION_CALL     = 0x00497C4A;
+constexpr uintptr_t GLASS_BULLET_BREAK_CALL  = 0x00504779;
+constexpr uintptr_t GLASS_BLAST_BREAK_CALL   = 0x0050483D;
+
+// CGlass::WasGlassHitByBullet(CEntity *, CVector point), __cdecl. Was a lead
+// (game/driveby.h, GLASS_HIT_BY_BULLET_LEAD) and the bytes above settle it:
+// `push ebx / push ebp / sub esp,10h / mov ebp,[esp+1Ch]` (the entity), the
+// eight IsGlass compares on [ebp+5Ch], then bGlassCracked (+0x175 bit 3):
+// clear, it cracks the window and plays a sound (0x0050471B, call 0057C5F0
+// with sound 74h); set, the one in four above. Its callers are every bullet
+// in the game: 0x00558C2A (CBulletInfo::Update, the sniper round),
+// 0x0055F9A4 (DoBulletImpact), 0x00560EEB (FireShotgun) and 0x00562D43
+// (FireInstantHitFromCar).
+constexpr uintptr_t CGlass__WasGlassHitByBullet = 0x00504670;
+constexpr uintptr_t CGlass__WindowRespondsToExplosion = 0x00504790;
+
 } // namespace object
 
 
@@ -11604,6 +11883,17 @@ constexpr uintptr_t crt_strncmp          = 0x005A0A10;
 // first, and the cheats are left to it.
 constexpr uint8_t CPAD_ADD_TO_PC_CHEAT_STRING_PROLOGUE[] = {
     0x83, 0xEC, 0x08, 0x89, 0x4C, 0x24, 0x04};
+// The shift that follows it, up to the first row: `mov edx,12h / lea eax,[eax]
+// / mov al,[edx+885B90h] / mov [edx+885B91h],al / dec edx / test edx,edx /
+// jge 00492460 / mov al,[esp+0Ch]`. The detour does this itself in a session
+// (cheats.h, PushCheatChar), so it is checked along with the rows. The `jge`
+// lands at 0x00492460, well past the five bytes the detour overwrites.
+constexpr uintptr_t CPad__CheatShiftBegin = 0x00492457;
+constexpr uint8_t CPAD_CHEAT_SHIFT[] = {
+    0xBA, 0x12, 0x00, 0x00, 0x00, 0x8D, 0x44, 0x20, 0x00, 0x8A, 0x82, 0x90, 0x5B, 0x88, 0x00,
+    0x88, 0x82, 0x91, 0x5B, 0x88, 0x00, 0x4A, 0x85, 0xD2, 0x7D, 0xEF, 0x8A, 0x44, 0x24, 0x0C};
+static_assert(CPad__CheatShiftBegin + sizeof(CPAD_CHEAT_SHIFT) == CPad__CheatRowsBegin,
+              "the shift runs straight into row 0");
 
 // One row per `if`, in the order the function tests them, which is CheatId's
 // order (protocol.h). `string` is the reversed literal it passes to strncmp,
@@ -11843,6 +12133,31 @@ constexpr int32_t VEHICLE_POOL_SIZE = 110;
 //                      else owns is refused like any other observer.
 constexpr uintptr_t CAutomobile__TankControl      = 0x0053D530;   // recorded
 constexpr uintptr_t CAutomobile__BlowUpCarsInPath = 0x0053E000;   // recorded
+
+// ---- TPTO, CoopIII's own cheat (game/tpto.h) -------------------------------------
+//
+// The key every one of the generic handlers above pushes for its line, the
+// "Cheat activated" one: `push 5F64C0h` at 0x00490EED (the tank), 0x0049104B,
+// 0x004911C7 and eleven more. TPTO shows the same line the same way,
+// CHud::SetHelpMessage(TheText.Get(key), true).
+constexpr uintptr_t CHEAT_ACTIVATED_KEY = 0x005F64C0;   // "CHEAT1"
+
+// CAutomobile::Teleport(CVector), __thiscall, `ret 0Ch`: CAutomobile's
+// vtable slot 11 (+2Ch, 0x00600C48), the slot SET_PLAYER_COORDINATES calls on
+// the car of a player in one. Its body is re3's:
+//
+//   00535199  call 004AE9D0              CWorld::Remove(this)
+//   0053519E  fstp [ebp+34h] x3          the position into the matrix
+//   005351D5  call 004B93A0              SetRotate(0, 0, 0)
+//   005351FA  mov [ebp+78h..8Ch],0       move and turn speed zeroed
+//   00535230  call 005353A0              ResetSuspension
+//   00535236  call 004AE930              CWorld::Add(this)
+//
+// CVehicle's and every other slot 11 is CEntity's empty one (0x00405930,
+// `sub esp,8 / ... / ret 0Ch`), so TPTO takes only a car whose slot 11 is
+// this one.
+constexpr uintptr_t CAutomobile__Teleport      = 0x00535180;
+constexpr size_t    ENTITY_VT_TELEPORT         = 0x2C;   // slot 11
 
 // ---- the vote before a rampage (game/rampagevote.h) -----------------------
 //
@@ -12523,6 +12838,121 @@ constexpr size_t HANIM_KEYFRAME_TO_MATRIX = 0x40;   // callback Update..Matrices
 constexpr size_t HANIM_READ_SPAN          = 0x44;   // enough to read both
 } // namespace offs
 
+
+// ---- CTheZones, for IS_PLAYER_IN_ZONE asked of a participant (game/anyplace.h) ----
+//
+// The handler (ProcessCommands200To299, case 0x121) reads the zone's label
+// out of the script, finds it and tests the player's position against it:
+//
+//   0043E3D8  call 004B6800    CTheZones::FindZoneByLabelAndReturnIndex(label)
+//   0043E40F  call 004B6FA0    CTheZones::GetZone(index)
+//   0043E41B  call 004B6710    CTheZones::PointLiesWithinZone(&pos, zone)
+//
+// GetZone is `movzx eax,word [esp+4] / imul eax,eax,38h / add eax,86BEE0h /
+// ret`: ZoneArray, 0x38 bytes a zone. FindZoneByLabelAndReturnIndex walks
+// it up to TotalNumberOfZones (`cmp word [0095CC36h],0`) comparing the
+// label's two dwords with the zone's name, its first eight bytes, and
+// PointLiesWithinZone tests x, y and z against min at +08h, +0Ch, +10h and
+// max at +14h, +18h, +1Ch, inclusive (re3 Zones.h, CZone). A participant's
+// zone is read from the same array by the same label, never written.
+namespace zones {
+constexpr uintptr_t CTheZones__ZoneArray          = 0x0086BEE0;
+constexpr uintptr_t CTheZones__TotalNumberOfZones = 0x0095CC36;   // uint16
+constexpr uintptr_t CTheZones__GetZone            = 0x004B6FA0;
+constexpr uintptr_t CTheZones__FindZoneByLabel    = 0x004B6800;
+constexpr uintptr_t CTheZones__PointLiesWithinZone = 0x004B6710;
+constexpr uintptr_t IN_ZONE_FINDS_LABEL           = 0x0043E3D8;   // the handler's calls
+constexpr uintptr_t IN_ZONE_GETS_ZONE             = 0x0043E40F;
+constexpr uintptr_t IN_ZONE_TESTS_POINT           = 0x0043E41B;
+constexpr size_t    SIZEOF_ZONE                   = 0x38;
+constexpr size_t    ZONE_NAME                     = 0x00;   // char[8]
+constexpr size_t    ZONE_MIN                      = 0x08;   // float x, y, z
+constexpr size_t    ZONE_MAX                      = 0x14;   // float x, y, z
+constexpr size_t    ZONE_NAME_LEN                 = 8;
+// The array's length (re3 config.h, NUMZONES); a count past it is not one.
+constexpr uint16_t  MAX_ZONES                     = 50;
+} // namespace zones
+
+// ---- the player's skin (game/skin.h) ---------------------------------------
+//
+// Options > Player Setup picks a BMP out of the skins folder, and the engine
+// keeps it as CWorld::Players[0].m_pSkinTexture. Nothing ties it to a ped:
+// CVisibilityPlugins::RenderPlayerCB, the render callback of every atomic of
+// a clump built from a model named "player", writes it over the clump's
+// materials before every draw, so every ped built from the player model -
+// ours and every remote player's - wears it.
+//
+//   00528B30  mov  eax,[00941428h]       Players[0].m_pSkinTexture (+0x138)
+//   00528B35  push ebx
+//   00528B36  test eax,eax
+//   00528B38  mov  ebx,[esp+8]           the atomic
+//   00528B3C  je   00528B50
+//   00528B3E  push eax / mov eax,[ebx+18h] / push 528B10h / push eax
+//   00528B48  call 005ACBF0              RpGeometryForAllMaterials(geometry,
+//                                         SetTextureCB, texture)
+//   00528B50  push ebx
+//   00528B51  call 0059E690              AtomicDefaultRenderCallBack
+//
+// CPedModelInfo::SetClump (0x00510210) hands it out: `repe cmpsb` of m_name
+// against "player" (0x005FE908, seven bytes, at 0x00510245), then `push
+// 528B30h` at 0x00510258 into RpClumpForAllAtomics with
+// CClumpModelInfo::SetAtomicRendererCB. An instance is an RpClumpClone of
+// that clump, callbacks and shared geometry included. A special slot loaded
+// with "player" (game/look.h) gets it too. (CClumpModelInfo::SetClump does
+// the same for "playerh", the cutscene head, at 0x004F887F; the frontend's
+// Player Setup preview at 0x0059BC7A.)
+//
+// So a remote player's ped is left built as it is and only its atomics'
+// callback is swapped, every frame, for one that puts that player's texture
+// in m_pSkinTexture around a call to RenderPlayerCB and puts ours back. The
+// texture field is a plain pointer the engine reads nowhere else in the draw,
+// and no code is patched. The atomic's callback is a field
+// (SetAtomicRenderCallback 0x00528C20: `mov [ecx+48h],eax`), its clump at
+// +0x3C (`mov ebp,[ebx+3Ch]` in RenderPedLowDetailCB, 0x00528B69).
+constexpr uintptr_t CVisibilityPlugins__RenderPlayerCB = 0x00528B30;
+constexpr uintptr_t PED_SETCLUMP_PLAYER_RENDERER       = 0x00510258;   // push 528B30h
+constexpr uintptr_t RpClumpForAllAtomics               = 0x0059EDD0;   // cdecl (clump, cb, data)
+
+// CPlayerInfo::LoadPlayerSkin (0x004A1700): RwTextureDestroy(m_pSkinTexture)
+// at 0x004A170E, then m_pSkinTexture = CPlayerSkin::GetSkinTexture(
+// m_aSkinName) at 0x004A1725, and when that is nil GetSkinTexture("$$\"\"")
+// at 0x004A173F - the default skin, models\generic\player.bmp, by the name
+// at 0x005F6ABC. GetSkinTexture (0x0059B9F0, cdecl (const char *)) looks in
+// the "skin" dictionary first and returns that texture with a reference
+// added, else reads the BMP and leaves a new texture with one reference in
+// the dictionary. Either way the caller owns one reference.
+constexpr uintptr_t CPlayerSkin__GetSkinTexture = 0x0059B9F0;
+constexpr uintptr_t PLAYER_SKIN_DEFAULT_NAME    = 0x005F6ABC;   // "$$\"\""
+constexpr uintptr_t PLAYER_SKIN_NAME            = CWorld__Players + 0x118;   // char[32]
+constexpr uintptr_t PLAYER_SKIN_TEXTURE         = CWorld__Players + 0x138;   // RwTexture *
+
+// RenderWare, as GetSkinTexture builds a texture out of an image (0x0059BA8F
+// on): RwImageFindRasterFormat(image, rwRASTERTYPETEXTURE, &w, &h, &depth,
+// &format), RwRasterCreate(w, h, depth, format), RwRasterSetFromImage(raster,
+// image), RwTextureCreate(raster), RwImageDestroy(image). The image itself
+// as RtBMPImageRead makes one (0x005B0005, 0x005B001C): RwImageCreate(w, h,
+// depth) and RwImageAllocatePixels(image), which sets the stride at +0x10
+// and the pixels at +0x14 (0x005A9211, 0x005A9226). A 32-bit image is RwRGBA,
+// R G B A in that order. RwTextureDestroy drops one reference and frees the
+// texture and its raster at none (`dec [esi+54h]`, 0x005A7335). A material
+// holds a reference of its own on the texture it shows (RpMaterialSetTexture,
+// 0x005ADD10), so destroying ours never frees one still on a material.
+constexpr uintptr_t RwImageCreate           = 0x005A9120;   // cdecl (w, h, depth)
+constexpr uintptr_t RwImageAllocatePixels   = 0x005A91E0;   // cdecl (image)
+constexpr uintptr_t RwImageDestroy          = 0x005A9180;   // cdecl (image)
+constexpr uintptr_t RwImageFindRasterFormat = 0x005BBF80;
+constexpr uintptr_t RwRasterCreate          = 0x005AD930;
+constexpr uintptr_t RwRasterSetFromImage    = 0x005BBF50;   // cdecl (raster, image)
+constexpr uintptr_t RwTextureCreate         = 0x005A72D0;   // cdecl (raster)
+constexpr uintptr_t RwTextureDestroy        = 0x005A7330;   // cdecl (texture)
+constexpr int32_t   rwRASTERTYPETEXTURE     = 4;
+
+namespace offs {
+constexpr size_t RPATOMIC_CLUMP     = 0x3C;
+constexpr size_t RPATOMIC_RENDER_CB = 0x48;
+constexpr size_t RWIMAGE_STRIDE     = 0x10;
+constexpr size_t RWIMAGE_PIXELS     = 0x14;
+} // namespace offs
 
 // ---- helpers --------------------------------------------------------------
 

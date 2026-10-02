@@ -479,6 +479,27 @@ int main(int argc, char **argv) {
 	Check(CountOp(inbox[0], OP_S_PED_BODY_PART) == 0,
 	      "and alice is told nothing, bob's word about her included");
 
+
+	std::printf("\na pedestrian chatting\n");
+	inbox[0].clear();
+	inbox[1].clear();
+	C_PedOverlay talk{};
+	InitHeader(talk, 3140);
+	talk.body.netId  = pedNetId;
+	talk.body.animId = 0x0B;   // idle_chat
+	a.Send(talk, CH_EVENT);
+	C_PedOverlay notHis = talk;
+	b.Send(notHis, CH_EVENT);   // bob cannot make alice's pedestrian talk
+	C_PedOverlay notATalk = talk;
+	notATalk.body.animId = 0x0D;   // a knockdown
+	a.Send(notATalk, CH_EVENT);
+	PumpUntil(both, inbox, 500, [&] { return false; });
+	Check(CountOp(inbox[1], OP_S_PED_OVERLAY) == 1, "bob hears exactly one overlay");
+	if (const Message *m = FindOp(inbox[1], OP_S_PED_OVERLAY))
+		if (const auto *s = m->as<S_PedOverlay>())
+			Check(s->body.netId == pedNetId && s->body.animId == 0x0B,
+			      "the chat, of alice's pedestrian");
+	Check(CountOp(inbox[0], OP_S_PED_OVERLAY) == 0, "alice is told nothing of her own");
 	// --- the pedestrian fighting -------------------------------------------
 	//
 	// Alice's pedestrian fires and hits bob. The round is drawn for everybody

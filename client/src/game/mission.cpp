@@ -1,15 +1,19 @@
 #include "mission.h"
 
+#include "anyplace.h"
 #include "carauthority.h"
+#include "carremoval.h"
 #include "chat.h"
 #include "cutscene.h"
 #include "cutsceneskip.h"
 #include "effectshape.h"
 #include "fuzzball.h"
 #include "gates.h"
+#include "getaway.h"
 #include "leadcheck.h"
 #include "missioncombat.h"
 #include "missionworld.h"
+#include "nearchar.h"
 #include "object.h"
 #include "outfit.h"
 #include "pause.h"
@@ -24,6 +28,7 @@
 #include "seatplan.h"
 #include "sidejob.h"
 #include "standapart.h"
+#include "standin.h"
 #include "teardown.h"
 #include "vehicle.h"
 
@@ -304,6 +309,13 @@ void   TickOutfit();
 void   ForgetSeatOrders();
 int8_t PassengerOrder(void *script, int32_t command, RangeFn original);
 int8_t LeaderOrder(void *script, int32_t command, RangeFn original);
+bool   InGetaway(void *script);
+bool   GetawayCrewPrint(int32_t command, const uint8_t *code, size_t length);
+bool   GetawayCrewBlip(int32_t handle, MissionEffectBody &body);
+bool   GetawayBlipTarget(int32_t handle, int32_t command, MissionEffectBody &body);
+void   ForgetGetaway();
+bool   GetawayPlace(void *script, int32_t command, uint16_t andOr, bool notFlag, uint8_t before);
+int8_t GetawayLeader(void *script, int32_t command, RangeFn original);
 
 // What the owner's mission has done to a participant's screen, camera and
 // controls, through the replay: whatever of it is still on when the session's
@@ -380,6 +392,8 @@ constexpr int32_t   OP_REMOVE_CATALINA_HELI           = 0x03B4;
 constexpr int32_t   OP_HAS_CATALINA_HELI_BEEN_SHOT_DOWN = 0x03B5;
 constexpr int32_t   OP_CATALINA_HELI_FLY_AWAY         = 0x03BE;
 constexpr int32_t   OP_REMOVE_ALL_SCRIPT_FIRES        = 0x031A;
+constexpr uint16_t  OP_ADD_BLIP_FOR_PICKUP            = 0x03DC;
+constexpr uint16_t  OP_ADD_SPRITE_BLIP_FOR_PICKUP     = 0x03DD;
 constexpr uintptr_t CATALINA_SLOT                     = CHeli__pHelis + 3 * 4;
 constexpr uintptr_t CHeli__CatalinaHeliOn             = 0x0095CD85;
 
@@ -472,6 +486,7 @@ bool g_missionInstruction = false;
 bool g_saidGate = false, g_saidCheckpoint = false, g_saidEffect = false, g_saidDropped = false;
 bool g_saidNotHost = false;
 bool g_saidRiderStart = false;
+bool g_saidSequel     = false;
 
 // ---- the script's memory ------------------------------------------------------
 
@@ -800,6 +815,17 @@ int8_t Launch(void *script, int32_t command, RangeFn original) {
 			// far, and round its loop again.
 			uint32_t past = ip;
 			Func<CollectFn>(CTheScripts__CollectParameters)(script, &past, 1);
+			// And the odd job's "begun" flag after it (game/sidejob.h).
+			const uint32_t sequel = GivenUpSequelLength(Space(), SCRIPT_SPACE_SIZE, past, number);
+			if (sequel != 0) {
+				past += sequel;
+				if (!g_saidSequel) {
+					g_saidSequel = true;
+					Log("missions: %s's start was given up; the trigger's flag after it is "
+					    "skipped too, so it can offer the job again",
+					    MissionName(static_cast<uint16_t>(number)));
+				}
+			}
 			At<uint32_t>(script, layout::SCRIPT_IP) = past;
 			return 0;
 		}
@@ -971,6 +997,9 @@ void EndOwnMission(uint32_t nowMs) {
 	const bool passed = g_own.passed;
 	g_client->Missions().Ended(g_own.number, passed ? MISSION_OUTCOME_PASSED : MISSION_OUTCOME_FAILED,
 	                           nowMs);
+	// What the mission made that is still here goes out as ordinary crowd, and
+	// the session takes the rest away (game/missionclear.h).
+	NoteOwnMissionOver(nowMs);
 	if (passed)
 		g_missionCarCount = 0;
 	else
@@ -1043,9 +1072,13 @@ int32_t CarForNetId(int32_t netId) {
 		return CatalinaRef();
 	if (!g_client || netId < 0)
 		return -1;
-	if (const RemoteAmbientCar *c = g_client->AmbientCar(static_cast<uint16_t>(netId)))
+	if (const RemoteAmbientCar *c = g_client->AmbientCar(static_cast<uint16_t>(netId))) {
 		if (c->poolHandle >= 0)
 			return c->poolHandle;
+		// A mission car that is one of our session cars (game/missiontake.h).
+		if (c->sameAsVehicle != INVALID_NETID)
+			return g_client->SessionCarHandleOf(c->sameAsVehicle);
+	}
 	return g_client->SessionCarHandleOf(static_cast<uint16_t>(netId));
 }
 
@@ -1202,12 +1235,16 @@ void ClearLeftCars(uint32_t nowMs) {
 		if (!car || Occupied(car))
 			continue;
 		// Nor one our player is opening the door of or climbing out of: no
-		// seat says so, only his m_pMyVehicle, and DELETE_CAR would leave him
-		// mid-animation with that pointer nulled (game/teardown.h refuses the
-		// same car for the same reason).
-		void *const me = Func<PlayerFn>(FindPlayerPed)();
-		if (me && Field<void *>(me, offs::PED_MY_VEHICLE) == car)
+		// seat says so, only his m_pMyVehicle and his state, and DELETE_CAR
+		// would leave him mid-animation with that pointer nulled
+		// (game/teardown.h refuses the same car for the same reason). Asked
+		// again next time: once he is in it, it is his. The car he merely
+		// drove last is not his for that, and used to be left standing for
+		// the retry (game/missionclear.h).
+		if (LocalPlayerAboard(car)) {
+			g_leftCars[kept++] = c;
 			continue;
+		}
 		if (g_client->SessionCarNetIdOf(c.handle) != INVALID_NETID) {
 			if (nowMs - c.sinceMs < LEFT_CAR_WAIT_MS)
 				g_leftCars[kept++] = c;
@@ -1250,7 +1287,56 @@ int8_t Undress(void *script, int32_t command, RangeFn original) {
 const void *g_locationScript      = nullptr;
 uint32_t    g_locationFrame       = 0;
 uint16_t    g_locationAndOr       = 0;
+// And the area it asked about, when it named one (AreaForCondition).
+MissionArea g_locationArea{};
+bool        g_locationHasArea     = false;
 bool        g_saidInCarForAnybody = false;
+bool        g_saidInCarAtPlace    = false;
+// The car IS_PLAYER_IN_CAR was last answered yes in for a participant, with the
+// script and frame it ran in, for a location asked after it in the same block
+// (standin.h, the car at the place). An `if` forgets it.
+const void *g_inCarScript         = nullptr;
+uint32_t    g_inCarFrame          = 0;
+int32_t     g_inCarHandle         = -1;
+bool        g_saidCarAtPlace      = false;
+// The car the owner's mission last asked IS_PLAYER_IN_CAR about, and in
+// which mission: Decoy's van (standin.h, IsDecoyEnd).
+int32_t     g_askedCar            = -1;
+uint16_t    g_askedCarMission     = MISSION_NONE;
+bool        g_saidDecoyEnd        = false;
+// The car the owner's mission walked its own player out of, in a scene that
+// has not given him his controls back (standin.h): its IS_PLAYER_IN_CAR is
+// the owner's own answer.
+standin::WalkedOut g_walkedOut{};
+bool               g_saidWalkedOut = false;
+
+// The `if` (00D6) a script starts a block with: a location check of an earlier
+// block is not one of this block's conditions.
+constexpr int32_t OP_ANDOR = 0x00D6;
+// GOTO_IF_FALSE, where a block's result is read (a held answer is settled there).
+constexpr int32_t OP_GOTO_IF_FALSE = 0x004D;
+
+// The car a participant's copy sits in here, at the wheel or riding: his
+// replica's own seat, which holds while the session's word for it is on its
+// way (a car whose netId is still NAME_PENDING has none to compare).
+bool ReplicaSeatedIn(uint8_t id, void *car);
+
+// SET_CHAR_OBJ_LEAVE_CAR on the owner's own ped, and SET_PLAYER_CONTROL giving
+// him his controls back, in the owner's mission (standin.h, the car the owner
+// was walked out of). Only noted: the instruction runs as it always does.
+void NoteWalkOut(void *script, int32_t command) {
+	if (!g_client || !g_own.running || !IsMissionScript(script))
+		return;
+	PeekParams(script, 2);
+	const int32_t *p = reinterpret_cast<const int32_t *>(Params());
+	if (command == op::SET_PLAYER_CONTROL) {
+		standin::NoteControl(g_walkedOut, p[1] != 0);
+		return;
+	}
+	void *const player = Func<PlayerFn>(FindPlayerPed)();
+	standin::NoteLeaveCar(g_walkedOut, player && Func<GetPedFn>(CPools__GetPed)(p[0]) == player,
+	                      p[1]);
+}
 
 // IS_PLAYER_IN_CAR from the owner's mission, about the owner: the car it
 // wants its player in. A participant who was in that car at the last ask and
@@ -1270,22 +1356,51 @@ int8_t PlayerInCar(void *script, int32_t command, RangeFn original) {
 	const uint8_t  condBefore = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
 	const uint16_t andOr      = At<uint16_t>(script, layout::SCRIPT_AND_OR);
 	const bool     notFlag    = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
+	g_askedCar                = handle;
+	g_askedCarMission         = g_own.number;
 	const int8_t   r          = original(script, nullptr, command);
 	const int32_t  netId      = NetIdForCar(handle);
 	if (netId < 0)
 		return r;
+	if (standin::InCarIsOwnersAlone(g_walkedOut, handle)) {
+		if (!g_saidWalkedOut) {
+			g_saidWalkedOut = true;
+			Log("missions: %s waits for its own player to get out of car %d; whoever else "
+			    "sits in it does not keep it waiting",
+			    MissionName(g_own.number), handle);
+		}
+		return r;
+	}
+	void *const   car          = Func<GetPedFn>(CPools__GetVehicle)(handle);
 	const uint8_t participants = g_client->Missions().Participants();
 	uint8_t       inside       = 0;
 	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
 		if (id == LocalId() || (participants & PlayerBit(id)) == 0)
 			continue;
 		const RemotePlayer &p = g_client->PlayerSlot(id);
-		if (p.active && p.seatVehicleNetId == static_cast<uint16_t>(netId))
+		if (p.active && (p.seatVehicleNetId == static_cast<uint16_t>(netId) ||
+		                 (car && ReplicaSeatedIn(id, car))))
 			inside = static_cast<uint8_t>(inside | PlayerBit(id));
 	}
-	const uint16_t locationAndOr =
-	    g_locationScript == script && g_locationFrame == g_frame ? g_locationAndOr : 0;
-	if (inside != 0 && MayAnswerInCarForAnybody(andOr, locationAndOr)) {
+	const bool     sameBlock     = g_locationScript == script && g_locationFrame == g_frame;
+	const uint16_t locationAndOr = sameBlock ? g_locationAndOr : 0;
+	bool           answer        = inside != 0 && MayAnswerInCarForAnybody(andOr, locationAndOr);
+	if (inside != 0 && !answer && car) {
+		// The owner at the place, and the car with a participant in it there too.
+		const float *at = &Field<float>(car, offs::POSITION);
+		answer = InCarAtThePlace(Vec3{at[0], at[1], at[2]}, sameBlock && g_locationHasArea,
+		                         g_locationArea);
+		if (answer && !g_saidInCarAtPlace) {
+			g_saidInCarAtPlace = true;
+			Log("missions: %s asks whether its player is at the place and in car %d; the "
+			    "owner is there and a participant has brought the car in, and that answers it",
+			    MissionName(g_own.number), handle);
+		}
+	}
+	if (answer) {
+		g_inCarScript = script;
+		g_inCarFrame  = g_frame;
+		g_inCarHandle = handle;
 		At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = CompareFlagIfTrue(condBefore, andOr, notFlag);
 		if (!g_saidInCarForAnybody) {
 			g_saidInCarForAnybody = true;
@@ -1931,7 +2046,8 @@ int32_t HolderOfCarIn(const replay::Encoded &enc) {
 	const CarSimulator sim =
 	    row ? WhoSimulates(true, row->driverPlayerId, row->custodianPlayerId, INVALID_PLAYER, LocalId())
 	        : WhoSimulates(false, INVALID_PLAYER, INVALID_PLAYER, INVALID_PLAYER, LocalId());
-	switch (WhereTheWordGoes(sim)) {
+	const bool wreck = enc.length >= 2 && (enc.code[0] | (enc.code[1] << 8)) == op::EXPLODE_CAR;
+	switch (wreck ? WhereTheWreckGoes(sim) : WhereTheWordGoes(sim)) {
 	case CarWordTo::Nobody:    return CAR_SIMULATED_HERE;
 	case CarWordTo::OnePlayer: return sim.player;
 	default:                   return CAR_HELD_BY_NOBODY;
@@ -2025,6 +2141,10 @@ int8_t Record(void *script, int32_t command, RangeFn original) {
 			std::memcpy(g_getBackInLabel, enc.code + 2, TEXT_LABEL);
 		return r;
 	}
+	// What it says about the car goes to the one who has to deal with it
+	// (game/getaway.h).
+	if (fromMission && InGetaway(script) && GetawayCrewPrint(command, enc.code, enc.length))
+		return r;
 	MissionEffectBody body{};
 	body.missionNumber = missionNumber;
 	body.length        = enc.length;
@@ -2034,7 +2154,19 @@ int8_t Record(void *script, int32_t command, RangeFn original) {
 		body.readySeq = ++g_readySeq;
 	std::memcpy(body.code, enc.code, enc.length);
 	switch (enc.kind) {
-	case replay::Kind::Plain:   body.kind = MISSION_EFFECT_RUN; break;
+	case replay::Kind::Plain:
+		body.kind = MISSION_EFFECT_RUN;
+		// One of the main script's objects taken away is the world's for good
+		// (replay.h, DeletesWorldObject): in the campaign too, for a game that
+		// catches up from the log rather than watching it happen.
+		if (fromMission && g_worldOpCount < MAX_WORLD_OPS &&
+		    replay::DeletesWorldObject(enc.code, enc.length,
+		                               [](uint16_t g) { return g_writes.Known(g); })) {
+			WorldOp &w = g_worldOps[g_worldOpCount++];
+			w.length   = enc.length;
+			std::memcpy(w.code, enc.code, enc.length);
+		}
+		break;
 	case replay::Kind::Pay: {
 		// What the mission charges its player (Bomb Da Base: Act II's
 		// $100,000, The Exchange's $500,000) is the owner's alone: only the
@@ -2052,10 +2184,17 @@ int8_t Record(void *script, int32_t command, RangeFn original) {
 		body.kind = MISSION_EFFECT_PAY;
 		break;
 	}
-	case replay::Kind::BlipUse: body.kind = MISSION_EFFECT_BLIP_USE; break;
+	case replay::Kind::BlipUse:
+		body.kind = MISSION_EFFECT_BLIP_USE;
+		if (fromMission && InGetaway(script) && GetawayBlipTarget(enc.ownerBlip, command, body))
+			return r;
+		break;
 	case replay::Kind::BlipNew:
 		body.kind      = MISSION_EFFECT_BLIP_NEW;
 		body.ownerBlip = *reinterpret_cast<const int32_t *>(Params());   // what it stored
+		if (fromMission && command == getaway::OP_ADD_BLIP_FOR_CHAR && InGetaway(script) &&
+		    GetawayCrewBlip(body.ownerBlip, body))
+			return r;
 		break;
 	case replay::Kind::World:
 		body.kind = MISSION_EFFECT_RUN;
@@ -2193,10 +2332,428 @@ void AnswerForAGuest(void *script, int32_t command, uint16_t andOr, bool notFlag
 	}
 }
 
+// A location check of the owner, asked in the block where IS_PLAYER_IN_CAR was
+// just answered for a participant in the car: yes when that car stands at the
+// place, stopped where the check asks for stopped (standin.h). The Thieves and
+// Don't Spank Ma Bitch Up ask "resprayed, in the car, stopped in the
+// Pay'n'Spray" in that order, which a guest driving the car never passed.
+void CarAtThePlace(void *script, int32_t command, uint16_t andOr, bool notFlag, uint8_t before) {
+	standin::PlaceNeeds needs{};
+	if (!g_client || g_own.finishing || g_inCarScript != script || g_inCarFrame != g_frame ||
+	    !g_locationHasArea || !standin::PlaceNeedsOf(command, &needs))
+		return;
+	void *const car = Func<GetPedFn>(CPools__GetVehicle)(g_inCarHandle);
+	if (!car)
+		return;
+	const float *v = &Field<float>(car, offs::MOVE_SPEED);
+	if (!standin::CarAnswersPlace(needs, standin::CarStopped(v[0], v[1], v[2])))
+		return;
+	const float *at = &Field<float>(car, offs::POSITION);
+	if (!InCarAtThePlace(Vec3{at[0], at[1], at[2]}, true, g_locationArea))
+		return;
+	At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = CompareFlagIfTrue(before, andOr, notFlag);
+	if (!g_saidCarAtPlace) {
+		g_saidCarAtPlace = true;
+		Log("missions: %s asks whether its player is at the place after asking about car %d; "
+		    "a participant has the car there, and that answers it",
+		    MissionName(g_own.number), g_inCarHandle);
+	}
+}
+
+// Sayonara Salvatore's guards (standin.h): whom the two place checks right
+// after a spotting are about, when the spotting was answered for somebody
+// other than the owner, or for him in one of the two places with a
+// participant seen in the open.
+struct SpotStandIn {
+	const void *script = nullptr;
+	uint32_t    ip     = 0;   // the spotting's, where its operands start
+	uint32_t    frame  = 0;
+	uint8_t     who    = INVALID_PLAYER;
+	Vec3        at{};
+};
+SpotStandIn g_spotStandIn;
+bool        g_saidSpotStandIn  = false;
+
+// One of the two place checks after a spotting: answered for where the
+// participant spotted stands. True when it was.
+bool AskedOfSpotted(void *script, int32_t command, uint32_t ip, uint16_t andOr, bool notFlag) {
+	if (g_own.number != standin::SAYONARA_SALVATORE || andOr != ANDOR_NONE ||
+	    g_spotStandIn.script != script || g_spotStandIn.frame != g_frame ||
+	    !standin::AsksAfterSpotting(g_spotStandIn.ip, ip))
+		return false;
+	const int box = standin::SafeBoxOf(command, Params() + 1);
+	if (box < 0)
+		return false;
+	const Vec3 &at = g_spotStandIn.at;
+	const bool  in = standin::InBox(standin::SPOTTED_DOES_NOT_COUNT[box], at.x, at.y, at.z);
+	At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = in != notFlag ? 1 : 0;
+	if (!g_saidSpotStandIn) {
+		g_saidSpotStandIn = true;
+		Log("missions: %s asks where its player is after a guard spotted %s; answered for where %s "
+		    "stands",
+		    MissionName(g_own.number), g_client->PlayerSlot(g_spotStandIn.who).nick.c_str(),
+		    g_client->PlayerSlot(g_spotStandIn.who).nick.c_str());
+	}
+	return true;
+}
+
+void WakaCarpark(void *script, int32_t command, uint16_t andOr, bool notFlag);
+void *ReplicaOf(uint8_t playerId);
+void *SeatedCar(void *ped);
+
+// A place the group answers as one (the owner's no becomes the yes it would
+// have been, through the block's own flag, when a participant is inside the
+// area as the check asks: on foot, in a car, stopped, standin.h PlaceNeedsOf).
+// Two tables first: nearchar.h's places anybody answers (Smack Down's
+// dealers, Shima's Diablos, Liberator's garage doors and compound,
+// Bling-Bling Scramble's checkpoints), which are then no checkpoint for
+// everybody to reach, and standin.h's boxes anybody keeps (Salvatore's garage
+// in Sayonara Salvatore, so its door shuts only on nobody), which still are.
+// Everywhere else the general rule (anyplace.h): anybody there with the owner
+// nearby, a checkpoint as before. True for a site of the first table.
+bool g_saidAnybodyAtPlace = false;
+
+bool PedDown(void *ped);
+bool Wrecked(void *car);
+bool SkipOperand(uint32_t &ip);
+
+// Participant `id` as the owner's machine sees him at a place: where his
+// state puts him, whether he sits in a car and whether he has stopped (his
+// copy's car here, or his own speed on foot), and whether that car is
+// `storedCar`. Not valid for anybody outside the owner's mission.
+anyplace::Candidate PlaceCandidate(uint8_t id, void *storedCar) {
+	anyplace::Candidate c{};
+	if (id == LocalId() || (g_client->Missions().Participants() & PlayerBit(id)) == 0)
+		return c;
+	const RemotePlayer &pl = g_client->PlayerSlot(id);
+	if (!pl.active || !pl.haveState)
+		return c;
+	void *const car = SeatedCar(ReplicaOf(id));
+	c.valid         = true;
+	c.at            = Vec3{pl.last.pos.x, pl.last.pos.y, pl.last.pos.z};
+	c.seated        = pl.Seated();
+	if (car) {
+		const float *v = &Field<float>(car, offs::MOVE_SPEED);
+		c.stopped      = standin::CarStopped(v[0], v[1], v[2]);
+	} else {
+		c.stopped = !c.seated && standin::CarStopped(pl.last.moveSpeed.x, pl.last.moveSpeed.y,
+		                                             pl.last.moveSpeed.z);
+	}
+	c.inStoredCar = storedCar && car == storedCar;
+	return c;
+}
+
+// The participant who satisfies the place, or INVALID_PLAYER.
+uint8_t WhoAnswersPlace(const standin::PlaceNeeds &needs, const MissionArea &area, void *storedCar) {
+	anyplace::Candidate c[MAX_PLAYERS];
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id)
+		c[id] = PlaceCandidate(id, storedCar);
+	const int who = anyplace::WhoAnswers(needs, area, c, MAX_PLAYERS, storedCar != nullptr);
+	return who < 0 ? INVALID_PLAYER : static_cast<uint8_t>(who);
+}
+
+// ---- anybody at the place, the owner nearby (anyplace.h) ---------------------------
+//
+// The general rule, after the two tables. The block a place is asked in is
+// followed from its `if` to its goto_if_false (AnyplaceInstruction, from
+// MissionInstruction), for the cars asked beside it and for the yes that is
+// only settled there (anyplace.h, PlanFor).
+
+struct AnyplacePending {
+	anyplace::Plan plan;
+	MissionArea    area;
+};
+
+constexpr size_t ANYPLACE_MAX = 4;
+
+struct AnyplaceBlock {
+	const void     *script = nullptr;
+	uint32_t        frame  = 0;
+	bool            anyCar = false;   // IS_PLAYER_IN_ANY_CAR and the like beside it
+	int32_t         cars[ANYPLACE_MAX] = {};
+	uint8_t         carCount           = 0;
+	AnyplacePending pending[ANYPLACE_MAX];
+	uint8_t         pendingCount = 0;
+};
+AnyplaceBlock g_anyBlock;
+
+// The car the mission stored as its player's (STORE_CAR_PLAYER_IS_IN), and
+// in which mission.
+int32_t  g_storedCar         = -1;
+uint16_t g_storedCarMission  = MISSION_NONE;
+bool     g_saidAnyplace      = false;
+bool     g_saidAnyplaceUndone = false;
+bool     g_saidAnyplaceOwners = false;
+bool     g_saidAnyplaceTarget = false;
+
+void ForgetAnyplace() {
+	g_anyBlock           = AnyplaceBlock{};
+	g_storedCar          = -1;
+	g_storedCarMission   = MISSION_NONE;
+	g_saidAnyplace       = false;
+	g_saidAnyplaceUndone = false;
+	g_saidAnyplaceOwners = false;
+	g_saidAnyplaceTarget = false;
+	g_askedCar           = -1;
+	g_askedCarMission    = MISSION_NONE;
+	g_saidDecoyEnd       = false;
+}
+
+bool InAnyplaceBlock(const void *script) {
+	return g_anyBlock.script == script && g_anyBlock.frame == g_frame;
+}
+
+// The stored car, while it is still a car, or null.
+void *AnyplaceStoredCar() {
+	if (g_storedCar < 0 || g_storedCarMission != g_own.number)
+		return nullptr;
+	void *const car = Func<GetPedFn>(CPools__GetVehicle)(g_storedCar);
+	return car && !Wrecked(car) ? car : nullptr;
+}
+
+// The owner's own ped is the script's: one of its scenes, or the walk out of
+// the car at the casino.
+bool OwnersSceneRuns() {
+	const uint8_t controls = Global<uint8_t>(CPad__Pads + pad::DISABLE_PLAYER_CONTROLS);
+	return g_sceneHidden || g_walkedOut.held ||
+	       (controls & (pad::PLAYERCONTROL_PLAYERINFO | pad::PLAYERCONTROL_CUTSCENE)) != 0;
+}
+
+// Whether a car asked beside the place does not stand at it.
+bool AnyplaceConflict(const AnyplaceBlock &b, const MissionArea *areas, size_t n) {
+	if (b.anyCar)
+		return true;
+	for (uint8_t i = 0; i < b.carCount; ++i) {
+		void *const car = Func<GetPedFn>(CPools__GetVehicle)(b.cars[i]);
+		if (!car)
+			return true;
+		const float *at   = &Field<float>(car, offs::POSITION);
+		bool         here = false;
+		for (size_t k = 0; k < n && !here; ++k)
+			here = InCarAtThePlace(Vec3{at[0], at[1], at[2]}, true, areas[k]);
+		if (!here)
+			return true;
+	}
+	return false;
+}
+
+// Every instruction of the owner's mission script, before it runs.
+void AnyplaceInstruction(void *script, int32_t command) {
+	if (command == OP_ANDOR) {
+		g_anyBlock        = AnyplaceBlock{};
+		g_anyBlock.script = script;
+		g_anyBlock.frame  = g_frame;
+		return;
+	}
+	if (!InAnyplaceBlock(script))
+		return;
+	if (command == OP_GOTO_IF_FALSE) {
+		const AnyplaceBlock b = g_anyBlock;
+		g_anyBlock            = AnyplaceBlock{};
+		if (b.pendingCount == 0)
+			return;
+		MissionArea areas[ANYPLACE_MAX];
+		for (uint8_t i = 0; i < b.pendingCount; ++i)
+			areas[i] = b.pending[i].area;
+		const bool conflict = AnyplaceConflict(b, areas, b.pendingCount);
+		for (uint8_t i = 0; i < b.pendingCount; ++i)
+			if (anyplace::SettleWrites(b.pending[i].plan, conflict))
+				At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = b.pending[i].plan.settleTo;
+		if (conflict && !g_saidAnyplaceUndone) {
+			g_saidAnyplaceUndone = true;
+			Log("missions: %s asks where its player is and which car he is in, in one block; the "
+			    "car is not at the place, so the owner answers it himself",
+			    MissionName(g_own.number));
+		}
+		return;
+	}
+	switch (anyplace::BesideOf(command)) {
+	case anyplace::Beside::AnyCar: g_anyBlock.anyCar = true; break;
+	case anyplace::Beside::Car:
+		if (g_anyBlock.carCount == ANYPLACE_MAX) {
+			g_anyBlock.anyCar = true;
+			break;
+		}
+		PeekParams(script, 2);
+		g_anyBlock.cars[g_anyBlock.carCount++] = reinterpret_cast<const int32_t *>(Params())[1];
+		break;
+	default: break;
+	}
+}
+
+// A handle the owner's mission just stored in global `at`, by the
+// instruction whose operands start at `ip`: the car STORE_CAR_PLAYER_IS_IN
+// stored is the mission's player's.
+void AnyplaceStored(uint32_t ip, uint16_t at) {
+	if (ip < 2 || ip > SCRIPT_SPACE_SIZE || at + 4u > SCRIPT_SPACE_SIZE)
+		return;
+	const uint8_t *s = Space();
+	if ((s[ip - 2] | (s[ip - 1] << 8)) != anyplace::OP_STORE_CAR_PLAYER_IS_IN)
+		return;
+	if (anyplace::StoreIsOnlyATarget(g_own.number)) {
+		if (!g_saidAnyplaceTarget) {
+			g_saidAnyplaceTarget = true;
+			Log("missions: %s stores its player's car only for its goons to destroy; its places "
+			    "stay anybody's",
+			    MissionName(g_own.number));
+		}
+		return;
+	}
+	std::memcpy(&g_storedCar, s + at, 4);
+	g_storedCarMission = g_own.number;
+}
+
+// The general rule: the owner's no becomes the block's yes when a
+// participant is at the place as the check asks and the owner is within
+// anyplace::OWNER_NEARBY_M of it. `params` are the operands as the handler
+// collected them (null for a zone, which has its label there instead).
+void AnybodyNearby(void *script, int32_t command, uint16_t andOr, bool notFlag, uint8_t before,
+                   const standin::PlaceNeeds &needs, const MissionArea &area, const float *params) {
+	if (!g_client || !g_own.running || g_own.finishing || !IsMissionScript(script))
+		return;
+	const anyplace::Plan plan = anyplace::PlanFor(andOr, notFlag);
+	const uint8_t        yes  = CompareFlagIfTrue(before, andOr, notFlag);
+	if (!plan.valid || At<uint8_t>(script, layout::SCRIPT_COND_RESULT) == yes)
+		return;
+	if (const char *why = anyplace::ExcludedWhy(g_own.number, command, params)) {
+		if (!g_saidAnyplaceOwners) {
+			g_saidAnyplaceOwners = true;
+			Log("missions: %s asks where its player is, and only the owner answers: %s",
+			    MissionName(g_own.number), why);
+		}
+		return;
+	}
+	if (OwnersSceneRuns() || !anyplace::OwnerNearby(area, LocalPlayerPos()))
+		return;
+	if (plan.settle && (!InAnyplaceBlock(script) || g_anyBlock.pendingCount == ANYPLACE_MAX ||
+	                    AnyplaceConflict(g_anyBlock, &area, 1)))
+		return;
+	const uint8_t who = WhoAnswersPlace(needs, area, AnyplaceStoredCar());
+	if (who == INVALID_PLAYER)
+		return;
+	if (plan.now)
+		At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = yes;
+	if (plan.settle)
+		g_anyBlock.pending[g_anyBlock.pendingCount++] = AnyplacePending{plan, area};
+	if (!g_saidAnyplace) {
+		g_saidAnyplace = true;
+		Log("missions: %s asks whether its player is at (%.1f %.1f); %s is, with the owner "
+		    "nearby, and that answers it",
+		    MissionName(g_own.number), area.centre.x, area.centre.y,
+		    g_client->PlayerSlot(who).nick.c_str());
+	}
+}
+
+bool AnybodyAtPlace(void *script, int32_t command, uint16_t andOr, bool notFlag, uint8_t before) {
+	const float        *p = Params();
+	standin::PlaceNeeds needs{};
+	MissionArea         area{};
+	if (g_own.finishing || !standin::PlaceNeedsOf(command, &needs) ||
+	    !AreaForCondition(command, p, &area))
+		return false;
+	const bool place = nearchar::AnswersPlaceForAnybody(g_own.number, command, p);
+	const bool keeps = !place && standin::AreaAnybodyKeeps(g_own.number, command, p + 1) != nullptr;
+	if (!place && !keeps) {
+		AnybodyNearby(script, command, andOr, notFlag, before, needs, area, p);
+		return false;
+	}
+	const uint8_t yes = CompareFlagIfTrue(before, andOr, notFlag);
+	if (At<uint8_t>(script, layout::SCRIPT_COND_RESULT) == yes)
+		return place;
+	const uint8_t who = WhoAnswersPlace(needs, area, nullptr);
+	if (who == INVALID_PLAYER)
+		return place;
+	At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = yes;
+	if (!g_saidAnybodyAtPlace) {
+		g_saidAnybodyAtPlace = true;
+		Log("missions: %s asks whether its player is at (%.1f %.1f); %s is, and that answers it",
+		    MissionName(g_own.number), area.centre.x, area.centre.y,
+		    g_client->PlayerSlot(who).nick.c_str());
+	}
+	return place;
+}
+
+// IS_PLAYER_IN_ZONE (0121) in the owner's mission: the zone is read the way
+// the handler reads it, its label out of the script after the player, and
+// looked up in the engine's own ZoneArray (addresses.h, zones).
+bool ZoneAreaOf(const char (&label)[zones::ZONE_NAME_LEN], MissionArea *out) {
+	const uint16_t n = Global<uint16_t>(zones::CTheZones__TotalNumberOfZones);
+	if (n > zones::MAX_ZONES)
+		return false;
+	for (uint16_t i = 0; i < n; ++i) {
+		const uint8_t *z = Ptr<uint8_t>(zones::CTheZones__ZoneArray + i * zones::SIZEOF_ZONE);
+		if (std::memcmp(z + zones::ZONE_NAME, label, zones::ZONE_NAME_LEN) != 0)
+			continue;
+		*out = anyplace::ZoneArea(reinterpret_cast<const float *>(z + zones::ZONE_MIN),
+		                          reinterpret_cast<const float *>(z + zones::ZONE_MAX));
+		return true;
+	}
+	return false;
+}
+
+int8_t PlayerInZone(void *script, int32_t command, RangeFn original) {
+	const uint16_t andOr                       = At<uint16_t>(script, layout::SCRIPT_AND_OR);
+	const bool     notFlag                     = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
+	const uint8_t  before                      = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
+	char           label[zones::ZONE_NAME_LEN] = {};
+	bool           haveLabel                   = false;
+	if (g_client && g_own.running && !g_own.finishing && IsMissionScript(script)) {
+		// ReadTextLabelFromScript's strncpy: up to the first NUL, zeros after.
+		uint32_t ip = At<uint32_t>(script, layout::SCRIPT_IP);
+		if (SkipOperand(ip) && ip + zones::ZONE_NAME_LEN <= SCRIPT_SPACE_SIZE) {
+			for (size_t i = 0; i < zones::ZONE_NAME_LEN && Space()[ip + i] != 0; ++i)
+				label[i] = static_cast<char>(Space()[ip + i]);
+			haveLabel = true;
+		}
+	}
+	const int8_t r = original(script, nullptr, command);
+	MissionArea  area{};
+	if (haveLabel && ZoneAreaOf(label, &area))
+		AnybodyNearby(script, command, andOr, notFlag, before, standin::PlaceNeeds{}, area, nullptr);
+	return r;
+}
+
+bool InOwnMission(uint8_t id);
+
+// Decoy's end (standin.h, IsDecoyEnd): with a participant in the decoy van
+// and the owner not in it, "the player more than 160 m from the warehouse"
+// is asked of the van, the owner's own answer replaced, either way. The van
+// is the car the mission asks IS_PLAYER_IN_CAR about. True when answered.
+bool DecoyEnd(void *script, int32_t command, uint16_t andOr, bool notFlag) {
+	if (!g_client || !g_own.running || g_own.finishing || andOr != ANDOR_NONE ||
+	    g_askedCarMission != g_own.number || !IsMissionScript(script))
+		return false;
+	const float *p = Params();
+	if (!standin::IsDecoyEnd(g_own.number, command, p[1], p[2], p[3], p[4]))
+		return false;
+	void *const van = g_askedCar >= 0 ? Func<GetPedFn>(CPools__GetVehicle)(g_askedCar) : nullptr;
+	if (!van || Wrecked(van))
+		return false;
+	void *const me = Func<PlayerFn>(FindPlayerPed)();
+	bool        inVan[MAX_PLAYERS] = {};
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id)
+		inVan[id] = id != LocalId() && InOwnMission(id) && ReplicaSeatedIn(id, van);
+	const int who = standin::DecoyRider(me && SeatedCar(me) == van, inVan, MAX_PLAYERS);
+	if (who < 0)
+		return false;
+	const float *at  = &Field<float>(van, offs::POSITION);
+	const bool   raw = nearchar::InLocateBox(at[0] - p[1], at[1] - p[2], 0.0f, p[3], p[4], 0.0f, false);
+	At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = notFlag != raw ? 1 : 0;
+	if (!g_saidDecoyEnd) {
+		g_saidDecoyEnd = true;
+		Log("missions: %s asks how far its player is from the warehouse; %s drives the decoy van, "
+		    "and the van answers it (%s)",
+		    MissionName(g_own.number), g_client->PlayerSlot(static_cast<uint8_t>(who)).nick.c_str(),
+		    raw ? "still near" : "far enough");
+	}
+	return true;
+}
+
 int8_t Location(void *script, int32_t command, RangeFn original) {
 	const uint16_t andOr    = At<uint16_t>(script, layout::SCRIPT_AND_OR);
 	const bool     notFlag  = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
 	const uint8_t  before   = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
+	const uint32_t ip       = At<uint32_t>(script, layout::SCRIPT_IP);
 	const bool     mayForce = MayForceCondition(andOr, notFlag);
 	const int8_t   r        = original(script, nullptr, command);
 	if (g_client && At<uint8_t>(script, layout::SCRIPT_COND_RESULT) == 0 &&
@@ -2204,10 +2761,23 @@ int8_t Location(void *script, int32_t command, RangeFn original) {
 		AnswerForAGuest(script, command, andOr, notFlag, before);
 		return r;
 	}
+	if (g_client && g_own.running && IsMissionScript(script)) {
+		if (AskedOfSpotted(script, command, ip, andOr, notFlag))
+			return r;
+		if (DecoyEnd(script, command, andOr, notFlag))
+			return r;
+		if (InGetaway(script) && GetawayPlace(script, command, andOr, notFlag, before))
+			return r;
+	}
 	if (g_own.running && IsMissionScript(script)) {
-		g_locationScript = script;
-		g_locationFrame  = g_frame;
-		g_locationAndOr  = andOr;
+		g_locationScript  = script;
+		g_locationFrame   = g_frame;
+		g_locationAndOr   = andOr;
+		g_locationHasArea = AreaForCondition(command, Params(), &g_locationArea);
+		CarAtThePlace(script, command, andOr, notFlag, before);
+		WakaCarpark(script, command, andOr, notFlag);
+		if (g_client && AnybodyAtPlace(script, command, andOr, notFlag, before))
+			return r;
 	}
 	if (!g_client || !mayForce || At<uint8_t>(script, layout::SCRIPT_COND_RESULT) == 0)
 		return r;
@@ -2297,6 +2867,7 @@ struct MissionInstruction {
 	MissionInstruction(void *script, int32_t command) : was(g_missionInstruction) {
 		if (g_own.running && IsMissionScript(script)) {
 			g_missionInstruction = true;
+			AnyplaceInstruction(script, command);
 			if (WritesHandle(command)) {
 				handleScript = script;
 				handleIp     = At<uint32_t>(script, layout::SCRIPT_IP);
@@ -2308,8 +2879,10 @@ struct MissionInstruction {
 		if (handleScript) {
 			const uint32_t after = At<uint32_t>(handleScript, layout::SCRIPT_IP);
 			const uint16_t at    = HandleOutputGlobal(Space(), SCRIPT_SPACE_SIZE, handleIp, after);
-			if (at != 0)
+			if (at != 0) {
 				NoteWrite(at, true);
+				AnyplaceStored(handleIp, at);
+			}
 		}
 	}
 	MissionInstruction(const MissionInstruction &)            = delete;
@@ -2413,6 +2986,238 @@ void *SeatedCar(void *ped) {
 		return nullptr;
 	void *const car = Field<void *>(ped, offs::PED_MY_VEHICLE);
 	return car && !Wrecked(car) ? car : nullptr;
+}
+
+bool ReplicaSeatedIn(uint8_t id, void *car) {
+	return car && SeatedCar(ReplicaOf(id)) == car;
+}
+
+// ---- a session car the mission clears away (mission.h, ClearTakesCar) ------------
+
+int32_t FloatBits(float f) {
+	int32_t v = 0;
+	std::memcpy(&v, &f, 4);
+	return v;
+}
+
+Vec3 EntityPos(void *entity) {
+	const float *p = &Field<float>(entity, offs::POSITION);
+	return {p[0], p[1], p[2]};
+}
+
+float CarRadius(void *car) {
+	return Func<float(__thiscall *)(void *)>(CEntity__GetBoundRadius)(car);
+}
+
+// Every car of the engine's pool, the way its own walks go (game/ride.cpp).
+template <typename F>
+void ForEachVehicle(F f) {
+	auto *const pool = Global<uint8_t *>(CPools__ms_pVehiclePool);
+	if (!pool)
+		return;
+	uint8_t *const entries = Field<uint8_t *>(pool, object::POOL_ENTRIES);
+	uint8_t *const flags   = Field<uint8_t *>(pool, object::POOL_FLAGS);
+	const int32_t  size    = Field<int32_t>(pool, object::POOL_SIZE);
+	if (!entries || !flags || size <= 0 || size > VEHICLE_POOL_SIZE)
+		return;
+	for (int32_t i = 0; i < size; ++i)
+		if ((flags[i] & object::POOLFLAG_ISFREE) == 0)
+			f(static_cast<void *>(entries + static_cast<size_t>(i) * offs::SIZEOF_AUTOMOBILE));
+}
+
+int32_t CarHandle(void *car) { return Func<int32_t(__cdecl *)(void *)>(CPools__GetVehicleRef)(car); }
+
+// A point beside `car`, across it, on the first side the buildings leave
+// clear of it. The ground under it is the engine's to find (a z of -100).
+void BesideCar(void *car, float *x, float *y) {
+	const float *right = &Field<float>(car, offs::MATRIX_RIGHT);
+	const Vec3   at    = EntityPos(car);
+	const float  d     = LeaveCarDistance(CarRadius(car));
+	for (float side : {1.0f, -1.0f}) {
+		const float cx = at.x + side * right[0] * d, cy = at.y + side * right[1] * d;
+		const Vec3f from{at.x, at.y, at.z + 1.0f}, to{cx, cy, at.z + 1.0f};
+		if (Func<LineOfSightFn>(CWorld__GetIsLineOfSightClear)(&from, &to, 1, 0, 0, 1, 0, 0, 0) != 0) {
+			*x = cx;
+			*y = cy;
+			return;
+		}
+	}
+	*x = at.x + right[0] * d;
+	*y = at.y + right[1] * d;
+}
+
+// Our own player out of `car`, or off its roof, and down beside it on foot
+// (mission.h, LeaveCarEffect). Nothing when he is neither.
+void LeaveCarHere(void *car) {
+	void *const me = Func<PlayerFn>(FindPlayerPed)();
+	if (!me || !car)
+		return;
+	float x = 0.0f, y = 0.0f;
+	if (Field<uint8_t>(me, offs::PED_IN_VEHICLE) != 0) {
+		if (Field<void *>(me, offs::PED_MY_VEHICLE) != car)
+			return;
+		BesideCar(car, &x, &y);
+		// The warp nils m_pMyVehicle under whatever door animation he is in
+		// (game/animcb.h): its callbacks come off first, on this car.
+		LetGoOfCarChain(me);
+		RunOurs(op::WARP_PLAYER_FROM_CAR_TO_COORD, {0, FloatBits(x), FloatBits(y), FloatBits(-100.0f)});
+		Log("missions: the owner's mission takes away the car we were in; we are out of it, "
+		    "beside it at (%.1f, %.1f)",
+		    x, y);
+		return;
+	}
+	if (!StandingOnCar(EntityPos(me), EntityPos(car), CarRadius(car)))
+		return;
+	BesideCar(car, &x, &y);
+	RunOurs(op::SET_PLAYER_COORDINATES, {0, FloatBits(x), FloatBits(y), FloatBits(-100.0f)});
+	Log("missions: the owner's mission takes away the car we stood on; we are down beside it "
+	    "at (%.1f, %.1f)",
+	    x, y);
+}
+
+// Another player in `car`, the session car `netId`: his copy in a seat of it
+// here, or the session's word that he sits in it or drives it.
+bool OtherPlayerIn(void *car, uint16_t netId) {
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+		if (id == LocalId())
+			continue;
+		const RemotePlayer &p = g_client->PlayerSlot(id);
+		if (p.active && (p.seatVehicleNetId == netId || ReplicaSeatedIn(id, car)))
+			return true;
+	}
+	const RemoteVehicle *row = g_client->VehicleByNetId(netId);
+	return row && row->driverPlayerId != INVALID_PLAYER && row->driverPlayerId != LocalId();
+}
+
+// One of the mission's people in a seat of `car`: a character the engine
+// keeps for a script, and not a player's copy.
+bool MissionPedIn(void *car) {
+	void *const me = Func<PlayerFn>(FindPlayerPed)();
+	for (size_t seat = 0; seat <= offs::VEH_MAX_PASSENGERS; ++seat) {
+		void *const in = seat == 0 ? Field<void *>(car, offs::VEH_DRIVER)
+		                           : Field<void *>(car, offs::VEH_PASSENGERS + (seat - 1) * 4);
+		if (in && in != me && PlayerOfReplica(in) == INVALID_PLAYER &&
+		    Field<uint8_t>(in, offs::PED_CHAR_CREATED_BY) == CHAR_CREATED_BY_MISSION)
+			return true;
+	}
+	return false;
+}
+
+// A session car the owner's mission takes away, out of this world and, by
+// C_VehicleRemoved, out of everybody else's (game/carremoval.h).
+void TakeSessionCar(int32_t handle, uint16_t netId) {
+	void *const car = handle >= 0 ? VehicleAt(handle) : nullptr;
+	if (!car)
+		return;
+	Func<void(__thiscall *)(void *)>(CPhysical__RemoveFromMovingList)(car);
+	ForgetEngineRawPointersTo(car);
+	NoteCarTakenAway(netId, VEHICLE_REMOVED_MISSION);
+	RunOurs(op::DELETE_CAR, {handle});
+	Log("missions: %s takes session car %u away, on every machine", MissionName(g_own.number),
+	    static_cast<unsigned>(netId));
+}
+
+// While a CLEAR_AREA of the session's mission runs here, the owner's or the
+// replay's: every session car is locked, so the engine's own clear takes none
+// of them, with whoever sits in it, nor one the session would put back. A
+// session car goes by TakeSessionCar alone.
+class SessionCarsLocked {
+public:
+	explicit SessionCarsLocked(bool active) {
+		if (!active || !g_client)
+			return;
+		ForEachVehicle([this](void *car) {
+			uint8_t &flags = Field<uint8_t>(car, offs::VEH_FLAGS_A);
+			if ((flags & offs::VEH_IS_LOCKED) != 0 || m_count == MAX ||
+			    g_client->SessionCarNetIdOf(CarHandle(car)) == INVALID_NETID)
+				return;
+			flags                = static_cast<uint8_t>(flags | offs::VEH_IS_LOCKED);
+			m_handles[m_count++] = CarHandle(car);
+		});
+	}
+	~SessionCarsLocked() {
+		for (size_t i = 0; i < m_count; ++i)
+			if (void *const car = VehicleAt(m_handles[i])) {
+				uint8_t &flags = Field<uint8_t>(car, offs::VEH_FLAGS_A);
+				flags          = static_cast<uint8_t>(flags & ~offs::VEH_IS_LOCKED);
+			}
+	}
+	SessionCarsLocked(const SessionCarsLocked &)            = delete;
+	SessionCarsLocked &operator=(const SessionCarsLocked &) = delete;
+
+private:
+	static constexpr size_t MAX = 64;
+	int32_t m_handles[MAX] = {};
+	size_t  m_count        = 0;
+};
+
+// The cars the owner's mission is taking away, and the instruction it is held
+// at until no other player sits in them (mission.h, CLEAR_HOLD_MS).
+constexpr size_t MAX_TAKEN_CARS = 16;
+struct TakenCar {
+	int32_t  handle = -1;
+	uint16_t netId  = INVALID_NETID;
+};
+struct CarHold {
+	const void *script  = nullptr;
+	uint32_t    ip      = 0;
+	uint32_t    sinceMs = 0;
+};
+CarHold g_carHold;
+// The cars a hold gave up on, a player still in them: this mission does not
+// wait for them again, so a clear it runs every frame does not stall it.
+uint16_t g_sparedCars[MAX_TAKEN_CARS];
+size_t   g_sparedCarCount = 0;
+
+bool Spared(uint16_t netId) {
+	for (size_t i = 0; i < g_sparedCarCount; ++i)
+		if (g_sparedCars[i] == netId)
+			return true;
+	return false;
+}
+
+// Whether the owner's mission waits at this instruction another frame for the
+// players in `cars`. The first time, everybody is told to get out of them and
+// off them, and so is our own player.
+bool HoldForPlayersIn(void *script, const TakenCar *cars, size_t count, bool mayHold) {
+	const uint32_t ip  = At<uint32_t>(script, layout::SCRIPT_IP);
+	const uint32_t now = WallClock::NowMs();
+	if (g_carHold.script != script || g_carHold.ip != ip) {
+		g_carHold = CarHold{script, ip, now};
+		for (size_t i = 0; i < count; ++i) {
+			g_client->Missions().SendEffect(LeaveCarEffect(g_own.number, cars[i].netId), now);
+			LeaveCarHere(VehicleAt(cars[i].handle));
+		}
+	}
+	bool seated = false;
+	for (size_t i = 0; i < count; ++i)
+		if (void *const car = VehicleAt(cars[i].handle))
+			seated = seated || OtherPlayerIn(car, cars[i].netId);
+	if (mayHold && KeepHoldingForSeats(seated, g_carHold.sinceMs, now)) {
+		At<uint32_t>(script, layout::SCRIPT_IP) = ip - 2;   // this instruction again next frame
+		return true;
+	}
+	g_carHold = CarHold{};
+	return false;
+}
+
+// Each of `cars` nobody else sits in, taken away; the others are left, as they
+// always were.
+void TakeFreeCars(const TakenCar *cars, size_t count) {
+	for (size_t i = 0; i < count; ++i) {
+		void *const car = VehicleAt(cars[i].handle);
+		if (!car)
+			continue;
+		if (OtherPlayerIn(car, cars[i].netId)) {
+			if (!Spared(cars[i].netId) && g_sparedCarCount < MAX_TAKEN_CARS)
+				g_sparedCars[g_sparedCarCount++] = cars[i].netId;
+			Log("missions: %s would take session car %u away, but a player is still in it; "
+			    "it stays",
+			    MissionName(g_own.number), static_cast<unsigned>(cars[i].netId));
+			continue;
+		}
+		TakeSessionCar(cars[i].handle, cars[i].netId);
+	}
 }
 
 // Everybody an enemy could go for, as it stands now.
@@ -3245,10 +4050,74 @@ bool CanSee(void *npc, void *target) {
 // for a helper who brought the car in or had it resprayed.
 bool g_saidGarageElsewhere = false;
 
+// HAS_RESPRAY_HAPPENED inside a block, where MayWiden never reaches: a
+// participant's respray answers it, and is held until the block's
+// goto_if_false says whether it was spent (standin.h).
+struct HeldRespray {
+	const void     *script  = nullptr;
+	uint8_t         garage  = 0;
+	standin::Block  block   = standin::Block::Single;
+	bool            notFlag = false;
+};
+HeldRespray g_heldRespray;
+bool        g_saidHeldRespray = false;
+
+bool HoldRespray(void *script, int32_t garage, uint16_t andOrBefore, uint8_t condBefore,
+                 bool notFlag) {
+	const standin::Block block = standin::BlockOf(andOrBefore);
+	if (!g_client || !g_own.running || g_own.finishing || !IsMissionScript(script) ||
+	    (block != standin::Block::And && block != standin::Block::Or) || garage < 0 ||
+	    garage >= MISSION_GARAGES ||
+	    !g_client->Missions().ResprayElsewhere(static_cast<uint8_t>(garage)))
+		return false;
+	At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = CompareFlagIfTrue(condBefore, andOrBefore, notFlag);
+	g_heldRespray = HeldRespray{script, static_cast<uint8_t>(garage), block, notFlag};
+	return true;
+}
+
+// The block's goto_if_false: the held respray is taken if the block went its way.
+void SettleRespray(void *script) {
+	const HeldRespray held = g_heldRespray;
+	g_heldRespray          = HeldRespray{};
+	const bool final       = At<uint8_t>(script, layout::SCRIPT_COND_RESULT) != 0;
+	if (!g_client || !standin::HeldAnswerSpent(held.block, held.notFlag, final))
+		return;
+	g_client->Missions().TakeResprayElsewhere(held.garage);
+	if (!g_saidHeldRespray) {
+		g_saidHeldRespray = true;
+		Log("missions: a participant's respray at garage %u answered %s", static_cast<unsigned>(held.garage),
+		    MissionName(g_own.number));
+	}
+}
+
 int8_t GarageCondition(void *script, int32_t command, RangeFn original) {
 	PeekParams(script, 1);
-	const int32_t garage = *reinterpret_cast<const int32_t *>(Params());
-	const int8_t  r      = original(script, nullptr, command);
+	const int32_t  garage     = *reinterpret_cast<const int32_t *>(Params());
+	const uint16_t andOr      = At<uint16_t>(script, layout::SCRIPT_AND_OR);
+	const uint8_t  condBefore = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
+	const bool     notFlag    = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
+	const int8_t   r          = original(script, nullptr, command);
+	if (command == op::HAS_RESPRAY_HAPPENED && HoldRespray(script, garage, andOr, condBefore, notFlag))
+		return r;
+	// Grand Theft Auto asks it in an `if and` beside a flag of its own (the
+	// car stood in the lock-up undamaged), the only block main.scm puts it in.
+	// Whether the car is in the garage is about the car, not about who
+	// brought it, so the block's own arithmetic takes the yes: without it a
+	// participant's delivery deleted the car here unanswered, and the next
+	// IS_CAR_DEAD on it failed the mission with "The vehicle is wrecked!".
+	if (command == op::IS_CAR_IN_MISSION_GARAGE && andOr != ANDOR_NONE) {
+		if (g_client && g_own.running && IsMissionScript(script) && garage >= 0 &&
+		    garage < MISSION_GARAGES &&
+		    g_client->Missions().GarageHasCarElsewhere(static_cast<uint8_t>(garage))) {
+			At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = CompareFlagIfTrue(condBefore, andOr, notFlag);
+			if (!g_saidGarageElsewhere) {
+				g_saidGarageElsewhere = true;
+				Log("missions: garage %d of %s is answered by somebody else's machine, where the car "
+				    "is", static_cast<int>(garage), MissionName(g_own.number));
+			}
+		}
+		return r;
+	}
 	if (!MayWiden(script) || garage < 0 || garage >= MISSION_GARAGES)
 		return r;
 	const uint8_t g   = static_cast<uint8_t>(garage);
@@ -3286,10 +4155,53 @@ int8_t PlaneCondition(void *script, int32_t command, RangeFn original) {
 }
 
 // HAS_CHAR_SPOTTED_PLAYER: any participant it can see.
+// Sayonara Salvatore's spotting (standin.h, SpottedStandIn): who was seen,
+// and whether the two place checks after it are about him rather than the
+// owner. Only in a single condition, as every one of its thirteen is.
+void SpottedInSayonara(void *script, void *npc, uint32_t ip) {
+	g_spotStandIn = SpotStandIn{};
+	if (At<uint16_t>(script, layout::SCRIPT_AND_OR) != ANDOR_NONE)
+		return;
+	const bool  ownerSeen = RawResult(script);
+	void *const me        = Func<PlayerFn>(FindPlayerPed)();
+	const Vec3  mine      = me ? EntityPos(me) : Vec3{};
+	const bool  ownerSafe = me && standin::InSafeBox(mine.x, mine.y);
+	standin::Watched w[MAX_PLAYERS];
+	Vec3             at[MAX_PLAYERS] = {};
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+		void *const ped = InOwnMission(id) ? ReplicaOf(id) : nullptr;
+		if (!ped || PedDown(ped))
+			continue;
+		at[id]     = EntityPos(ped);
+		w[id].valid = true;
+		w[id].seen  = CanSee(npc, ped);
+		w[id].safe  = standin::InSafeBox(at[id].x, at[id].y);
+	}
+	const int who = standin::SpottedStandIn(ownerSeen, ownerSafe, w, MAX_PLAYERS);
+	if (who < 0)
+		return;
+	if (!ownerSeen)
+		ForceTrue(script);
+	g_spotStandIn = SpotStandIn{script, ip, g_frame, static_cast<uint8_t>(who), at[who]};
+	static uint8_t saidWho = INVALID_PLAYER;
+	if (saidWho != who) {
+		saidWho = static_cast<uint8_t>(who);
+		Log("missions: %s's guard spotted %s%s", MissionName(g_own.number),
+		    g_client->PlayerSlot(saidWho).nick.c_str(), w[who].safe ? ", where it does not count" : "");
+	}
+}
+
 int8_t Spotted(void *script, int32_t command, RangeFn original) {
 	PeekParams(script, 2);
-	const int32_t charHandle = reinterpret_cast<const int32_t *>(Params())[0];
-	const int8_t  r          = original(script, nullptr, command);
+	const int32_t  charHandle = reinterpret_cast<const int32_t *>(Params())[0];
+	const uint32_t ip         = At<uint32_t>(script, layout::SCRIPT_IP);
+	const int8_t   r          = original(script, nullptr, command);
+	if (g_client && g_own.running && g_own.number == standin::SAYONARA_SALVATORE &&
+	    IsMissionScript(script)) {
+		if (void *const npc = Func<GetPedFn>(CPools__GetPed)(charHandle))
+			SpottedInSayonara(script, npc, ip);
+		return r;
+	}
 	if (!MayWiden(script))
 		return r;
 	void *const npc = Func<GetPedFn>(CPools__GetPed)(charHandle);
@@ -3307,12 +4219,19 @@ int8_t Spotted(void *script, int32_t command, RangeFn original) {
 }
 
 // IS_PLAYER_SHOOTING_IN_AREA: any participant firing inside it, as their own
-// snapshot says (PF_FIRING).
+// snapshot says (PF_FIRING). Alone, or in an `if or`, where a yes for anybody
+// is the block's yes: Bomb Da Base: Act II sends 8-Ball in on "a guard down
+// or the player shooting at the docks" (38_frank3.sc, FLAG_BLOKE_IN_AREA_FM3
+// 1), and a participant's first shot there went unheard (mission.h,
+// QuietCheckMayWiden).
 int8_t ShootingInArea(void *script, int32_t command, RangeFn original) {
 	PeekParams(script, 5);
-	const float  x1 = Params()[1], y1 = Params()[2], x2 = Params()[3], y2 = Params()[4];
-	const int8_t r  = original(script, nullptr, command);
-	if (!MayWiden(script))
+	const float    x1 = Params()[1], y1 = Params()[2], x2 = Params()[3], y2 = Params()[4];
+	const uint16_t andOr   = At<uint16_t>(script, layout::SCRIPT_AND_OR);
+	const bool     notFlag = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
+	const uint8_t  before  = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
+	const int8_t   r       = original(script, nullptr, command);
+	if (!g_client || !g_own.running || !IsMissionScript(script) || !QuietCheckMayWiden(andOr))
 		return r;
 	const float lx = x1 < x2 ? x1 : x2, hx = x1 < x2 ? x2 : x1;
 	const float ly = y1 < y2 ? y1 : y2, hy = y1 < y2 ? y2 : y1;
@@ -3323,7 +4242,7 @@ int8_t ShootingInArea(void *script, int32_t command, RangeFn original) {
 		if (!p.active || !p.haveState || (p.last.flags & PF_FIRING) == 0)
 			continue;
 		if (p.last.pos.x >= lx && p.last.pos.x <= hx && p.last.pos.y >= ly && p.last.pos.y <= hy) {
-			ForceTrue(script);
+			At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = CompareFlagIfTrue(before, andOr, notFlag);
 			break;
 		}
 	}
@@ -3334,23 +4253,23 @@ int8_t ShootingInArea(void *script, int32_t command, RangeFn original) {
 // whether in a Mafia car, is answered for whichever player is nearest him.
 // Every locate against a pedestrian in that mission is about him (at 40, 30,
 // 20 and 25 m for the spooking, 160 m for losing him), and the car test is
-// asked right after one.
-constexpr uint16_t CUTTING_THE_GRASS  = 36;
+// asked right after one. Triads And Tribulations' warlords and escort are
+// answered the same way (nearchar.h).
+constexpr uint16_t CUTTING_THE_GRASS  = nearchar::CUTTING_THE_GRASS;
 int32_t            g_stealthChar      = -1;
 uint32_t           g_stealthCharFrame = 0;
 uint8_t            g_stealthNearest   = INVALID_PLAYER;
 
-int8_t LocateNearChar(void *script, int32_t command, RangeFn original) {
-	const bool in3d = command == op::LOCATE_PLAYER_ANY_MEANS_CHAR_3D;
-	PeekParams(script, in3d ? 5 : 4);
-	const int32_t charHandle = reinterpret_cast<const int32_t *>(Params())[1];
-	const float   rx = Params()[2], ry = Params()[3], rz = in3d ? Params()[4] : 1e9f;
-	const int8_t  r  = original(script, nullptr, command);
-	if (!g_client || !g_own.running || g_own.number != CUTTING_THE_GRASS || !IsMissionScript(script))
-		return r;
+int8_t NearestAtChar(void *script, int32_t charHandle, float rx, float ry, float rz, bool in3d,
+                     uint8_t condBefore, uint16_t andOr, bool notFlag);
+
+// Who of the players is nearest the pedestrian a locate asks about, the owner
+// counting: INVALID_PLAYER when it is the owner. Cutting The Grass's Mafia
+// car test, right after a locate against Curly, asks it of that player.
+void NoteNearestToChar(int32_t charHandle) {
 	void *const npc = Func<GetPedFn>(CPools__GetPed)(charHandle);
 	if (!npc)
-		return r;
+		return;
 	g_stealthChar      = charHandle;
 	g_stealthCharFrame = g_frame;
 	g_stealthNearest   = INVALID_PLAYER;
@@ -3364,14 +4283,101 @@ int8_t LocateNearChar(void *script, int32_t command, RangeFn original) {
 				g_stealthNearest = id;
 			}
 		}
-	if (!MayWiden(script) || g_stealthNearest == INVALID_PLAYER)
+}
+
+// LOCATE_PLAYER_ANY_MEANS_CHAR_2D/3D in a mission of nearchar.h's table: the
+// owner's no becomes a yes, through the block's own flag, when a participant
+// is inside the same box (NearestAtChar).
+int8_t LocateNearChar(void *script, int32_t command, RangeFn original) {
+	const bool in3d = command == op::LOCATE_PLAYER_ANY_MEANS_CHAR_3D;
+	PeekParams(script, in3d ? 5 : 4);
+	const int32_t  charHandle = reinterpret_cast<const int32_t *>(Params())[1];
+	const float    rx = Params()[2], ry = Params()[3], rz = in3d ? Params()[4] : 1e9f;
+	const uint8_t  condBefore = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
+	const uint16_t andOr      = At<uint16_t>(script, layout::SCRIPT_AND_OR);
+	const bool     notFlag    = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
+	const int8_t   r          = original(script, nullptr, command);
+	if (!g_client || !g_own.running || !nearchar::AnswersForNearest(g_own.number) ||
+	    !IsMissionScript(script))
 		return r;
-	void *const  ped = ReplicaOf(g_stealthNearest);
-	const float *a   = &Field<float>(ped, offs::POSITION);
-	const float *b   = &Field<float>(npc, offs::POSITION);
-	const float  dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
-	if (std::fabs(dx) < rx && std::fabs(dy) < ry && std::fabs(dz) < rz)
-		ForceTrue(script);
+	if (g_own.number == CUTTING_THE_GRASS)
+		NoteNearestToChar(charHandle);
+	NearestAtChar(script, charHandle, rx, ry, rz, in3d, condBefore, andOr, notFlag);
+	return r;
+}
+
+// A locate against one of the mission's pedestrians in a mission that asks it
+// of whoever is on him (nearchar.h): the owner's no becomes the yes it would
+// have been, through the and/or block's own arithmetic, when a participant
+// stands inside the same box round the pedestrian, or round his car.
+bool g_saidNearestAtChar = false;
+bool g_saidNearestAtCar  = false;
+
+// The box round `at`, the pedestrian's or the car's position: yes through the
+// block's flag when a participant stands inside it. Whom it was about goes in
+// the log once, `said` saying whether it has.
+void NearestInBox(void *script, const float *at, float rx, float ry, float rz, bool in3d,
+                  uint8_t condBefore, uint16_t andOr, bool notFlag, const char *what, int32_t handle,
+                  bool *said, nearchar::CarMeans means = nearchar::CarMeans::Any) {
+	const uint8_t yes = CompareFlagIfTrue(condBefore, andOr, notFlag);
+	if (At<uint8_t>(script, layout::SCRIPT_COND_RESULT) == yes)
+		return;
+	const uint8_t participants = g_client->Missions().Participants();
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+		if (id == LocalId() || (participants & PlayerBit(id)) == 0)
+			continue;
+		const RemotePlayer &p = g_client->PlayerSlot(id);
+		if (!p.active || !p.haveState || !nearchar::MeansFits(means, p.Seated()))
+			continue;
+		if (!nearchar::InLocateBox(p.last.pos.x - at[0], p.last.pos.y - at[1], p.last.pos.z - at[2], rx,
+		                           ry, rz, in3d))
+			continue;
+		At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = yes;
+		if (!*said) {
+			*said = true;
+			Log("missions: %s asks whether its player is near %s %d; %s is, and that answers it",
+			    MissionName(g_own.number), what, static_cast<int>(handle), p.nick.c_str());
+		}
+		break;
+	}
+}
+
+int8_t NearestAtChar(void *script, int32_t charHandle, float rx, float ry, float rz, bool in3d,
+                     uint8_t condBefore, uint16_t andOr, bool notFlag) {
+	void *const npc = Func<GetPedFn>(CPools__GetPed)(charHandle);
+	if (!npc)
+		return 0;
+	void *const car = SeatedCar(npc);
+	NearestInBox(script, &Field<float>(car ? car : npc, offs::POSITION), rx, ry, rz, in3d, condBefore,
+	             andOr, notFlag, "pedestrian", charHandle, &g_saidNearestAtChar);
+	return 0;
+}
+
+// LOCATE_PLAYER_*_CAR_2D/3D against one of the mission's cars, in a mission
+// of nearchar.h's car table: the owner's no becomes the yes it would have
+// been when a participant stands inside the same box round the car, on foot
+// or in a car as the locate asks (Evidence Dash's prosecution, Gone
+// Fishing's partner, Paparazzi Purge's spy boat and the Stallion he gets away
+// in, Grand Theft Aero's van, Escort Service's truck).
+int8_t LocateNearCar(void *script, int32_t command, RangeFn original) {
+	nearchar::CarLocate l{};
+	nearchar::CarLocateOf(command, &l);
+	PeekParams(script, l.is3d ? 5 : 4);
+	const int32_t  carHandle  = reinterpret_cast<const int32_t *>(Params())[1];
+	const float    rx = Params()[2], ry = Params()[3], rz = l.is3d ? Params()[4] : 1e9f;
+	const uint8_t  condBefore = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
+	const uint16_t andOr      = At<uint16_t>(script, layout::SCRIPT_AND_OR);
+	const bool     notFlag    = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
+	const int8_t   r          = original(script, nullptr, command);
+	if (!g_client || !g_own.running || g_own.finishing ||
+	    !nearchar::AnswersNearCarForNearest(g_own.number) || !IsMissionScript(script) ||
+	    !nearchar::CarLocateMayWiden(l, andOr) || !IsMissionCar(carHandle))
+		return r;
+	void *const car = Func<GetPedFn>(CPools__GetVehicle)(carHandle);
+	if (!car)
+		return r;
+	NearestInBox(script, &Field<float>(car, offs::POSITION), rx, ry, rz, l.is3d, condBefore, andOr, notFlag,
+	             "car", carHandle, &g_saidNearestAtCar, l.means);
 	return r;
 }
 
@@ -3486,12 +4492,10 @@ bool SkipOperand(uint32_t &ip) {
 	return true;
 }
 
-// 00DA for the subject: his car's handle, into the variable the script names,
-// and the instruction done without the handler (which reads the owner's car).
-int8_t FuzzStoreCar(void *script, int32_t command, RangeFn original) {
-	void *const ped = FuzzSubjectPed();
-	if (!ped)
-		return original(script, nullptr, command);
+// 00DA for somebody else's player: the handle of the car `ped` sits in, into
+// the variable the script names, and the instruction done without the handler
+// (which reads the owner's car).
+int8_t StoreCarOf(void *ped, void *script, int32_t command, RangeFn original) {
 	uint32_t ip = At<uint32_t>(script, layout::SCRIPT_IP);
 	if (!SkipOperand(ip) || ip + 3 > SCRIPT_SPACE_SIZE)
 		return original(script, nullptr, command);
@@ -3506,6 +4510,14 @@ int8_t FuzzStoreCar(void *script, int32_t command, RangeFn original) {
 		return original(script, nullptr, command);
 	At<uint32_t>(script, layout::SCRIPT_IP) = ip + 3;
 	return 0;
+}
+
+// 00DA for the subject of The Fuzz Ball.
+int8_t FuzzStoreCar(void *script, int32_t command, RangeFn original) {
+	void *const ped = FuzzSubjectPed();
+	if (!ped)
+		return original(script, nullptr, command);
+	return StoreCarOf(ped, script, command, original);
 }
 
 // 01DF for the subject's girl: his copy is her leader, not the owner.
@@ -3549,10 +4561,616 @@ int8_t FuzzInGroup(void *script, int32_t command, RangeFn original) {
 	return r;
 }
 
+// ---- Donald Love's and King Courtney's Staunton missions (standin.h) -------------
+//
+// Only on the owner's machine, only in the mission's own script, and only
+// ever turning a no into a yes the group gave.
+
+bool g_saidAnybodyInModel = false;
+
+// The participant `id`'s copy here, standing or seated, in the owner's mission.
+void *ParticipantPed(uint8_t id) {
+	if (id == LocalId() || !InOwnMission(id))
+		return nullptr;
+	void *const ped = ReplicaOf(id);
+	return ped && !PedDown(ped) ? ped : nullptr;
+}
+
+int32_t CarModel(void *car) { return car ? Field<int16_t>(car, offs::MODEL_INDEX) : -1; }
+
+// IS_PLAYER_IN_MODEL in Liberator (single) and S.A.M. (three to a block):
+// yes, through the block's own flag, when a participant sits in a car of
+// that model.
+int8_t AnybodyInModel(void *script, int32_t command, RangeFn original) {
+	PeekParams(script, 2);
+	const int32_t  model   = reinterpret_cast<const int32_t *>(Params())[1];
+	const uint8_t  before  = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
+	const uint16_t andOr   = At<uint16_t>(script, layout::SCRIPT_AND_OR);
+	const bool     notFlag = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
+	const int8_t   r       = original(script, nullptr, command);
+	if (!g_client || !g_own.running || g_own.finishing || !IsMissionScript(script))
+		return r;
+	const uint8_t yes = CompareFlagIfTrue(before, andOr, notFlag);
+	if (At<uint8_t>(script, layout::SCRIPT_COND_RESULT) == yes)
+		return r;
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+		void *const ped = ParticipantPed(id);
+		if (!ped || CarModel(SeatedCar(ped)) != model)
+			continue;
+		At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = yes;
+		if (!g_saidAnybodyInModel) {
+			g_saidAnybodyInModel = true;
+			Log("missions: %s asks whether its player is in a model %d; %s is, and that answers it",
+			    MissionName(g_own.number), static_cast<int>(model),
+			    g_client->PlayerSlot(id).nick.c_str());
+		}
+		break;
+	}
+	return r;
+}
+
+// Gangcar Round-Up: with the owner not in a gang car, the participant who
+// is, for IS_PLAYER_IN_ANY_CAR, IS_PLAYER_IN_MODEL and STORE_CAR_PLAYER_IS_IN
+// (standin.h, RoundUpSubject). Chosen at each IS_PLAYER_IN_ANY_CAR, which
+// every one of the script's model checks and stores follows in the same frame.
+uint8_t  g_roundUpSubject      = INVALID_PLAYER;
+uint32_t g_roundUpSubjectFrame = 0;
+bool     g_saidRoundUp         = false;
+
+bool InRoundUp(void *script) {
+	return g_client && g_own.running && !g_own.finishing &&
+	       g_own.number == standin::GANGCAR_ROUND_UP && IsMissionScript(script);
+}
+
+void *RoundUpSubjectPed() {
+	if (g_roundUpSubject == INVALID_PLAYER || g_roundUpSubjectFrame != g_frame)
+		return nullptr;
+	void *const ped = ParticipantPed(g_roundUpSubject);
+	return ped && SeatedCar(ped) ? ped : nullptr;
+}
+
+int8_t RoundUpInAnyCar(void *script, int32_t command, RangeFn original) {
+	const int8_t r = original(script, nullptr, command);
+	g_roundUpSubject = INVALID_PLAYER;
+	int32_t models[MAX_PLAYERS];
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+		void *const ped = ParticipantPed(id);
+		models[id]      = ped ? CarModel(SeatedCar(ped)) : -1;
+	}
+	const int subject = standin::RoundUpSubject(
+	    CarModel(SeatedCar(Func<PlayerFn>(FindPlayerPed)())), models, MAX_PLAYERS);
+	if (subject < 0)
+		return r;
+	g_roundUpSubject      = static_cast<uint8_t>(subject);
+	g_roundUpSubjectFrame = g_frame;
+	if (MayWiden(script))
+		ForceTrue(script);
+	if (!g_saidRoundUp) {
+		g_saidRoundUp = true;
+		Log("missions: %s sits in a gang car of Gangcar Round-Up; the mission takes his car as "
+		    "its player's", g_client->PlayerSlot(g_roundUpSubject).nick.c_str());
+	}
+	return r;
+}
+
+// IS_PLAYER_IN_MODEL, single, for the subject: his car's model, the owner's
+// answer replaced (the owner sits in none of the three, or there would be no
+// subject).
+int8_t RoundUpInModel(void *script, int32_t command, RangeFn original) {
+	PeekParams(script, 2);
+	const int32_t model = reinterpret_cast<const int32_t *>(Params())[1];
+	const int8_t  r     = original(script, nullptr, command);
+	void *const   ped   = RoundUpSubjectPed();
+	if (!ped || At<uint16_t>(script, layout::SCRIPT_AND_OR) != ANDOR_NONE)
+		return r;
+	const bool raw = CarModel(SeatedCar(ped)) == model;
+	At<uint8_t>(script, layout::SCRIPT_COND_RESULT) =
+	    (At<uint8_t>(script, layout::SCRIPT_NOT) != 0) != raw ? 1 : 0;
+	return r;
+}
+
+int8_t RoundUpStoreCar(void *script, int32_t command, RangeFn original) {
+	void *const ped = RoundUpSubjectPed();
+	if (!ped)
+		return original(script, nullptr, command);
+	return StoreCarOf(ped, script, command, original);
+}
+
+// ---- The Getaway: the robbers ride with whoever drives them (game/getaway.h) -------
+//
+// Only on the owner's machine, only in mission 29, only in its own script. The
+// owner as the robbers' driver is the script as it always was; a guest as the
+// driver answers the questions about "the player" in the owner's place.
+uint8_t  g_gwDriver               = INVALID_PLAYER;
+bool     g_gwRobbersSeated        = false;
+bool     g_gwHasGuest             = false;   // somebody besides the owner is in it
+uint32_t g_gwFrame                = 0xFFFFFFFFu;
+uint32_t g_gwArrived[MAX_PLAYERS] = {};
+uint32_t g_gwSeq                  = 0;
+bool     g_saidGetawayGuest       = false;
+bool     g_saidGetawayNobody      = false;
+bool     g_saidGetawayHint        = false;
+uint8_t  g_gwPrintLabel[TEXT_LABEL] = {};
+uint32_t g_gwPrintMs              = 0;
+
+// The blips the owner's script made above a robber, and whose they are.
+struct GetawayBlip {
+	int32_t handle;
+	uint8_t viewer;
+};
+constexpr size_t GETAWAY_BLIPS = 8;
+GetawayBlip      g_gwBlips[GETAWAY_BLIPS];
+size_t           g_gwBlipCount = 0;
+
+void ForgetGetaway() {
+	g_gwDriver          = INVALID_PLAYER;
+	g_gwRobbersSeated   = false;
+	g_gwHasGuest        = false;
+	g_gwFrame           = 0xFFFFFFFFu;
+	std::memset(g_gwArrived, 0, sizeof g_gwArrived);
+	g_gwSeq             = 0;
+	g_saidGetawayGuest  = false;
+	g_saidGetawayNobody = false;
+	g_saidGetawayHint   = false;
+	std::memset(g_gwPrintLabel, 0, sizeof g_gwPrintLabel);
+	g_gwPrintMs         = 0;
+	g_gwBlipCount       = 0;
+}
+
+bool InGetaway(void *script) {
+	return g_client && g_own.running && !g_own.finishing && getaway::RideOf(g_own.number) &&
+	       IsMissionScript(script);
+}
+
+// The ped of player `id` here when he is in the owner's mission: ours for the
+// owner, a participant's copy for the rest.
+void *GetawayPedOf(uint8_t id) {
+	return id == LocalId() ? Func<PlayerFn>(FindPlayerPed)() : ParticipantPed(id);
+}
+
+// Who drives the robbers, once a frame (getaway.h, ChooseDriver).
+void GetawayRefresh() {
+	if (g_gwFrame == g_frame)
+		return;
+	g_gwFrame = g_frame;
+	const getaway::Ride *const rideOf = getaway::RideOf(g_own.number);
+	if (!rideOf) {
+		g_gwDriver = INVALID_PLAYER;
+		return;
+	}
+	const getaway::Ride &ride = *rideOf;
+	void        *peds[16];
+	void        *robbers[8];
+	size_t       alive      = 0;
+	void        *robbersCar = nullptr;
+	const size_t n          = HostedMissionPeds(peds, sizeof peds / sizeof peds[0]);
+	for (size_t i = 0; i < n && alive < sizeof robbers / sizeof robbers[0]; ++i) {
+		if (PedDown(peds[i]))
+			continue;
+		robbers[alive++] = peds[i];
+		if (!robbersCar)
+			robbersCar = SeatedCar(peds[i]);
+	}
+	const int need = getaway::SeatsNeeded(static_cast<int>(alive), ride);
+	getaway::Candidate c[MAX_PLAYERS];
+	g_gwHasGuest = false;
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+		void *const ped = GetawayPedOf(id);
+		if (!ped) {
+			g_gwArrived[id] = 0;
+			continue;
+		}
+		void *const car     = SeatedCar(ped);
+		c[id].valid         = true;
+		g_gwHasGuest        = g_gwHasGuest || id != LocalId();
+		c[id].drives        = car && Field<void *>(car, offs::VEH_DRIVER) == ped;
+		c[id].inRobbersCar  = car && car == robbersCar;
+		c[id].drivesRobbers = c[id].drives && c[id].inRobbersCar;
+		if (c[id].drives) {
+			uint8_t max = Field<uint8_t>(car, offs::VEH_NUM_MAX_PASSENGERS);
+			if (max > offs::VEH_MAX_PASSENGERS)
+				max = static_cast<uint8_t>(offs::VEH_MAX_PASSENGERS);
+			const uint8_t taken = Field<uint8_t>(car, offs::VEH_NUM_PASSENGERS);
+			c[id].freeSeats     = max > taken ? max - taken : 0;
+		}
+		const float *at = &Field<float>(car ? car : ped, offs::POSITION);
+		if (alive == 0) {
+			c[id].nearby = getaway::AtThePickup(at[0], at[1], ride);
+		} else {
+			for (size_t i = 0; i < alive && !c[id].nearby; ++i) {
+				const float *r  = &Field<float>(robbers[i], offs::POSITION);
+				const float  dx = r[0] - at[0], dy = r[1] - at[1];
+				c[id].nearby = dx * dx + dy * dy <=
+				             ride.passengerReachM * ride.passengerReachM;
+			}
+		}
+		if (getaway::CouldTakeThem(c[id], need)) {
+			if (g_gwArrived[id] == 0)
+				g_gwArrived[id] = ++g_gwSeq;
+		} else {
+			g_gwArrived[id] = 0;
+		}
+		c[id].arrived = g_gwArrived[id];
+	}
+	const int previous = g_gwDriver == INVALID_PLAYER ? -1 : g_gwDriver;
+	const int pick     = getaway::ChooseDriver(c, MAX_PLAYERS, LocalId(), need, robbersCar != nullptr,
+	                                           previous, alive > 0);
+	g_gwDriver        = pick < 0 ? INVALID_PLAYER : static_cast<uint8_t>(pick);
+	g_gwRobbersSeated = robbersCar != nullptr;
+	if (g_gwDriver != INVALID_PLAYER && g_gwDriver != LocalId() && !g_saidGetawayGuest) {
+		g_saidGetawayGuest = true;
+		Log("missions: %s takes the robbers of %s in his own car; the mission asks about him "
+		    "where it asks about its player",
+		    g_client->PlayerSlot(g_gwDriver).nick.c_str(), MissionName(g_own.number));
+	}
+	if (g_gwRobbersSeated && g_gwDriver == INVALID_PLAYER && !g_saidGetawayNobody) {
+		g_saidGetawayNobody = true;
+		Log("missions: nobody of the group sits in the car the robbers of %s are in; the owner in "
+		    "another car is not its player there", MissionName(g_own.number));
+	}
+}
+
+// The guest who drives the robbers, his copy here, or null: the owner, or
+// nobody, is the script as it was.
+void *GetawayGuestPed() {
+	GetawayRefresh();
+	if (g_gwDriver == INVALID_PLAYER || g_gwDriver == LocalId())
+		return nullptr;
+	void *const ped = ParticipantPed(g_gwDriver);
+	return ped && SeatedCar(ped) ? ped : nullptr;
+}
+
+// The robbers in a car with nobody of the group in it. Alone, the owner changing
+// cars is the script as it always was: the robbers follow him into the new one.
+bool GetawayNobodyInCar() {
+	GetawayRefresh();
+	return g_gwRobbersSeated && g_gwDriver == INVALID_PLAYER && g_gwHasGuest;
+}
+
+// The condition the engine just answered for the owner, said again as `raw`.
+void GetawayAnswer(void *script, uint8_t before, uint16_t andOr, bool notFlag, bool raw) {
+	At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = CompareFlagFor(before, andOr, notFlag, raw);
+}
+
+// IS_PLAYER_IN_ANY_CAR, STORE_CAR_PLAYER_IS_IN, IS_PLAYER_IN_MODEL,
+// IS_PLAYER_PRESSING_HORN and LOCATE_PLAYER_ANY_MEANS_CHAR_2D, for the guest
+// who drives the robbers; and IS_PLAYER_IN_ANY_CAR no, for the robbers in a
+// car nobody of the group sits in. False for anything the owner answers
+// himself, which is then run as it was.
+bool GetawayCommand(void *script, int32_t command, RangeFn original, int8_t *out) {
+	if (command != getaway::OP_IS_PLAYER_IN_ANY_CAR && command != getaway::OP_STORE_CAR_PLAYER_IS_IN &&
+	    command != getaway::OP_IS_PLAYER_IN_MODEL && command != getaway::OP_IS_PLAYER_PRESSING_HORN &&
+	    command != getaway::OP_LOCATE_PLAYER_ANY_MEANS_CHAR_2D &&
+	    command != getaway::OP_IS_PLAYER_SITTING_IN_ANY_CAR)
+		return false;
+	void *const    guest   = GetawayGuestPed();
+	const uint8_t  before  = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
+	const uint16_t andOr   = At<uint16_t>(script, layout::SCRIPT_AND_OR);
+	const bool     notFlag = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
+	if (!guest) {
+		if ((command != getaway::OP_IS_PLAYER_IN_ANY_CAR &&
+		     command != getaway::OP_IS_PLAYER_SITTING_IN_ANY_CAR) ||
+		    !GetawayNobodyInCar())
+			return false;
+		*out = original(script, nullptr, command);
+		GetawayAnswer(script, before, andOr, notFlag, false);
+		return true;
+	}
+	if (command == getaway::OP_STORE_CAR_PLAYER_IS_IN) {
+		*out = StoreCarOf(guest, script, command, original);
+		return true;
+	}
+	bool raw = true;
+	if (command == getaway::OP_IS_PLAYER_IN_MODEL) {
+		PeekParams(script, 2);
+		raw = CarModel(SeatedCar(guest)) == reinterpret_cast<const int32_t *>(Params())[1];
+	} else if (command == getaway::OP_IS_PLAYER_PRESSING_HORN) {
+		const RemotePlayer  &p   = g_client->PlayerSlot(g_gwDriver);
+		const RemoteVehicle *car = p.active && p.Seated() ? g_client->VehicleByNetId(p.seatedVehicleNetId)
+		                                                   : nullptr;
+		raw = car && car->hornSounding;
+	} else if (command == getaway::OP_LOCATE_PLAYER_ANY_MEANS_CHAR_2D) {
+		PeekParams(script, 4);
+		void *const npc = Func<GetPedFn>(CPools__GetPed)(reinterpret_cast<const int32_t *>(Params())[1]);
+		if (!npc)
+			return false;
+		const float  rx = Params()[2], ry = Params()[3];
+		const float *a  = &Field<float>(SeatedCar(npc) ? SeatedCar(npc) : npc, offs::POSITION);
+		const float *b  = &Field<float>(SeatedCar(guest), offs::POSITION);
+		raw = nearchar::InLocateBox(b[0] - a[0], b[1] - a[1], 0.0f, rx, ry, 0.0f, false);
+	}
+	*out = original(script, nullptr, command);
+	GetawayAnswer(script, before, andOr, notFlag, raw);
+	return true;
+}
+
+// A location condition of the mission, asked of its player: the guest who
+// drives the robbers answers it as himself, the owner as the owner, and with
+// the robbers in a car nobody of the group sits in, only what is asked on
+// foot stays the owner's. Never a checkpoint for everybody to reach: the
+// group is not in one car, and the one that matters is the robbers'. True once
+// it is this rule's.
+bool GetawayPlace(void *script, int32_t command, uint16_t andOr, bool notFlag, uint8_t before) {
+	standin::PlaceNeeds needs{};
+	MissionArea         area{};
+	if (!standin::PlaceNeedsOf(command, &needs) || !AreaForCondition(command, Params(), &area))
+		return false;
+	if (GetawayGuestPed()) {
+		const anyplace::Candidate who = PlaceCandidate(g_gwDriver, nullptr);
+		GetawayAnswer(script, before, andOr, notFlag, anyplace::Answers(needs, area, who, false));
+	} else if (GetawayNobodyInCar() && !getaway::NobodyAnswersAsOwner(needs.onFoot)) {
+		GetawayAnswer(script, before, andOr, notFlag, false);
+	}
+	return true;
+}
+
+// What the script prints about the car goes to the one who has to deal with
+// it (getaway.h, IsCrewLabel). Ours, where the engine has just shown it, when
+// that is the owner; otherwise taken off here and shown to the guest, no more
+// than once a second, which is as often as the script's own loop reprints it.
+bool GetawayCrewPrint(int32_t command, const uint8_t *code, size_t length) {
+	if (length < 2 + TEXT_LABEL ||
+	    (command != op::PRINT && command != op::PRINT_NOW && command != op::PRINT_SOON) ||
+	    !getaway::IsCrewLabel(code + 2, *getaway::RideOf(g_own.number)))
+		return false;
+	GetawayRefresh();
+	const uint8_t viewer = g_gwDriver != INVALID_PLAYER ? g_gwDriver : LocalId();
+	if (viewer == LocalId())
+		return true;
+	uint8_t clear[2 + TEXT_LABEL] = {static_cast<uint8_t>(op::CLEAR_THIS_PRINT & 0xFF),
+	                                 static_cast<uint8_t>(op::CLEAR_THIS_PRINT >> 8)};
+	std::memcpy(clear + 2, code + 2, TEXT_LABEL);
+	RunHere(clear, sizeof clear, nullptr);
+	const uint32_t now = WallClock::NowMs();
+	if (std::memcmp(g_gwPrintLabel, code + 2, TEXT_LABEL) == 0 && now - g_gwPrintMs < 1000)
+		return true;
+	std::memcpy(g_gwPrintLabel, code + 2, TEXT_LABEL);
+	g_gwPrintMs = now;
+	g_client->Missions().SendEffect(GetBackInEffect(g_own.number, g_gwPrintLabel, viewer), now);
+	if (!g_saidGetawayHint) {
+		g_saidGetawayHint = true;
+		Log("missions: what %s says about the car is shown to %s, who drives the robbers, and "
+		    "not to the owner", MissionName(g_own.number), g_client->PlayerSlot(viewer).nick.c_str());
+	}
+	return true;
+}
+
+// The marker the script puts above a robber who has fallen behind is for the
+// one who has to go back for him. The owner's own: kept off the wire. The
+// guest's: sent to him alone and put out here. Remembered by handle, so the
+// marker's end goes the same way (GetawayBlipTarget).
+bool GetawayCrewBlip(int32_t handle, MissionEffectBody &body) {
+	GetawayRefresh();
+	const uint8_t viewer = g_gwDriver != INVALID_PLAYER ? g_gwDriver : LocalId();
+	if (g_gwBlipCount < GETAWAY_BLIPS)
+		g_gwBlips[g_gwBlipCount++] = GetawayBlip{handle, viewer};
+	if (viewer == LocalId())
+		return true;
+	RunOurs(op::CHANGE_BLIP_DISPLAY, {handle, 0});
+	body.onlyTo = static_cast<uint8_t>(viewer + 1);
+	return false;
+}
+
+// A later instruction about one of those markers: where it goes, and whether.
+bool GetawayBlipTarget(int32_t handle, int32_t command, MissionEffectBody &body) {
+	for (size_t i = 0; i < g_gwBlipCount; ++i) {
+		if (g_gwBlips[i].handle != handle)
+			continue;
+		const uint8_t viewer = g_gwBlips[i].viewer;
+		if (command == op::REMOVE_BLIP)
+			g_gwBlips[i] = g_gwBlips[--g_gwBlipCount];
+		if (viewer == LocalId())
+			return true;
+		body.onlyTo = static_cast<uint8_t>(viewer + 1);
+		return false;
+	}
+	return false;
+}
+
+// Waka-Gashira Wipeout!'s car park (missioncombat.h, stealth): a participant
+// on foot there, or upstairs in anything but a Colombian car, gives the hit
+// away as the owner would. The condition before the car park in its block is
+// remembered as it runs.
+struct WakaPrev {
+	void    *script  = nullptr;
+	uint32_t frame   = 0;
+	int32_t  command = 0;
+	bool     notFlag = false;
+	int32_t  model   = -1;
+};
+WakaPrev g_wakaPrev;
+void    *g_wakaUpperScript = nullptr;   // upstairs was given away; the model check follows
+uint32_t g_wakaUpperFrame  = 0;
+bool     g_saidWaka        = false;
+
+bool InWaka(void *script) {
+	return g_client && g_own.running && !g_own.finishing &&
+	       g_own.number == stealth::WAKA_GASHIRA_WIPEOUT && IsMissionScript(script);
+}
+
+void NoteWakaCondition(void *script, int32_t command) {
+	if (!InWaka(script))
+		return;
+	g_wakaPrev.script  = script;
+	g_wakaPrev.frame   = g_frame;
+	g_wakaPrev.command = command;
+	g_wakaPrev.notFlag = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
+	g_wakaPrev.model   = -1;
+	if (command == 0x00DE) {
+		PeekParams(script, 2);
+		g_wakaPrev.model = reinterpret_cast<const int32_t *>(Params())[1];
+	}
+}
+
+bool WatcherOf(uint8_t id, stealth::Watcher *w);
+
+// Whoever of the participants gives the car park away, or INVALID_PLAYER.
+uint8_t WakaGivenAway(stealth::Carpark box, stealth::CarparkAsk ask) {
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+		stealth::Watcher w;
+		if (WatcherOf(id, &w) && stealth::BlowsCarparkCover(w, box, ask))
+			return id;
+	}
+	return INVALID_PLAYER;
+}
+
+void SayWaka(uint8_t id) {
+	if (g_saidWaka)
+		return;
+	g_saidWaka = true;
+	Log("missions: %s is in the Newport car park out of a Colombian car; the Yakuza have "
+	    "identified the group", g_client->PlayerSlot(id).nick.c_str());
+}
+
+// IS_PLAYER_IN_AREA_3D in Waka-Gashira, answered: the two `if and`s ending
+// on the car park, and the upstairs check alone.
+void WakaCarpark(void *script, int32_t command, uint16_t andOr, bool notFlag) {
+	if (command != nearchar::OP_IS_PLAYER_IN_AREA_3D || notFlag || !InWaka(script))
+		return;
+	const float *p   = Params();
+	const auto   box = stealth::CarparkOf(p[1], p[2], p[3], p[4], p[5], p[6]);
+	if (box == stealth::Carpark::None)
+		return;
+	if (andOr == ANDOR_NONE && box == stealth::Carpark::Upper) {
+		const uint8_t id = WakaGivenAway(box, stealth::CarparkAsk::NotColombian);
+		if (id == INVALID_PLAYER)
+			return;
+		At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = 1;
+		g_wakaUpperScript                               = script;
+		g_wakaUpperFrame                                = g_frame;
+		SayWaka(id);
+		return;
+	}
+	stealth::CarparkAsk ask;
+	if (andOr != 1 || box != stealth::Carpark::Whole || g_wakaPrev.script != script ||
+	    g_wakaPrev.frame != g_frame ||
+	    !stealth::CarparkAskOf(g_wakaPrev.command, g_wakaPrev.notFlag, g_wakaPrev.model, &ask))
+		return;
+	const uint8_t id = WakaGivenAway(box, ask);
+	if (id == INVALID_PLAYER)
+		return;
+	// The last condition of a two-condition `if and`: the block's answer.
+	At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = 1;
+	SayWaka(id);
+}
+
+// NOT IS_PLAYER_IN_MODEL #COLUMB right after a participant gave upstairs
+// away: he is the one not in a Colombian car.
+bool WakaUpperModel(void *script) {
+	if (g_wakaUpperScript != script || g_frame - g_wakaUpperFrame > 1 ||
+	    At<uint16_t>(script, layout::SCRIPT_AND_OR) != ANDOR_NONE ||
+	    At<uint8_t>(script, layout::SCRIPT_NOT) == 0 || g_wakaPrev.model != stealth::COLOMBIAN_CAR)
+		return false;
+	g_wakaUpperScript                               = nullptr;
+	At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = 1;
+	return true;
+}
+
+// IS_PLAYER_IN_MODEL, by mission.
+int8_t InModel(void *script, int32_t command, RangeFn original) {
+	if (InRoundUp(script))
+		return RoundUpInModel(script, command, original);
+	if (InWaka(script)) {
+		NoteWakaCondition(script, command);
+		const int8_t r = original(script, nullptr, command);
+		WakaUpperModel(script);
+		return r;
+	}
+	if (g_own.running && standin::AnybodyInModel(g_own.number) && IsMissionScript(script))
+		return AnybodyInModel(script, command, original);
+	return InModelOfNearest(script, command, original);
+}
+
+// ---- Marty's passengers: a participant driving them is the player near them --------
+//
+// LOCATE_PLAYER_*_CHAR in The Crook, The Thieves, The Wife and Her Lover: the
+// owner's answer first, then a participant sitting in one of the mission's
+// cars, or in the car the pedestrian rides in, inside the box (standin.h).
+bool g_saidEscort = false;
+
+int8_t EscortLocate(void *script, int32_t command, const standin::CharLocate &l, RangeFn original) {
+	PeekParams(script, l.is3d ? 5 : 4);
+	const int32_t  charHandle = reinterpret_cast<const int32_t *>(Params())[1];
+	const float    rx = Params()[2], ry = Params()[3], rz = l.is3d ? Params()[4] : 0.0f;
+	const uint16_t andOr      = At<uint16_t>(script, layout::SCRIPT_AND_OR);
+	const uint8_t  condBefore = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
+	const bool     notFlag    = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
+	const int8_t   r          = original(script, nullptr, command);
+	if (!g_client || g_own.finishing)
+		return r;
+	void *const npc = Func<GetPedFn>(CPools__GetPed)(charHandle);
+	if (!npc || PedDown(npc))
+		return r;
+	void *const   charCar = SeatedCar(npc);
+	const float  *c       = &Field<float>(charCar ? charCar : npc, offs::POSITION);
+	standin::Escort escorts[MAX_PLAYERS];
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+		void *const ped = id != LocalId() && InOwnMission(id) ? ReplicaOf(id) : nullptr;
+		if (!ped || PedDown(ped))
+			continue;
+		void *const  car = SeatedCar(ped);
+		const float *at  = &Field<float>(car ? car : ped, offs::POSITION);
+		standin::Escort &e = escorts[id];
+		e.dx           = at[0] - c[0];
+		e.dy           = at[1] - c[1];
+		e.dz           = at[2] - c[2];
+		e.seated       = car != nullptr;
+		e.inMissionCar = car && IsMissionCar(CarHandle(car));
+		e.withChar     = car && car == charCar;
+		e.valid        = true;
+	}
+	const int id = standin::EscortFor(escorts, MAX_PLAYERS, l, rx, ry, rz);
+	if (id < 0)
+		return r;
+	At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = CompareFlagIfTrue(condBefore, andOr, notFlag);
+	if (!g_saidEscort) {
+		g_saidEscort = true;
+		Log("missions: %s drives %s's passenger, and is the player near him",
+		    g_client->PlayerSlot(static_cast<uint8_t>(id)).nick.c_str(), MissionName(g_own.number));
+	}
+	return r;
+}
+
+// IS_PLAYER_SITTING_IN_CAR in Give Me Liberty, at the hideout: not widened,
+// but with the Kuruma there and a participant in it, the owner is told to get
+// in rather than left waiting with nothing on his screen (standin.h).
+constexpr int32_t OP_IS_PLAYER_SITTING_IN_CAR = 0x0442;
+uint32_t          g_sitHintMs                 = 0;
+
+int8_t SittingInCar(void *script, int32_t command, RangeFn original) {
+	PeekParams(script, 2);
+	const int32_t handle = reinterpret_cast<const int32_t *>(Params())[1];
+	const int8_t  r      = original(script, nullptr, command);
+	if (!g_client || !g_own.running || g_own.finishing || g_own.number != standin::GIVE_ME_LIBERTY ||
+	    !IsMissionScript(script))
+		return r;
+	void *const car = Func<GetPedFn>(CPools__GetVehicle)(handle);
+	void *const me  = Func<PlayerFn>(FindPlayerPed)();
+	if (!car || !me || SeatedCar(me) == car)
+		return r;
+	bool participantIn = false;
+	for (uint8_t id = 0; id < MAX_PLAYERS && !participantIn; ++id)
+		participantIn = id != LocalId() && InOwnMission(id) && ReplicaSeatedIn(id, car);
+	const float *at       = &Field<float>(car, offs::POSITION);
+	const bool   sameBlock = g_locationScript == script && g_locationFrame == g_frame;
+	const uint32_t now     = WallClock::NowMs();
+	if (!participantIn || !InCarAtThePlace(Vec3{at[0], at[1], at[2]}, sameBlock && g_locationHasArea,
+	                                       g_locationArea) ||
+	    !standin::SitHintDue(g_sitHintMs, now))
+		return r;
+	g_sitHintMs                = now != 0 ? now : 1;
+	const MissionEffectBody hint = GetBackInEffect(g_own.number, g_getBackInLabel, LocalId());
+	RunHere(hint.code, hint.length, nullptr);
+	Log("missions: %s waits at the place for its player to sit in car %d, where a participant "
+	    "is; the owner is told to get in", MissionName(g_own.number), handle);
+	return r;
+}
+
 // Deal Steal's rendezvous and Plaster Blaster's decoy (missioncombat.h,
 // stealth): a participant gives the game away there too. Each participant
 // as their own snapshot has them: where, in which car, and firing.
 constexpr int32_t OP_LOCATE_PLAYER_ANY_MEANS_2D = 0x00E3;
+constexpr int32_t OP_LOCATE_PLAYER_ANY_MEANS_3D = 0x00F5;
 constexpr int32_t OP_IS_PLAYER_SHOOTING         = 0x02DF;
 uint32_t          g_dealBlownFrame              = 0;
 bool              g_dealBlown                   = false;
@@ -3565,6 +5183,7 @@ bool WatcherOf(uint8_t id, stealth::Watcher *w) {
 		return false;
 	w->x      = p.last.pos.x;
 	w->y      = p.last.pos.y;
+	w->z      = p.last.pos.z;
 	w->firing = (p.last.flags & PF_FIRING) != 0;
 	const RemoteVehicle *car = p.Seated() ? g_client->VehicleByNetId(p.seatedVehicleNetId) : nullptr;
 	w->seated   = car != nullptr;
@@ -3575,14 +5194,19 @@ bool WatcherOf(uint8_t id, stealth::Watcher *w) {
 int8_t StealthLocate(void *script, int32_t command, RangeFn original) {
 	PeekParams(script, 6);
 	const float    x = Params()[1], y = Params()[2], rx = Params()[3], ry = Params()[4];
-	const uint16_t andOr = At<uint16_t>(script, layout::SCRIPT_AND_OR);
-	const int8_t   r     = Location(script, command, original);
-	// A single condition, not NOTed, of the session's mission here.
-	if (!g_client || !g_own.running || !IsMissionScript(script) || andOr != ANDOR_NONE ||
+	const uint16_t andOr  = At<uint16_t>(script, layout::SCRIPT_AND_OR);
+	const uint8_t  before = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
+	const int8_t   r      = Location(script, command, original);
+	// Not NOTed, of the session's mission here: the rendezvous alone, the
+	// decoy alone or in an `if and` beside the script's own flag (two of its
+	// three locates, once the ambulance has turned for the hospital).
+	if (!g_client || !g_own.running || !IsMissionScript(script) ||
 	    At<uint8_t>(script, layout::SCRIPT_NOT) != 0)
 		return r;
-	const bool deal  = g_own.number == stealth::DEAL_STEAL && stealth::IsDealRendezvous(x, y);
-	const bool decoy = g_own.number == stealth::PLASTER_BLASTER && stealth::IsDecoyLocate(rx, ry);
+	const bool deal  = g_own.number == stealth::DEAL_STEAL && andOr == ANDOR_NONE &&
+	                  stealth::IsDealRendezvous(x, y);
+	const bool decoy = g_own.number == stealth::PLASTER_BLASTER && stealth::IsDecoyLocate(rx, ry) &&
+	                   stealth::DecoyMayWidenUnder(andOr);
 	if (!deal && !decoy)
 		return r;
 	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
@@ -3592,8 +5216,11 @@ int8_t StealthLocate(void *script, int32_t command, RangeFn original) {
 		if (deal ? !stealth::BlowsDealCover(w, x, y, rx, ry) : !stealth::SpotsDecoy(w, x, y, rx, ry))
 			continue;
 		// The owner there already is the locate's answer; what the owner's
-		// car and trigger finger say is the group's, widened below.
-		if (!RawResult(script))
+		// car and trigger finger say is the group's, widened below. The
+		// decoy's yes goes through its block's own arithmetic.
+		if (decoy)
+			At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = CompareFlagIfTrue(before, andOr, false);
+		else if (!RawResult(script))
 			ForceTrue(script);
 		if (deal) {
 			g_dealBlown      = true;
@@ -3606,6 +5233,47 @@ int8_t StealthLocate(void *script, int32_t command, RangeFn original) {
 			    MissionName(g_own.number),
 			    deal ? (w.firing ? "shooting at the rendezvous" : "at the rendezvous in the wrong car")
 			         : "within 25 m of the decoy");
+		}
+		break;
+	}
+	return r;
+}
+
+// Evidence Dash's files and S.A.M.'s cargo (standin.h, CollectSlack): a
+// locate of the player at the object the owner's copy dropped is yes for a
+// participant on it.
+bool g_saidEvidence = false;
+
+int8_t EvidenceLocate(void *script, int32_t command, RangeFn original) {
+	const bool in3d = command == OP_LOCATE_PLAYER_ANY_MEANS_3D;
+	PeekParams(script, in3d ? 7 : 5);
+	const float    x = Params()[1], y = Params()[2], z = in3d ? Params()[3] : 0.0f;
+	const float    rx = Params()[in3d ? 4 : 3], ry = Params()[in3d ? 5 : 4];
+	const float    rz = in3d ? Params()[6] : 0.0f;
+	const uint8_t  condBefore = At<uint8_t>(script, layout::SCRIPT_COND_RESULT);
+	const uint16_t andOr      = At<uint16_t>(script, layout::SCRIPT_AND_OR);
+	const bool     notFlag    = At<uint8_t>(script, layout::SCRIPT_NOT) != 0;
+	const int8_t   r          = in3d ? Location(script, command, original)
+	                                 : StealthLocate(script, command, original);
+	const float slack = standin::CollectSlack(g_own.number, command, rx, ry);
+	if (!g_client || !g_own.running || g_own.finishing || !IsMissionScript(script) || slack < 0.0f)
+		return r;
+	const uint8_t yes = CompareFlagIfTrue(condBefore, andOr, notFlag);
+	if (At<uint8_t>(script, layout::SCRIPT_COND_RESULT) == yes)
+		return r;
+	for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+		if (id == LocalId() || !InOwnMission(id))
+			continue;
+		const RemotePlayer &p = g_client->PlayerSlot(id);
+		if (!p.active || !p.haveState ||
+		    !standin::OnTheObject(p.last.pos.x - x, p.last.pos.y - y, p.last.pos.z - z, rx, ry, rz, in3d,
+		                          slack))
+			continue;
+		At<uint8_t>(script, layout::SCRIPT_COND_RESULT) = yes;
+		if (!g_saidEvidence) {
+			g_saidEvidence = true;
+			Log("missions: %s picks up one of %s's %s", p.nick.c_str(), MissionName(g_own.number),
+			    g_own.number == standin::SAM ? "packages" : "files");
 		}
 		break;
 	}
@@ -3858,6 +5526,74 @@ int8_t Pass(Range range, void *s, int32_t c) {
 	return Original(range)(s, nullptr, c);
 }
 
+// CLEAR_AREA. From the owner's mission: the session cars inside it that the
+// clear takes (mission.h, ClearTakesCar) are emptied of players and taken
+// away on every machine first, and then the engine clears the rest with every
+// session car locked. From anybody else's script, as it was.
+int8_t ClearArea(void *script, int32_t command) {
+	if (!g_client || !g_own.running || g_own.finishing || !IsMissionScript(script))
+		return Pass(R900, script, command);
+	PeekParams(script, 5);
+	const float x = Params()[0], y = Params()[1], radius = Params()[3];
+	void *const me = Func<PlayerFn>(FindPlayerPed)();
+	TakenCar    cars[MAX_TAKEN_CARS];
+	size_t      count = 0;
+	ForEachVehicle([&](void *car) {
+		const Vec3 at = EntityPos(car);
+		if (count == MAX_TAKEN_CARS || !InClearCircle(at.x, at.y, x, y, radius))
+			return;
+		const int32_t handle = CarHandle(car);
+		ClearCarFacts f;
+		const uint16_t netId = g_client->SessionCarNetIdOf(handle);
+		f.sessionCar         = netId != INVALID_NETID;
+		f.missionCar         = IsMissionCar(handle);
+		f.wrecked            = Wrecked(car);
+		f.ownerInside        = me && Field<uint8_t>(me, offs::PED_IN_VEHICLE) != 0 &&
+		                Field<void *>(me, offs::PED_MY_VEHICLE) == car;
+		f.missionPed = f.sessionCar && MissionPedIn(car);
+		// Two-Faced Tanner's clears take in the checkpoint everybody stopped
+		// at, and the chase starts a second after the second one (standin.h).
+		if (f.sessionCar && standin::ClearSparesRiders(g_own.number) && OtherPlayerIn(car, netId))
+			return;
+		if (ClearTakesCar(f) && !Spared(netId))
+			cars[count++] = TakenCar{handle, netId};
+	});
+	if (count != 0) {
+		if (HoldForPlayersIn(script, cars, count, true))
+			return 1;
+		TakeFreeCars(cars, count);
+	}
+	const SessionCarsLocked locked(true);
+	return Pass(R900, script, command);
+}
+
+// DELETE_CAR from the owner's mission on a session car: everybody out of it
+// first, and then it goes from every machine, not from the owner's alone to be
+// put back by the session (Chaperone's Stretch, Salvatore's limo, Toni's car
+// in Cipriani's Chauffeur). The owner's own player in it is the script's
+// business, as ever.
+int8_t MissionDeletesCar(void *script, int32_t command, RangeFn original) {
+	if (!g_client || !g_own.running || !IsMissionScript(script))
+		return CarLetGo(script, command, original);
+	PeekParams(script, 1);
+	const int32_t  handle = *reinterpret_cast<const int32_t *>(Params());
+	void *const    car    = VehicleAt(handle);
+	const uint16_t netId  = car ? g_client->SessionCarNetIdOf(handle) : INVALID_NETID;
+	void *const    me     = Func<PlayerFn>(FindPlayerPed)();
+	if (!car || netId == INVALID_NETID || Wrecked(car) || Spared(netId) ||
+	    (me && Field<uint8_t>(me, offs::PED_IN_VEHICLE) != 0 &&
+	     Field<void *>(me, offs::PED_MY_VEHICLE) == car))
+		return CarLetGo(script, command, original);
+	const TakenCar taken{handle, netId};
+	if (HoldForPlayersIn(script, &taken, 1, !g_own.finishing))
+		return 1;
+	TakeFreeCars(&taken, 1);
+	// What is left of the instruction: the mission's own list of what it made.
+	// The car is gone already, unless a player is still in it, and then the
+	// engine deletes this copy as it always did.
+	return CarLetGo(script, command, original);
+}
+
 // $ONMISSION is the session's, never a campaign value, whichever of its two
 // witnesses names it.
 bool IsOnMissionGlobal(uint32_t at) {
@@ -3936,6 +5672,8 @@ int8_t __fastcall Hooked0(void *s, void *, int32_t c) {
 		return Location(s, c, Original(R0));
 	if (c == 0x004F)
 		return StartThread(s, c, Original(R0));
+	if (c == OP_GOTO_IF_FALSE && g_heldRespray.script == s)
+		SettleRespray(s);
 	if (c == fuzzball::OP_WAIT && InFuzzBall(s))
 		ForgetFuzzSubject();
 	if (IsTrackedAssignment(c) && g_own.running && IsMissionScript(s))
@@ -3954,7 +5692,7 @@ int8_t __fastcall Hooked100(void *s, void *, int32_t c) {
 	if (c == op::CREATE_CAR)
 		return CarMade(s, c, Original(R100));
 	if (c == op::DELETE_CAR)
-		return CarLetGo(s, c, Original(R100));
+		return MissionDeletesCar(s, c, Original(R100));
 	if (IsTrackedAssignment(c) && g_own.running && IsMissionScript(s))
 		TrackAssignment(s, c);
 	return Pass(R100, s, c);
@@ -3962,20 +5700,50 @@ int8_t __fastcall Hooked100(void *s, void *, int32_t c) {
 
 int8_t __fastcall Hooked200(void *s, void *, int32_t c) {
 	const MissionInstruction scope(s, c);
+	if (c == OP_ANDOR && g_locationScript == s)
+		g_locationScript = nullptr;   // a new block: its own conditions only
+	if (c == OP_ANDOR && g_inCarScript == s)
+		g_inCarScript = nullptr;
+	if (c == OP_ANDOR && g_heldRespray.script == s)
+		g_heldRespray = HeldRespray{};   // a block with no goto_if_false: nothing spent
+	if (c == OP_ANDOR && g_wakaPrev.script == s)
+		g_wakaPrev = WakaPrev{};
 	if (c == op::MISSION_HAS_FINISHED)
 		return Finished(s, c, Original(R200));
+	if (InGetaway(s)) {
+		int8_t answered = 0;
+		if (GetawayCommand(s, c, Original(R200), &answered))
+			return answered;
+	}
+	if ((c == OP_LOCATE_PLAYER_ANY_MEANS_2D || c == OP_LOCATE_PLAYER_ANY_MEANS_3D) && g_own.running &&
+	    (g_own.number == standin::EVIDENCE_DASH || g_own.number == standin::SAM) && IsMissionScript(s))
+		return EvidenceLocate(s, c, Original(R200));
 	if (c == OP_LOCATE_PLAYER_ANY_MEANS_2D)
 		return StealthLocate(s, c, Original(R200));
 	if (IsLocationCondition(c))
 		return Location(s, c, Original(R200));
+	if (c == anyplace::OP_IS_PLAYER_IN_ZONE)
+		return PlayerInZone(s, c, Original(R200));
 	if (c == op::HAS_CHAR_SPOTTED_PLAYER)
 		return Spotted(s, c, Original(R200));
+	standin::CharLocate charLocate;
+	if (standin::CharLocateOf(c, &charLocate) && g_own.running &&
+	    standin::EscortMission(g_own.number) && IsMissionScript(s))
+		return EscortLocate(s, c, charLocate, Original(R200));
 	if (c == op::LOCATE_PLAYER_ANY_MEANS_CHAR_2D || c == op::LOCATE_PLAYER_ANY_MEANS_CHAR_3D)
 		return LocateNearChar(s, c, Original(R200));
 	if (c == op::IS_PLAYER_IN_MODEL)
-		return InModelOfNearest(s, c, Original(R200));
+		return InModel(s, c, Original(R200));
 	if (c == op::IS_PLAYER_IN_CAR)
 		return PlayerInCar(s, c, Original(R200));
+	if (c == fuzzball::OP_IS_PLAYER_IN_ANY_CAR && InWaka(s))
+		NoteWakaCondition(s, c);
+	if (InRoundUp(s)) {
+		if (c == fuzzball::OP_IS_PLAYER_IN_ANY_CAR)
+			return RoundUpInAnyCar(s, c, Original(R200));
+		if (c == fuzzball::OP_STORE_CAR_PLAYER_IS_IN)
+			return RoundUpStoreCar(s, c, Original(R200));
+	}
 	if (InFuzzBall(s)) {
 		if (c == fuzzball::OP_LOCATE_PLAYER_ON_FOOT_CHAR_3D)
 			ForgetFuzzSubject();
@@ -4004,6 +5772,11 @@ int8_t __fastcall Hooked400(void *s, void *, int32_t c) {
 	const MissionInstruction scope(s, c);
 	if (IsLocationCondition(c))
 		return Location(s, c, Original(R400));
+	if (c == getaway::OP_IS_PLAYER_SITTING_IN_ANY_CAR && InGetaway(s)) {
+		int8_t answered = 0;
+		if (GetawayCommand(s, c, Original(R400), &answered))
+			return answered;
+	}
 	if (c == op::SET_CHAR_OBJ_KILL_PLAYER_ON_FOOT || c == op::SET_CHAR_OBJ_KILL_PLAYER_ANY_MEANS)
 		return RetargetKill(s, c, Original(R400));
 	if (c == mcombat::OP_SET_CHAR_OBJ_DESTROY_CAR)
@@ -4018,10 +5791,14 @@ int8_t __fastcall Hooked400(void *s, void *, int32_t c) {
 		return ScriptedWheel(s, c, Original(R400));
 	if (c == op::SET_CHAR_OBJ_ENTER_CAR_AS_PASSENGER)
 		return PassengerOrder(s, c, Original(R400));
+	if (c == op::SET_PLAYER_AS_LEADER && InGetaway(s))
+		return GetawayLeader(s, c, Original(R400));
 	if (c == op::SET_PLAYER_AS_LEADER || c == op::CLEAR_LEADER)
 		return LeaderOrder(s, c, Original(R400));
 	if (c == op::GET_NUMBER_OF_PASSENGERS)
 		return PassengersBesidePlayers(s, c, Original(R400));
+	if (c == op::SET_CHAR_OBJ_LEAVE_CAR || c == op::SET_PLAYER_CONTROL)
+		NoteWalkOut(s, c);
 	if (c == fuzzball::OP_SET_PLAYER_AS_LEADER && InFuzzBall(s))
 		return FuzzLeader(s, c, Original(R400));
 	return Pass(R400, s, c);
@@ -4033,6 +5810,8 @@ int8_t __fastcall Hooked500(void *s, void *, int32_t c) {
 		return RemovePickup(s, c, Original(R500));
 	if (c == op::IS_CAR_IN_MISSION_GARAGE)
 		return GarageCondition(s, c, Original(R500));
+	if (nearchar::CarLocate carLocate; nearchar::CarLocateOf(c, &carLocate))
+		return LocateNearCar(s, c, Original(R500));
 	if (c == op::HAS_MODEL_LOADED || c == op::HAS_SPECIAL_CHARACTER_LOADED)
 		return ModelsLoaded(s, c, Original(R500));
 	if (c == world::op::DRAW_CORONA || c == shape::DRAW_LIGHT)
@@ -4083,13 +5862,15 @@ int8_t __fastcall Hooked800(void *s, void *, int32_t c) {
 	}
 	if (c == op::WARP_PLAYER_INTO_CAR || c == op::WARP_CHAR_INTO_CAR)
 		return ScriptedWheel(s, c, Original(R800));
-	if (c == fuzzball::OP_IS_CHAR_IN_PLAYERS_GROUP && InFuzzBall(s))
+	if (c == fuzzball::OP_IS_CHAR_IN_PLAYERS_GROUP && (InFuzzBall(s) || InGetaway(s)))
 		return FuzzInGroup(s, c, Original(R800));
 	return Pass(R800, s, c);
 }
 
 int8_t __fastcall Hooked900(void *s, void *, int32_t c) {
 	const MissionInstruction scope(s, c);
+	if (c == world::op::CLEAR_AREA)
+		return ClearArea(s, c);
 	if (c == OP_HAS_CATALINA_HELI_BEEN_SHOT_DOWN)
 		return PlaneCondition(s, c, Original(R900));
 	return Pass(R900, s, c);
@@ -4099,6 +5880,8 @@ int8_t __fastcall Hooked1000(void *s, void *, int32_t c) {
 	const MissionInstruction scope(s, c);
 	if (c == op::CAN_PLAYER_START_MISSION)
 		return StartGate(s, c, Original(R1000));
+	if (c == OP_IS_PLAYER_SITTING_IN_CAR)
+		return SittingInCar(s, c, Original(R1000));
 	if (c == op::LOAD_AND_LAUNCH_MISSION_INTERNAL)
 		return Launch(s, c, Original(R1000));
 	return Pass(R1000, s, c);
@@ -4796,6 +6579,14 @@ bool RunEffect(const MissionEffectBody &body) {
 		ShowPill(pillSlot, pill);
 		return true;
 	}
+	// A session car the owner's mission takes away: our player out of it, or
+	// off it (mission.h, LeaveCarEffect). The car goes by the session.
+	uint16_t leaveNetId = INVALID_NETID;
+	if (ReadLeaveCarEffect(body, &leaveNetId)) {
+		const int32_t handle = CarForNetId(leaveNetId);
+		LeaveCarHere(handle >= 0 ? VehicleAt(handle) : nullptr);
+		return true;
+	}
 	if (!EffectSafeHere(body.code, body.length))
 		return false;
 	// The owner's line plays once ours is in: the owner's mission waited for
@@ -4898,6 +6689,13 @@ bool RunEffect(const MissionEffectBody &body) {
 		}
 		return false;
 	}
+	// A blip on a pickup: the handler puts it on the pickup's object without
+	// asking whether the slot or the object is still there (replay.h).
+	if (opcode0 == OP_ADD_BLIP_FOR_PICKUP || opcode0 == OP_ADD_SPRITE_BLIP_FOR_PICKUP) {
+		int32_t pickup = -1;
+		if (!replay::LiteralAt(run.code, run.length, 0, &pickup) || !PickupObjectUp(pickup))
+			return true;   // taken here already: no blip to put on it
+	}
 	// An object named by its global is this machine's own, and the handler
 	// takes whatever the global holds on trust: a live one, or nothing is run.
 	uint16_t objects[4];
@@ -4927,8 +6725,13 @@ bool RunEffect(const MissionEffectBody &body) {
 		return false;
 	NoteWorldBefore(run);
 	int32_t local0 = -1;
-	if (!RunHere(run.code, run.length, &local0))
-		return false;
+	{
+		// The owner's clear takes no session car here: the owner's machine
+		// takes the ones it means to (ClearArea).
+		const SessionCarsLocked locked(opcode0 == world::op::CLEAR_AREA);
+		if (!RunHere(run.code, run.length, &local0))
+			return false;
+	}
 	uint16_t made = 0;
 	if (replay::OutGlobalOf(run.code, run.length, &made) && made >= 8 && made + 4u <= end &&
 	    g_madeObjectCount < MAX_MADE_OBJECTS) {
@@ -5216,6 +7019,10 @@ bool Teleport(const MissionEffectBody &body, uint8_t rank, uint8_t count) {
 		    x, y);
 	NoteStandPlacement(at == 0 ? "the owner's critical mission restart"
 	                           : "the owner's mission moving its player");
+	// The warp out nils m_pMyVehicle under whatever door animation he is in
+	// (game/animcb.h): its callbacks come off first, on this car.
+	if (car && static_cast<uint16_t>(code[0] | (code[1] << 8)) == op::WARP_PLAYER_FROM_CAR_TO_COORD)
+		LetGoOfCarChain(me);
 	return RunHere(code, body.length, nullptr);
 }
 
@@ -5392,6 +7199,20 @@ bool ReadGlobal(uint16_t at, int32_t *value) {
 	return true;
 }
 
+// Every object a campaign instruction names by its global is a live one of
+// ours: the handler takes what the global holds on trust. A main-script
+// barrier this game took away already (live, during the mission) leaves a
+// handle whose slot has moved on, and is not taken away twice; 0 is never a
+// handle of ours (a pool generation starts at 1).
+bool ObjectGlobalsLive(const uint8_t *code, size_t length, uint32_t end) {
+	uint16_t     globals[4];
+	const size_t n = replay::ObjectGlobals(code, length, globals, 4);
+	for (size_t i = 0; i < n; ++i)
+		if (!ObjectIn(globals[i], end) || At<int32_t>(Space(), globals[i]) == 0)
+			return false;
+	return true;
+}
+
 // A delta somebody else's mission left, or one this machine's game lacks after
 // a load: its globals written, its threads started unless one of them runs
 // here already, under the name it gives itself or its label's.
@@ -5406,7 +7227,7 @@ bool ApplyCampaign(const CampaignDeltaBody &body) {
 	NoteOwnMissionName();
 	if (body.opLength >= 2 && body.opLength <= MISSION_EFFECT_CODE &&
 	    EffectSafeHere(body.op, body.opLength) && ReadyBlipGlobal(body.op, body.opLength) &&
-	    ReadyPickupGlobal(body.op, body.opLength))
+	    ReadyPickupGlobal(body.op, body.opLength) && ObjectGlobalsLive(body.op, body.opLength, end))
 		RunHere(body.op, body.opLength, nullptr);
 	for (uint8_t i = 0; i < body.valueCount && i < CAMPAIGN_VALUES; ++i) {
 		const uint16_t at = body.values[i].offset;
@@ -5522,10 +7343,17 @@ int32_t   g_followers[MAX_SEAT_ORDERS];
 size_t    g_followerCount = 0;
 
 void ForgetSeatOrders() {
+	ForgetGetaway();
 	g_seatOrderCount      = 0;
 	g_followerCount       = 0;
 	g_saidInCarForAnybody = false;
+	g_saidInCarAtPlace    = false;
+	g_walkedOut           = standin::WalkedOut{};
+	g_saidWalkedOut       = false;
 	g_locationScript      = nullptr;
+	g_carHold             = CarHold{};
+	g_sparedCarCount      = 0;
+	ForgetAnyplace();
 }
 
 void ForgetSeatOrder(size_t i) {
@@ -5533,8 +7361,10 @@ void ForgetSeatOrder(size_t i) {
 }
 
 // Whether every passenger seat of `car` is taken here, and whether one of
-// them by another player's copy.
+// them by a player: another player's copy, or our own player riding beside
+// somebody else at the wheel (mission.h, RiderInSeat).
 void SeatsOf(void *car, bool &full, bool &playerRiding) {
+	void *const me = Func<PlayerFn>(FindPlayerPed)();
 	uint8_t max = Field<uint8_t>(car, offs::VEH_NUM_MAX_PASSENGERS);
 	if (max > offs::VEH_MAX_PASSENGERS)
 		max = static_cast<uint8_t>(offs::VEH_MAX_PASSENGERS);
@@ -5542,7 +7372,7 @@ void SeatsOf(void *car, bool &full, bool &playerRiding) {
 	playerRiding = false;
 	for (uint8_t seat = 0; seat < max; ++seat) {
 		void *const in = Field<void *>(car, offs::VEH_PASSENGERS + seat * 4u);
-		if (in && PlayerOfReplica(in) != INVALID_PLAYER)
+		if (in && RiderInSeat(in == me, PlayerOfReplica(in), LocalId()) != INVALID_PLAYER)
 			playerRiding = true;
 	}
 }
@@ -5593,6 +7423,26 @@ int8_t LeaderOrder(void *script, int32_t command, RangeFn original) {
 		g_followers[g_followerCount++] = ped;
 	}
 	return r;
+}
+
+// 01DF for the guest's robbers: his copy is their leader, and the engine's own
+// follower logic walks them to his car and into it.
+int8_t GetawayLeader(void *script, int32_t command, RangeFn original) {
+	void *const guest = GetawayGuestPed();
+	if (!guest)
+		return LeaderOrder(script, command, original);
+	PeekParams(script, 1);
+	const int32_t ped = reinterpret_cast<const int32_t *>(Params())[0];
+	uint32_t      ip  = At<uint32_t>(script, layout::SCRIPT_IP);
+	Func<CollectFn>(CTheScripts__CollectParameters)(script, &ip, 2);
+	At<uint32_t>(script, layout::SCRIPT_IP) = ip;
+	RunOurs(fuzzball::OP_SET_CHAR_AS_LEADER, {ped, PedRef(guest)});
+	size_t i = 0;
+	while (i < g_followerCount && g_followers[i] != ped)
+		++i;
+	if (i == g_followerCount && g_followerCount < MAX_SEAT_ORDERS)
+		g_followers[g_followerCount++] = ped;
+	return 0;
 }
 
 // Once a frame on the owner: which of the remembered orders the engine has
@@ -5662,6 +7512,21 @@ void EachPassengerKeptOut(Fn fn) {
 		if (ped && car && !SeatedIn(ped, car))
 			fn(ped, car);
 	}
+	// A pedestrian following a participant: the same, in the car his copy sits in
+	// (The Getaway's robbers behind a guest's car, getaway.h).
+	for (size_t i = 0; i < g_followerCount; ++i) {
+		void *const ped = Func<GetPedFn>(CPools__GetPed)(g_followers[i]);
+		if (!ped || DyingOrDead(ped) || Field<uint8_t>(ped, offs::PED_IN_VEHICLE) != 0)
+			continue;
+		void *const lead = Field<void *>(ped, fuzzball::PED_LEADER);
+		void *const car  = lead && PlayerOfReplica(lead) != INVALID_PLAYER ? SeatedCar(lead) : nullptr;
+		bool full = false, playerRiding = false;
+		if (car) {
+			SeatsOf(car, full, playerRiding);
+			if (FollowerKeptOut(true, false, full, playerRiding))
+				fn(ped, car);
+		}
+	}
 	void *const me = Func<PlayerFn>(FindPlayerPed)();
 	if (!me || Field<uint8_t>(me, offs::PED_IN_VEHICLE) == 0 ||
 	    Field<uint32_t>(me, offs::PED_STATE) != PEDSTATE_DRIVING)
@@ -5729,6 +7594,10 @@ void KeepMissionSeats(uint32_t nowMs) {
 		board(ped, car);
 	}
 	EachPassengerKeptOut([&](void *ped, void *car) { board(ped, car); });
+	// Our own player riding beside a participant at the wheel is a rider like
+	// any other: out of a seat the mission's pedestrian needs, or Salvatore's
+	// Called A Meeting waits for ever on Toni at the restaurant.
+	void *const me = Func<PlayerFn>(FindPlayerPed)();
 	MissionSeatCar out[MISSION_SEAT_CARS];
 	size_t         count = 0;
 	for (size_t i = 0; i < cars; ++i) {
@@ -5744,7 +7613,7 @@ void KeepMissionSeats(uint32_t nowMs) {
 		uint8_t riders[offs::VEH_MAX_PASSENGERS];
 		for (uint8_t seat = 0; seat < max; ++seat) {
 			void *const in = Field<void *>(car, offs::VEH_PASSENGERS + seat * 4u);
-			riders[seat]   = in ? PlayerOfReplica(in) : INVALID_PLAYER;
+			riders[seat]   = in ? RiderInSeat(in == me, PlayerOfReplica(in), LocalId()) : INVALID_PLAYER;
 			if (in)
 				++taken;
 		}
@@ -5753,6 +7622,10 @@ void KeepMissionSeats(uint32_t nowMs) {
 		                          ? LeaveMaskFor(boarding[i].peds, max, taken, riders, max)
 		                          : 0;
 		out[count++] = MissionSeatCar{netId, flags, leave};
+		if (OwnerGivesUpSeat(leave, LocalId()) && me && SeatedIn(me, car) && UnseatLocalPlayer())
+			Log("missions: our player rode in car %d beside a participant at the wheel, in the seat "
+			    "%s's pedestrian needs; out, as a participant would be", handle,
+			    MissionName(g_own.number));
 	}
 	g_client->Missions().SeatsNeeded(out, count, LocalId(), nowMs);
 }
@@ -5956,6 +7829,9 @@ void OwnMissionVanished(uint32_t nowMs) {
 	g_ownCoronas.Clear();
 	ForgetEffects();
 	g_client->Missions().Ended(g_own.number, MISSION_OUTCOME_FAILED, nowMs);
+	// What the mission made that is still here goes out as ordinary crowd, and
+	// the session takes the rest away (game/missionclear.h).
+	NoteOwnMissionOver(nowMs);
 	// Its cars are the old game's handles too.
 	g_missionCarCount = 0;
 	g_getBackIn.Clear();

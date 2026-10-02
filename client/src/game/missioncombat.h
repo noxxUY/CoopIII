@@ -257,6 +257,7 @@ struct Watcher {
 	bool    seated   = false;
 	int32_t carModel = -1;
 	bool    firing   = false;
+	float   z        = 0.0f;
 };
 
 // A participant at Deal Steal's rendezvous gives the deal away when not in a
@@ -267,9 +268,84 @@ inline bool BlowsDealCover(const Watcher &w, float cx, float cy, float rx, float
 	return !(w.seated && w.carModel == YARDIE_CAR) || w.firing;
 }
 
+// Under which and/or state a decoy locate may be answered for a participant:
+// alone (the first) or in an `if and` (the other two, each beside
+// `$FLAG_POLICE_TRIGGER == 0`, a flag of the script's own, so one
+// participant's state answers the block). It is never in an `if or`.
+inline bool DecoyMayWidenUnder(uint16_t andOrBefore) {
+	return andOrBefore == SCRIPT_ANDOR_NONE || (andOrBefore >= 1 && andOrBefore <= 8);
+}
+
 // A participant inside Plaster Blaster's 25 m box is seen, whatever they do.
 inline bool SpotsDecoy(const Watcher &w, float cx, float cy, float rx, float ry) {
 	return InLocateBox(w.x, w.y, cx, cy, rx, ry);
+}
+
+// Waka-Gashira Wipeout! (mission 61): the Yakuza at the top of the Newport
+// car park must take the hit for the Cartel's, so "the player" there on foot,
+// or upstairs in anything but a Colombian car, gives it away: "The Yakuza have
+// identified you!!", and the mission fails. The retail script asks it of its
+// player only, and only once the owner is in the car park, in four shapes:
+//
+//   `if and / NOT IS_PLAYER_IN_ANY_CAR / IS_PLAYER_IN_AREA_3D car park`
+//       (offsets 2856, 3322): on foot anywhere in the car park;
+//   `if / IS_PLAYER_IN_AREA_3D upper car park` then `if / NOT
+//       IS_PLAYER_IN_MODEL #COLUMB` (2966, 3432): upstairs, not in one;
+//   `if and / NOT IS_PLAYER_IN_MODEL #COLUMB / IS_PLAYER_IN_AREA_3D car park`
+//       (4117, once Kenji is dead): anywhere in it, not in one.
+//
+// The car park is $CARPARK_MIN/MAX: 265.5 -610.5 32.5 to 345.5 -479.5 50.0,
+// upstairs the same from 35.0. The one other `if and` that ends on the car
+// park (3224, a flag and the car park: two Yakuza go for the player) is left
+// as it is. A participant who gives it away answers the block for the group,
+// one participant's state answering all of it.
+constexpr uint16_t WAKA_GASHIRA_WIPEOUT = 61;
+constexpr int32_t  COLOMBIAN_CAR        = 138;   // #COLUMB
+constexpr float    CARPARK_MIN_X = 265.5f, CARPARK_MIN_Y = -610.5f, CARPARK_MIN_Z = 32.5f;
+constexpr float    CARPARK_MAX_X = 345.5f, CARPARK_MAX_Y = -479.5f, CARPARK_MAX_Z = 50.0f;
+constexpr float    CARPARK_UPPER_Z = 35.0f;
+
+enum class Carpark : uint8_t { None, Whole, Upper };
+
+// Which of the two boxes an IS_PLAYER_IN_AREA_3D's corners are, if either.
+inline Carpark CarparkOf(float x1, float y1, float z1, float x2, float y2, float z2) {
+	auto near = [](float a, float b) { return std::fabs(a - b) < 0.25f; };
+	if (!near(x1, CARPARK_MIN_X) || !near(y1, CARPARK_MIN_Y) || !near(x2, CARPARK_MAX_X) ||
+	    !near(y2, CARPARK_MAX_Y) || !near(z2, CARPARK_MAX_Z))
+		return Carpark::None;
+	if (near(z1, CARPARK_MIN_Z))
+		return Carpark::Whole;
+	return near(z1, CARPARK_UPPER_Z) ? Carpark::Upper : Carpark::None;
+}
+
+enum class CarparkAsk : uint8_t { OnFoot, NotColombian };
+
+// What the condition before the car park in its `if and` asks, from its
+// opcode, NOT and model: false for anything but the two above.
+inline bool CarparkAskOf(int32_t command, bool notFlag, int32_t model, CarparkAsk *out) {
+	if (!notFlag)
+		return false;
+	if (command == 0x00E0) {
+		*out = CarparkAsk::OnFoot;
+		return true;
+	}
+	if (command == 0x00DE && model == COLOMBIAN_CAR) {
+		*out = CarparkAsk::NotColombian;
+		return true;
+	}
+	return false;
+}
+
+// Whether a participant gives the hit away: inside the box (the engine's area
+// test is inclusive) and on foot, or not in a Colombian car, as asked.
+inline bool BlowsCarparkCover(const Watcher &w, Carpark box, CarparkAsk ask) {
+	if (box == Carpark::None)
+		return false;
+	const float minZ = box == Carpark::Upper ? CARPARK_UPPER_Z : CARPARK_MIN_Z;
+	if (w.x < CARPARK_MIN_X || w.x > CARPARK_MAX_X || w.y < CARPARK_MIN_Y || w.y > CARPARK_MAX_Y ||
+	    w.z < minZ || w.z > CARPARK_MAX_Z)
+		return false;
+	return ask == CarparkAsk::OnFoot ? !w.seated : !(w.seated && w.carModel == COLOMBIAN_CAR);
 }
 
 // May a condition that has just been answered be made true, by the and/or

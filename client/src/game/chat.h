@@ -14,11 +14,16 @@
 // list key (F9) pins the scoreboard up or lets it go (game/scoreboard.h).
 // Nothing here is an engine address.
 //
-// **The chat key is also a letter of eleven cheats.** When it would finish
-// one it goes to the game and the line stays shut; when the line typed after
-// it is exactly the rest of one, the keys go to the game and the line is not
-// sent. Chat text on its own never reaches the cheat buffer. game/cheats.h,
-// "the chat key inside a cheat", has the rule and why it is safe.
+// **The chat key is also a letter of eleven cheats, and of TPTO.** When it
+// would finish one it goes to the game and the line stays shut; when the line
+// typed after it is exactly the rest of one, the keys go to the game the
+// moment the last one is typed and the line is shut, unsent. Chat text on its
+// own never reaches the cheat buffer. game/cheats.h, "the chat key inside a
+// cheat", has the rule and why it is safe; it goes by the cheats the running
+// game has, which another plugin may have changed.
+//
+// **Every key the game had is shown to CoopIII's own cheats** after the
+// game's window procedure has run (cheats.h, NoticeTypedKeys).
 //
 // **While a line is open the game is kept off the keyboard** three ways, each
 // through something addresses.h already proves: CPad::DisablePlayerControls'

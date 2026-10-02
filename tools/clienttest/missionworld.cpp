@@ -604,7 +604,8 @@ void TestTheStreetsAgainstTheImage() {
 	const uint32_t params = g::CTheScripts__ScriptParams;
 	const uint32_t t300 = g::g_ScriptOpcodeTable_300, t400 = g::g_ScriptOpcodeTable_400,
 	               t500 = g::g_ScriptOpcodeTable_500, t900 = g::g_ScriptOpcodeTable_900,
-	               t1000 = g::g_ScriptOpcodeTable_1000;
+	               t1000 = g::g_ScriptOpcodeTable_1000, t600 = g::g_ScriptOpcodeTable_600,
+	               t800 = g::g_ScriptOpcodeTable_800;
 
 	// The handlers the replay list names, where it says they are.
 	struct Named {
@@ -626,6 +627,9 @@ void TestTheStreetsAgainstTheImage() {
 	    {t900, 900, w::op::REMOVE_SPHERE, 0x0044EA3D},     {t500, 500, w::op::DRAW_CORONA, 0x004447E9},
 	    {t900, 900, w::op::LOAD_SCENE, 0x0044F0B6},        {t1000, 1001, w::op::START_CREDITS, 0x005896AA},
 	    {t1000, 1001, w::op::STOP_CREDITS, 0x005896BA},    {t500, 500, w::op::RESTART_CRITICAL_MISSION, 0x004449E6},
+	    {t300, 304, 0x0161, 0x0043F8BD},                    {t900, 900, 0x03DC, 0x0044F600},
+	    {t900, 900, 0x03DD, 0x0044F696},                    {t600, 657, 0x0294, 0x00444C25},
+	    {t800, 800, 0x037F, 0x0044C9A7},                    {t500, 500, 0x024E, 0x004447B2},
 	};
 	int wrong = 0;
 	for (const Named &n : named)
@@ -635,6 +639,19 @@ void TestTheStreetsAgainstTheImage() {
 			++wrong;
 		}
 	Check(wrong == 0, "every new instruction's handler is where its comment says");
+	Check(Bytes(img, 0x00444C2A, {0x6A, 0x02}) && Bytes(img, 0x00444C4C, {0x8A, 0x88, 0xD9, 0x04, 0x00, 0x00}) &&
+	          Bytes(img, 0x00444C69, {0x80, 0xCB, 0x20}) && CallAt(img, 0x0044C9A7) == 0x00427BD0,
+	      "SET_CAN_RESPRAY_CAR takes two and writes bit 5 of +0x4D9; GIVE_PLAYER_DETONATOR is one call");
+	Check(Bytes(img, 0x0044F60B, {0x6A, 0x01}) && Bytes(img, 0x0044F6A1, {0x6A, 0x02}) &&
+	          CallAt(img, 0x0044F619) == g::CPickups__GetActualPickupIndex &&
+	          Bytes(img, 0x0044F634, {0x8B, 0x34, 0xBD, LE32(g::CPickups__aPickUps + g::offs::PICKUP_OBJECT)}),
+	      "the pickup blips read aPickUps[i].m_pObject with no test, one operand and two");
+	Check(Bytes(img, 0x004447B7, {0x6A, 0x01}) && CallAt(img, 0x004447BA) == 0x004382E0 &&
+	          Bytes(img, 0x004447BF, {0xA1, LE32(params)}) && CallAt(img, 0x004447D6) == 0x0042FF90 &&
+	          Bytes(img, 0x004447C9, {0x6A, 0x00, 0x6A, 0x00, 0x6A, 0x00, 0x6A, 0x00, 0x6A, 0x00, 0x6A, 0x00}) &&
+	          CallAt(img, 0x00444764) == 0x0042FF90,
+	      "TURN_PHONE_OFF takes the phone and gives SET_PHONE_MESSAGE's call no message, the index "
+	      "unchecked");
 
 	// The streets.
 	Check(Bytes(img, 0x0044F743, {0xD9, 0x05, LE32(params)}) &&
@@ -706,6 +723,15 @@ void TestTheStreetsAgainstTheImage() {
 	          CallAt(img, 0x00444A3F) == w::CWorld__FindGroundZForCoord &&
 	          Bytes(img, 0x0044483A, {0xD9, 0x9C, 0x24}) && Bytes(img, 0x00444841, {0x59, 0x59}),
 	      "the ground under a coordinate is one cdecl call of two floats, the answer in st0");
+
+	// The clear, and the session cars it leaves alone.
+	Check(CallAt(img, w::CLEAR_AREA_CLEAR_CALL) == w::CWorld__ClearExcitingStuff &&
+	          Bytes(img, w::CLEAR_SKIPS_LOCKED_CAR,
+	                {0x8A, 0x85, LE32(static_cast<uint32_t>(g::offs::VEH_FLAGS_A)), 0xC0, 0xE8, 0x03, 0x24,
+	                 0x01, 0x0F, 0x85}) &&
+	          CallAt(img, w::CLEAR_CAN_BE_DELETED_CALL) == w::CVehicle__CanBeDeleted &&
+	          g::offs::VEH_IS_LOCKED == 0x08,
+	      "CLEAR_AREA's clear skips a locked car (bit 3 of +1F5h) before it asks CanBeDeleted");
 
 	// The restart.
 	Check(Bytes(img, 0x004449EB, {0x6A, 0x04}) && CallAt(img, 0x004449EE) == g::CTheScripts__CollectParameters,

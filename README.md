@@ -57,6 +57,9 @@ III never got a proper co-op mod. This is an attempt at building one.
   (one player gets each), hidden packages, rampages (with a vote), garages,
   the scripted gates, breakable street objects, medics and fire trucks,
   cheats.
+- CoopIII's own cheat, typed in play like the game's: `TPTO` and a player's
+  number from the Tab list (`TPTO1` to `TPTO8`) puts you beside that player,
+  in your car if you are driving.
 
 **The story**
 
@@ -116,6 +119,13 @@ What's missing or still being tested is in
 Starting `gta3.exe` normally still gives you plain single player. The mod only
 turns on when the game is started from the launcher.
 
+With the Discord app running, a game started from the launcher shows as
+"Playing CoopIII": single player or a co-op session, and in a session the
+mission or free roam and how many are in it, such as "Free roam (2/8)". No
+server address and no names go to Discord. Untick "Show CoopIII in Discord" in
+the launcher, or set `discordPresence = false` in `CoopIII.ini`, to leave it
+out.
+
 ### Server settings
 
 | Setting | Default | What it does |
@@ -130,8 +140,10 @@ turns on when the game is started from the launcher.
 | `missionMargin` | 5 | metres from a marker or checkpoint that still count as there |
 | `missionEnemies` | original | `original`, `tougher` or `more` |
 | `ammoSync` | false | show everybody's real ammo |
+| `syncCustomSkins` | true | show everybody's custom skin from Player Setup |
 | `rampages` | shared | `shared`, `scaled` or `off` |
 | `cheats` | shared | `shared`, `personal` or `off` |
+| `coopCheats` | outsidemissions | CoopIII's own cheats: `outsidemissions`, `always` or `off` |
 | `money` | off | `off`, `own` or `shared` |
 | `hiddenPackages` | shared | `shared` or `perplayer` |
 

@@ -134,6 +134,10 @@ inline const Entry *Find(uint16_t opcode) {
 	    // For Ray's phones. A phone is an index init.sc made in the same
 	    // order on every machine.
 	    {0x024C, K::Plain, 2, {A::Value, A::Text}},                           // SET_PHONE_MESSAGE
+	    // And the same phones switched off at the end (0x004447B2, the phone:
+	    // SetPhoneMessage_JustOnce with no message), so a phone the guest
+	    // never lifted does not ring on with Ray's old directions.
+	    {0x024E, K::Plain, 1, {A::Value}},                                    // TURN_PHONE_OFF
 	    // Everybody is paid, and every machine's stats count the mission.
 	    {0x0109, K::Pay, 2, {A::Value, A::Value}},                            // ADD_SCORE
 	    {0x0317, K::Plain, 0, {}},                                            // INCREMENT_MISSION_ATTEMPTS
@@ -169,6 +173,16 @@ inline const Entry *Find(uint16_t opcode) {
 	    {0x02A8, K::BlipNew, 5, {A::Value, A::Value, A::Value, A::Value, A::Output}},
 	    {0x0186, K::BlipNew, 2, {A::Car, A::Output}},                         // ADD_BLIP_FOR_CAR
 	    {0x0187, K::BlipNew, 2, {A::Char, A::Output}},                        // ADD_BLIP_FOR_CHAR
+	    // The old blip on a car, with its colour and display (0x0043F8BD,
+	    // three, then the handle): Turismo's three racers.
+	    {0x0161, K::BlipNew, 4, {A::Car, A::Value, A::Value, A::Output}},   // ADD_BLIP_FOR_CAR_OLD
+	    // A blip on a pickup (0x0044F600, one, then the handle) and a sprite
+	    // one (0x0044F696, the pickup and the sprite): the briefcases, the
+	    // free guns. Both read aPickUps[i].m_pObject unchecked, so a
+	    // participant runs one only on a pickup of its own still standing
+	    // (game/mission.cpp, RunEffect).
+	    {0x03DC, K::BlipNew, 2, {A::Pickup, A::Output}},                      // ADD_BLIP_FOR_PICKUP
+	    {0x03DD, K::BlipNew, 3, {A::Pickup, A::Value, A::Output}},            // ADD_SPRITE_BLIP_FOR_PICKUP
 	    {0x0164, K::BlipUse, 1, {A::Blip}},                                   // REMOVE_BLIP
 	    {0x0165, K::BlipUse, 2, {A::Blip, A::Value}},                         // CHANGE_BLIP_COLOUR
 	    {0x0166, K::BlipUse, 2, {A::Blip, A::Value}},                         // DIM_BLIP
@@ -339,6 +353,13 @@ inline const Entry *Find(uint16_t opcode) {
 	    {0x00AB, K::Holder, 4, {A::Car, A::Value, A::Value, A::Value}},       // SET_CAR_COORDINATES
 	    {0x0175, K::Holder, 2, {A::Car, A::Value}},                           // SET_CAR_HEADING
 	    {0x0224, K::Holder, 2, {A::Car, A::Value}},                           // SET_CAR_HEALTH
+	    // And blowing it up (0x00442DE4: GetAt, then BlowUpCar(null) through
+	    // the vtable). A wreck is decided once, where the car is simulated:
+	    // the owner's own BlowUpCar refuses a car somebody else drives or
+	    // settles, so Blow Fish's truck at a participant's wheel never went up
+	    // when the timer ran out. To its holder alone, never to everybody for
+	    // a car nobody holds (carauthority.h, WhereTheWreckGoes).
+	    {0x020B, K::Holder, 1, {A::Car}},                                     // EXPLODE_CAR
 	    // And to every machine: a car's doors are locked on the copy each
 	    // player's own engine tries to get into, its colour is what everybody
 	    // sees, and the brakes are each player's own pad's, the car they drive.
@@ -360,6 +381,15 @@ inline const Entry *Find(uint16_t opcode) {
 	    // shop is free for everybody who drives in.
 	    {0x0242, K::Plain, 2, {A::Car, A::Value}},                            // ARM_CAR_WITH_BOMB
 	    {0x021D, K::Plain, 1, {A::Value}},                                    // SET_FREE_BOMB_SHOP
+	    // The mission's detonator in the player's hand (0x0044C9A7, none:
+	    // CGarages::GivePlayerDetonator), I Scream, You Scream's remote: every
+	    // participant may press it (mission-audit.md R6), and the cleanup's
+	    // SET_PLAYER_AMMO 12 to 0 takes it back from everybody.
+	    {0x037F, K::Plain, 0, {}},                                            // GIVE_PLAYER_DETONATOR
+	    // A car that keeps its paint through a Pay'n'Spray (0x00444C25, two:
+	    // bFixedColour, bit 5 of +0x4D9), Lips' car: on every copy, since the
+	    // spray it goes through may be a helper's.
+	    {0x0294, K::Plain, 2, {A::Car, A::Value}},                            // SET_CAN_RESPRAY_CAR
 	    // And a mine it drops is in every participant's world, where each
 	    // engine arms its own and the first to go off takes the others with it
 	    // (game/mine.h): Gone Fishing's, in the partner's wake.
@@ -901,6 +931,20 @@ inline size_t ObjectGlobals(const uint8_t *code, size_t length, uint16_t *out, s
 	return n;
 }
 
+// A DELETE_OBJECT the world keeps: one whose global the mission never wrote,
+// so it names an object the main script made (init.sc's barriers), not one
+// of the mission's own. Last Requests takes Portland's subway gate and tunnel
+// block away for good, and Love's third mission Staunton's; a save
+// carries that, so the campaign has to. `missionWrote` says whether the
+// mission wrote a global (game/mission.h, CampaignWrites::Known).
+template <class Wrote>
+inline bool DeletesWorldObject(const uint8_t *code, size_t length, Wrote missionWrote) {
+	if (length < 2 || static_cast<uint16_t>(code[0] | (code[1] << 8)) != 0x0108)
+		return false;
+	uint16_t global = 0;
+	return ObjectGlobals(code, length, &global, 1) == 1 && !missionWrote(global);
+}
+
 // A literal operand's four bytes: a Value, Blip or Object at `index`. False
 // for anything else or past the end.
 inline bool LiteralAt(const uint8_t *code, size_t length, uint8_t index, int32_t *out) {
@@ -1228,9 +1272,11 @@ inline bool OperandsInRange(const uint8_t *code, size_t length) {
 	    {0x0361, 0, 0, 31},    // CLOSE_GARAGE
 	    {0x03BB, 0, 0, 31},    // SET_GARAGE_DOOR_TYPE_TO_SWING_OPEN
 	    {0x024C, 0, 0, 49},    // SET_PHONE_MESSAGE
+	    {0x024E, 0, 0, 49},    // TURN_PHONE_OFF
 	    {0x023C, 0, 1, 4},     // LOAD_SPECIAL_CHARACTER
 	    {0x0296, 0, 1, 4},     // UNLOAD_SPECIAL_CHARACTER
 	    {0x0437, 0, 0, 67},    // CREATE_SINGLE_PARTICLE
+	    {0x03DD, 1, 0, 20},    // ADD_SPRITE_BLIP_FOR_PICKUP, RadarSprites[21]
 	    {0x01F9, 1, 0, 0x7FFFFFFF},   // START_KILL_FRENZY, the weapon
 	    // The player, CWorld::Players[i]: four of them, and only the first
 	    // has a ped on any machine, which each of these reads through.

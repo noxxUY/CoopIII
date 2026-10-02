@@ -1,5 +1,5 @@
 set_project("CoopIII")
-set_version("0.1.2")
+set_version("0.1.3")
 
 -- GTA III retail is a 32-bit executable; the client DLL must match its
 -- bitness to be loadable in-process. Server/launcher don't strictly need to
@@ -289,7 +289,7 @@ target("clienttest")
               "client/src/client.cpp", "client/src/netthread.cpp",
               "client/src/interp.cpp", "client/src/log.cpp",
               "client/src/game/sessionclock.cpp",
-              "client/src/helisync.cpp", "client/src/moneysync.cpp",
+              "client/src/helisync.cpp", "client/src/moneysync.cpp", "client/src/skinsync.cpp",
               "client/src/missionsync.cpp")
     add_includedirs("client/src")
     add_deps("sdk")

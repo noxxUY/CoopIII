@@ -208,6 +208,11 @@ everything a respawn clears or an island left behind loses, cars and people
 alike. What the host's engine takes for a reason that holds everywhere (a
 script's clear, the crusher, a full pool, a wreck, a corpse) still goes.
 
+**And 2026-10-01** (`protocol.md` §1.73, §8 below): what nobody can take over
+no longer vanishes from a screen it stands on. It fades out there the way the
+engine fades its own, every copy fades in when it is built, and a host's
+generators keep out of every player's view at close range, not only its own.
+
 ---
 
 ## 2. What this costs, honestly
@@ -289,9 +294,11 @@ waited was X ms`. The observer: `other machines' crowd here - N of M ped
 replica(s) and N of M car replica(s) had a row in the last 3 s`. Before this
 change the first number stopped at 12 and 8.
 
-Not done: a view-direction or line-of-sight term (the camera is not on the
-wire), and dropping rows nobody can see to save bandwidth rather than only
-sharing it out.
+Not done: a view-direction or line-of-sight term, and dropping rows nobody can
+see to save bandwidth rather than only sharing it out. Every player's camera
+is on the wire since `protocol.md` §1.73 (`S_PlayerView`, four times a
+second), but only the generators use it so far (§8); the weight above still
+knows distance and nothing else.
 
 ### 2.2 The pools
 
@@ -777,3 +784,76 @@ the design.
   handed to us is rebuilt as a real `CCopPed` under the same netId. This is
   the one handover of a living pedestrian §1.3.2 said was its own piece of
   work.
+
+## 8. Nothing appears or disappears in front of a player
+
+Built 2026-10-01, not yet run in game. `protocol.md` §1.73 is the design and
+`client/src/game/crowdfade.h` the rule.
+
+### 8.1 The engine's own three rules
+
+GTA III never pops its crowd on its own player's screen, and it takes three
+rules to manage it (`addresses.h`, "how the engine keeps its own crowd from
+popping"):
+
+- **It makes nothing in view at close range.** The traffic generator deletes
+  a car it built on screen nearer than 90 m to the camera; the pedestrian one
+  adds nobody in view nearer than 40 m. Both times the multipliers.
+- **What it makes, it fades in.** Both generators set the new clump's alpha
+  to 0, and `ProcessControl` raises it 16 a frame.
+- **What it takes, it takes off screen, or fades out.** Both reapers remove
+  what is off the screen at once and set `bFadeOut` on what is on it;
+  `ProcessControl` lowers the alpha 8 a frame and the reaper removes it at 0.
+
+Every one of those is measured against one camera. In a session the crowd is
+drawn on every machine and judged on one. The reports from two-player runs,
+cars and people vanishing or appearing right in front of a player when the
+machine hosting them drove off, died, went far or left, were all three rules
+failing for the camera that was not the host's.
+
+### 8.2 Run against every camera
+
+- **Every machine's camera is on the wire** (`C_PlayerView`, four times a
+  second). The generators' four is-the-spot-free tests (§2.3's) refuse a spot
+  inside any other player's view nearer than the engine's own limit for that
+  kind of thing, so a host makes nothing behind its own player that appears
+  in front of the player beside him. A view is a 60-degree half-cone on the
+  ground, and one not heard from for 2 s counts for nothing.
+- **Every copy fades in** when it is built, from alpha 0 over 400 ms, and a
+  live spawn inside our own view at close range that slipped past the host's
+  test (a round trip late, or a camera turned) is held unbuilt until it is
+  out of view, 8 s at most.
+- **What its host gives up on with nobody to take it fades out.** The
+  hand-overs of §1.3.2 still come first. What they cannot place (nobody
+  within reach, a type a copy cannot become, the 15 s rule, a leaver's crowd
+  nobody is near, an adopter that cannot convert) goes as `S_CrowdGone`
+  rather than as despawns, and a watcher takes it the reapers' way: at once
+  off its screen, faded over 700 ms on it. A fading copy belongs to nobody
+  and is never built again; a new name given to its netId ends it at once.
+
+### 8.3 What it does not do
+
+- **A car a host's engine took for a reason that holds everywhere** still
+  goes at once: a claim (whose session car stands on the same spot), a
+  script's clear, the crusher, a wreck, a full pool.
+- **A pedestrian re-filed by the engine** (`CPed::Teleport`,
+  `CPed::WarpPedIntoCar`, both `CWorld::Remove` then `CWorld::Add`) is still a
+  despawn and a new pedestrian on the other screens, as before; only the
+  mission's own are kept across it. Rare for the crowd, and not touched here.
+- **A cop or gang member** let go of is still not taken over (a copy can only
+  become a civilian, `server/core/adopt.h`); it fades out instead of
+  vanishing.
+- **The generators' view test is a cone, not the engine's frustum**, and the
+  remote camera can be a quarter of a second old. A spot just outside a
+  screen is sometimes passed over for nothing; that costs a generator one more
+  try, never a car.
+- **The stream does not use the cameras yet** (§2.1).
+
+### 8.4 What proves it in game
+
+On a host: `crowd: our ... generator picked a spot inside another player's
+view at close range` and the 30 s line counting them, and the reaper's line
+counting what went out as `C_CrowdGone`. On a watcher: `pedestrian N, whose
+host gave him up, stands on our screen; he fades out` (and the car line), and
+every 30 s how many faded, went at once, and were held back. The thing to
+watch for is a copy that never comes up to full alpha.

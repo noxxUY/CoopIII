@@ -493,6 +493,7 @@ bool SaneRotation(const ObjectRestBody &body) {
 }
 
 void SetObjectCallbacks(const ObjectCallbacks &callbacks) { g_cb = callbacks; }
+void RememberObject(const ObjectIdent &ident) { g_known.Add(ident); }
 void SetMissionObjectBroken(MissionObjectBrokenFn fn) { g_missionBroken = fn; }
 
 ObjectPoolView LiveObjectPool() {
@@ -633,6 +634,13 @@ void ApplyMissionObjectBreak(void *object, float amount, uint8_t state) {
 	if (!object || Field<uint8_t>(object, obj::CREATED_BY) != obj::MISSION_OBJECT)
 		return;
 	++g_stats.received;
+	// Plaster Blaster's bodycast breaks on one shared health, not on the
+	// amount: whoever smashed it there, it is smashed here too.
+	const int16_t bodycast = *reinterpret_cast<const int16_t *>(obj::MI_BODYCAST);
+	if (bodycast >= 0 && Field<int16_t>(object, offs::MODEL_INDEX) == bodycast) {
+		int16_t &health = *reinterpret_cast<int16_t *>(obj::CObject__nBodyCastHealth);
+		health          = obj::BodyCastHealthForBreak(health);
+	}
 	ApplyBreak(object, amount, state);
 }
 

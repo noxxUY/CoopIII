@@ -100,6 +100,12 @@ const char *const kCheatsWhy[] = {
     "Personal: only the cheats about whoever typed them, like health or weapons.",
     "Off: no cheats at all while connected.",
 };
+const char *const kCoopCheats[]    = {"Outside missions", "Always", "Off"};
+const char *const kCoopCheatsWhy[] = {
+    "Outside missions: TPTO1 to TPTO8 put you beside that player, but not in a mission.",
+    "Always: the same, during a mission too.",
+    "Off: CoopIII's own cheats do nothing.",
+};
 
 Setting Toggle(int section, const char *key, const char *title, const char *detail,
                int (*get)(const ServerConfig &), void (*set)(ServerConfig &, int)) {
@@ -218,6 +224,11 @@ const std::vector<Setting> &Settings() {
 		    "Everybody's gun holds what its owner really has, so it can run dry on your screen.",
 		    [](const ServerConfig &c) { return c.ammoSync ? 1 : 0; },
 		    [](ServerConfig &c, int v) { c.ammoSync = v != 0; }));
+		t.push_back(Toggle(
+		    SECTION_PLAYERS, "syncCustomSkins", "Custom skins",
+		    "Everybody sees the skin each player picked in Player Setup.",
+		    [](const ServerConfig &c) { return c.syncCustomSkins ? 1 : 0; },
+		    [](ServerConfig &c, int v) { c.syncCustomSkins = v != 0; }));
 
 		// ---- wanted level
 		t.push_back(Choice(
@@ -392,6 +403,10 @@ const std::vector<Setting> &Settings() {
 		    SECTION_WORLD, "cheats", "Cheats", "", kCheats, 3, kCheatsWhy,
 		    [](const ServerConfig &c) { return static_cast<int>(c.cheats); },
 		    [](ServerConfig &c, int v) { c.cheats = static_cast<CheatMode>(v); }));
+		t.push_back(Choice(
+		    SECTION_WORLD, "coopCheats", "CoopIII cheats", "", kCoopCheats, 3, kCoopCheatsWhy,
+		    [](const ServerConfig &c) { return static_cast<int>(c.coopCheats); },
+		    [](ServerConfig &c, int v) { c.coopCheats = static_cast<CoopCheatMode>(v); }));
 		t.push_back(Number(
 		    SECTION_WORLD, "abandonedCars", "Abandoned cars",
 		    "How long a car stays once everybody has left it and gone more than 200 m away.",

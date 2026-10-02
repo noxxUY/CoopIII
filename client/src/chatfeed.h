@@ -558,6 +558,13 @@ inline void AppendDesync(char *raw, size_t cap, uint16_t offCm) {
 // their slot, counted from one.
 inline unsigned ListNumber(uint8_t playerId) { return static_cast<unsigned>(playerId) + 1; }
 
+// And back: the slot a number from the list names, or INVALID_PLAYER. The
+// same number the Tab list puts before a name and TPTO takes.
+inline uint8_t PlayerIdFromListNumber(unsigned number) {
+	return number >= 1 && number <= MAX_PLAYERS ? static_cast<uint8_t>(number - 1)
+	                                            : static_cast<uint8_t>(INVALID_PLAYER);
+}
+
 // ---- commands ----------------------------------------------------------------
 //
 // A typed line that starts with '/' is a command. It is read here and never

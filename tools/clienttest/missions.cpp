@@ -5,12 +5,15 @@
 // Nothing here runs a script. The engine half is a stub that records what it
 // was asked to do, and the wire is a list of the packets that would have gone.
 
+#include "game/effectshape.h"
 #include "game/fuzzball.h"
 #include "game/mission.h"
+#include "game/nearchar.h"
 #include "game/radar.h"
 #include "game/replay.h"
 #include "game/seatplan.h"
 #include "missionsync.h"
+#include "sideprogress.h"
 
 #include <coopiii/mission.h>
 #include <coopiii/net.h>
@@ -2224,6 +2227,14 @@ void TestOnlyAsManyGetOutAsTheSeatsNeeded() {
 	const uint8_t thugs[3] = {N, N, N};
 	Check(LeaveMaskFor(1, 3, 3, thugs, 3) == 0, "a car full of the mission's own names nobody");
 	Check(LeaveMaskFor(3, 1, 1, back, 1) == PlayerBit(1), "and a two-seater has one to give");
+	// Salvatore's Called A Meeting: bob (1) drives the Stretch, the owner
+	// alice (0) rides, Joey and Luigi are in. Toni is coming.
+	const uint8_t stretch[3] = {N, N, game::RiderInSeat(true, N, 0)};
+	Check(stretch[2] == 0 && game::RiderInSeat(false, 2, 0) == 2,
+	      "the owner's own player in a passenger seat is a rider, a copy is its player");
+	const uint8_t toni = LeaveMaskFor(1, 3, 3, stretch, 3);
+	Check(toni == PlayerBit(0) && game::OwnerGivesUpSeat(toni, 0) && !game::OwnerGivesUpSeat(toni, 1),
+	      "so Toni's seat takes the owner out, on his own machine, and nobody else");
 
 	MissionSync owner = Fresh();   // alice, 0
 	owner.OnState(State(MISSION_STATE_RUNNING, 0, 44, 0x07), 0, 1000);
@@ -2467,6 +2478,165 @@ void TestAHelpersGarageIsHeard() {
 	alice.OnState(State(MISSION_STATE_IDLE, 0, 20, 0, MISSION_OUTCOME_PASSED), 0, 9000);
 	Check(!alice.GarageHasCarElsewhere(7) && !alice.TakeResprayElsewhere(3),
 	      "and nothing is left of it once the mission is over");
+}
+
+void TestToniAndSalvatoresPortland() {
+	std::printf("\nToni's and Salvatore's Portland missions\n");
+	using namespace game::replay;
+	std::vector<uint8_t> space(0x400, 0);
+	const int32_t pickup = 0x00050012;   // $FREE_GREANDES
+	std::memcpy(space.data() + 0xC0, &pickup, 4);
+	// ADD_SPRITE_BLIP_FOR_PICKUP $FREE_GREANDES RADAR_SPRITE_WEAPON $GRENADE_BLIP
+	const uint8_t sprite[] = {0x02, 0xC0, 0x00, 0x04, 0x14, 0x02, 0xC4, 0x00};
+	std::memcpy(space.data() + 0x200, sprite, sizeof sprite);
+	Encoded e;
+	int32_t seen = 0, kind = 0;
+	Check(Encode(0x03DD, space.data(), 0x400, 0x200, nullptr, &e) && e.kind == Kind::BlipNew &&
+	          LiteralAt(e.code, e.length, 0, &seen) && seen == pickup &&
+	          LiteralAt(e.code, e.length, 1, &kind) && kind == 20 && OperandsInRange(e.code, e.length),
+	      "a marker on the mission's grenades goes to everybody, on each machine's own pickup");
+	SetLiteralAt(e.code, e.length, 1, 21);
+	Check(!OperandsInRange(e.code, e.length), "and one with a sprite past the radar's 21 is not run");
+	BlipMap pickups;
+	pickups.Add(pickup, 0x00020007);
+	Handles h;
+	h.pickups = &pickups;
+	Encoded run;
+	Check(Find(0x03DC) && Find(0x03DC)->kind == Kind::BlipNew && Find(0x03DC)->count == 2 &&
+	          Translate(e, h, &run) && LiteralAt(run.code, run.length, 0, &seen) && seen == 0x00020007,
+	      "the briefcase's plain marker too, and the pickup is ours there");
+	BlipMap none;
+	h.pickups = &none;
+	Check(!Translate(e, h, &run), "a pickup we never made gets no marker");
+
+	// EXPLODE_CAR $BLOWFISH_GARBAGE_TRUCK
+	const int32_t truck = 0x00090004;
+	std::memcpy(space.data() + 0xC8, &truck, 4);
+	const uint8_t boom[] = {0x02, 0xC8, 0x00};
+	std::memcpy(space.data() + 0x220, boom, sizeof boom);
+	Check(Encode(0x020B, space.data(), 0x400, 0x220, nullptr, &e) && e.kind == Kind::Holder &&
+	          Find(0x020B)->count == 1,
+	      "the mission blowing up its truck goes where the truck is simulated");
+
+	// IS_PLAYER_SHOOTING_IN_AREA, Bomb Da Base: Act II's `if or`.
+	Check(game::QuietCheckMayWiden(game::scripts::ANDOR_NONE) &&
+	          game::QuietCheckMayWiden(game::scripts::ANDOR_ORS_1) &&
+	          game::QuietCheckMayWiden(game::scripts::ANDOR_ORS_1 + 1) && !game::QuietCheckMayWiden(1) &&
+	          !game::QuietCheckMayWiden(2),
+	      "anybody's shot at the docks counts alone and in an `if or`, never inside an `if and`");
+	Check(game::CompareFlagIfTrue(0, game::scripts::ANDOR_ORS_1, false) == 1 &&
+	          game::CompareFlagIfTrue(0, game::scripts::ANDOR_ORS_1, true) == 0,
+	      "and in an `if or` it is the block's yes");
+
+	// LOCATE_PLAYER_ANY_MEANS_CHAR_2D/3D, for the participant nearest.
+	Check(game::nearchar::AnswersForNearest(36) && game::nearchar::AnswersForNearest(33) &&
+	          !game::nearchar::AnswersForNearest(34) && !game::nearchar::AnswersForNearest(38),
+	      "Curly Bob and the Triad warlords are near whoever is nearest them, and nobody else's are");
+	Check(game::CompareFlagIfTrue(1, 2, true) == 0,
+	      "\"Curly got away\" is false in its `if and` once a participant is within 160 m");
+	{
+		Check(game::nearchar::AnswersForNearest(46) && !game::nearchar::AnswersForNearest(45) &&
+		          !game::nearchar::AnswersForNearest(56) && !game::nearchar::AnswersForNearest(68),
+		      "Paparazzi Purge's spy on foot is near whoever is nearest him; Evidence Dash's and Escort "
+		      "Service's pedestrians are not this table's");
+		Check(game::nearchar::AnswersNearCarForNearest(46) && !game::nearchar::AnswersNearCarForNearest(45) &&
+		          !game::nearchar::AnswersNearCarForNearest(69),
+		      "and his boat and Stallion are in the one car table, beside Evidence Dash's and Gone Fishing's; Decoy's van is not");
+		Check(game::nearchar::OP_LOCATE_PLAYER_ANY_MEANS_CAR_2D == 0x01FC &&
+		          game::nearchar::OP_LOCATE_PLAYER_ANY_MEANS_CAR_3D == 0x01FF,
+		      "the player near a car, any means, 2D (01FC) and 3D (01FF)");
+		Check(game::nearchar::InLocateBox(150.0f, -160.0f, 40.0f, 160.0f, 160.0f, 0.0f, false) &&
+		          !game::nearchar::InLocateBox(161.0f, 0.0f, 0.0f, 160.0f, 160.0f, 0.0f, false),
+		      "a guest 150 m behind the spy boat keeps him in reach; 161 m out does not");
+		Check(game::CompareFlagIfTrue(0, 0, true) == 0,
+		      "\"He's clean out of here!\" (NOT within 160 m, alone) is false with a guest in reach");
+	}
+
+	// DELETE_OBJECT
+	const uint8_t gate[] = {0x02, 0xD0, 0x00};   // $CHINA_SUBWAY_GATE
+	std::memcpy(space.data() + 0x240, gate, sizeof gate);
+	Check(Encode(0x0108, space.data(), 0x400, 0x240, nullptr, &e) &&
+	          DeletesWorldObject(e.code, e.length, [](uint16_t) { return false; }),
+	      "Last Requests taking Portland's subway gate away is the world's, in the campaign");
+	Check(!DeletesWorldObject(e.code, e.length, [](uint16_t g) { return g == 0xD0; }),
+	      "a barrel the mission made and takes away again is not");
+	Check(!DeletesWorldObject(boom, sizeof boom, [](uint16_t) { return false; }),
+	      "and nothing but DELETE_OBJECT is");
+}
+
+void TestADeliveryElsewhereIsHeardFirst() {
+	std::printf("\na helper's lock-up taking the car, heard before the car goes\n");
+	MissionSync alice = Fresh();   // alice, 0, the owner
+	alice.CarDeliveredElsewhere(1, 7, 0);
+	Check(!alice.GarageHasCarElsewhere(7), "nothing with no session's mission");
+	alice.OnState(State(MISSION_STATE_RUNNING, 0, 26, 0x07), 0, 1000);
+	alice.CarDeliveredElsewhere(1, 7, 0);
+	Check(alice.GarageHasCarElsewhere(7) && !alice.GarageHasCarElsewhere(6),
+	      "bob's garage 7 took Van Heist's van: alice's garage 7 has it, at once");
+	S_MissionAnswers in{};
+	InitHeader(in, 1000);
+	in.playerId      = 1;
+	in.missionNumber = 26;
+	in.hasCar        = 0;
+	alice.OnAnswers(in, 0);
+	Check(!alice.GarageHasCarElsewhere(7), "bob's next answers overwrite it as any of his do");
+	alice.CarDeliveredElsewhere(0, 7, 0);
+	alice.CarDeliveredElsewhere(1, 32, 0);
+	alice.CarDeliveredElsewhere(3, 7, 0);
+	Check(!alice.GarageHasCarElsewhere(7),
+	      "not from alice herself, a garage past the 32, or somebody out of the mission");
+	MissionSync bob = Fresh();
+	bob.OnState(State(MISSION_STATE_RUNNING, 0, 26, 0x07), 1, 1000);
+	bob.CarDeliveredElsewhere(2, 7, 1);
+	Check(!bob.GarageHasCarElsewhere(7), "and only on the owner's machine");
+	alice.CarDeliveredElsewhere(1, 7, 0);
+	alice.OnState(State(MISSION_STATE_IDLE, 0, 26, 0, MISSION_OUTCOME_PASSED), 0, 9000);
+	Check(!alice.GarageHasCarElsewhere(7), "and nothing of it is left once the mission is over");
+}
+
+void TestTheChaseIsEverybodys() {
+	std::printf("\na locate against the mission's target, for the player nearest him\n");
+	using namespace game::nearchar;
+	Check(AnswersForNearest(25) && AnswersForNearest(41) && AnswersForNearest(43),
+	      "Chunky, I Scream and Big'N'Veiny ask it of whoever is on the target");
+	Check(!AnswersForNearest(29) && !AnswersForNearest(24) && AnswersForNearest(36) &&
+	          AnswersForNearest(33),
+	      "not The Getaway's thugs nor Mike Lips; Cutting The Grass and the Triad warlords too");
+	Check(AnswersForNearest(54) && AnswersForNearest(57) && !AnswersForNearest(55) &&
+	          !AnswersForNearest(56) && !AnswersForNearest(58) && !AnswersForNearest(59),
+	      "McAffrey and Ray's partner too; not Marked Man, whose Ray follows the owner");
+	Check(AnswersNearCarForNearest(56) && AnswersNearCarForNearest(57) &&
+	          !AnswersNearCarForNearest(54) && !AnswersNearCarForNearest(36) &&
+	          !AnswersNearCarForNearest(59),
+	      "the prosecution's car and the partner's boat are near whoever chases them");
+	Check(OP_LOCATE_PLAYER_ANY_MEANS_CAR_2D == 0x01FC && OP_LOCATE_PLAYER_ANY_MEANS_CAR_3D == 0x01FF,
+	      "01FC and 01FF, the any-means two of the six player-near-a-car locates");
+	Check(InLocateBox(160.0f, -160.0f, 900.0f, 160.0f, 160.0f, 0.0f, false),
+	      "the 2D box is the engine's, edges included, height left out");
+	Check(!InLocateBox(160.5f, 0.0f, 0.0f, 160.0f, 160.0f, 0.0f, false) &&
+	          !InLocateBox(0.0f, 0.0f, 2.5f, 8.0f, 8.0f, 2.0f, true) &&
+	          InLocateBox(-8.0f, 7.9f, -2.0f, 8.0f, 8.0f, 2.0f, true),
+	      "and the 3D one asks the height too");
+	using namespace game::replay;
+	const Entry *e = Find(0x0161);
+	Check(e && e->kind == Kind::BlipNew && e->count == 4 && e->args[0] == Arg::Car &&
+	          e->args[3] == Arg::Output && game::shape::AddNamesEntity(0x0161),
+	      "Turismo's racer blips go to everybody, on each one's copy of the car");
+	e = Find(0x03DC);
+	const Entry *f = Find(0x03DD);
+	Check(e && e->kind == Kind::BlipNew && e->count == 2 && e->args[0] == Arg::Pickup && f &&
+	          f->kind == Kind::BlipNew && f->count == 3 && f->args[0] == Arg::Pickup &&
+	          f->args[2] == Arg::Output,
+	      "and the blips on a pickup, the briefcase's and Chunky's Colt's");
+	const uint8_t sprite20[] = {0xDD, 0x03, 0x01, 1, 0, 0, 0, 0x01, 20, 0, 0, 0, 0x03, 0, 0};
+	const uint8_t sprite21[] = {0xDD, 0x03, 0x01, 1, 0, 0, 0, 0x01, 21, 0, 0, 0, 0x03, 0, 0};
+	Check(OperandsInRange(sprite20, sizeof sprite20) && !OperandsInRange(sprite21, sizeof sprite21),
+	      "a sprite past RadarSprites' 21 is not run");
+	e = Find(0x037F);
+	f = Find(0x0294);
+	Check(e && e->kind == Kind::Plain && e->count == 0 && f && f->kind == Kind::Plain &&
+	          f->count == 2 && f->args[0] == Arg::Car,
+	      "the detonator in everybody's hand, and Lips' car keeping its paint on every copy");
 }
 
 void TestTheMissionsWordToACar() {
@@ -2949,8 +3119,10 @@ void TestOnlyWhoeverGotOutIsToldToGetBackIn() {
 	const uint8_t inVeh2[8] = {'I', 'N', '_', 'V', 'E', 'H', '2', 0};
 	const uint8_t stretch[8] = {'F', 'M', '1', '_', '1', 0, 0, 0};
 	const uint8_t other[8] = {'F', 'M', '1', '_', '1', '0', 0, 0};
-	Check(IsGetBackInLabel(inVeh) && IsGetBackInLabel(stretch),
-	      "\"Hey! Get back in the vehicle!\" and \"Get back into the Stretch!\" are the two");
+	const uint8_t uzi[8] = {'Y', 'D', '2', '_', 'N', 0, 0, 0};
+	Check(IsGetBackInLabel(inVeh) && IsGetBackInLabel(stretch) && IsGetBackInLabel(uzi),
+	      "\"Hey! Get back in the vehicle!\", \"Get back into the Stretch!\" and Uzi Rider's "
+	      "\"Get your ass back in this car!\" are the three");
 	Check(!IsGetBackInLabel(inVeh2) && !IsGetBackInLabel(other),
 	      "and \"You need some wheels for this job\" is not, nor a label that only starts the same");
 
@@ -3409,6 +3581,86 @@ void TestAnyParticipantInTheCarIsThePlayerInIt() {
 	      "an `if and` too, Lips' blips beside a flag, unless it asked where the owner is");
 	Check(!MayAnswerInCarForAnybody(1, 2),
 	      "`if and` 'within 20 m of the destination' then 'in the car' is the owner's alone");
+}
+
+void TestTheCarAtThePlaceIsAnybodys() {
+	std::printf("\nthe car brought to the place, by anybody in it\n");
+	const MissionArea door = MissionAreaLocate2D(906.0f, -425.0f, 4.0f, 4.0f);
+	Check(game::InCarAtThePlace(Vec3{907.0f, -424.0f, 14.0f}, true, door),
+	      "Curly's taxi stopped at the door with a helper in it, the owner there too: yes");
+	Check(game::InCarAtThePlace(Vec3{913.5f, -425.0f, 14.0f}, true, door) &&
+	          !game::InCarAtThePlace(Vec3{916.0f, -425.0f, 14.0f}, true, door),
+	      "within the checkpoints' 5 m of the area, and not beyond it");
+	Check(!game::InCarAtThePlace(Vec3{907.0f, -424.0f, 14.0f}, false, door),
+	      "and never for a location check that named no area");
+	const MissionArea box = MissionAreaLocate3D(10.0f, 10.0f, 5.0f, 2.0f, 2.0f, 2.0f);
+	Check(!game::InCarAtThePlace(Vec3{10.0f, 10.0f, 20.0f}, true, box),
+	      "a 3D area is high as well as wide: the car on the bridge overhead is not at it");
+}
+
+void TestASessionCarTheMissionClearsAway() {
+	std::printf("\na session car the mission clears away\n");
+	Check(game::InClearCircle(1189.7f, -864.3f, 1195.0f, -870.25f, 15.0f),
+	      "Cipriani's Chauffeur: a car at Toni's spot is inside the 15 m clear at Joey's door");
+	Check(!game::InClearCircle(1215.0f, -870.25f, 1195.0f, -870.25f, 15.0f) &&
+	          !game::InClearCircle(1195.0f, -870.25f, 1195.0f, -870.25f, 0.0f),
+	      "one 20 m off is not, nor is anything in a clear of no size");
+
+	game::ClearCarFacts f;
+	f.sessionCar = true;
+	Check(game::ClearTakesCar(f), "a car a player came in, parked there: taken");
+	game::ClearCarFacts m = f;
+	m.missionCar          = true;
+	Check(!game::ClearTakesCar(m), "Toni's car, the mission's own, stays");
+	game::ClearCarFacts o = f;
+	o.ownerInside         = true;
+	game::ClearCarFacts p = f;
+	p.missionPed          = true;
+	game::ClearCarFacts w = f;
+	w.wrecked             = true;
+	Check(!game::ClearTakesCar(o) && !game::ClearTakesCar(p) && !game::ClearTakesCar(w),
+	      "nor one the owner sits in, one with the mission's people in it, or a wreck");
+	Check(!game::ClearTakesCar(game::ClearCarFacts{}),
+	      "and a car nobody has driven is the engine's own clear's, on each machine");
+
+	Check(game::KeepHoldingForSeats(true, 1000, 1000 + game::CLEAR_HOLD_MS - 1) &&
+	          !game::KeepHoldingForSeats(true, 1000, 1000 + game::CLEAR_HOLD_MS) &&
+	          !game::KeepHoldingForSeats(false, 1000, 1001),
+	      "the mission waits while a player is in it, three seconds at most, and not at all for "
+	      "an empty one");
+	Check(game::KeepHoldingForSeats(true, 0xFFFFFF00u, 0x00000100u),
+	      "across the clock's wrap too");
+
+	const Vec3 car{100.0f, 100.0f, 10.0f};
+	Check(game::StandingOnCar(Vec3{100.5f, 99.0f, 11.6f}, car, 3.0f),
+	      "a player on the roof stands on it");
+	Check(!game::StandingOnCar(Vec3{101.0f, 100.0f, 10.3f}, car, 3.0f) &&
+	          !game::StandingOnCar(Vec3{104.0f, 100.0f, 11.6f}, car, 3.0f) &&
+	          !game::StandingOnCar(Vec3{100.0f, 100.0f, 16.0f}, car, 3.0f),
+	      "one beside it, one past its end and one on the bridge above do not");
+	Check(game::LeaveCarDistance(3.0f) > 2.0f && game::LeaveCarDistance(0.5f) > 1.5f,
+	      "and he is put down clear of its side, however small its model says it is");
+
+	const MissionEffectBody b = game::LeaveCarEffect(27, 513);
+	uint16_t                netId = 0;
+	Check(b.kind == MISSION_EFFECT_RUN && b.onlyTo == 0 && b.length == game::LEAVE_CAR_EFFECT_LENGTH &&
+	          game::ReadLeaveCarEffect(b, &netId) && netId == 513,
+	      "the word to get out of it goes to everybody and reads back as the car it names");
+	MissionEffectBody script{};
+	script.kind    = MISSION_EFFECT_RUN;
+	script.length  = 7;
+	script.code[0] = 0xA6;
+	script.code[1] = 0x00;
+	script.code[2] = game::scripts::PARAM_INT32;
+	MissionEffectBody untagged = b;
+	untagged.code[8] ^= 1;
+	MissionEffectBody none = game::LeaveCarEffect(27, INVALID_NETID);
+	Check(!game::ReadLeaveCarEffect(script, &netId) && !game::ReadLeaveCarEffect(untagged, &netId) &&
+	          !game::ReadLeaveCarEffect(none, &netId),
+	      "a script's own DELETE_CAR, one without the tag and one naming no car are not it");
+	const uint8_t inVeh[game::TEXT_LABEL] = {'I', 'N', '_', 'V', 'E', 'H'};
+	Check(!game::ReadLeaveCarEffect(game::GetBackInEffect(27, inVeh, 1), &netId),
+	      "nor is anything else the mission says");
 }
 
 void TestThePassengerOrderAgainstTheImage() {
@@ -4628,7 +4880,7 @@ void TestAGuestAtTheHostsMarkerStartsIt() {
 	g_ourContacts               = {Contact(892.75f, -425.75f, 13), Contact(1191.688f, -870.0f, 10)};
 	g_bridge.ReadContactMarkers = &ReadOurContacts;
 	host.SetHost(0);
-	const Vec3 near{1191.688f + 30.0f, -870.0f, 15.0f};
+	const Vec3 near{1191.688f + 4.0f, -870.0f, 15.0f};
 	g_roster.others = {MissionPresence{1, true, {1191.9f, -870.3f, 15.2f}}};
 	uint8_t who = INVALID_PLAYER;
 	Check(!host.OtherPlayerAtOurContact(joey, near, 0, &who),
@@ -4638,7 +4890,7 @@ void TestAGuestAtTheHostsMarkerStartsIt() {
 	      "nor before the host has read its own contacts");
 	host.Tick(0, 1100);
 	Check(host.OtherPlayerAtOurContact(joey, near, 0, &who) && who == 1,
-	      "bob in Joey's marker, alice 30 m off: the trigger takes bob for alice");
+	      "bob in Joey's marker, alice 4 m off: the trigger takes bob for alice");
 	Check(!host.OtherPlayerAtOurContact(joey, {1191.688f + 80.0f, -870.0f, 15.0f}, 0),
 	      "not with alice a block away: the opening would run wherever she is");
 	g_roster.others = {MissionPresence{1, true, {1194.0f, -870.0f, 15.0f}}};
@@ -4704,12 +4956,12 @@ void TestAGuestAtTheHostsMarkerStartsIt() {
 void TestTheStartsRadius() {
 	std::printf("\nhow far from its start a player is at it\n");
 	Check(StartMarginMetres(MISSION_MARGIN_CM_DEFAULT) == MISSION_START_RADIUS_M &&
-	          MISSION_START_RADIUS_M == 50.0f,
-	      "50 m, over the session's 5 m margin");
+	          MISSION_START_RADIUS_M == 5.0f,
+	      "5 m, the same as the session's margin");
 	Check(StartMarginMetres(8000) == 80.0f, "a server margin wider than that wins");
 	const float start = StartMarginMetres(MISSION_MARGIN_CM_DEFAULT);
-	Check(InMissionArea({140.0f, 70.0f, 12.0f}, kMarker, start),
-	      "a friend parked 40 m down the street is at the start");
+	Check(InMissionArea({104.0f, 103.0f, 12.0f}, kMarker, start),
+	      "a friend a few steps off is at the start");
 	Check(!InMissionArea({160.0f, 100.0f, 10.0f}, kMarker, start),
 	      "one 60 m off is not");
 }
@@ -5009,6 +5261,68 @@ void TestAGuestAheadKeepsItsOwnStory() {
 	Check(Applied({3, 4}), "a mission that never got its last part ends where the next one starts");
 }
 
+// A side job's delta from somebody else's save (sideprogress.h).
+S_CampaignDelta SidePart(uint32_t seq, uint16_t number, std::initializer_list<V> values, bool last,
+                         const uint8_t *op = nullptr, uint8_t opLength = 0) {
+	S_CampaignDelta d    = Part(seq, number, values, last, 1);
+	d.body.scriptHash    = sideprogress::RETAIL_SCRIPT_HASH;
+	d.body.opLength      = opLength;
+	if (op)
+		std::memcpy(d.body.op, op, opLength);
+	return d;
+}
+
+void TestASideJobKeepsEachSavesProgress() {
+	std::printf("\na side job somebody else ran never takes this save back\n");
+	const uint8_t  progress[] = {0x0C, 0x03, 0x04, 0x01};
+	constexpr uint16_t KILLS = 1075 * 4, PAGER = 1080 * 4, FARES = 395 * 4, BEST = 386 * 4,
+	                   SCRATCH = 2000 * 4;
+
+	// alice, the host, has 25 criminals of Portland and both its bribes; bob
+	// starts a Vigilante shift from a save with 9 and makes his tenth.
+	MissionSync host = Fresh();
+	g_hash    = sideprogress::RETAIL_SCRIPT_HASH;
+	g_globals = {{KILLS, 25}, {PAGER, 2}, {SCRATCH, 4}};
+	host.OnState(State(MISSION_STATE_IDLE, INVALID_PLAYER, MISSION_NONE, 0), 0, 500);
+	host.OnCampaignDelta(SidePart(1, 13, {}, false, progress, sizeof progress));
+	host.OnCampaignDelta(SidePart(2, 13, {{KILLS, 10, 0}, {PAGER, 1, 0}, {SCRATCH, 10, 0}}, true));
+	host.Tick(0, 600);
+	Check(Applied({2}) && g_globals[KILLS] == 25 && g_globals[PAGER] == 2 && g_globals[SCRATCH] == 10,
+	      "the host keeps her 25 kills and her pager flag; the shift's own scratch goes as ever");
+	Check(host.CampaignSideKept() == 3, "and the bribe's progress point is not paid to her again");
+
+	// carol has 3 kills and no bribe: bob's shift moves her on, point and all.
+	MissionSync behind = Fresh();
+	g_hash    = sideprogress::RETAIL_SCRIPT_HASH;
+	g_globals = {{KILLS, 3}, {PAGER, 0}};
+	behind.OnState(State(MISSION_STATE_IDLE, INVALID_PLAYER, MISSION_NONE, 0), 2, 500);
+	behind.OnCampaignDelta(SidePart(1, 13, {}, false, progress, sizeof progress));
+	behind.OnCampaignDelta(SidePart(2, 13, {{KILLS, 10, 0}, {PAGER, 1, 0}}, true));
+	behind.Tick(2, 600);
+	Check(Applied({1, 2}) && g_globals[KILLS] == 10 && g_globals[PAGER] == 1 &&
+	          behind.CampaignSideKept() == 0,
+	      "a save behind takes the count, the flag and the progress point");
+
+	// The fares only go up, and a best time only down.
+	MissionSync fares = Fresh();
+	g_hash    = sideprogress::RETAIL_SCRIPT_HASH;
+	g_globals = {{FARES, 90}, {BEST, 150}};
+	fares.OnState(State(MISSION_STATE_IDLE, INVALID_PLAYER, MISSION_NONE, 0), 0, 500);
+	fares.OnCampaignDelta(SidePart(1, 14, {{FARES, 3, 0}}, true));
+	fares.OnCampaignDelta(SidePart(2, 7, {{BEST, 120, 0}}, true));
+	fares.Tick(0, 600);
+	Check(g_globals[FARES] == 90 && g_globals[BEST] == 120,
+	      "ninety fares stay ninety after a guest's three, and a better best time comes in");
+
+	// Another main.scm, or a story mission, goes as it always did.
+	MissionSync other = Fresh();
+	g_globals = {{FARES, 90}};
+	other.OnState(State(MISSION_STATE_IDLE, INVALID_PLAYER, MISSION_NONE, 0), 0, 500);
+	other.OnCampaignDelta(Part(1, 14, {{FARES, 3, 0}}, true, 1));
+	other.Tick(0, 600);
+	Check(g_globals[FARES] == 3, "under a main.scm that is not the retail one, the old rule");
+}
+
 // main.scm itself, for what the owner calls a latch.
 bool LoadMainScm(std::vector<uint8_t> &scm) {
 	std::vector<std::string> candidates;
@@ -5149,6 +5463,7 @@ void TestTheLatchesInMainScm() {
 
 int RunMissionTests() {
 	TestAGuestAheadKeepsItsOwnStory();
+	TestASideJobKeepsEachSavesProgress();
 	TestTheLatchesInMainScm();
 	TestTheSessionsCampaignIsTheHosts();
 	TestTheHostsContactsReachTheGuests();
@@ -5188,6 +5503,8 @@ int RunMissionTests() {
 	TestOnlyAsManyGetOutAsTheSeatsNeeded();
 	TestAPassengerTheEngineGaveUpOnIsKept();
 	TestAnyParticipantInTheCarIsThePlayerInIt();
+	TestTheCarAtThePlaceIsAnybodys();
+	TestASessionCarTheMissionClearsAway();
 	TestThePassengerOrderAgainstTheImage();
 	TestEverybodyIntoTheCarTheMissionPutItsPlayerIn();
 	TestTheWaterDoesNotWaitForTheBoatless();
@@ -5201,7 +5518,10 @@ int RunMissionTests() {
 	TestTwoNewGamesMeetAtTheBridge();
 	TestEverybodysKillsCount();
 	TestTheMissionsWordToACar();
+	TestToniAndSalvatoresPortland();
 	TestAHelpersGarageIsHeard();
+	TestADeliveryElsewhereIsHeardFirst();
+	TestTheChaseIsEverybodys();
 	TestAnInstructionIsSentAsValues();
 	TestTheStartGatesAreToldApart();
 	TestTheLaunchAhead();

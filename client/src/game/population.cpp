@@ -4,8 +4,11 @@
 #include "adopt.h"
 #include "carletgo.h"
 #include "crowdaddr.h"
+#include "crowdfade.h"
 #include "mission.h"
 #include "missioncombat.h"
+#include "missionclear.h"
+#include "missiontake.h"
 #include "ped.h"
 #include "pedanim.h"
 #include "pedspeech.h"
@@ -405,6 +408,10 @@ struct HostedPed {
 	// one our own engine made. A cop handed to us is not handed on again
 	// inside COP_HANDOVER_HOLD_MS (game/wanted.h).
 	uint32_t  heldSinceMs = 0;
+	// The talk or wait-state overlay last said for it (C_PedOverlay), and when,
+	// on WallClock. Said again every AMBIENT_OVERLAY_SAID_MS while it holds.
+	uint16_t  overlayId       = ANIM_NONE;
+	uint32_t  overlaySentMs   = 0;
 };
 
 // Matched to the engine rather than to the session: GTA III's ped pool is 140
@@ -505,18 +512,50 @@ void QueueLost(HostedPed &h, const char *why) {
 // mission runs on its owner's machine, and so its pedestrians are hosted
 // there. A remote player's ped is a MISSION_CHAR too, and is added from the
 // frame pump, never inside a script instruction.
+//
+// That last sentence is how it was meant, not something any test held: an
+// instruction can teleport a ped it never made, and a remote player or a copy
+// of somebody else's pedestrian is a MISSION_CHAR too. Either is on the
+// session already under its own name (game/missiontake.h), and is never
+// announced as the mission's.
+bool PedOnSessionAlready(const void *ped, uint16_t &netId) {
+	return RemotePlayerForPed(ped, netId) || AmbientReplicaForPed(ped, netId);
+}
+
+uint16_t g_saidMissionAddedSessionPed = INVALID_NETID;
+
 bool IsAmbientPedWeShouldHost(void *entity) {
 	if (!entity)
 		return false;
 	if (EntityType(entity) != offs::ENTITY_TYPE_PED)
 		return false;
-	const uint8_t createdBy = Field<uint8_t>(entity, offs::PED_CHAR_CREATED_BY);
-	if (createdBy != CHAR_CREATED_BY_RANDOM &&
-	    !(createdBy == CHAR_CREATED_BY_MISSION && MissionMakingEntities()))
-		return false;
 	if (entity == PlayerPed())
 		return false;
-	return true;
+	const uint8_t createdBy = Field<uint8_t>(entity, offs::PED_CHAR_CREATED_BY);
+	if (createdBy == CHAR_CREATED_BY_RANDOM)
+		return true;
+	const bool inInstruction = MissionMakingEntities();
+	const bool made          = inInstruction && createdBy == CHAR_CREATED_BY_MISSION;
+	uint16_t   remoteId = INVALID_NETID, replicaId = INVALID_NETID;
+	const bool remote  = made && RemotePlayerForPed(entity, remoteId);
+	const bool replica = made && !remote && AmbientReplicaForPed(entity, replicaId);
+	switch (MissionPedAdd(inInstruction, made, remote, replica)) {
+	case MissionAdd::Mission:
+		return true;
+	case MissionAdd::OnSession: {
+		const uint16_t netId = remote ? remoteId : replicaId;
+		if (g_saidMissionAddedSessionPed != netId) {
+			g_saidMissionAddedSessionPed = netId;
+			Log("population: the mission put %s %u back in the world; that is who it is still, "
+			    "not a new pedestrian of the mission's",
+			    remote ? "remote player" : "pedestrian", static_cast<unsigned>(netId));
+		}
+		return false;
+	}
+	case MissionAdd::NotMission:
+		break;
+	}
+	return false;
 }
 
 // ---- ambient traffic (docs/population.md §3 step 4) ------------------------
@@ -817,6 +856,60 @@ void QueueLostNetId(uint16_t netId) {
 		g_lost[g_lostCount++] = netId;
 }
 
+// ---- what our engine gave up on with nobody to take it (game/crowdfade.h) -----
+//
+// Gone as a despawn is gone, but said as C_CrowdGone, so a copy standing on
+// another player's screen fades out there the way our engine fades its own
+// rather than vanishing. Only what CarFadesWhenDropped / PedFadesWhenDropped
+// pass: our player's distance, a respawn's clear, an island left behind.
+constexpr size_t MAX_FADED_QUEUED = 96;
+CrowdGoneRow     g_faded[MAX_FADED_QUEUED];
+uint32_t         g_fadedCount      = 0;
+bool             g_warnedFadedFull = false;
+uint32_t         g_fadedPeds       = 0;   // since the last summary
+uint32_t         g_fadedCars       = 0;
+
+// False when the queue is full, and then the caller despawns it as before.
+bool QueueFaded(uint8_t kind, uint16_t netId) {
+	if (netId == INVALID_NETID)
+		return false;
+	if (g_fadedCount >= MAX_FADED_QUEUED) {
+		if (!g_warnedFadedFull) {
+			g_warnedFadedFull = true;
+			Log("population: the faded-crowd queue is full; what our engine gives up on is "
+			    "despawned for a while instead (and this will not be said again)");
+		}
+		return false;
+	}
+	CrowdGoneRow &r = g_faded[g_fadedCount++];
+	r.netId         = netId;
+	r.kind          = kind;
+	r.pad           = 0;
+	if (kind == AMBIENT_ADOPT_CAR)
+		++g_fadedCars;
+	else
+		++g_fadedPeds;
+	return true;
+}
+
+// A pedestrian of ours gone with the reason our player's, or else lost.
+void QueueFadedOrLostNetId(uint16_t netId, bool fades) {
+	if (!fades || !QueueFaded(AMBIENT_ADOPT_PED, netId))
+		QueueLostNetId(netId);
+}
+
+uint32_t DrainFadedAmbient(CrowdGoneRow *out, uint32_t max) {
+	const uint32_t n = g_fadedCount < max ? g_fadedCount : max;
+	for (uint32_t i = 0; i < n; ++i)
+		out[i] = g_faded[i];
+	for (uint32_t i = n; i < g_fadedCount; ++i)
+		g_faded[i - n] = g_faded[i];
+	g_fadedCount -= n;
+	if (g_fadedCount == 0)
+		g_warnedFadedFull = false;
+	return n;
+}
+
 // The first dozen pedestrians of ours our engine took with somebody near.
 void DescribePedDrop(uint16_t netId, uint16_t modelId, const Vec3 &at, PedDrop drop,
                      float nearD2, bool handed) {
@@ -869,7 +962,7 @@ void SettleSeatedDrops() {
 		    QueuePedLetGo(d.netId))
 			++g_pedDrops.handed;
 		else
-			QueueLostNetId(d.netId);
+			QueueFadedOrLostNetId(d.netId, PedFadesWhenDropped(PedDrop::Respawn, true, false));
 	}
 	g_seatedDropCount = 0;
 }
@@ -951,14 +1044,22 @@ void ReportReaps() {
 		    p.by[static_cast<size_t>(PedDrop::Respawn)],
 		    p.by[static_cast<size_t>(PedDrop::Island)], p.nearby,
 		    static_cast<double>(AMBIENT_PED_KEEP_RADIUS_M), p.handed);
+	if (g_fadedCars != 0 || g_fadedPeds != 0)
+		Log("population: over the last %us %u of our car(s) and %u of our pedestrian(s) our "
+		    "engine gave up on with nobody to take them went out as C_CrowdGone, to fade on "
+		    "any screen they stood on rather than vanish",
+		    static_cast<unsigned>((now - g_reapsSaidMs) / 1000), g_fadedCars, g_fadedPeds);
+	g_fadedCars   = 0;
+	g_fadedPeds   = 0;
 	g_reaps       = ReapTally{};
 	g_pedDrops    = PedDropTally{};
 	g_reapsSaidMs = now;
 }
 
 // A hosted car of ours on its way out of the world, from the Remove detour.
-// True when it went out as a let-go, and then the record is already cleared;
-// false, and the caller despawns it as always.
+// True when it went out as a let-go, or as a fade nobody could take
+// (game/crowdfade.h), and then the record is already cleared; false, and the
+// caller despawns it as always.
 //
 // The pedestrians of ours sitting in it go with it: ~CVehicle (0x00551060)
 // calls FlagToDestroyWhenNextProcessed through vtable slot 16 on the driver
@@ -1014,8 +1115,31 @@ bool LetGoHostedCar(HostedCar &c, void *vehicle, CarReap reap, uintptr_t ret) {
 		}
 	};
 	if (!letGo) {
-		seatedDrops([](uint16_t netId) { QueueLostNetId(netId); });
-		return false;
+		// Nobody to hand it to. Gone, but as our player's reason: a copy on
+		// somebody's screen fades out there (game/crowdfade.h), and so do the
+		// people of ours in its seats, whom ~CVehicle takes with it.
+		const bool fades = CarFadesWhenDropped(reap, c.named, c.mission) &&
+		                   QueueFaded(AMBIENT_ADOPT_CAR, c.netId);
+		seatedDrops([fades](uint16_t netId) { QueueFadedOrLostNetId(netId, fades); });
+		if (!fades)
+			return false;
+		auto fadeRider = [](void *ped) {
+			if (!ped)
+				return;
+			HostedPed *h = FindHostedByPed(ped);
+			if (!h || !h->named || h->mission)
+				return;
+			QueueFadedOrLostNetId(h->netId, true);
+			*h = HostedPed{};
+		};
+		fadeRider(Field<void *>(vehicle, offs::VEH_DRIVER));
+		uint8_t riders = Field<uint8_t>(vehicle, offs::VEH_NUM_MAX_PASSENGERS);
+		if (riders > offs::VEH_MAX_PASSENGERS)
+			riders = static_cast<uint8_t>(offs::VEH_MAX_PASSENGERS);
+		for (uint8_t i = 0; i < riders; ++i)
+			fadeRider(Field<void *>(vehicle, offs::VEH_PASSENGERS + 4u * i));
+		c = HostedCar{};
+		return true;
 	}
 
 	LocalCarLetGo &out = g_letGo[g_letGoCount++];
@@ -1060,9 +1184,9 @@ uint32_t DrainLetGoAmbientCars(LocalCarLetGo *out, uint32_t max) {
 }
 
 // A hosted pedestrian of ours on his way out of the world, from the Remove
-// detour. True when he went out as a let-go, or is waiting for his car to be
-// decided (SeatedDrop), and then the record is already cleared; false, and
-// the caller despawns him as always.
+// detour. True when he went out as a let-go or a fade, or is waiting for his
+// car to be decided (SeatedDrop), and then the record is already cleared;
+// false, and the caller despawns him as always.
 bool LetGoHostedPed(HostedPed &h, void *ped, PedDrop drop) {
 	if (drop == PedDrop::Other)
 		return false;
@@ -1094,8 +1218,15 @@ bool LetGoHostedPed(HostedPed &h, void *ped, PedDrop drop) {
 	const bool letGo = ShouldLetGoPed(drop, h.named, h.mission, alive, pedType, nearD2);
 	if (AnybodyToHandPedTo(nearD2))
 		DescribePedDrop(h.netId, h.modelId, at, drop, nearD2, letGo);
-	if (!letGo || !QueuePedLetGo(h.netId))
-		return false;
+	if (!letGo || !QueuePedLetGo(h.netId)) {
+		// Nobody to hand him to: gone, but faded out on any screen he stands
+		// on rather than vanishing from it (game/crowdfade.h).
+		if (!PedFadesWhenDropped(drop, h.named, h.mission) ||
+		    !QueueFaded(AMBIENT_ADOPT_PED, h.netId))
+			return false;
+		h = HostedPed{};
+		return true;
+	}
 	++g_pedDrops.handed;
 	if (PopTrace())
 		Log("population/trace: host let go ped %p net %u model %u (%s)", ped, h.netId,
@@ -1255,9 +1386,35 @@ void ForgetMissionEntity(const void *entity) {
 // the session's mission runs one of its instructions here. The script may
 // well lock one, and a replica cannot be what is being added inside one of
 // its instructions, so the lock test is not asked of them.
+//
+// Except that one of its instructions can add back a car it never made: a
+// session car or a replica, both MISSION_VEHICLEs, teleported by
+// SET_PLAYER_COORDINATES with the owner sitting in it (game/missiontake.h).
+// That one is the session's already, and stays under the name it has.
+uint16_t g_saidMissionAddedSessionCar = INVALID_NETID;
+
 bool IsMissionCarWeShouldHost(void *entity) {
-	return MissionMakingEntities() &&
-	       Field<uint8_t>(entity, offs::VEH_CREATED_BY) == VEHICLE_CREATED_BY_MISSION;
+	const bool inInstruction = MissionMakingEntities();
+	const bool made =
+	    inInstruction && Field<uint8_t>(entity, offs::VEH_CREATED_BY) == VEHICLE_CREATED_BY_MISSION;
+	uint16_t   netId     = INVALID_NETID;
+	const bool onSession = made && SessionAlreadyHasCar(entity, netId);
+	switch (MissionCarAdd(inInstruction, made, onSession)) {
+	case MissionAdd::Mission:
+		return true;
+	case MissionAdd::OnSession:
+		if (g_saidMissionAddedSessionCar != netId) {
+			g_saidMissionAddedSessionCar = netId;
+			Log("population: the mission put session car %u back in the world (model %u); it is "
+			    "that car still, not a new one of the mission's",
+			    static_cast<unsigned>(netId),
+			    static_cast<unsigned>(Field<uint32_t>(entity, offs::MODEL_INDEX) & 0xFFFF));
+		}
+		return false;
+	case MissionAdd::NotMission:
+		break;
+	}
+	return false;
 }
 
 bool IsAmbientCarWeShouldHost(void *entity) {
@@ -1277,7 +1434,7 @@ bool IsAmbientCarWeShouldHost(void *entity) {
 }
 
 // What became of an attempt to host a car or a pedestrian here.
-enum class Hosting : uint8_t { Hosted, Already, TableFull, QueueFull, NoModel };
+enum class Hosting : uint8_t { Hosted, Already, TableFull, QueueFull, NoModel, OnSession };
 
 const char *HostingWhy(Hosting h) {
 	switch (h) {
@@ -1286,6 +1443,7 @@ const char *HostingWhy(Hosting h) {
 	case Hosting::TableFull: return "the table of what this machine hosts is full";
 	case Hosting::QueueFull: return "the queue of announcements is full";
 	case Hosting::NoModel:   return "it has no model index yet";
+	case Hosting::OnSession: return "the session has it already, under a name of its own";
 	}
 	return "?";
 }
@@ -1307,6 +1465,12 @@ Hosting HostCar(void *entity, bool mission) {
 		    entity);
 		QueueLostCar(*old, "its pool slot was reused");
 	}
+
+	// Somebody's session car or a copy of somebody else's traffic is never
+	// announced again as ours: everybody else would build it a second time.
+	uint16_t sessionNetId = INVALID_NETID;
+	if (SessionAlreadyHasCar(entity, sessionNetId))
+		return Hosting::OnSession;
 
 	HostedCar *slot = nullptr;
 	for (HostedCar &c : g_hostedCars)
@@ -1395,6 +1559,7 @@ void TallyCarHosting(void *entity, Hosting h) {
 	switch (h) {
 	case Hosting::Hosted:    ++g_carAdds.hosted; break;
 	case Hosting::Already:   ++g_carAdds.already; break;
+	case Hosting::OnSession: ++g_carAdds.notRandom; break;
 	case Hosting::TableFull:
 	case Hosting::QueueFull: ++g_carAdds.full; break;
 	case Hosting::NoModel:
@@ -1845,6 +2010,12 @@ Hosting HostPed(void *entity, bool mission) {
 		QueueLost(*old, "its pool slot was reused");
 	}
 
+	// A remote player or a copy of somebody else's pedestrian is the
+	// session's already (game/missiontake.h).
+	uint16_t sessionNetId = INVALID_NETID;
+	if (PedOnSessionAlready(entity, sessionNetId))
+		return Hosting::OnSession;
+
 	HostedPed *slot = nullptr;
 	for (HostedPed &h : g_hosted)
 		if (!h.active) {
@@ -2160,6 +2331,42 @@ uint32_t DrainAmbientBodyParts(PedBodyPartBody *out, uint32_t max) {
 	return n;
 }
 
+// ---- a pedestrian talking ---------------------------------------------------
+//
+// A scripted ped that chats, hails a taxi, puts its hands up or ducks plays an
+// ASSOC_PARTIAL overlay the ped stream does not carry (protocol.h,
+// C_PedOverlay). Read here for every named ped we host, said on a change and
+// again while it holds.
+uint32_t DrainAmbientOverlays(PedOverlayBody *out, uint32_t max, uint32_t nowMs) {
+	uint32_t n = 0;
+	for (HostedPed &h : g_hosted) {
+		if (n >= max)
+			break;
+		if (!h.active || !h.named || h.netId == INVALID_NETID || h.poolHandle < 0)
+			continue;
+		void *const ped = Func<GetPedFn>(CPools__GetPed)(h.poolHandle);
+		if (ped != h.ped)
+			continue;
+		const uint16_t now = ReadPedOverlayAnim(ped);
+		const bool     changed = now != h.overlayId;
+		if (!changed && (now == ANIM_NONE || nowMs - h.overlaySentMs < AMBIENT_OVERLAY_SAID_MS))
+			continue;
+		h.overlayId     = now;
+		h.overlaySentMs = nowMs;
+		out[n].netId  = h.netId;
+		out[n].animId = now;
+		++n;
+		static bool said = false;
+		if (changed && !said) {
+			said = true;
+			Log("population: pedestrian %u plays %02Xh as a talk or wait-state overlay; "
+			    "telling the session so every copy plays it (and this will not be said "
+			    "again)", h.netId, static_cast<unsigned>(now));
+		}
+	}
+	return n;
+}
+
 // ---- a pedestrian dying ----------------------------------------------------
 //
 // The same shape as the limb above and for the same reason: the only witness
@@ -2394,6 +2601,142 @@ void *ResolveHostedCar(uint16_t netId) {
 	return nullptr;
 }
 
+// ---- what the mission lets go of (game/missionclear.h) -------------------------
+//
+// The rows waiting for C_MissionRelease, and the last batch's state. A
+// mission makes a few dozen things at most; past the queue's room the rest
+// wait in their records for the next drain, since a record stays the
+// mission's until its row is queued.
+namespace {
+
+constexpr size_t  MAX_RELEASE_QUEUED = 64;
+MissionReleaseRow g_releaseRows[MAX_RELEASE_QUEUED];
+uint32_t          g_releaseCount      = 0;
+bool              g_missionOver       = false;   // the last batch is being gathered
+uint32_t          g_missionOverSince  = 0;
+bool              g_finalDue          = false;   // the last batch is all queued
+uint32_t          g_releasedSaid      = 0;
+
+bool QueueRelease(uint16_t netId, uint8_t kind) {
+	if (g_releaseCount >= MAX_RELEASE_QUEUED)
+		return false;
+	g_releaseRows[g_releaseCount++] = MissionReleaseRow{netId, kind, 0};
+	return true;
+}
+
+void SayReleased(const char *what, uint16_t netId, uint16_t model, bool over) {
+	if (g_releasedSaid >= 16)
+		return;
+	++g_releasedSaid;
+	Log("population: the mission's %s %u (model %u) is %s; everybody else holds it as "
+	    "ordinary crowd from now on",
+	    what, static_cast<unsigned>(netId), static_cast<unsigned>(model),
+	    over ? "still here after the mission ended" : "no longer needed by it");
+}
+
+void SweepMissionHolds(uint32_t nowMs) {
+	uint32_t waiting = 0;
+	bool     full    = false;
+	const bool over  = g_missionOver;
+	for (HostedCar &c : g_hostedCars) {
+		if (!c.active || !c.mission)
+			continue;
+		void *const now = c.poolHandle >= 0 ? AmbientCarFromRef(c.poolHandle) : nullptr;
+		if (now != c.vehicle)
+			continue;   // gone: the sweep says so, as a despawn
+		const bool still =
+		    Field<uint8_t>(now, offs::VEH_CREATED_BY) == VEHICLE_CREATED_BY_MISSION;
+		switch (MissionEntityHold(c.mission, c.named, still, over)) {
+		case MissionHold::Keep:
+			break;
+		case MissionHold::WaitForName:
+			++waiting;
+			break;
+		case MissionHold::Release:
+			if (!QueueRelease(c.netId, AMBIENT_ADOPT_CAR)) {
+				full = true;
+				break;
+			}
+			c.mission = false;
+			ForgetMissionEntity(c.vehicle);
+			SayReleased("car", c.netId, c.modelId, over);
+			break;
+		}
+	}
+	for (HostedPed &h : g_hosted) {
+		if (!h.active || !h.mission)
+			continue;
+		void *const now = h.poolHandle >= 0 ? Func<GetPedFn>(CPools__GetPed)(h.poolHandle) : nullptr;
+		if (now != h.ped)
+			continue;
+		const bool still =
+		    Field<uint8_t>(now, offs::PED_CHAR_CREATED_BY) == CHAR_CREATED_BY_MISSION;
+		switch (MissionEntityHold(h.mission, h.named, still, over)) {
+		case MissionHold::Keep:
+			break;
+		case MissionHold::WaitForName:
+			++waiting;
+			break;
+		case MissionHold::Release:
+			if (!QueueRelease(h.netId, AMBIENT_ADOPT_PED)) {
+				full = true;
+				break;
+			}
+			h.mission = false;
+			ForgetMissionEntity(h.ped);
+			SayReleased("pedestrian", h.netId, h.modelId, over);
+			break;
+		}
+	}
+	// The queue full, the rest are let go of on a later drain, and the last
+	// batch waits for them.
+	if (!over || full)
+		return;
+	if (!FinalReleaseReady(waiting, nowMs - g_missionOverSince))
+		return;
+	// Past the wait, one still unnamed is nobody's mission's here any more
+	// either; what the session makes of it is its own row, which the last
+	// batch takes as gone.
+	if (waiting != 0) {
+		for (HostedCar &c : g_hostedCars)
+			if (c.active && c.mission && !c.named)
+				c.mission = false;
+		for (HostedPed &h : g_hosted)
+			if (h.active && h.mission && !h.named)
+				h.mission = false;
+		Log("population: %u of the mission's pedestrians and cars still had no name %u ms after "
+		    "it ended; the last batch goes without them",
+		    waiting, MISSION_FINAL_WAIT_MS);
+	}
+	g_missionOver = false;
+	g_finalDue    = true;
+}
+
+} // namespace
+
+void NoteOwnMissionOver(uint32_t nowMs) {
+	g_missionOver      = true;
+	g_missionOverSince = nowMs != 0 ? nowMs : 1;
+	g_finalDue         = false;
+	g_releasedSaid     = 0;
+}
+
+uint32_t DrainMissionRelease(MissionReleaseRow *out, uint32_t max, bool &final) {
+	final = false;
+	SweepMissionHolds(WallClock::NowMs());
+	const uint32_t n = g_releaseCount < max ? g_releaseCount : max;
+	for (uint32_t i = 0; i < n; ++i)
+		out[i] = g_releaseRows[i];
+	for (uint32_t i = n; i < g_releaseCount; ++i)
+		g_releaseRows[i - n] = g_releaseRows[i];
+	g_releaseCount -= n;
+	if (g_finalDue && g_releaseCount == 0) {
+		g_finalDue = false;
+		final      = true;
+	}
+	return n;
+}
+
 bool HostedMissionEntity(const void *entity) {
 	if (!entity)
 		return false;
@@ -2482,6 +2825,12 @@ bool HostMissionCar(void *vehicle, bool &hostedNow, const char *&why) {
 		why = "it is a wreck";
 		return false;
 	}
+	// Marked no longer needed since: the session has heard it is traffic now
+	// (game/missionclear.h), and it is not made the mission's again.
+	if (Field<uint8_t>(vehicle, offs::VEH_CREATED_BY) != VEHICLE_CREATED_BY_MISSION) {
+		why = "the mission has let go of it";
+		return false;
+	}
 	const Hosting h = HostCar(vehicle, true);
 	if (h != Hosting::Hosted && h != Hosting::Already) {
 		why = HostingWhy(h);
@@ -2506,13 +2855,16 @@ void KeepMissionEntitiesHosted(uint32_t nowMs) {
 			ForgetMissionEntityAt(i);   // gone from its pool: the sweep said so
 			continue;
 		}
-		bool hosted = false;
+		// On the session under another name counts: a car somebody claimed
+		// since is a session car, and hosting it again would be a second one.
+		bool     hosted  = false;
+		uint16_t already = INVALID_NETID;
 		if (m.car) {
 			bool named = false;
-			hosted     = HostedCarFor(m.entity, named);
+			hosted     = HostedCarFor(m.entity, named) || SessionAlreadyHasCar(m.entity, already);
 		} else {
 			bool named = false;
-			hosted     = HostedPedFor(m.entity, named);
+			hosted     = HostedPedFor(m.entity, named) || PedOnSessionAlready(m.entity, already);
 		}
 		// Somebody at the wheel is the claim path's; a wreck or a corpse
 		// would come back to the others whole.
@@ -3326,6 +3678,10 @@ void ApplyAmbientPedState(RemoteAmbientPed &ped, const Pose &at) {
 	if (ReplicaAnimNeedsBlend(mem, ped.animId, ped.appliedAnimId) &&
 	    BlendReplicaAnim(mem, ped.animId))
 		ped.appliedAnimId = ped.animId;
+
+	// And the talk or wait-state overlay his host says he is playing, on top of it
+	// (C_PedOverlay). Every frame: it only blends when it is not live already.
+	ApplyReplicaOverlay(mem, ped.overlayId, ped.appliedOverlayId);
 }
 
 // A pedestrian on fire, on a screen that isn't his host's.
@@ -3762,6 +4118,10 @@ void RestartHostedNames() {
 	g_bornCarCount = 0;
 	g_lostCarCount = 0;
 	g_letGoCount   = 0;
+	g_fadedCount   = 0;
+	g_releaseCount = 0;
+	g_missionOver  = false;
+	g_finalDue     = false;
 	g_deathCount   = 0;
 	g_limbCount    = 0;
 	UnownedBlast stale[8];
@@ -3842,6 +4202,10 @@ void RemovePopulationHooks() {
 	g_bornCarCount = 0;
 	g_lostCarCount = 0;
 	g_letGoCount   = 0;
+	g_fadedCount   = 0;
+	g_releaseCount = 0;
+	g_missionOver  = false;
+	g_finalDue     = false;
 	g_viewerCount  = 0;
 }
 
@@ -4276,6 +4640,11 @@ bool AdoptAmbientCop(RemoteAmbientPed &ped) {
 		    !HasModelLoaded(PedModelForCopType(copType)) ||
 		    Field<uint8_t>(car, offs::VEH_CREATED_BY) != VEHICLE_CREATED_BY_RANDOM)
 			return false;
+		// Not under a jack or our player's own way into that car, whose
+		// callbacks would seat him over the new cop.
+		void *const me = PlayerPed();
+		if (PullOutOf(mem) != PULL_NONE || (me && Field<void *>(me, offs::PED_MY_VEHICLE) == car))
+			return false;
 
 		UnseatAmbientPed(ped);
 		DespawnAmbientReplica(ped);
@@ -4283,6 +4652,9 @@ bool AdoptAmbientCop(RemoteAmbientPed &ped) {
 		                           : offs::VEH_PASSENGERS + 4u * static_cast<size_t>(seat);
 		if (Field<void *>(car, at) != nullptr)
 			return false;   // somebody else is in the seat now; the row is let go of
+		// AddPed goes on with a null when the pool is full (0x004F53A2).
+		if (!PedPoolHasRoom())
+			return false;
 		ReplicaScope scope;
 		cop = seat < 0 ? Func<SetUpFn>(CVehicle__SetUpDriver)(car)
 		               : Func<SetUpPassFn>(CVehicle__SetupPassenger)(car, seat);
@@ -4489,6 +4861,7 @@ void AddPopulationToBridge(WorldBridge &bridge) {
 	// one on its own.
 	if (g_bodyPartDetour.IsInstalled()) {
 		bridge.DrainAmbientBodyParts = &DrainAmbientBodyParts;
+		bridge.DrainAmbientOverlays  = &DrainAmbientOverlays;
 		bridge.RemoveAmbientBodyPart = &RemoveAmbientBodyPart;
 		bridge.RemovePlayerBodyPart  = &RemovePlayerBodyPart;
 	}
@@ -4523,6 +4896,11 @@ void AddPopulationToBridge(WorldBridge &bridge) {
 	// reaper's calls not taken this simply stays empty.
 	bridge.DrainLetGoAmbientCars    = &DrainLetGoAmbientCars;
 	bridge.DrainLetGoAmbientPeds    = &DrainLetGoAmbientPeds;
+	// And what it gives up on with nobody to take it, faded rather than popped
+	// on every other screen (game/crowdfade.h).
+	bridge.DrainFadedAmbient        = &DrainFadedAmbient;
+	// And what our own mission lets go of (game/missionclear.h).
+	bridge.DrainMissionRelease      = &DrainMissionRelease;
 	bridge.NoteRemoteViewers        = &NoteRemoteViewers;
 	bridge.NameLocalAmbientCar      = &NameLocalAmbientCar;
 	bridge.SpawnAmbientCarReplica   = &SpawnAmbientCarReplicaCounted;
@@ -4535,6 +4913,7 @@ void AddPopulationToBridge(WorldBridge &bridge) {
 	// game/vehicle.cpp, because the roster half of the promotion is the
 	// ambient roster and this is where that roster's seam is installed.
 	bridge.LocalDrivesAmbientCar    = &LocalDrivesAmbientCar;
+	bridge.LocalAboardAmbientCar    = &LocalAboardAmbientCar;
 	bridge.AdoptPromotedCar         = &AdoptPromotedCarHere;
 	bridge.HostedCarHandle          = &HostedCarHandle;
 	bridge.HostedCarNetId           = &HostedCarNetId;

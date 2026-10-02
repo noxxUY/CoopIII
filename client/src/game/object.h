@@ -427,6 +427,11 @@ struct KnownObjects {
 
 void SetObjectCallbacks(const ObjectCallbacks &callbacks);
 
+// Puts a map object in the ring above from outside this file: a window
+// shattered here or off the wire (game/glass.h), so that building it again
+// asks the session the way a lamp post does.
+void RememberObject(const ObjectIdent &ident);
+
 // One of the session's mission's own objects broke here (mission-audit.md
 // R3), which the map's identity cannot name: game/mission.cpp names it by
 // the global that holds it. `ours` when this machine's own player, car or

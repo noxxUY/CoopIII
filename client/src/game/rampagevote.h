@@ -313,7 +313,13 @@ void TickRampageVote();
 // dead, being arrested, in a cutscene, or already on the way somewhere.
 // MovePlayerBeside is false, doing nothing, when it can't.
 bool MayMovePlayer();
-bool MovePlayerBeside(const Vec3 &pos, uint8_t targetId, uint8_t slot, uint8_t count);
+bool MovePlayerBeside(const Vec3 &pos, uint8_t targetId, uint8_t slot, uint8_t count,
+                      const char *tag = "missions");
+
+// What DecideTeleport is given about our own player now, and whether a move
+// is under way. For TPTO (game/tpto.h), which says why it will not go.
+TeleportFacts ReadTeleportFacts();
+bool          MoveInProgress();
 
 // Our copy of the car another player sits in, by his ped here or, while that
 // is being built, by the seat the session gave him; null on foot, for our own

@@ -205,6 +205,8 @@ void TestWhatIsOutOfRange() {
 	Check(Code(0x021B).Int(5).Int(-1).InRange() && !Code(0x021B).Int(-1).Int(-1).InRange(),
 	      "SET_TARGET_CAR_FOR_MISSION_GARAGE: no car is fine, no garage is not");
 	Check(!Code(0x024C).Int(50).Text("AM4_1A").InRange(), "SET_PHONE_MESSAGE past the fifty phones");
+	Check(Code(0x024E).Int(49).InRange() && !Code(0x024E).Int(50).InRange() && !Code(0x024E).Int(-1).InRange(),
+	      "TURN_PHONE_OFF inside the fifty phones");
 	Check(Code(0x023C).Int(4).Text("eight").InRange() && !Code(0x023C).Int(5).Text("eight").InRange() &&
 	          !Code(0x023C).Int(0).Text("eight").InRange(),
 	      "LOAD_SPECIAL_CHARACTER in slots 1 to 4");

@@ -132,6 +132,18 @@ constexpr uint32_t SHOWN_CORONA_ID = 0xC0000000u;
 // restart (0x00444A3F) call for a z at or below -100, two pushes, `fstp`,
 // two pops.
 constexpr uintptr_t CWorld__FindGroundZForCoord = 0x004B3A80;
+
+// CLEAR_AREA's handler calls CWorld::ClearExcitingStuffFromArea (0x004B4E70)
+// at 0x0044D8DD, and its car loop skips a locked car before it asks
+// CVehicle::CanBeDeleted: `mov al,[ebp+1F5h] / shr al,3 / and al,1 / jne`
+// at 0x004B4FAF, the call to 0x005511B0 at 0x004B4FC4. So a session car
+// locked for the length of the instruction stays in the world
+// (game/mission.cpp, SessionCarsLocked), whatever else the clear takes.
+constexpr uintptr_t CLEAR_AREA_CLEAR_CALL       = 0x0044D8DD;
+constexpr uintptr_t CWorld__ClearExcitingStuff  = 0x004B4E70;
+constexpr uintptr_t CLEAR_SKIPS_LOCKED_CAR      = 0x004B4FAF;
+constexpr uintptr_t CLEAR_CAN_BE_DELETED_CALL   = 0x004B4FC4;
+constexpr uintptr_t CVehicle__CanBeDeleted      = 0x005511B0;
 using FindGroundZFn = float(__cdecl *)(float x, float y);
 
 } // namespace coopiii::game::world

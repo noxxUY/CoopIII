@@ -27,6 +27,10 @@
 // engine's own car (HandCopyToEngine), which is what a stored car is, and the
 // session lets go of it.
 //
+// **A crane that takes a car is the holder's**, and game/crane.h makes the
+// holder settle the car while its crane has it and every other machine's
+// crane follow that one (docs/protocol.md 1.62).
+//
 // **Craig's lists and the crane's were already the session's** (C_CarLists,
 // protocol 63). With one engine delivering, the model is paid for once, to
 // the player who brought it, and the change to the list goes out as any does.
@@ -57,6 +61,20 @@ void CarRemovalAfterGarageUpdate(void *garage, uint8_t stateBefore);
 // rebuilt. Asked by ResolveRemoteVehicle between the engine doing it and
 // Client marking the row.
 bool EngineTookCarAway(uint16_t netId);
+
+// For the cranes (game/crane.h), from this frame's roster: the session car
+// this machine has for `netId`, or null; the netId of a car, INVALID_NETID
+// when it is no session car of this machine's; and whether our engine may
+// take it, which is what keeps every other machine's crusher and crane off it.
+void    *SessionCarHere(uint16_t netId);
+uint16_t SessionNetIdHere(void *vehicle);
+bool     EngineMayTakeCar(void *vehicle);
+
+// A session car the owner's mission takes away on purpose (game/mission.cpp:
+// its CLEAR_AREA, its DELETE_CAR): noted as one this engine took, so nothing
+// rebuilds it and the session hears of it (C_VehicleRemoved). The caller
+// deletes it, after everybody is out of it.
+void NoteCarTakenAway(uint16_t netId, uint8_t reason);
 
 // A car the automobile constructor locked because of its model (police,
 // Enforcer, Rhino: CARLOCK_LOCKED_INITIALLY). The engine only unlocks it when

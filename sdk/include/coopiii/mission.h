@@ -28,6 +28,9 @@ struct MissionPresence {
 	// Their game is in a mission of its own, a new game's intro say: nowhere,
 	// whatever havePos says (docs/missions.md 11.6).
 	bool    busy     = false;
+	// Sitting in a car, whatever the seat. A story start waits for them to get
+	// out: the opening would otherwise run with them still in it.
+	bool    inCar    = false;
 };
 
 inline uint8_t PlayerBit(uint8_t playerId) {
@@ -92,12 +95,12 @@ inline MissionArea MissionAreaAround(const Vec3 &owner) {
 inline float MarginMetres(uint16_t marginCm) { return static_cast<float>(marginCm) / 100.0f; }
 
 // How far from a mission's start a player still counts as at it when it
-// launches: 50 m outside the start's area (docs/missions.md 5.6,
-// protocol.md 1.55). A friend in his own car across the street, or on foot
-// round the corner from the door, is in; one a block away is waited for. It
-// is the start's only: a checkpoint keeps the session's margin. A server
-// margin wider than this wins.
-constexpr float MISSION_START_RADIUS_M = 50.0f;
+// launches: 5 m outside the start's area (docs/missions.md 5.6,
+// protocol.md 1.55; 50 m, then 30 m, until 2026-10-01). A friend standing
+// by the marker is in; one across the street, or one still in a car at a
+// story start (missionslot.cpp), is waited for. The server's own margin,
+// 5 m by default, is the same number, and a wider one wins.
+constexpr float MISSION_START_RADIUS_M = 5.0f;
 
 inline float StartMarginMetres(uint16_t marginCm) {
 	const float m = MarginMetres(marginCm);

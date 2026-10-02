@@ -1,6 +1,7 @@
 #include "missionsync.h"
 
 #include "log.h"
+#include "sideprogress.h"
 
 #include <coopiii/net.h>
 
@@ -375,6 +376,22 @@ bool MissionSync::GarageHasCarElsewhere(uint8_t garage) const {
 		if ((m_participants & PlayerBit(id)) != 0 && (m_garageHasCar[id] & (1u << garage)) != 0)
 			return true;
 	return false;
+}
+
+void MissionSync::CarDeliveredElsewhere(uint8_t playerId, uint8_t garage, uint8_t localPlayerId) {
+	if (!m_serverShares || m_state != MISSION_STATE_RUNNING || m_owner != localPlayerId ||
+	    playerId == localPlayerId || playerId >= MAX_PLAYERS || garage >= MISSION_GARAGES ||
+	    (m_participants & PlayerBit(playerId)) == 0)
+		return;
+	m_garageHasCar[playerId] |= 1u << garage;
+	Log("missions: %s's garage %u took %s's car; our garage question hears it before the car "
+	    "goes from here",
+	    NickOf(playerId), static_cast<unsigned>(garage), MissionName(m_number));
+}
+
+bool MissionSync::ResprayElsewhere(uint8_t garage) const {
+	return garage < MISSION_GARAGES && m_state == MISSION_STATE_RUNNING &&
+	       (m_garageResprays & (1u << garage)) != 0;
 }
 
 bool MissionSync::TakeResprayElsewhere(uint8_t garage) {
@@ -1093,6 +1110,10 @@ void MissionSync::SettleCampaign() {
 	// is written: writing one could set the latches another is judged by.
 	size_t partsEnd  = 0;
 	bool   ownPassed = false;
+	// A side job's delta keeps this game's own progress (sideprogress.h):
+	// whether it is one, and whether its progress points count here.
+	bool           sideRules = false, sideProgress = true;
+	const uint32_t sideKeptBefore = m_sideKept;
 	size_t settled   = m_log.size();
 	for (size_t i = from; i < m_log.size(); ++i) {
 		const CampaignEntry &e = m_log[i];
@@ -1109,6 +1130,9 @@ void MissionSync::SettleCampaign() {
 			}
 			partsEnd  = end + 1;
 			ownPassed = PassedHere(start, end, hash);
+			sideRules = hash == sideprogress::RETAIL_SCRIPT_HASH &&
+			            sideprogress::IsSideJob(e.body.missionNumber);
+			sideProgress = !sideRules || SideProgressHere(start, end, hash);
 			if (ownPassed) {
 				++passed;
 				Log("missions: %s's %s is one this game's own save has passed already; it is left "
@@ -1119,7 +1143,28 @@ void MissionSync::SettleCampaign() {
 		}
 		if (ownPassed)
 			continue;
-		if (!m_bridge->ApplyCampaign(e.body)) {
+		const CampaignDeltaBody *apply = &e.body;
+		CampaignDeltaBody        kept;
+		if (sideRules) {
+			if (!sideProgress && sideprogress::IsProgressOp(e.body.op, e.body.opLength)) {
+				++m_sideKept;
+				continue;
+			}
+			kept            = e.body;
+			kept.valueCount = 0;
+			for (uint8_t v = 0; v < e.body.valueCount && v < CAMPAIGN_VALUES; ++v) {
+				const CampaignValue &cv   = e.body.values[v];
+				int32_t              here = 0;
+				if (m_bridge->ReadGlobal(cv.offset, &here) &&
+				    !sideprogress::ValueGoes(cv.offset, here, cv.value)) {
+					++m_sideKept;
+					continue;
+				}
+				kept.values[kept.valueCount++] = cv;
+			}
+			apply = &kept;
+		}
+		if (!m_bridge->ApplyCampaign(*apply)) {
 			++failed;
 			continue;
 		}
@@ -1145,6 +1190,10 @@ void MissionSync::SettleCampaign() {
 		        missions == 1 ? "" : "s");
 	m_campaignKeptOwn += passed;
 	m_settled = settled;
+	if (m_sideKept != sideKeptBefore)
+		Log("missions: a side job's delta left %u of this game's own counts, records and "
+		    "progress points as they were: this save was further on",
+		    static_cast<unsigned>(m_sideKept - sideKeptBefore));
 }
 
 // The parts of one mission's delta are in the log one after another, the one
@@ -1203,6 +1252,30 @@ bool MissionSync::PassedHere(size_t start, size_t end, uint32_t hash) const {
 		}
 	}
 	return latches != 0;
+}
+
+// A side job's progress points count here when its delta carries none of the
+// job's reward flags, or one of them moves this game on (sideprogress.h): a
+// save that already has the bribe, the flamethrower or the Borgnine taxi is
+// not given the point for it again.
+bool MissionSync::SideProgressHere(size_t start, size_t end, uint32_t hash) const {
+	bool seen = false;
+	for (size_t k = start; k <= end; ++k) {
+		const CampaignDeltaBody &b = m_log[k].body;
+		if (b.scriptHash != hash)
+			continue;
+		for (uint8_t v = 0; v < b.valueCount && v < CAMPAIGN_VALUES; ++v) {
+			const sideprogress::Global *g = sideprogress::Find(b.values[v].offset);
+			if (g == nullptr || !g->reward)
+				continue;
+			seen         = true;
+			int32_t here = 0;
+			if (m_bridge->ReadGlobal(b.values[v].offset, &here) &&
+			    sideprogress::Takes(g->rule, here, b.values[v].value))
+				return true;
+		}
+	}
+	return !seen;
 }
 
 void MissionSync::OnCarLists(const S_CarLists &pkt) {

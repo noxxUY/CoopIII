@@ -255,6 +255,9 @@ constexpr int32_t REMOVE_PICKUP                          = 0x0215;
 constexpr int32_t CREATE_MONEY_PICKUP                    = 0x02E1;
 constexpr int32_t CREATE_PICKUP_WITH_AMMO                = 0x032B;
 constexpr int32_t CREATE_FLOATING_PACKAGE                = 0x035B;
+// A car blown up by the script (0x00442DE4, one operand: GetAt, then
+// BlowUpCar(null) through the vtable at 0x00442E08).
+constexpr int32_t EXPLODE_CAR                            = 0x020B;
 // An enemy made tougher (docs/missions.md 10.2).
 constexpr int32_t SET_CHAR_HEALTH                        = 0x0223;
 constexpr int32_t ADD_ARMOUR_TO_CHAR                     = 0x035F;
@@ -279,6 +282,11 @@ constexpr int32_t DONT_REMOVE_CAR                        = 0x01C6;
 // (+0x314) and m_pMyVehicle (+0x310) against the vehicle pool's GetAt of the
 // second operand.
 constexpr int32_t IS_PLAYER_IN_CAR                       = 0x00DC;
+// SET_CHAR_OBJ_LEAVE_CAR char car: the ped's objective to get out of the car.
+// Deal Steal and Shima give it to the owner's own ped (GET_PLAYER_CHAR) at the
+// casino and then wait on IS_PLAYER_IN_CAR (standin.h, the car the owner was
+// walked out of).
+constexpr int32_t SET_CHAR_OBJ_LEAVE_CAR                 = 0x01D3;
 // Takes an object off the mission's cleanup list (0x004418BE: GetAt on the
 // object pool, then CMissionCleanup::RemoveEntityFromList on 0x008F2A24 with
 // type 3): the object stays in the world after the mission.

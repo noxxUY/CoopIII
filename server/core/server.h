@@ -11,12 +11,14 @@
 #pragma once
 
 #include "config.h"
+#include "cranes.h"
 #include "cutscenevote.h"
 #include "objectrecords.h"
 #include "progress.h"
 #include "rampagevote.h"
 #include "lobby.h"
 #include "session.h"
+#include "skinrelay.h"
 #include "stuntcam.h"
 
 #include "coopiii/net.h"
@@ -206,6 +208,8 @@ public:
 		m_configured                 = true;
 		const uint8_t  flagsBefore   = SessionFlagsNow();
 		const uint8_t  wantedBefore  = m_maxWanted;
+		const uint8_t  coopBefore    = m_coopCheats;
+		const bool     skinsBefore   = m_syncSkins;
 		const S_MissionState missionBefore = m_session.Mission().State();
 
 		if (first || c.password != m_password)
@@ -217,6 +221,10 @@ public:
 		m_session.SetCheatRule(WireValue(c.cheats));
 		m_session.SetPackageRule(WireValue(c.hiddenPackages));
 		m_maxWanted = SaneMaxWanted(c.maxWanted);
+		m_coopCheats = SaneCoopCheatRule(WireValue(c.coopCheats));
+		m_syncSkins  = c.syncCustomSkins;
+		if (!m_syncSkins)
+			m_skins.Forget();
 
 		const uint8_t rampage = WireValue(c.rampage);
 		m_pendingRampageRule  = INVALID_RULE;
@@ -297,13 +305,22 @@ public:
 		const S_MissionState missionAfter = m_session.Mission().State();
 		if (m_listening && std::memcmp(&missionBefore, &missionAfter, sizeof missionAfter) != 0)
 			BroadcastMissionState();
-		if (m_listening && (SessionFlagsNow() != flagsBefore || m_maxWanted != wantedBefore))
+		if (m_listening && (SessionFlagsNow() != flagsBefore || m_maxWanted != wantedBefore ||
+		                    m_coopCheats != coopBefore || m_syncSkins != skinsBefore))
 			BroadcastSessionRules();
+		if (m_syncSkins != skinsBefore)
+			Log(LogKind::Info, "skins: %s", m_syncSkins ? "everybody's custom skin is sent again"
+			                                            : "custom skins are no longer sent; "
+			                                              "everybody wears the default skin");
 	}
 
 	// For the window's player count and a test.
 	uint8_t PlayerLimit() const { return m_session.PlayerLimit(); }
 	uint8_t MaxWanted() const { return m_maxWanted; }
+	uint8_t CoopCheats() const { return m_coopCheats; }
+	// syncCustomSkins, and the skin the server holds for a player, or null.
+	bool            SyncsSkins() const { return m_syncSkins; }
+	const SkinInfo *SkinOf(uint8_t playerId) const { return m_skins.Held(playerId); }
 	// What every player's car generators are seeded from (S_ParkedSeed).
 	uint32_t ParkedSeed() const { return m_parkedSeed; }
 	bool    RampageRulePending() const { return m_pendingRampageRule != INVALID_RULE; }
@@ -398,6 +415,7 @@ public:
 		m_net.Service(m_events, waitMs);
 		for (const ServerEvent &ev : m_events)
 			Handle(ev);
+		SendSkinPieces(NowMs());
 
 		// A hello whose password never came. An older client, or one with
 		// nothing in its ini. On a clock read after the service above, which
@@ -556,12 +574,16 @@ private:
 		m_session.RemovePeer(peer);
 		m_net.SetMember(peer, false);
 		m_net.Broadcast(out, CH_EVENT, peer);
+		// Their skin goes with them, and whatever was still being sent.
+		m_skins.Left(out.playerId);
 		// A vote they started is off; one they were voting in is recounted
 		// without them.
 		TickRampageVote(NowMs());
 		// And so is the cutscene they were in.
 		m_cutscenes.Leave(out.playerId);
 		FlushCutsceneVotes(NowMs());
+		// And any crane they were working.
+		EndCranesOf(out.playerId);
 		// After the leave, so every machine has them gone before it hears the
 		// mission end or lose a participant.
 		if (missionMoved) {
@@ -625,6 +647,10 @@ private:
 		case OP_C_PLAYER_LOOK:
 			if (const auto *pkt = msg.as<C_PlayerLook>())
 				OnPlayerLook(peer, *pkt);
+			break;
+		case OP_C_PLAYER_SKIN:
+			if (const auto *pkt = msg.as<C_PlayerSkin>())
+				OnPlayerSkin(peer, *pkt);
 			break;
 		case OP_C_PLAYER_AWAY:
 			if (const auto *pkt = msg.as<C_PlayerAway>())
@@ -729,6 +755,10 @@ private:
 		case OP_C_CAR_HIT:
 			if (const auto *pkt = msg.as<C_CarHit>())
 				OnCarHit(peer, *pkt);
+			break;
+		case OP_C_VEHICLE_BUMP:
+			if (const auto *pkt = msg.as<C_VehicleBump>())
+				OnVehicleBump(peer, *pkt);
 			break;
 		case OP_C_WORLD_STATE:
 			if (const auto *pkt = msg.as<C_WorldState>())
@@ -838,6 +868,10 @@ private:
 			if (const auto *pkt = msg.as<C_PedBodyPart>())
 				OnPedBodyPart(peer, *pkt);
 			break;
+		case OP_C_PED_OVERLAY:
+			if (const auto *pkt = msg.as<C_PedOverlay>())
+				OnPedOverlay(peer, *pkt);
+			break;
 		case OP_C_PED_DEATH:
 			if (const auto *pkt = msg.as<C_PedDeath>())
 				OnPedDeath(peer, *pkt);
@@ -873,6 +907,18 @@ private:
 		case OP_C_PED_LET_GO:
 			if (const auto *pkt = msg.as<C_PedLetGo>())
 				OnPedLetGo(peer, *pkt);
+			break;
+		case OP_C_MISSION_RELEASE:
+			if (const auto *pkt = msg.as<C_MissionRelease>())
+				OnMissionRelease(peer, *pkt);
+			break;
+		case OP_C_CROWD_GONE:
+			if (const auto *pkt = msg.as<C_CrowdGone>())
+				OnCrowdGone(peer, *pkt);
+			break;
+		case OP_C_PLAYER_VIEW:
+			if (const auto *pkt = msg.as<C_PlayerView>())
+				OnPlayerView(peer, *pkt);
 			break;
 		case OP_C_COP_HANDOVER:
 			if (const auto *pkt = msg.as<C_CopHandover>())
@@ -966,6 +1012,10 @@ private:
 			if (const auto *pkt = msg.as<C_ObjectRebuilt>())
 				OnObjectRebuilt(peer, *pkt);
 			break;
+		case OP_C_GLASS_BROKEN:
+			if (const auto *pkt = msg.as<C_GlassBroken>())
+				OnGlassBroken(peer, *pkt);
+			break;
 		case OP_C_GATE_STATE:
 			if (const auto *pkt = msg.as<C_GateState>())
 				OnGateState(peer, *pkt);
@@ -1005,6 +1055,10 @@ private:
 		case OP_C_STUNT_CAMERA:
 			if (const auto *pkt = msg.as<C_StuntCamera>())
 				OnStuntCamera(peer, *pkt);
+			break;
+		case OP_C_CRANE_STATE:
+			if (const auto *pkt = msg.as<C_CraneState>())
+				OnCraneState(peer, *pkt);
 			break;
 		case OP_C_MONEY_CHANGE:
 			if (const auto *pkt = msg.as<C_MoneyChange>())
@@ -1108,6 +1162,26 @@ private:
 			return;
 
 		S_PedBodyPart out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.body = in.body;
+		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// What one of the sender's own pedestrians is playing as a talk or wait-state
+	// overlay (protocol.h, C_PedOverlay). Relayed and not kept: the host restates
+	// it while it holds. Only the ped's owner may say it, and only the ids
+	// CPed::SetWaitState plays, because the observer hands the id to the blender.
+	void OnPedOverlay(PeerId peer, const C_PedOverlay &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const AmbientPed *ped = m_session.FindPed(in.body.netId);
+		if (!ped || ped->ownerPlayerId != p->id)
+			return;
+		if (in.body.animId != ANIM_NONE && !IsPedOverlayAnim(in.body.animId))
+			return;
+
+		S_PedOverlay out;
 		InitHeader(out, in.hdr.sendTimeMs);
 		out.body = in.body;
 		m_net.Broadcast(out, CH_EVENT, peer);
@@ -1314,6 +1388,9 @@ private:
 
 		size_t goneP = 0, goneC = 0, keptP = 0, keptC = 0;
 		size_t perP[MAX_PLAYERS] = {}, perC[MAX_PLAYERS] = {};
+		// What nobody keeps goes as S_CrowdGone: a copy of the leaver's crowd
+		// on somebody's screen fades out rather than vanishing in front of him.
+		std::vector<CrowdGoneRow> gone;
 		for (const AdoptVerdict &v : verdicts) {
 			const bool car = v.kind == AMBIENT_ADOPT_CAR;
 			if (v.adopter != INVALID_PLAYER) {
@@ -1326,20 +1403,13 @@ private:
 					++per[v.adopter];
 				continue;
 			}
-			if (car) {
+			if (car)
 				++goneC;
-				S_CarDespawn out;
-				InitHeader(out, now);
-				out.netId = v.netId;
-				m_net.Broadcast(out, CH_EVENT);
-			} else {
+			else
 				++goneP;
-				S_PedDespawn out;
-				InitHeader(out, now);
-				out.netId = v.netId;
-				m_net.Broadcast(out, CH_EVENT);
-			}
+			gone.push_back(CrowdGoneRow{v.netId, v.kind, 0});
 		}
+		BroadcastCrowdGone(gone, now);
 
 		for (const std::vector<AmbientAdoptRow> &batch : PackAdoptRows(verdicts)) {
 			S_AmbientAdopt out{};
@@ -1385,6 +1455,8 @@ private:
 		uint8_t adopter = INVALID_PLAYER;
 		size_t  keptP = 0, goneP = 0;
 		bool    carKept = false, carGone = false;
+		// Nobody to take it: gone, as S_CrowdGone, faded where it is seen.
+		std::vector<CrowdGoneRow> gone;
 		for (const AdoptVerdict &v : verdicts) {
 			const bool car = v.kind == AMBIENT_ADOPT_CAR;
 			if (v.adopter != INVALID_PLAYER) {
@@ -1425,20 +1497,13 @@ private:
 				}
 				continue;
 			}
-			if (car) {
+			if (car)
 				carGone = true;
-				S_CarDespawn out;
-				InitHeader(out, now);
-				out.netId = v.netId;
-				m_net.Broadcast(out, CH_EVENT, peer);
-			} else {
+			else
 				++goneP;
-				S_PedDespawn out;
-				InitHeader(out, now);
-				out.netId = v.netId;
-				m_net.Broadcast(out, CH_EVENT, peer);
-			}
+			gone.push_back(CrowdGoneRow{v.netId, v.kind, 0});
 		}
+		BroadcastCrowdGone(gone, now, peer);
 
 		for (const std::vector<AmbientAdoptRow> &batch : PackAdoptRows(verdicts)) {
 			S_AmbientAdopt out{};
@@ -1476,6 +1541,7 @@ private:
 		const size_t   n   = in.count < MAX_PED_LET_GO ? in.count : MAX_PED_LET_GO;
 		const std::vector<AdoptVerdict> verdicts = m_session.LetGoPeds(in.peds, n, p->id, now);
 
+		std::vector<CrowdGoneRow> gone;
 		for (const AdoptVerdict &v : verdicts) {
 			if (v.adopter != INVALID_PLAYER) {
 				++m_pedLetGoKept;
@@ -1492,11 +1558,10 @@ private:
 				continue;
 			}
 			++m_pedLetGoGone;
-			S_PedDespawn out;
-			InitHeader(out, now);
-			out.netId = v.netId;
-			m_net.Broadcast(out, CH_EVENT, peer);
+			gone.push_back(CrowdGoneRow{v.netId, AMBIENT_ADOPT_PED, 0});
 		}
+		// Nobody to take them: gone, faded on any screen they stand on.
+		BroadcastCrowdGone(gone, now, peer);
 
 		for (const std::vector<AmbientAdoptRow> &batch : PackAdoptRows(verdicts)) {
 			S_AmbientAdopt out{};
@@ -1536,6 +1601,7 @@ private:
 		    m_session.HandCopsTo(in.carNetId, in.peds, n, p->id, in.toPlayerId);
 
 		size_t kept = 0, gone = 0;
+		std::vector<CrowdGoneRow> goneRows;
 		for (const AdoptVerdict &v : verdicts) {
 			const bool car = v.kind == AMBIENT_ADOPT_CAR;
 			if (v.adopter != INVALID_PLAYER) {
@@ -1575,18 +1641,11 @@ private:
 				continue;
 			}
 			++gone;
-			if (car) {
-				S_CarDespawn out;
-				InitHeader(out, now);
-				out.netId = v.netId;
-				m_net.Broadcast(out, CH_EVENT, peer);
-			} else {
-				S_PedDespawn out;
-				InitHeader(out, now);
-				out.netId = v.netId;
-				m_net.Broadcast(out, CH_EVENT, peer);
-			}
+			goneRows.push_back(CrowdGoneRow{v.netId, v.kind, 0});
 		}
+		// A group nobody could take: its host's engine has it gone already,
+		// and the wanted player it was meant for is beside it, so it fades.
+		BroadcastCrowdGone(goneRows, now, peer);
 
 		for (const std::vector<AmbientAdoptRow> &batch : PackAdoptRows(verdicts)) {
 			S_AmbientAdopt out{};
@@ -1723,6 +1782,89 @@ private:
 		InitHeader(out, in.hdr.sendTimeMs);
 		out.netId = in.netId;
 		m_net.Broadcast(out, CH_EVENT, peer);
+	}
+
+	// What the sender's mission lets go of (protocol.h, C_MissionRelease):
+	// released rows become the sender's ordinary crowd, and after its mission
+	// ended whatever of it the sender no longer holds goes. Everybody else is
+	// told, sixteen rows a packet.
+	void OnMissionRelease(PeerId peer, const C_MissionRelease &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const uint8_t n = in.count < MAX_MISSION_RELEASE ? in.count : MAX_MISSION_RELEASE;
+		const std::vector<MissionReleaseRow> rows =
+		    m_session.ReleaseMissionEntities(p->id, in.rows, n, in.final != 0);
+		size_t gone = 0;
+		for (const MissionReleaseRow &r : rows)
+			gone += r.gone != 0 ? 1 : 0;
+		if (rows.size() != gone)
+			Log(LogKind::Detail, "%s's mission let go of %zu of its pedestrians and cars; they "
+			    "are ordinary crowd now", p->nick.c_str(), rows.size() - gone);
+		if (gone != 0)
+			Log(LogKind::Detail, "%s's mission is over and %zu of what it made is held by nobody; "
+			    "every copy of it goes", p->nick.c_str(), gone);
+		for (size_t at = 0; at < rows.size(); at += MAX_MISSION_RELEASE) {
+			S_MissionRelease out{};
+			InitHeader(out, in.hdr.sendTimeMs);
+			out.ownerPlayerId = p->id;
+			const size_t left = rows.size() - at;
+			out.count = static_cast<uint8_t>(left < MAX_MISSION_RELEASE ? left : MAX_MISSION_RELEASE);
+			for (uint8_t i = 0; i < out.count; ++i)
+				out.rows[i] = rows[at + i];
+			m_net.Broadcast(out, CH_EVENT, peer);
+		}
+	}
+
+	// What the sender's engine gave up on for its own player's sake with
+	// nobody near enough to take it over (protocol.h, C_CrowdGone). Each row
+	// is a despawn, taken from its owner only exactly as OnPedDespawn and
+	// OnCarDespawn take one; what was taken goes to everybody else as
+	// S_CrowdGone, so a copy on their screens fades out.
+	void OnCrowdGone(PeerId peer, const C_CrowdGone &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const uint8_t n = in.count < MAX_CROWD_GONE ? in.count : MAX_CROWD_GONE;
+		std::vector<CrowdGoneRow> gone;
+		for (uint8_t i = 0; i < n; ++i) {
+			const CrowdGoneRow &r = in.rows[i];
+			const bool removed = r.kind == AMBIENT_ADOPT_CAR   ? m_session.RemoveCar(r.netId, p->id)
+			                     : r.kind == AMBIENT_ADOPT_PED ? m_session.RemovePed(r.netId, p->id)
+			                                                   : false;
+			if (removed)
+				gone.push_back(CrowdGoneRow{r.netId, r.kind, 0});
+		}
+		BroadcastCrowdGone(gone, NowMs(), peer);
+	}
+
+	// Rows nobody keeps, as S_CrowdGone, sixteen a packet, to everybody but
+	// `except`. Peds and cars may share a packet; a receiver takes the peds
+	// first.
+	void BroadcastCrowdGone(const std::vector<CrowdGoneRow> &rows, uint32_t now,
+	                        PeerId except = INVALID_PEER) {
+		for (size_t at = 0; at < rows.size(); at += MAX_CROWD_GONE) {
+			S_CrowdGone out{};
+			InitHeader(out, now);
+			const size_t left = rows.size() - at;
+			out.count = static_cast<uint8_t>(left < MAX_CROWD_GONE ? left : MAX_CROWD_GONE);
+			for (uint8_t i = 0; i < out.count; ++i)
+				out.rows[i] = rows[at + i];
+			m_net.Broadcast(out, CH_EVENT, except);
+		}
+	}
+
+	// Where a player's camera looks (protocol.h, C_PlayerView), for everybody
+	// else's generators. Relayed when it is sane, never kept.
+	void OnPlayerView(PeerId peer, const C_PlayerView &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p || !PlayerViewSane(in.body))
+			return;
+		S_PlayerView out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.body     = in.body;
+		m_net.Broadcast(out, CH_SNAPSHOT, peer);
 	}
 
 	// Relayed as a whole batch, with the rows the sender does not own taken
@@ -2006,6 +2148,9 @@ private:
 			m_net.SendTo(peer, m_contacts, CH_EVENT);
 		if (m_havePlaces && m_places.hostId == m_session.HostId() && m_places.hostId != p->id)
 			m_net.SendTo(peer, m_places, CH_EVENT);
+		// And everybody's skin, a piece at a time from the next Tick on
+		// (SendSkinPieces), behind everything above.
+		m_skins.Joined(p->id);
 
 		Log(LogKind::Join, "%s joined (slot %u, net %u); backfilled %zu player(s), "
 		            "%zu vehicle(s), %zu seat(s)",
@@ -2046,6 +2191,27 @@ private:
 
 		Log(LogKind::Detail, "%s is wearing '%s'", p->nick.c_str(), p->look);
 		m_net.Broadcast(m_session.MakeLook(*p, in.hdr.sendTimeMs), CH_EVENT, peer);
+	}
+
+	// A piece of their custom skin (skinrelay.h). Kept and sent on only once
+	// the whole skin is here, and not at all with syncCustomSkins off.
+	void OnPlayerSkin(PeerId peer, const C_PlayerSkin &in) {
+		Player *p = m_session.FindByPeer(peer);
+		if (!p || !m_syncSkins)
+			return;
+		const uint32_t rejectedBefore = m_skins.Rejected();
+		if (m_skins.Take(p->id, in)) {
+			const SkinInfo *skin = m_skins.Held(p->id);
+			if (skin && skin->format == SKIN_FORMAT_DEFAULT)
+				Log(LogKind::Detail, "%s wears the default skin", p->nick.c_str());
+			else if (skin)
+				Log(LogKind::Detail, "%s wears the skin '%s' (%ux%u, %u bytes)", p->nick.c_str(),
+				    skin->name, unsigned(skin->width), unsigned(skin->height),
+				    unsigned(skin->bytes));
+		} else if (m_skins.Rejected() != rejectedBefore) {
+			Log(LogKind::Warn, "%s sent a piece of a skin that does not fit; it is thrown away",
+			    p->nick.c_str());
+		}
 	}
 
 	// Their menu went up or down, or their window left the front. Stored for
@@ -2607,6 +2773,27 @@ private:
 			return;
 
 		S_CarHit out;
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.attackerId = attacker->id;
+		out.body       = in.body;
+		m_net.SendTo(owner->peer, out, CH_EVENT);
+	}
+
+	// A ram, sent on to the machine simulating the car that was hit
+	// (docs/protocol.md 1.71). Session::VehicleBumpRecipient decides who, and
+	// whether at all; the numbers in it are bounded by the client about to
+	// put them on a car, the same position OnVehicleHit takes on its amount.
+	void OnVehicleBump(PeerId peer, const C_VehicleBump &in) {
+		const Player *attacker = m_session.FindByPeer(peer);
+		if (!attacker)
+			return;
+
+		const Player *owner = m_session.VehicleBumpRecipient(in.body.netId, in.body.byNetId,
+		                                                     attacker->id, NowMs());
+		if (!owner)
+			return;
+
+		S_VehicleBump out;
 		InitHeader(out, in.hdr.sendTimeMs);
 		out.attackerId = attacker->id;
 		out.body       = in.body;
@@ -3401,6 +3588,29 @@ private:
 			    p->nick.c_str(), MissionName(in.missionHint), who.empty() ? "?" : who.c_str());
 		}
 
+		// Why a start waits, said when the answer changes: who is missing and
+		// whether that is distance, a car seat, no position or a mission of
+		// their own.
+		if (a.verdict == MISSION_CLAIM_WAITING &&
+		    (a.missing != m_claimLoggedMissing || in.launchKey != m_claimLoggedKey)) {
+			for (size_t i = 0; i < n; ++i) {
+				const MissionPresence &q = present[i];
+				if (!(a.missing & PlayerBit(q.playerId)))
+					continue;
+				const Player *m  = m_session.FindById(q.playerId);
+				const float   dx = q.pos.x - in.area.centre.x;
+				const float   dy = q.pos.y - in.area.centre.y;
+				const float   dz = q.pos.z - in.area.centre.z;
+				Log(LogKind::Info,
+				    "%s's start of %s waits for %s: %.1f m from the marker (%.1f m up), %s%s%s",
+				    p->nick.c_str(), MissionName(in.missionHint), m ? m->nick.c_str() : "?",
+				    std::sqrt(dx * dx + dy * dy), dz, q.inCar ? "in a car" : "on foot",
+				    q.havePos ? "" : ", no position", q.busy ? ", in a mission of their own" : "");
+			}
+		}
+		m_claimLoggedMissing = a.verdict == MISSION_CLAIM_WAITING ? a.missing : 0;
+		m_claimLoggedKey     = in.launchKey;
+
 		S_MissionClaim out;
 		InitHeader(out, NowMs());
 		out.launchKey   = in.launchKey;
@@ -3881,10 +4091,25 @@ private:
 		InitHeader(out, NowMs());
 		out.flags     = SessionFlagsNow();
 		out.maxWanted = m_maxWanted;
+		out.coopCheats = m_coopCheats;
+		out.skins      = m_syncSkins ? SKIN_RULE_SYNC : SKIN_RULE_OFF;
 		return out;
 	}
 
 	void BroadcastSessionRules() { m_net.Broadcast(SessionRulesNow(), CH_EVENT); }
+
+	// The skin pieces each player is owed, as fast as its pace allows.
+	void SendSkinPieces(uint32_t now) {
+		if (!m_syncSkins)
+			return;
+		for (const Player &p : m_session.Players()) {
+			if (!p.active)
+				continue;
+			S_PlayerSkin piece;
+			while (m_skins.Next(p.id, now, piece))
+				m_net.SendTo(p.peer, piece, CH_EVENT);
+		}
+	}
 
 	// A rampage, or the vote before one, is running: a change of rampage rule
 	// waits for it.
@@ -4457,6 +4682,27 @@ private:
 		m_objects.NoteBroken(p->id, in.body, NowMs());
 	}
 
+	// A window shattered on somebody's machine. docs/objects.md 10.
+	//
+	// The same job as a break: stamp it, pass it on, and keep it while
+	// anybody is near. Kept as the window's ObjectRecord with OBJ_BREAK_GLASS,
+	// so a joiner and a machine that builds the window again hear of it the
+	// way they hear of a lamp post, through SendObjectRecord. Two machines
+	// may both send one for the same window (each shattered its own); the
+	// second relay is a no-op on every engine, and the record is one row.
+	void OnGlassBroken(PeerId peer, const C_GlassBroken &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+
+		S_GlassBroken out;
+		InitHeader(out, NowMs());
+		out.playerId = p->id;
+		out.body     = in.body;
+		m_net.Broadcast(out, CH_EVENT, peer);
+		m_objects.NoteBroken(p->id, GlassRecordBody(in.body), NowMs());
+	}
+
 	// A machine rebuilt an object it was told was broken: the break and the
 	// resting place again, to it alone. Nothing when the record has gone,
 	// which means nobody has been near it and every copy is pristine.
@@ -4593,6 +4839,43 @@ private:
 			Log(LogKind::Detail, "%s is in a unique jump in vehicle %u; the shot goes to %u "
 			    "riding with him", p->nick.c_str(), static_cast<unsigned>(in.body.netId),
 			    static_cast<unsigned>(to.size()));
+	}
+
+	// ---- the cranes - cranes.h ------------------------------------------------
+	//
+	// From the one machine working a crane to everybody else: where its hook
+	// is while it is busy, on the snapshot channel it came on, and its end on
+	// the reliable one.
+	void OnCraneState(PeerId peer, const C_CraneState &in) {
+		const Player *p = m_session.FindByPeer(peer);
+		if (!p)
+			return;
+		const uint8_t before = m_cranes.WorkerAt(in.body.craneX, in.body.craneY);
+		if (!m_cranes.Accept(p->id, in.body, NowMs()))
+			return;
+		S_CraneState out{};
+		InitHeader(out, in.hdr.sendTimeMs);
+		out.playerId = p->id;
+		out.body     = in.body;
+		m_net.Broadcast(out, in.body.active ? CH_SNAPSHOT : CH_EVENT, peer);
+		if (in.body.active && before != p->id)
+			Log(LogKind::Detail, "%s's crane at %.0f %.0f is working (car %u); everybody "
+			    "else's follows it", p->nick.c_str(), in.body.craneX, in.body.craneY,
+			    static_cast<unsigned>(in.body.netId));
+		else if (!in.body.active)
+			Log(LogKind::Detail, "%s's crane at %.0f %.0f is idle again", p->nick.c_str(),
+			    in.body.craneX, in.body.craneY);
+	}
+
+	// A player who left was working these: everybody goes back to their own.
+	void EndCranesOf(uint8_t playerId) {
+		for (const CraneStateBody &b : m_cranes.Forget(playerId)) {
+			S_CraneState out{};
+			InitHeader(out, NowMs());
+			out.playerId = playerId;
+			out.body     = b;
+			m_net.Broadcast(out, CH_EVENT);
+		}
 	}
 
 	// ---- money - protocol.h, MoneyRule ---------------------------------------
@@ -4920,6 +5203,8 @@ private:
 
 	NetServer                m_net;
 	Session                  m_session;
+	uint8_t                  m_claimLoggedMissing = 0;
+	uint32_t                 m_claimLoggedKey     = 0;
 	// Broken and knocked-over street objects while anybody is near them.
 	ObjectRecords            m_objects;
 	uint32_t                 m_objectsExpiredMs = 0;
@@ -4952,12 +5237,19 @@ private:
 	RampageVote m_vote;
 	// Who is in which cutscene, and who said skip. cutscenevote.h.
 	CutsceneVotes m_cutscenes;
+	// Who works each busy crane. cranes.h.
+	CraneWorkers m_cranes;
 
 	// What Configure set that lives nowhere else. INVALID_RULE is no rampage
 	// rule waiting.
 	static constexpr uint8_t INVALID_RULE = 0xFF;
 	bool                      m_configured         = false;
 	uint8_t                   m_maxWanted          = WANTED_LEVEL_CEILING;
+	// CoopIII's own typed cheats (protocol.h, CoopCheatRule), in S_SessionRules.
+	uint8_t                   m_coopCheats         = COOP_CHEATS_OUTSIDE_MISSIONS;
+	// syncCustomSkins, and the skins it lets through (skinrelay.h).
+	bool                      m_syncSkins          = true;
+	SkinRelay                 m_skins;
 	uint8_t                   m_pendingRampageRule = INVALID_RULE;
 	bool                      m_payHelpers         = true;
 	// Rolled once, when the server is made, and the same for everybody who

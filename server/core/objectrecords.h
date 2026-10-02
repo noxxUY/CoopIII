@@ -52,6 +52,21 @@ inline bool SameObjectIdent(const ObjectIdent &a, const ObjectIdent &b) {
 	return dx * dx + dy * dy + dz * dz <= 0.25f * 0.25f;
 }
 
+// A shattered window, as the record every other broken object keeps: the
+// ident, the amount, and OBJ_BREAK_GLASS for a state. Nothing else of the
+// shatter is kept, because what the record is for is a machine that builds
+// the window again or joins later, and that one is told it is gone, not shown
+// it going (docs/objects.md 10).
+inline ObjectBreakBody GlassRecordBody(const GlassBreakBody &glass) {
+	ObjectBreakBody body{};
+	body.ident            = glass.ident;
+	body.ident.pad0       = 0;
+	body.ident.pad1       = 0;
+	body.amount           = glass.amount == glass.amount ? glass.amount : 0.0f;
+	body.state            = OBJ_BREAK_GLASS;
+	return body;
+}
+
 class ObjectRecords {
 public:
 	const ObjectRecord *Find(const ObjectIdent &ident) const {

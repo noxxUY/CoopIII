@@ -35,7 +35,7 @@
       "id": "coopiii",
       "name": "CoopIII",
       "description": "The co-op mod, its launcher and CoopIII.ini.",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "license": "see LICENSE",
       "required": true,
       "source": "local",

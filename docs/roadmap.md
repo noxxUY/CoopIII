@@ -149,6 +149,10 @@ and §5 are this file's.
 - A parked car somebody takes is gone from its spot on every screen, and the
   crusher, the Portland crane, Craig's garages and the safehouse garages act
   only on the copy of the machine holding the car (§1.44).
+- A crane is worked by the machine holding the car it takes, which settles
+  the car while the crane has it; every other screen follows the hook and the
+  car, and a car crushed on one machine answers `IS_CAR_CRUSHED` on the
+  others (§1.62). Not run in-game.
 - A traffic car its host's engine would drop next to another player is handed
   to that player instead of vanishing (§1.45).
 - Never `STATUS_PLAYER_REMOTE`: it is RC-car mode and it detonates cars
@@ -1094,6 +1098,15 @@ all 23 cheats in retail 1.0 and the argument for each; this is the decision.
   everybody so every car in the city goes up. It is not: that would blow up
   other players' cars with them inside, which is what friendly fire off
   (§5.2) exists to prevent.
+- **CoopIII's own cheats** (decided 2026-09-30, [cheats.md](cheats.md) §7).
+  Typed the same way, matched against the same buffer. The first is
+  TPTO1..TPTO8: beside the player with that number on the Tab list, in your
+  car if you drive one. Their own switch, `coopCheats = outsidemissions |
+  always | off`, default **`outsidemissions`**, because a player who jumps
+  across the map in the middle of a mission's script is one the script may
+  not expect. It travels in `S_SessionRules` (protocol.md §1.61), and each
+  client keeps it: the move is the player's own position, which the server
+  has no business refusing.
 
 ## 6. Rules that keep paying off
 
@@ -1131,6 +1144,22 @@ Learned the hard way this far in; worth not relearning.
   player joining mid-mission, a helper dying with `missionFailOnDeath = off`,
   the owner's connection dropping and coming back, and four cars moved by one
   teleport without touching. All built, all needing a real session.
+- **Cheats in a game with SilentPatch.** SilentPatch III rewrites two rows of
+  `CPad::AddToPCCheatString` (TORTOISE, BOOOOORING's length). The cheat
+  detour used to refuse to install there, so none of the routing ran. It now
+  accepts those two rewrites (and refuses any other) and compares by the
+  table the running code has (`cheats.md` §8). Built and tested against both
+  byte shapes, not yet run in a session with SilentPatch: the sky to the
+  host, the clock and riot for everybody need trying there. TPTO itself is
+  built and tested, not yet run in a game.
+- **A player's car taken by a mission.** The owner's mission teleporting the
+  car the owner rides in (Taking Out The Laundry, started from a guest in
+  the marker while the owner sat in the guest's car) announced that car as a
+  new mission car, and the guest saw his car twice. A session car, a copy of
+  somebody's traffic, a remote player and a copy of somebody's pedestrian
+  are never the mission's now, and a mission car standing on a session car
+  of the same model is never built (`missions.md` §15, "What the mission
+  takes that is already there"). Tested, not run in-game yet.
 - **Missions a helper drives.** A helper driving Lips' car to 8-Ball's,
   delivering to a lock-up, taking a car through a Pay'n'Spray, or driving the
   owner in a car the mission moves or brakes. Until a game has shown these,
@@ -1140,8 +1169,9 @@ Learned the hard way this far in; worth not relearning.
   participant's copy going down answers the owner's check; Deal Steal's and
   Plaster Blaster's stealth checks are answered for every participant; the
   power pills are drawn on everybody's screen and collected by the owner's
-  car only (`mission-audit.md` R7, R13). Built, not run in-game. The RC buggy
-  is checked and not seen, and the crusher crane is still the owner's (R7).
+  car only; the crusher crane is worked by the machine holding the car and
+  followed by everybody else (`mission-audit.md` R7, R13). Built, not run
+  in-game. The RC buggy is checked and not seen.
 - **Free roam features that are built and tested but have seen little of a
   real session**: car damage between players, the car radio, bombs and mines,
   medics and fire trucks, passenger free aim, the scripted gates, the traffic
@@ -1154,6 +1184,14 @@ Learned the hard way this far in; worth not relearning.
 
 ### Known issues
 
+- **The cranes** (`protocol.md` §1.62). Built and not run in-game: the
+  Portland crusher crane lifting a car parked by either player, the hook moving
+  on every screen, and Dead Skunk In The Trunk and The Crook passing when a
+  helper delivers the car. The crusher's own jaws close on the crushing
+  machine only; elsewhere the car is lowered into the open crusher and goes
+  when the removal arrives. A mission owner who never saw the car go up (his
+  copy missing at that moment) hears it gone as dead and fails rather than
+  softlocking.
 - **Alt-tab.** Retail stops its loop only when the D3D device is lost (a
   fullscreen alt-tab); the windowed-mode plugin's autoPause opens the menu
   instead, which the pause policy already runs through. In a session the lost
@@ -1175,25 +1213,51 @@ Learned the hard way this far in; worth not relearning.
 - **The instant replay** is taken for the game starting over when it ends,
   because the frame counter it puts back is the witness for that
   (`addresses-unverified.md`, REFUTED).
-- **Ramming a car another machine simulates.** Its copy is put where its
-  owner says after every frame of physics, so our car bounces off it and it
-  does not move; only a session car nobody holds is taken over by the shove
-  (`protocol.md` §1.21.5). A traffic copy now carries its host's speed into
-  the physics step and no spin of its own (`game/vehicle.h`,
-  `AmbientCopyMoveSpeed`), so the bounce is off a moving car, not a parked
-  one. Moving it would need the hit to go to its owner. Not run in-game yet,
-  and neither is the run-over hold (`protocol.md` §1.59.1).
+- **Ramming a car another machine simulates.** The hit now goes to its owner
+  (`protocol.md` §1.71): what our car's collision did to the copy's speed and
+  spin, and the impulse for the owner's own dents, unless the owner's engine
+  had the same collision. Our copy is left to our engine for a moment after
+  the hit and blended back onto the owner's stream, instead of being put back
+  every frame. A session car nobody holds is still taken over by the shove
+  (§1.21.5). Only a car a player drives sends a bump: traffic hitting a
+  player's car is still each machine's own. Covered by the suites; not run
+  in-game yet - the window, the blend and the 250 ms hold over a real
+  connection are unmeasured - and neither is the run-over hold
+  (`protocol.md` §1.59.1).
+- **The crowd vanishing or appearing in front of a player** when the machine
+  hosting it drives off, dies, goes far or leaves (`protocol.md` §1.73,
+  `population.md` §8). The hand-overs of §1.45 and §1.58 still come first;
+  what nobody can take now fades out on a screen it stands on and goes at
+  once off it, every copy fades in when built, a fresh one made inside our
+  view at close range waits until we look away, and every machine's
+  generators keep out of every player's camera, which is on the wire four
+  times a second. Covered by the suites and checked against the exe; not run
+  in-game. Left over: a pedestrian the engine re-files (`CPed::Teleport`,
+  `WarpPedIntoCar`) is still a despawn and a new one elsewhere, a cop or gang
+  member let go of still is not taken over (it fades), and a claim or a
+  script's clear still takes a copy at once.
+- **Shattered glass** (`protocol.md` §1.74, `objects.md` §10). A shop window
+  shattered on one machine, by a car, a round or a blast, now shatters on every
+  other with the engine's own panes and sound, and a joiner or a player who
+  comes back while somebody is still near sees it gone. A round somebody else
+  fired leaves the one in four that shatters a cracked window to the shooter's
+  roll. Covered by the suites and checked against the exe; not run in-game.
+  Left over: a crack alone (the first round, a soft knock) is not sent, so a
+  window cracked by a collision only one engine ran is whole on the other
+  screen until it shatters. Car glass is the windscreen, already a synced
+  panel.
 - **A co-op kill on a pedestrian another machine hosts** reaches the
   shooter's stats screen only when it counts toward a running rampage
   (`protocol.md` §1.52). Any other such kill is the host's
   `PeopleKilledByOthers` and nobody's own (`rampage.md` §7).
 - **A guest's save ahead of the host's** no longer takes the deltas of story
   missions it had passed (`missions.md` §5.8, the story's latches). Still
-  applied as before, and able to put a guest's own state back: the four RC
-  runs' first pass, a repeat of an odd job or an RC, 4x4 or Mayhem run (a
-  record the guest beat is overwritten with the host's), a failed mission's
-  globals, and deltas the server kept from a build before the latches. Not
-  seen in a game.
+  applied as before, and able to put a guest's own state back: a failed
+  mission's globals, and deltas the server kept from a build before the
+  latches. The side jobs no longer do (2026-10-01, `mission-audit.md` §3,
+  "Side jobs, step by step"): their counts and records only go forward, and
+  a progress point counts only where its reward flag goes up, except the
+  Paramedic's last level, which has no flag. Not seen in a game.
 - **The safehouses' pedestrian doors**: all three are synced in the gate
   mask, Portland's on bit 7 and Staunton's and Shoreside's on bits 8 and 9
   (`protocol.md` §1.47). Not run in-game.

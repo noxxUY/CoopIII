@@ -228,18 +228,35 @@ enum class OccupantEnd : uint8_t {
 	FlagPed    = 2,   // CPed::FlagToDestroyWhenNextProcessed, which gets it out
 	                  // of the seat and hands it to the engine to delete
 	RefuseCar  = 3,   // the local player: the car must not go
+	PutOnFoot  = 4,   // a living character of a mission script: out of the
+	                  // seat alive, since the script still holds his handle and
+	                  // its next char instruction on a deleted one reads a null
 };
 
 inline OccupantEnd HowToEndOccupant(bool present, bool isLocalPlayer, bool pedLive,
-                                    bool thinksItIsInThisCar) {
+                                    bool thinksItIsInThisCar, bool aliveMissionChar = false) {
 	if (!present)
 		return OccupantEnd::None;
 	if (isLocalPlayer)
 		return OccupantEnd::RefuseCar;
 	if (!pedLive || !thinksItIsInThisCar)
 		return OccupantEnd::ClearSeat;
-	return OccupantEnd::FlagPed;
+	return aliveMissionChar ? OccupantEnd::PutOnFoot : OccupantEnd::FlagPed;
 }
+
+// A free slot in a pool's flags (POOLFLAG_ISFREE, 0x80): CPopulation::AddPed
+// goes on with a null when CPed::operator new finds none (0x004F53A2).
+inline bool PoolHasFreeSlot(const uint8_t *flags, int32_t size) {
+	if (!flags || size <= 0)
+		return false;
+	for (int32_t i = 0; i < size; ++i)
+		if ((flags[i] & 0x80) != 0)
+			return true;
+	return false;
+}
+
+// Whether the engine's ped pool has a free slot.
+bool PedPoolHasRoom();
 
 // ---- the engine side ----------------------------------------------------------
 
@@ -266,6 +283,11 @@ inline bool PedIsLive(void *ped) { return PedState(ped) == EntityState::Live; }
 // DestroyPed, and before anything that deletes a car through the engine
 // (DELETE_CAR, a garage's own delivery). How many there were.
 size_t ForgetEngineRawPointersTo(void *entity);
+
+// Whether the local player is in `vehicle`, or walking to its door, getting
+// in or getting out (game/missionclear.h, LocalAboardCar). Not merely the
+// last car he left, which m_pMyVehicle still names.
+bool LocalPlayerAboard(const void *vehicle);
 
 // The one way CoopIII takes a vehicle out of the world. False, having done
 // nothing, for one that is not live (said once) or that the local player is

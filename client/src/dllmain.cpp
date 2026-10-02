@@ -12,6 +12,7 @@
 #include "client.h"
 #include "clock.h"
 #include "config.h"
+#include "discordapp.h"
 #include "game/carcam.h"
 #include "game/carextras.h"
 #include "game/cargun.h"
@@ -24,6 +25,7 @@
 #include "game/darkel.h"
 #include "game/carremoval.h"
 #include "game/carletgo.h"
+#include "game/crowdfade.h"
 #include "game/crowdrange.h"
 #include "game/emergency.h"
 #include "game/fontcull.h"
@@ -41,6 +43,7 @@
 #include "game/nametag.h"
 #include "game/newgame.h"
 #include "game/object.h"
+#include "game/glass.h"
 #include "game/passengeraim.h"
 #include "game/passexit.h"
 #include "game/pause.h"
@@ -50,8 +53,10 @@
 #include "game/population.h"
 #include "game/radar.h"
 #include "game/rampagevote.h"
+#include "game/tpto.h"
 #include "game/ridecam.h"
 #include "game/runover.h"
+#include "game/bump.h"
 #include "game/animcb.h"
 #include "game/social.h"
 #include "game/replicacalm.h"
@@ -60,6 +65,7 @@
 #include "game/seat.h"
 #include "game/sessionclock.h"
 #include "game/sidejob.h"
+#include "game/skin.h"
 #include "game/standapart.h"
 #include "game/trains.h"
 #include "game/vehicle.h"
@@ -69,10 +75,13 @@
 #include "game/worldstate.h"
 #include "hook/hook.h"
 #include "log.h"
+#include "presence.h"
 
+#include <coopiii/mission.h>
 #include <coopiii/version.h>
 
 #include <cstdlib>
+#include <ctime>
 
 #include <windows.h>
 
@@ -98,6 +107,31 @@ constexpr uint32_t GAME_LOOP_TIMEOUT_MS = 20 * 60 * 1000;   // 20 minutes
 
 void InstallOnGameThread();
 bool g_installedAll = false;
+
+// Discord Rich Presence (presence.h): on once Boot has decided CoopIII runs,
+// and handed what to show from PostFrame, once a second.
+bool              g_presenceOn = false;
+presence::Tracker g_presence;
+uint32_t          g_presenceNextMs = 0;
+
+void TickPresence() {
+	const uint32_t now = WallClock::NowMs();
+	if (!g_presenceOn || static_cast<int32_t>(now - g_presenceNextMs) < 0)
+		return;
+	g_presenceNextMs = now + 1000;
+
+	const bool         connected = g_client.IsConnected();
+	const MissionSync &missions  = g_client.Missions();
+	const bool         running   = connected && missions.Running();
+	// The title the game shows for it, out of the mission table.
+	const char *title = running && missions.Number() < MISSION_COUNT
+	                        ? MissionName(missions.Number())
+	                        : nullptr;
+	presence::Update(g_presence.Observe(connected, running, title,
+	                                    static_cast<uint8_t>(g_client.RemoteCount() + 1),
+	                                    g_client.SessionSlots(),
+	                                    static_cast<int64_t>(std::time(nullptr))));
+}
 
 void PreFrame() {
 	// The rest of the install, once, before this frame touches anything it
@@ -140,6 +174,9 @@ void PreFrame() {
 	// The vote before a rampage: the help box, Y and N, and a move to the
 	// player who touched the skull. Before CGame::Process, so a move to
 	// another island is seen by this frame's CCollision::Update.
+	// CoopIII's own typed cheats first: TPTO starts the same move, which the
+	// vote's tick then carries on (game/tpto.h).
+	game::TickCoopCheats();
 	game::TickRampageVote();
 
 	// Two players on one spot: the one who does not keep it moves off it
@@ -174,6 +211,9 @@ void PostFrame() {
 	// cAudioManager::Service and the HUD read it - both run after
 	// CGame::Process returns.
 	game::RestorePauseForPresentation();
+
+	// What Discord shows; a copy under a lock, once a second.
+	TickPresence();
 
 	// Heartbeat - proof the hook is still live rather than silently
 	// detached, which is exactly the failure this whole file exists to
@@ -214,6 +254,18 @@ void PostFrame() {
 			    o.breaksSeen, o.reported, o.received, o.receivedUnmatched,
 			    o.receivedNoop, o.skippedExplosion, o.skippedReplica,
 			    o.skippedUnowned);
+
+		// Glass, on the same rule. `shattered here` moving while `reported`
+		// stays at zero is a game with no session to tell; `left to the
+		// shooter` is somebody else's round on a cracked window, whose roll
+		// is theirs and arrives as `from the wire` when it shatters.
+		const game::GlassStats &g = game::GetGlassStats();
+		if (g.shatteredHere || g.received || g.latched || g.leftToShooter)
+			Log("frame: glass - %u shattered here, %u reported, %u left to the "
+			    "shooter, %u from the wire (%u applied, %u had nothing here, %u "
+			    "already broken, %u refused), %u latched from the session's record",
+			    g.shatteredHere, g.reported, g.leftToShooter, g.received, g.applied,
+			    g.receivedUnmatched, g.receivedNoop, g.refused, g.latched);
 
 		// Uprooting, on its own line and on the same rule, because it is the
 		// half that used to be missing and "breaking works and nothing falls
@@ -287,6 +339,20 @@ DWORD WINAPI Boot(LPVOID) {
 		Log("CoopIII will not load. No hooks were installed and the game is "
 		    "untouched.");
 		return 0;
+	}
+
+	// "Playing CoopIII" in Discord rather than the GTA III it finds by itself.
+	// Its own thread, and nothing at all without Discord running.
+	if (g_config.discordPresence) {
+		const uint64_t appId = g_config.discordAppId != 0 ? g_config.discordAppId : DISCORD_APP_ID;
+		if (appId != 0) {
+			presence::Update(g_presence.Observe(false, false, nullptr, 0, 0,
+			                                    static_cast<int64_t>(std::time(nullptr))));
+			presence::Start(appId);
+			g_presenceOn = true;
+		}
+	} else {
+		Log("discord: discordPresence is off, so Discord shows the game as it finds it");
 	}
 
 	// The lobby's host started everybody's game into a new game
@@ -372,6 +438,10 @@ void InstallOnGameThread() {
 	// A car another player drives, hitting us: priced by its speed, and
 	// friendly fire decides whether it costs health. Not fatal.
 	game::InstallRunOverHooks();
+
+	// Our car into another machine's: what the collision did to the copy is
+	// seen and sent to its owner (game/bump.h). Not fatal.
+	game::InstallBumpWatch();
 
 	// The two car animation callbacks that read the car with no test, handed
 	// to the engine through a wrapper that has one (game/animcb.h). Not fatal:
@@ -505,6 +575,9 @@ void InstallOnGameThread() {
 	game::AddEmergencyToBridge(bridge);
 	game::AddCarRemovalToBridge(bridge);
 	game::AddCrowdRangeToBridge(bridge);
+	// Nothing synced appearing or vanishing in front of anybody
+	// (game/crowdfade.h): our camera, and our copies faded in and out.
+	game::AddCrowdFadeToBridge(bridge);
 	// The wanted level. Two reads and one write into the local player's own
 	// CWanted, and nothing else: the police are ambient entities that
 	// AddPopulationToBridge above has been replicating all along
@@ -517,6 +590,9 @@ void InstallOnGameThread() {
 	game::AddHeliGunToBridge(bridge);
 	game::AddCheatsToBridge(bridge);
 	game::AddMoneyToBridge(bridge);
+	// Each remote player in his own custom skin, and ours to them (game/skin.h).
+	// No hook: a remote ped's atomics are given a render callback of their own.
+	game::AddSkinsToBridge(bridge);
 	// The session's one mission (game/mission.h). Seven detours on the script
 	// engine's range handlers, and only with `missions = on`: the addresses are
 	// III.CLEO's and plugin-sdk's, not yet this project's own proof. Without it
@@ -687,6 +763,24 @@ void InstallOnGameThread() {
 		game::SetObjectCallbacks(objects);
 	}
 
+	// Shattered glass, docs/objects.md 10. The four calls that shatter a
+	// window, taken at the call. Not fatal: a site not taken leaves its cause
+	// breaking windows on one screen, and the log names it.
+	if (!game::InstallGlassHooks())
+		Log("CoopIII: some windows shatter on one machine only (the lines above say which)");
+	game::AddGlassToBridge(bridge);
+	{
+		game::GlassCallbacks glass;
+		glass.Shattered = [](const GlassBreakBody &body) {
+			return g_client.ReportGlassBroken(body);
+		};
+		glass.InSomebodyElsesRound = []() {
+			return game::ReplayingRemoteShot() || game::DrawingRemoteRoundOnGlass();
+		};
+		glass.HaveSession = []() { return g_client.IsConnected(); };
+		game::SetGlassCallbacks(glass);
+	}
+
 
 	g_client.SetPassword(g_config.password);
 	if (!g_client.Start(g_config.host, g_config.port, g_config.nick, bridge)) {
@@ -716,6 +810,9 @@ void InstallOnGameThread() {
 
 	// The vote before a rampage. Nothing hooked; ticked from PreFrame.
 	game::InstallRampageVote(g_client);
+	// CoopIII's own typed cheats, TPTO1..TPTO8. Nothing hooked; the keys are
+	// read off the chat's window procedure and ticked from PreFrame.
+	game::InstallTpto(g_client);
 
 	// Two players put on one spot. Nothing hooked; ticked from PreFrame.
 	game::InstallStandApart(g_client);
@@ -769,6 +866,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 		// runs it.
 		if (reserved != nullptr)
 			break;
+		// The pipe first: its thread reads nothing of the game, but it is ours.
+		presence::Stop();
 		if (g_started) {
 			// First, because the draw reads the roster straight out of the
 			// client and the client is about to be stopped.
@@ -779,6 +878,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 			// radar is on screen, so the detour goes before the client does.
 			game::RemoveRadarArrows();
 			game::RemoveRampageVote();
+			game::RemoveTpto();
 			game::RemoveStandApart();
 			game::RemoveCutsceneSkip();
 			game::RemoveCarCamera();
@@ -796,6 +896,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 			// for somebody else, and that has to happen while the detour
 			// keeping them from exploding is still installed.
 			game::RemoveRunOverHooks();
+			game::RemoveBumpWatch();
 			game::RemoveCarCallbackGuards();
 			game::RemoveSocialHooks();
 			game::RemoveReplicaCalm();
@@ -834,6 +935,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 			// and a redirect has no destructor to put it back: left in place
 			// it sends the population manager into an unloaded module.
 			game::RemoveObjectHooks();
+			// Four redirects, for the same reason.
+			game::RemoveGlassHooks();
 			game::RemovePickupHook();
 			game::RemovePedDropHooks();
 			game::RemoveRampageHooks();

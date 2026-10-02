@@ -246,6 +246,19 @@ void TestWhoGetsOutOfACarThatGoes() {
 	      "a seat pointing at a ped that is gone is only emptied");
 	Check(HowToEndOccupant(true, false, true, false) == OccupantEnd::ClearSeat,
 	      "and so is one whose ped thinks it is in some other car");
+	Check(HowToEndOccupant(true, false, true, true, true) == OccupantEnd::PutOnFoot,
+	      "a living mission character is put on foot, never deleted under the script");
+	Check(HowToEndOccupant(true, true, true, true, true) == OccupantEnd::RefuseCar,
+	      "the local player still keeps the car");
+	Check(HowToEndOccupant(true, false, false, true, true) == OccupantEnd::ClearSeat,
+	      "a mission character already gone only has his seat emptied");
+
+	std::printf("\na full ped pool\n");
+	const uint8_t full[3] = {0x01, 0x02, 0x03};
+	const uint8_t room[3] = {0x01, 0x80, 0x03};
+	Check(!PoolHasFreeSlot(full, 3), "every slot taken: no room, AddPed would go on with a null");
+	Check(PoolHasFreeSlot(room, 3), "one free slot is room");
+	Check(!PoolHasFreeSlot(nullptr, 3) && !PoolHasFreeSlot(room, 0), "no pool is no room");
 }
 
 // ---- the mission's "no car" -------------------------------------------------

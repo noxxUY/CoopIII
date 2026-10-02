@@ -231,6 +231,9 @@ struct Move {
 	// A rampage vote's, which the server hears the end of; otherwise the
 	// session's mission bringing a participant to its owner (MovePlayerBeside).
 	bool                vote   = true;
+	// What the log calls a move that is not a vote's: "missions", or "tpto"
+	// for the cheat (game/tpto.h).
+	const char         *tag    = "missions";
 	RampageTeleportBody body{};
 	int32_t             level  = 0;
 	bool                locked = false;
@@ -240,7 +243,7 @@ struct Move {
 Move g_move;
 
 // What the log calls the move.
-const char *Tag() { return g_move.vote ? "rampage" : "missions"; }
+const char *Tag() { return g_move.vote ? "rampage" : g_move.tag; }
 
 // Give up waiting for an island's collision after this long, and put him
 // down where he is being held. Loading an island takes a second or two with
@@ -490,9 +493,11 @@ void Settle(void *ped) {
 	g_move.active = false;
 }
 
-void StartMove(const RampageTeleportBody &body, bool vote = true) {
+void StartMove(const RampageTeleportBody &body, bool vote = true,
+               const char *tag = "missions") {
 	g_move        = Move{};
 	g_move.vote   = vote;
+	g_move.tag    = tag;
 	g_move.body   = body;
 
 	void *const   ped   = PlayerPed();
@@ -632,7 +637,8 @@ float CarSpeedMps(void *car) {
 	return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) * ENGINE_STEPS_PER_SECOND;
 }
 
-bool MovePlayerBeside(const Vec3 &pos, uint8_t targetId, uint8_t slot, uint8_t count) {
+bool MovePlayerBeside(const Vec3 &pos, uint8_t targetId, uint8_t slot, uint8_t count,
+                      const char *tag) {
 	if (!MayMovePlayer())
 		return false;
 	RampageTeleportBody body{};
@@ -640,9 +646,13 @@ bool MovePlayerBeside(const Vec3 &pos, uint8_t targetId, uint8_t slot, uint8_t c
 	body.slot      = slot;
 	body.count     = count;
 	body.pos       = pos;
-	StartMove(body, false);
+	StartMove(body, false, tag ? tag : "missions");
 	return true;
 }
+
+TeleportFacts ReadTeleportFacts() { return ReadFacts(PlayerPed()); }
+
+bool MoveInProgress() { return g_move.active; }
 
 void TickRampageVote() {
 	if (!g_client)

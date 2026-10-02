@@ -1913,6 +1913,13 @@ size_t Session::MissionPresences(MissionPresence (&out)[MAX_PLAYERS]) const {
 		out[n].havePos  = p.havePos && !p.missionBusy && p.alive;
 		out[n].pos      = p.pos;
 		out[n].busy     = p.missionBusy;
+		// Only a seat the car agrees with: a car gone, burnt out or more than
+		// 8 m from the player is a seat the record kept by mistake, and a stale
+		// one would hold a start for ever.
+		const Vehicle *seatCar = p.vehicleNetId != INVALID_NETID ? FindVehicle(p.vehicleNetId) : nullptr;
+		out[n].inCar = seatCar && seatCar->active && !seatCar->destroyed && p.havePos &&
+		               (seatCar->pos.x - p.pos.x) * (seatCar->pos.x - p.pos.x) +
+		                   (seatCar->pos.y - p.pos.y) * (seatCar->pos.y - p.pos.y) < 8.0f * 8.0f;
 		++n;
 	}
 	return n;
@@ -2201,6 +2208,51 @@ std::vector<uint16_t> Session::ReleaseMissionCars() {
 		v = Vehicle{};
 	}
 	return released;
+}
+
+std::vector<MissionReleaseRow> Session::ReleaseMissionEntities(uint8_t ownerId,
+                                                               const MissionReleaseRow *rows,
+                                                               size_t count, bool final) {
+	std::vector<MissionReleaseRow> out;
+	if (ownerId == INVALID_PLAYER)
+		return out;
+	if (count > MAX_MISSION_RELEASE)
+		count = MAX_MISSION_RELEASE;
+	for (size_t i = 0; rows && i < count; ++i) {
+		const MissionReleaseRow &r = rows[i];
+		uint8_t *flags = nullptr;
+		if (r.kind == AMBIENT_ADOPT_CAR) {
+			if (AmbientCar *car = FindCar(r.netId); car && car->ownerPlayerId == ownerId)
+				flags = &car->body.flags;
+		} else if (r.kind == AMBIENT_ADOPT_PED) {
+			if (AmbientPed *ped = FindPed(r.netId); ped && ped->ownerPlayerId == ownerId)
+				flags = &ped->body.flags;
+		}
+		if (!flags || (*flags & AMBIENT_MISSION) == 0)
+			continue;
+		*flags = static_cast<uint8_t>(*flags & ~AMBIENT_MISSION);
+		out.push_back(MissionReleaseRow{r.netId, r.kind, 0});
+	}
+
+	// What the owner did not name after its mission ended, it no longer holds:
+	// its despawn was lost, or the owner's engine took it some way nobody
+	// heard of. Not while a mission of the owner's runs again, whose own rows
+	// these may already be.
+	if (!final || (m_mission.Running() && m_mission.Owner() == ownerId))
+		return out;
+	for (AmbientPed &ped : m_peds) {
+		if (!ped.active || ped.ownerPlayerId != ownerId || (ped.body.flags & AMBIENT_MISSION) == 0)
+			continue;
+		out.push_back(MissionReleaseRow{ped.netId, AMBIENT_ADOPT_PED, 1});
+		ped = AmbientPed{};
+	}
+	for (AmbientCar &car : m_cars) {
+		if (!car.active || car.ownerPlayerId != ownerId || (car.body.flags & AMBIENT_MISSION) == 0)
+			continue;
+		out.push_back(MissionReleaseRow{car.netId, AMBIENT_ADOPT_CAR, 1});
+		car = AmbientCar{};
+	}
+	return out;
 }
 
 // ---- ambient peds ----------------------------------------------------------
@@ -2615,6 +2667,41 @@ Player *Session::CarHitRecipient(uint16_t netId, uint8_t byPlayerId) {
 	if (car->ownerPlayerId == byPlayerId)
 		return nullptr;
 	return FindById(car->ownerPlayerId);
+}
+
+Player *Session::VehicleBumpRecipient(uint16_t netId, uint16_t byNetId, uint8_t byPlayerId,
+                                      uint32_t nowMs) {
+	Player *const sender = FindById(byPlayerId);
+	if (!sender || !sender->alive || netId == byNetId)
+		return nullptr;
+	const Vehicle *by = FindVehicle(byNetId);
+	if (!by || !by->active || by->destroyed || by->driverPlayerId != byPlayerId)
+		return nullptr;
+
+	Player *owner = nullptr;
+	Vec3    at{};
+	if (const Vehicle *v = FindVehicle(netId)) {
+		owner = VehicleHitRecipient(netId, byPlayerId);
+		at    = v->pos;
+	} else if (const AmbientCar *car = FindCar(netId)) {
+		owner = CarHitRecipient(netId, byPlayerId);
+		at    = car->body.pos;
+	}
+	if (!owner)
+		return nullptr;
+
+	const float dx = at.x - by->pos.x, dy = at.y - by->pos.y, dz = at.z - by->pos.z;
+	if (!(dx * dx + dy * dy + dz * dz <= VEHICLE_BUMP_RANGE_M * VEHICLE_BUMP_RANGE_M))
+		return nullptr;
+
+	if (sender->bumpSecondMs == 0 || nowMs - sender->bumpSecondMs >= 1000) {
+		sender->bumpSecondMs    = nowMs ? nowMs : 1;
+		sender->bumpsThisSecond = 0;
+	}
+	if (sender->bumpsThisSecond >= VEHICLE_BUMP_MAX_PER_S)
+		return nullptr;
+	++sender->bumpsThisSecond;
+	return owner;
 }
 
 // ---- police helicopters ------------------------------------------------------

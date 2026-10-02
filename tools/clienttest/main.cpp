@@ -706,6 +706,11 @@ struct Recorder {
 	ObjectBreakBody lastObjectBreak{};
 	int            objectRests    = 0;
 	ObjectRestBody lastObjectRest{};
+	// Shattered glass (game/glass.h): the live shatter and the session's record.
+	int            glassBreaks    = 0;
+	GlassBreakBody lastGlassBreak{};
+	int            glassLatches   = 0;
+	ObjectBreakBody lastGlassLatch{};
 };
 
 Recorder g_rec;
@@ -1671,6 +1676,16 @@ void RecObjectSettled(const ObjectRestBody &body) {
 	g_rec.lastObjectRest = body;
 }
 
+void RecGlassBroken(const GlassBreakBody &body) {
+	++g_rec.glassBreaks;
+	g_rec.lastGlassBreak = body;
+}
+
+void RecGlassLatched(const ObjectBreakBody &body) {
+	++g_rec.glassLatches;
+	g_rec.lastGlassLatch = body;
+}
+
 WorldBridge RecordingBridge() {
 	g_rec = Recorder{};
 	g_observedHere.Clear();
@@ -1684,6 +1699,8 @@ WorldBridge RecordingBridge() {
 	b.ResetRampage        = &RecResetRampage;
 	b.ObjectBroken        = &RecObjectBroken;
 	b.ObjectSettled       = &RecObjectSettled;
+	b.GlassBroken         = &RecGlassBroken;
+	b.GlassLatched        = &RecGlassLatched;
 	b.SampleLocalPlayer     = &RecSampleLocalPlayer;
 	b.LocalWantsSeatToggle  = &RecLocalWantsSeatToggle;
 	b.LocalIsPassenger      = &RecLocalIsPassenger;
@@ -2311,6 +2328,65 @@ void TestNoSocketMeansNoObjectReportWentOut() {
 	rest.ident.modelIndex = 1393;
 	Check(!c.ReportObjectSettled(rest),
 	      "and so does a resting place - the seam counts the two apart");
+}
+
+// A shattered window, from the client's side of the seam (game/glass.h). Two
+// ways in: somebody's live shatter, which carries what the engine was handed,
+// and the session's record of one, which comes as an ordinary S_ObjectBroken
+// with OBJ_BREAK_GLASS and must reach the glass half rather than the street
+// object one, whose ObjectDamage replay knows nothing of windows.
+void TestAShatteredWindowArrivesAndOurOwnDoesNot() {
+	std::printf("\nglass: which shatters reach the engine seam\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	c.HandleMessage(Wrap(MakeWelcome(3), CH_EVENT));
+
+	S_GlassBroken glass;
+	InitHeader(glass, 1000);
+	glass.playerId              = 1;
+	glass.body.ident.pos        = {1012.5f, -870.25f, 14.0f};
+	glass.body.ident.modelIndex = 394;
+	glass.body.amount           = 742.0f;
+	glass.body.speed            = {0.6f, -0.1f, 0.0f};
+	glass.body.point            = {1013.0f, -870.0f, 14.6f};
+	c.HandleMessage(Wrap(glass, CH_EVENT));
+	Check(g_rec.glassBreaks == 1 && g_rec.lastGlassBreak.amount == 742.0f &&
+	          g_rec.lastGlassBreak.speed.x == 0.6f && g_rec.lastGlassBreak.point.z == 14.6f,
+	      "somebody else's shatter reaches the seam with what their engine was handed");
+	Check(g_rec.objectBreaks == 0, "and not the street object half");
+
+	S_GlassBroken ours = glass;
+	ours.playerId      = 3;
+	c.HandleMessage(Wrap(ours, CH_EVENT));
+	Check(g_rec.glassBreaks == 1, "our own shatter does not come back to us");
+
+	S_ObjectBroken record;
+	InitHeader(record, 1100);
+	record.playerId   = INVALID_PLAYER;
+	record.body.ident = glass.body.ident;
+	record.body.amount = 742.0f;
+	record.body.state = OBJ_BREAK_GLASS;
+	c.HandleMessage(Wrap(record, CH_EVENT));
+	Check(g_rec.glassLatches == 1 && g_rec.lastGlassLatch.ident.modelIndex == 394,
+	      "the session's record of a window goes to the glass half, to be latched");
+	Check(g_rec.objectBreaks == 0,
+	      "and never to ObjectDamage's replay, which would do nothing to a window");
+
+	ObjectBreakBody lamp{};
+	lamp.ident.modelIndex = 1393;
+	lamp.state            = OBJ_BREAK_SMASHED;
+	S_ObjectBroken post;
+	InitHeader(post, 1200);
+	post.playerId = 1;
+	post.body     = lamp;
+	c.HandleMessage(Wrap(post, CH_EVENT));
+	Check(g_rec.objectBreaks == 1 && g_rec.glassLatches == 1,
+	      "a lamp post still goes where it always did");
+
+	Client unwired;
+	unwired.SetBridge(RecordingBridge());
+	Check(!unwired.ReportGlassBroken(glass.body),
+	      "and a shatter with no session says it did not go out");
 }
 
 void TestOurOwnGarageMaskIsNotHeldAgainstUs() {
@@ -3455,18 +3531,18 @@ void TestTheSeatKeyPicksADoorOnOurSide() {
 void TestTheSeatKeyReach() {
 	std::printf("\nthe seat key reaches as far as a door, the engine's way\n");
 	const Vec3 me{10.0f, 20.0f, 30.0f};
-	Check(SeatCloseness(me, 0.0f, Vec3{10.0f, 23.0f, 30.0f}) > 0.0f, "a car 3 m ahead is in reach");
+	Check(SeatCloseness(me, 0.0f, Vec3{10.0f, 22.5f, 30.0f}) > 0.0f, "a car 2.5 m ahead is in reach");
 	Check(SeatCloseness(me, 0.0f, Vec3{10.0f, 20.0f + SEAT_REACH_M + 0.1f, 30.0f}) < 0.0f,
 	      "one just past the reach is not");
-	Check(SeatCloseness(me, 0.0f, Vec3{10.0f, 26.0f, 30.0f}) < 0.0f &&
+	Check(SeatCloseness(me, 0.0f, Vec3{10.0f, 24.0f, 30.0f}) < 0.0f &&
 	          SEAT_REACH_M < 8.0f,
-	      "and 6 m, which the old 8 m took, is out");
+	      "and 4 m, which the old 5 m took, is out");
 	Check(SeatCloseness(me, 0.0f, Vec3{10.0f, 22.0f, 32.5f}) < 0.0f,
 	      "a car 2 m or more above or below does not count, as for the enter key");
 	Check(SeatCloseness(me, 0.0f, Vec3{10.0f, 22.0f, 28.5f}) > 0.0f,
 	      "less than that does, measured flat");
-	Check(SeatCloseness(me, 0.0f, Vec3{10.0f, 23.0f, 30.0f}) >
-	          SeatCloseness(me, 0.0f, Vec3{10.0f, 17.0f, 30.0f}),
+	Check(SeatCloseness(me, 0.0f, Vec3{10.0f, 22.0f, 30.0f}) >
+	          SeatCloseness(me, 0.0f, Vec3{10.0f, 18.0f, 30.0f}),
 	      "of two at the same distance, the one we face wins");
 	Check(SeatCloseness(me, 0.0f, Vec3{10.0f, 21.0f, 30.0f}) >
 	          SeatCloseness(me, 0.0f, Vec3{10.0f, 24.0f, 30.0f}),
@@ -10451,6 +10527,57 @@ void TestAPlayersOwnLimbComesOffTheirPed() {
 	Check(g_rec.playerLimbs == 1, "not the torso, and not for a netId nobody has");
 }
 
+// ---- a pedestrian's talk and wait-state overlay (docs/protocol.md 1.76) -----
+
+S_PedOverlay MakeOverlay(uint16_t netId, uint16_t animId) {
+	S_PedOverlay s;
+	InitHeader(s, 1000);
+	s.body.netId  = netId;
+	s.body.animId = animId;
+	return s;
+}
+
+void TestAnOverlayIsKeptForTheReplica() {
+	std::printf("\nwhat the host's ped is chatting, hands up or ducking is kept for our replica\n");
+	Client c;
+	c.SetBridge(RecordingBridge());
+	GiveUsAnAmbientPed(c, 500);
+
+	c.HandleMessage(Wrap(MakeOverlay(500, ANIM_STD_CHAT), CH_EVENT));
+	const RemoteAmbientPed *p = c.AmbientPed(500);
+	Check(p != nullptr && p->overlayId == ANIM_STD_CHAT, "the chat reached the roster");
+	c.HandleMessage(Wrap(MakeOverlay(500, ANIM_NONE), CH_EVENT));
+	Check(p != nullptr && p->overlayId == ANIM_NONE, "and the end of it");
+
+	c.HandleMessage(Wrap(MakeOverlay(500, ANIM_STD_HANDSUP), CH_EVENT));
+	c.HandleMessage(Wrap(MakeOverlay(500, ANIM_STD_KO_FRONT), CH_EVENT));
+	c.HandleMessage(Wrap(MakeOverlay(500, 0xFFFE), CH_EVENT));
+	Check(p != nullptr && p->overlayId == ANIM_STD_HANDSUP,
+	      "an id that is not a wait state never reaches the blender");
+	c.HandleMessage(Wrap(MakeOverlay(501, ANIM_STD_CHAT), CH_EVENT));
+	Check(c.AmbientPed(501) == nullptr, "and a ped we never built gets nothing");
+}
+
+void TestOurOverlaysGoOut() {
+	std::printf("the overlays the bridge drains go to the session\n");
+	WorldBridge b = RecordingBridge();
+	b.DrainAmbientOverlays = [](PedOverlayBody *out, uint32_t max, uint32_t) -> uint32_t {
+		static bool once = true;
+		if (!once || max == 0)
+			return 0;
+		once = false;
+		out[0] = PedOverlayBody{500, ANIM_STD_CHAT};
+		return 1;
+	};
+	Client c;
+	c.SetBridge(b);
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.TickLocalAmbientPedsForTest();
+	Check(c.PedOverlaysSentForTest() == 1, "one went out, as a C_PedOverlay");
+	c.TickLocalAmbientPedsForTest();
+	Check(c.PedOverlaysSentForTest() == 1, "and the bridge's silence sends nothing");
+}
+
 void TestANodeThatIsNotALimbIsRefused() {
 	std::printf("a node that is not one of the five never reaches the engine\n");
 	Client c;
@@ -12724,7 +12851,11 @@ void TestTheRulesChangeWithEverybodyIn() {
 	                         RAMPAGE_RULE_SCALED),
 	    CHEAT_RULE_PERSONAL);
 	changed.maxWanted = 3;
+	Check(c.CoopCheatRule() == COOP_CHEATS_OUTSIDE_MISSIONS,
+	      "CoopIII's own cheats start outside missions, an older server's zero");
+	changed.coopCheats = COOP_CHEATS_ALWAYS;
 	c.HandleMessage(Wrap(changed, CH_EVENT));
+	Check(c.CoopCheatRule() == COOP_CHEATS_ALWAYS, "and the server can let them into missions");
 	Check(g_rec.friendlyFireCalls == 2 && g_rec.friendlyFire, "friendly fire reaches the bridge");
 	Check(g_rec.ammoSyncCalls >= 2, "and ammunition");
 	Check(g_rec.rampageRule == RAMPAGE_RULE_SCALED, "and the rampage rule");
@@ -12732,8 +12863,14 @@ void TestTheRulesChangeWithEverybodyIn() {
 	      "the stars are shared now, up to three");
 	Check(c.CheatRule() == CHEAT_RULE_PERSONAL, "and cheats are personal");
 
+	S_SessionRules odd = changed;
+	odd.coopCheats     = 9;
+	c.HandleMessage(Wrap(odd, CH_EVENT));
+	Check(c.CoopCheatRule() == COOP_CHEATS_OUTSIDE_MISSIONS, "a byte that is no rule is the default");
+
 	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
 	Check(c.MaxWanted() == WANTED_LEVEL_CEILING, "a new session starts from six again");
+	Check(c.CoopCheatRule() == COOP_CHEATS_OUTSIDE_MISSIONS, "and CoopIII's cheats from the default");
 }
 
 void TestOnlyTheCarYouAreInLendsYouStars() {
@@ -16558,6 +16695,127 @@ void TestAShoveAsksToSettleAParkedCar() {
 	g_pushedByUs = false;
 }
 
+
+// ---- ramming somebody else's car (bumpsync.h, docs/protocol.md 1.71) -------
+
+int32_t     g_contactHandle = -1;
+CopyContact g_contact;
+bool RecReadCopyContact(int32_t handle, CopyContact &out) {
+	out = CopyContact{};
+	if (handle == g_contactHandle) {
+		out             = g_contact;
+		g_contactHandle = -1;   // the engine's record is this frame's alone
+	}
+	return true;
+}
+bool RecReadVehiclePose(int32_t, VehicleTransform &out) {
+	out = VehicleTransform{};
+	return true;
+}
+int     g_bumpsPut      = 0;
+int32_t g_bumpTarget    = -1;
+int32_t g_bumpBy        = -1;
+float   g_bumpImpulse   = 0.0f;
+bool RecApplyVehicleBump(int32_t target, int32_t by, const Vec3 &, const Vec3 &, float impulse,
+                         uint8_t) {
+	++g_bumpsPut;
+	g_bumpTarget  = target;
+	g_bumpBy      = by;
+	g_bumpImpulse = impulse;
+	return true;
+}
+
+void ContactFrom(const Client &c, uint16_t netId, float impulse, bool ourWheel) {
+	g_contactHandle       = c.VehicleByNetId(netId)->poolHandle;
+	g_contact             = CopyContact{};
+	g_contact.fresh       = true;
+	g_contact.impulse     = impulse;
+	g_contact.piece       = 3;
+	g_contact.byOurWheel  = ourWheel;
+	g_contact.move        = Vec3{0.1f, 0.0f, 0.0f};
+}
+
+void TestRammingAnotherMachinesCar() {
+	std::printf("\nramming a car another machine simulates\n");
+	WorldBridge b      = RecordingBridge();
+	b.ReadCopyContact  = &RecReadCopyContact;
+	b.ReadVehiclePose  = &RecReadVehiclePose;
+	b.ApplyVehicleBump = &RecApplyVehicleBump;
+	g_bumpsPut         = 0;
+	Client c;
+	c.SetBridge(b);
+	g_rec.modelReady = true;
+	c.HandleMessage(Wrap(MakeWelcome(0), CH_EVENT));
+	c.HandleMessage(Wrap(MakeJoin(1, "alice"), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleSpawn(80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeEnter(1, 80), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleSpawn(81, 90, 14.0f), CH_EVENT));
+	c.HandleMessage(Wrap(MakeVehicleSpawn(82, 90, 18.0f), CH_EVENT));
+	c.Tick();
+	g_rec.drivingLocally     = true;
+	g_rec.localVehicleHandle = c.VehicleByNetId(81)->poolHandle;
+	c.HandleMessage(Wrap(MakeEnter(0, 81), CH_EVENT));
+	c.Tick();
+	Check(c.LocalVehicleNetId() == 81 && c.VehicleByNetId(80)->poolHandle >= 0,
+	      "(we drive 81, alice drives 80, 82 is parked)");
+
+	ContactFrom(c, 80, 120.0f, true);
+	c.TrackCopyContactsForTest(10000);
+	Check(c.BumpsSentForTest() == 1 && c.VehicleByNetId(80)->bump.loose,
+	      "our car into alice's: the bump goes to her, and our copy is ours for a moment");
+	ContactFrom(c, 80, 30.0f, true);
+	c.TrackCopyContactsForTest(10050);
+	Check(c.BumpsSentForTest() == 1, "the next frame's contact waits its turn");
+	c.TrackCopyContactsForTest(10000 + VEHICLE_BUMP_EVERY_MS);
+	Check(c.BumpsSentForTest() == 2, "and goes out with the next");
+	ContactFrom(c, 80, BUMP_MIN_IMPULSE - 1.0f, true);
+	c.TrackCopyContactsForTest(11000);
+	Check(c.BumpsSentForTest() == 2, "a car only leaning on hers sends nothing");
+	ContactFrom(c, 80, 120.0f, false);
+	c.TrackCopyContactsForTest(12000);
+	Check(c.BumpsSentForTest() == 2, "nor does somebody else's car hitting hers");
+
+	ContactFrom(c, 82, 120.0f, true);
+	c.TrackCopyContactsForTest(13000);
+	Check(c.BumpsSentForTest() == 2 && c.VehicleByNetId(82)->bump.loose,
+	      "a car nobody holds is kept loose and not bumped: the shove settles it");
+
+	// Alice's machine says her car rammed ours, and ours never saw it.
+	S_VehicleBump in;
+	InitHeader(in, 20000);
+	in.attackerId   = 1;
+	in.body         = VehicleBumpBody{};
+	in.body.netId   = 81;
+	in.body.byNetId = 80;
+	in.body.impulse = 250;
+	c.OnVehicleBumpForTest(in, 20000);
+	c.ApplyVehicleBumpsForTest(20000 + BUMP_HOLD_MS - 1);
+	Check(g_bumpsPut == 0 && c.BumpsWaitingForTest() == 1, "a bump on our car is held a moment");
+	c.ApplyVehicleBumpsForTest(20000 + BUMP_HOLD_MS);
+	Check(g_bumpsPut == 1 && g_bumpTarget == c.VehicleByNetId(81)->poolHandle &&
+	          g_bumpBy == c.VehicleByNetId(80)->poolHandle && g_bumpImpulse == 250.0f &&
+	          c.BumpsAppliedForTest() == 1,
+	      "and then put on our car, against our copy of hers");
+
+	// The same collision seen by our own engine: one response, not two.
+	c.OnVehicleBumpForTest(in, 30000);
+	ContactFrom(c, 80, 90.0f, true);
+	c.TrackCopyContactsForTest(30100);
+	c.ApplyVehicleBumpsForTest(30000 + BUMP_HOLD_MS);
+	Check(g_bumpsPut == 1 && c.BumpsDroppedForTest() == 1,
+	      "when our engine had the two touching it was that collision, and hers is dropped");
+
+	in.body.netId = 82;
+	c.OnVehicleBumpForTest(in, 40000);
+	c.ApplyVehicleBumpsForTest(40000 + BUMP_HOLD_MS);
+	Check(g_bumpsPut == 1 && c.BumpsWaitingForTest() == 0,
+	      "a bump on a car that is not ours to move goes nowhere");
+	in.attackerId = 0;
+	c.OnVehicleBumpForTest(in, 41000);
+	Check(c.BumpsWaitingForTest() == 0, "nor one claiming to be from us");
+	g_rec.drivingLocally     = false;
+	g_rec.localVehicleHandle = -1;
+}
 void TestWireMotionIsHeld() {
 	std::printf("\na car's motion off the wire is held\n");
 	const Vec3 slow = HeldMoveSpeed(Vec3{1.0f, 0.5f, 0.0f});
@@ -17557,6 +17815,8 @@ int RunSirenTests();
 // tools/clienttest/carextras.cpp
 int RunCarExtrasTests();
 int RunCarRemovalTests();
+// tools/clienttest/crane.cpp
+int RunCraneTests();
 // tools/clienttest/cargen.cpp
 int RunCarGenTests();
 int RunTeardownTests();
@@ -17573,11 +17833,19 @@ int RunPassengerAimTests();
 // tools/clienttest/runover.cpp
 int RunRunOverTests();
 
+// tools/clienttest/bump.cpp
+int RunBumpTests();
+
+// tools/clienttest/glass.cpp
+int RunGlassTests();
+
 // tools/clienttest/animcb.cpp
 int RunAnimCallbackTests();
+int RunPedOverlayTests();
 
 // tools/clienttest/stunt.cpp
 int RunStuntTests();
+int RunSideJobTests();
 int RunMissionCombatTests();
 
 // tools/clienttest/passengers.cpp
@@ -17588,6 +17856,7 @@ int RunRadioTests();
 
 // tools/clienttest/outfit.cpp
 int RunOutfitTests();
+int RunSkinTests();
 
 // tools/clienttest/money.cpp
 int RunMoneyTests();
@@ -17600,6 +17869,9 @@ int RunStreamPickTests();
 
 // tools/clienttest/chatfeed.cpp
 int RunChatFeedTests();
+
+// tools/clienttest/presence.cpp
+int RunPresenceTests();
 
 // tools/clienttest/fontcull.cpp
 int RunFontCullTests();
@@ -17621,7 +17893,8 @@ int RunWireCheckTests();
 // from a fixed seed so a failure comes back the same way.
 #define COOPIII_CLIENT_PACKETS(X)                                                                 \
 	X(S_AmbientAdopt) X(S_CampaignDelta) X(S_CarDespawn) X(S_CarHit) X(S_CarLists)                \
-	X(S_CarPromoted) X(S_CarSpawn) X(S_CarStates) X(S_Chat) X(S_Cheat) X(S_CutsceneVote)          \
+	X(S_CrowdGone) X(S_MissionRelease) X(S_PlayerView)                                                                 \
+	X(S_CarPromoted) X(S_CarSpawn) X(S_CraneState) X(S_CarStates) X(S_Chat) X(S_Cheat) X(S_CutsceneVote)          \
 	X(S_Damage) X(S_Death) X(S_DesyncReport) X(S_EnterVehicle) X(S_EnteringVehicle)               \
 	X(S_ExitVehicle) X(S_Explosion) X(S_GarageState) X(S_GateState) X(S_HeliGone) X(S_HeliHit)    \
 	X(S_HeliShot) X(S_HeliState) X(S_JackingVehicle) X(S_MineBlast) X(S_MissionAnswers)           \
@@ -17629,15 +17902,17 @@ int RunWireCheckTests();
 	X(S_MissionFail) X(S_MissionHandOver) X(S_MissionKill) X(S_MissionObjectBreak)                \
 	X(S_MissionPickup) X(S_MissionReady) X(S_MissionSeats) X(S_MissionState) X(S_MissionWaiting)  \
 	X(S_MissionWidget) X(S_Money) X(S_MoneyAward) X(S_NpcDamage) X(S_NpcShot) X(S_NpcVehicleHit)  \
-	X(S_ObjectBroken) X(S_ObjectSettled) X(S_PedBodyPart) X(S_PedDamage) X(S_PedDeath)            \
+	X(S_GlassBroken)                                                                              \
+	X(S_ObjectBroken) X(S_ObjectSettled) X(S_PedOverlay) X(S_PedBodyPart) X(S_PedDamage) X(S_PedDeath)            \
 	X(S_ParkedSeed) X(S_PlaceBlips) X(S_PedDespawn) X(S_PedRevive) X(S_PedSpawn) X(S_PedStates) X(S_PickupDenied) \
 	X(S_PickupDrop)                                                                               \
 	X(S_PickupGrant) X(S_PickupTaken) X(S_PlayerAmmo) X(S_PlayerAway) X(S_PlayerJoin)             \
 	X(S_PlayerLeave) X(S_PlayerLook) X(S_PlayerModel) X(S_PlayerPings) X(S_PlayerScore)           \
-	X(S_PlayerState)                                                                              \
+	X(S_PlayerSkin) X(S_PlayerState)                                                              \
 	X(S_PlayerStateRide) X(S_RampageCar) X(S_RampageEnd) X(S_RampageKill) X(S_RampageOpen)        \
 	X(S_RampageTeleport) X(S_RampageVote) X(S_Respawn) X(S_Respray) X(S_SessionRules) X(S_Shot)   \
 	X(S_StuntCamera) X(S_UnownedBlowUp) X(S_VehicleAim) X(S_VehicleAlarm) X(S_VehicleBlowUp)      \
+	X(S_VehicleBump)                                                                              \
 	X(S_VehicleBomb) X(S_VehicleCustody) X(S_VehicleDamage) X(S_VehicleDespawn) X(S_VehicleHit)   \
 	X(S_VehicleRadio) X(S_VehicleRemoved) X(S_VehicleSpawn) X(S_VehicleState) X(S_WaterCannon)    \
 	X(S_Welcome) X(S_WorldState)
@@ -17714,6 +17989,8 @@ int RunCrowdRangeTests();
 int RunCopChaseTests();
 // tools/clienttest/carletgo.cpp
 int RunCarLetGoTests();
+int RunCrowdFadeTests();
+int RunMissionClearTests();
 // tools/clienttest/carcam.cpp
 int RunCarCameraTests();
 // tools/clienttest/cargun.cpp
@@ -17724,6 +18001,14 @@ int RunPassengerExitTests();
 int RunStandApartTests();
 // tools/clienttest/entrystuck.cpp
 int RunEntryStuckTests();
+int RunStandInTests();
+// tools/clienttest/anyplace.cpp
+int RunAnyplaceTests();
+int RunShoresideTests();
+// tools/clienttest/getaway.cpp
+int RunGetawayTests();
+// tools/clienttest/missiontake.cpp
+int RunMissionTakeTests();
 
 // ---- who the ambient batches are ranked for (game/streampick.h) ------------
 
@@ -19719,6 +20004,17 @@ void TestWhoSimulatesAMissionCar() {
 	      "and nobody holding it: every copy is its own, and the word goes to all");
 	s = WhoSimulates(true, us, bob, INVALID_PLAYER, owner);
 	Check(s.player == us, "a driver outranks a custodian");
+
+	// EXPLODE_CAR: Blow Fish's truck at a participant's wheel when the timer
+	// runs out.
+	s = WhoSimulates(true, us, INVALID_PLAYER, INVALID_PLAYER, owner);
+	Check(WhereTheWreckGoes(s) == CarWordTo::OnePlayer,
+	      "the mission blowing up a car a participant drives goes to him, whose engine decides wrecks");
+	s = WhoSimulates(true, INVALID_PLAYER, INVALID_PLAYER, INVALID_PLAYER, owner);
+	Check(WhereTheWreckGoes(s) == CarWordTo::Nobody,
+	      "one nobody holds goes up on the owner's machine alone, not once on every machine");
+	s = WhoSimulates(false, INVALID_PLAYER, INVALID_PLAYER, INVALID_PLAYER, owner);
+	Check(WhereTheWreckGoes(s) == CarWordTo::Nobody, "and the owner's own car is the owner's");
 }
 
 void TestAHostsPedestrianSitsInASessionCar() {
@@ -20060,6 +20356,7 @@ int main() {
 	TestOurOwnGarageMaskIsNotHeldAgainstUs();
 	TestAKnockedOverPostArrivesAndOurOwnDoesNot();
 	TestNoSocketMeansNoObjectReportWentOut();
+	TestAShatteredWindowArrivesAndOurOwnDoesNot();
 	TestNoGarageReportWithoutAWorld();
 	TestResprayFindsTheCar();
 	TestResprayForACarWeDoNotHave();
@@ -20418,18 +20715,24 @@ int main() {
 	g_failures += RunSirenTests();
 	g_failures += RunCarExtrasTests();
 	g_failures += RunCarRemovalTests();
+	g_failures += RunCraneTests();
 	g_failures += RunCarGenTests();
 	g_failures += RunTeardownTests();
 	g_failures += RunCheatTests();
 	g_failures += RunDriveByTests();
 	g_failures += RunPassengerAimTests();
 	g_failures += RunRunOverTests();
+	g_failures += RunBumpTests();
+	g_failures += RunGlassTests();
 	g_failures += RunAnimCallbackTests();
+	g_failures += RunPedOverlayTests();
 	g_failures += RunStuntTests();
+	g_failures += RunSideJobTests();
 	g_failures += RunMissionCombatTests();
 	g_failures += RunPassengerTests();
 	g_failures += RunRadioTests();
 	g_failures += RunOutfitTests();
+	g_failures += RunSkinTests();
 	g_failures += RunMoneyTests();
 	g_failures += RunMissionTests();
 	g_failures += RunMissionWorldTests();
@@ -20437,6 +20740,7 @@ int main() {
 	g_failures += RunStreamPickTests();
 	g_failures += RunChatFeedTests();
 	g_failures += RunFontCullTests();
+	g_failures += RunPresenceTests();
 	g_failures += RunCutsceneTests();
 	g_failures += RunCutsceneSkipTests();
 	g_failures += RunCutsceneHeadTests();
@@ -20452,11 +20756,18 @@ int main() {
 	g_failures += RunCrowdRangeTests();
 	g_failures += RunCopChaseTests();
 	g_failures += RunCarLetGoTests();
+	g_failures += RunCrowdFadeTests();
+	g_failures += RunMissionClearTests();
 	g_failures += RunCarCameraTests();
 	g_failures += RunCarGunTests();
 	g_failures += RunPassengerExitTests();
 	g_failures += RunStandApartTests();
 	g_failures += RunEntryStuckTests();
+	g_failures += RunStandInTests();
+	g_failures += RunAnyplaceTests();
+	g_failures += RunShoresideTests();
+	g_failures += RunGetawayTests();
+	g_failures += RunMissionTakeTests();
 	g_failures += RunAdoptTests();
 	g_failures += RunPatchSiteTests();
 	g_failures += RunGapHudTests();
@@ -20477,12 +20788,15 @@ int main() {
 	TestSomebodyElseHasTheCarWeWereIn();
 	TestTheCarWeWereInNeverComesBack();
 	TestLimbsFromNoSessionStayBehind();
+	TestAnOverlayIsKeptForTheReplica();
+	TestOurOverlaysGoOut();
 	TestQuietCountsFromTheJoin();
 	TestACarChangingHandsIsOnItsNewDriversClock();
 	TestACopyHeldAtItsOldestIsNotProbed();
 	TestTheDesyncProbeSaysWhereOurCopiesAre();
 	TestTheProbeTakesInTheCrowdAndTheTraffic();
 	TestAShoveAsksToSettleAParkedCar();
+	TestRammingAnotherMachinesCar();
 	TestABlastOnAParkedCarStays();
 	TestABurningCarNobodyHoldsHasOneTimer();
 	TestOurBlastAsksForTheCar();

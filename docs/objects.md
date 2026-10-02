@@ -503,7 +503,7 @@ Three places decide it and all three read `m_fUprootLimit` (`+0x170`):
 
 | | test | where |
 |---|---|---|
-| a collision | `impulse > m_fUprootLimit \|\| IsFence(model)` | `0x00497559`, `0x00497B6B`; uproot at `0x00497EB1` |
+| a collision | `impulse > m_fUprootLimit` (`\|\| bIsStuck` in the car arm), and not glass | `0x00497559`, `0x00497B6B`; uproot at `0x00497EB1` |
 | a blast | `fPower > m_fUprootLimit` | `0x004B1473`; uproot at `0x004B154D` and `0x004B163A` |
 | a bullet, a pellet, a bat | `m_fUprootLimit <= 0.0f` | §2.2 |
 
@@ -602,23 +602,18 @@ it would have carried turns out to be one thing. `FireInstantHitFromCar` has an
 arm for a ped, one for a car and one for everything else, and the last one is
 `CGlass::WasGlassHitByBullet` and nothing more: no `ObjectDamage`, no uproot
 (`addresses.h`, "the drive-by"). So a crate shot from a car stays put on the
-shooter's screen too, and a window broke there alone. `DriveByImpact` now hands
-the same entity and point to the same function for somebody else's round, so
-the window breaks on every screen; its address is a lead, checked against both
-of the engine's calls to it before it is used (`addresses-unverified.md`).
+shooter's screen too. `DriveByImpact` hands the same entity and point to the
+same function for somebody else's round, so a window cracks on every screen;
+whether it then shatters is the shooter's roll (§10).
 
 **The watch table is 24 deep and the newest entry is dropped past that.** A
 car ploughing a row of lamp posts is nowhere near it and a rocket is excluded
 by the paragraph above, but the number is in the heartbeat line so it stops
 being a guess.
 
-**Glass is not carried.** `CGlass` is its own system with its own arrays
-(`WindowRespondsToCollision`, `WindowRespondsToExplosion`) and it never goes
-through `ObjectDamage`, so nothing here reports it. Every machine breaks its own
-windows from the same causes instead: a round on foot is replayed through
-`CWeapon::Fire` and reaches `DoBulletImpact`'s call, a drive-by round reaches
-the same call from `DriveByImpact` (above), and an explosion or a car is the
-same event everywhere.
+**Glass is not carried here.** `CGlass` is its own system and it never goes
+through `ObjectDamage`, so nothing in this seam reports a window. It has a seam
+of its own now, §10.
 
 **Script objects are untouched.** `MISSION_OBJECT` exists on the machine
 running the script, which is Area D's problem and `campaign.md`'s.
@@ -705,3 +700,105 @@ And on the uproot line, `came loose` moving while `rest sent` stays at zero
 means objects are being knocked over here and never coming to rest - which
 would be the watch table leaking, or the 80 m conversion taking them away
 before the engine's sleep test gets to them.
+
+---
+
+## 10. Glass
+
+Shop windows and the other panes that shatter. Before this, every machine
+broke its own, and two of the four causes did not agree. `game/glass.h` is the
+rule, `addresses.h` ("glass") has the instructions, protocol.md §1.74 the wire.
+
+### 10.1 What a window is
+
+A map object, exactly like a lamp post: one of eight models (`glassfx1` to
+`glassfx4`, `glassfx55`, `glassfxsub1`, `glassfxsub2`, `glassfx_composh`) that
+`object.dat` lists, so the IPL instance becomes a `CDummyObject`, and inside
+80 m a `CObject` with `ObjectCreatedBy == GAME_OBJECT`. The 13 IPLs place 42
+of them; within one model the closest two are 3.54 m apart, so §4's 0.25 m
+names exactly one and the same `ObjectIdent` (model plus `m_objectMatrix`)
+works unchanged.
+
+`object.dat` gives all eight a damage effect of 0, so `ObjectDamage` never
+touches a window. What shatters one is `CGlass::WindowRespondsToCollision`
+(`0x00503F10`, `__cdecl`, nine dwords: the window, an amount, a speed, a point
+and an `explosion` bool). It returns at once on a window already broken, sets
+`bGlassCracked` then `bGlassBroken` (`+0x175` bits 3 and 4), throws the panes
+and plays the sound, and moves the window's own matrix to z = -100.
+`m_objectMatrix` is untouched, so the window keeps its name after it is gone,
+and `ConvertToDummyObject` builds the dummy from it: the next `CObject` out of
+that dummy is a whole window. That is how the engine puts glass back, and
+nothing here fights it.
+
+### 10.2 The four causes, measured
+
+There are exactly four calls to it in the image:
+
+| site | cause | the same on every machine? |
+|---|---|---|
+| `0x0049761C` | `CPhysical::ApplyCollision`, a collider with ped physics | no: a collision only its owner ran for real |
+| `0x00497C4A` | the same, a car or anything else | no, for the same reason |
+| `0x00504779` | `WasGlassHitByBullet`, a round on a window already cracked | no: one round in four, by `CGeneral::GetRandomNumber() & 3 == 2`, rolled by every machine that replays the shot |
+| `0x0050483D` | `WindowRespondsToExplosion`, nearer than 10 m | yes: the same test on the same numbers, as §2.1 |
+
+The first round on a whole window only cracks it, with a sound, and that does
+agree: it is the same function on the same replayed round. Cracks are not sent.
+
+### 10.3 What travels
+
+All four calls are redirected at the call site, never detoured. Each runs the
+engine's function as before and then looks at bit 4:
+
+- **Whichever machine shattered a window says so** (`C_GlassBroken`), with the
+  arguments the engine was handed. Not one reporter chosen by ownership, as §5
+  chooses for a lamp post, because a shatter is a latch the engine itself
+  refuses to repeat: two machines that both shattered the same window and both
+  said so cost one wasted 54 byte packet, and nothing breaks twice. A replica
+  car that went through a window here really did on its owner's screen too.
+- **Every other machine runs the same function with the same arguments**, so
+  the panes fly the same way, the big break past an amount of 300 sounds like
+  one, and a small one spreads from the same point. It is called directly, not
+  through the redirected calls, so it never goes back out; a flag says so
+  as well.
+- **A round somebody else fired does not roll.** While `combat.cpp` replays a
+  remote shot through `CWeapon::Fire`, or `DriveByImpact` draws a remote
+  drive-by or sniper round, the bullet site leaves the window alone. The
+  shooter's machine rolled for that round, and its shatter arrives on the wire.
+- **A blast is said too**, although it agrees: the record below is what lets a
+  player who was not there hear of it.
+
+### 10.4 Coming back, and joining
+
+The server keeps a shattered window as the window's object record, with
+`OBJ_BREAK_GLASS` for its state (`server/core/objectrecords.h`,
+`GlassRecordBody`), for exactly as long as §8.5 keeps a lamp post: while any
+player is within 120 m. A joiner is handed it in the backfill and a machine
+that builds the window again asks for it (`C_ObjectRebuilt`), both through the
+ordinary `S_ObjectBroken`. The client hands a record with the glass bit to the
+glass half, which latches the window as the engine leaves it (the two bits and
+z = -100) without the panes or the sound, because nobody there watched it go.
+Once nobody is near, every copy is a dummy and whole, the record is gone, and
+the window is whole everywhere, which is the engine's own behaviour.
+
+### 10.5 Car glass
+
+A car's only glass in retail III is the windscreen, and it is panel 4 of
+`m_panelStatus` (`VehicleDamage`'s windscreen arm: `push 0 / push 4 / push 13h
+/ call SetPanelDamage` at `0x0052FCDD`). The panel word already travels whole
+from whoever simulates the car (`cardamage.md` §3.1, protocol.md §1.11), and
+the receiver applies panel 4 through `SetPanelDamage` on node `13h`, so a
+windscreen cracked or knocked out on the owner's car is the same on every
+screen. A round on a car touches its health only. Nothing was changed there;
+`tools/clienttest/glass.cpp` pins the panel, the node and the merge.
+
+### 10.6 Not run in game
+
+Covered by the suites and checked against the exe. What a run has to show:
+that a car through a shop window shatters it on the other screen with panes
+and sound; that a second shot at a cracked window from one player shatters it
+for both, one time in four, and never for one only; that a rocket at a window
+seen by one player and later approached by the other shows it gone; and that
+walking 80 m away and back with nobody near brings it back whole. The log line
+is `frame: glass - ...`: `shattered here` moving while `reported` stays at zero
+is a game with no session; `left to the shooter` counts somebody else's
+rounds on a cracked window, which should then turn up as `from the wire`.

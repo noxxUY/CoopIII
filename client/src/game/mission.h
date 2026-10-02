@@ -1282,6 +1282,23 @@ inline uint8_t LeaveMaskFor(uint8_t boarding, uint8_t maxPassengers, uint8_t tak
 	return mask;
 }
 
+// Who sits in a passenger slot, as LeaveMaskFor's `riders` counts him: the
+// player whose copy it is, or, on the owner's machine, the owner himself when
+// the slot holds his own player. A passenger slot is never the driver's, so a
+// slot holding him means somebody else is at the wheel. Salvatore's Called A
+// Meeting needs every passenger seat of the Stretch for Joey, Luigi and Toni:
+// with a guest driving and the owner riding, Toni's order was dropped for a
+// full car and nobody was ever asked out, since only copies were riders.
+inline uint8_t RiderInSeat(bool ownPlayer, uint8_t replicaOf, uint8_t localId) {
+	return ownPlayer ? localId : replicaOf;
+}
+
+// Whether the owner's own player is among those LeaveMaskFor names, and so
+// gets out on his own machine (participants are told by C_MissionSeats).
+inline bool OwnerGivesUpSeat(uint8_t leaveMask, uint8_t localId) {
+	return localId < 8 && (leaveMask & (1u << localId)) != 0;
+}
+
 // A pedestrian the mission told into a car as a passenger, and the engine gave
 // up on. CPed::ProcessObjective's ENTER_CAR_AS_PASSENGER arm opens with
 // `if (!bInVehicle && m_nNumPassengers >= m_nNumMaxPassengers)` and goes back
@@ -1357,6 +1374,25 @@ inline uint8_t CompareFlagIfTrue(uint8_t condBefore, uint16_t andOrBefore, bool 
 	return condBefore;
 }
 
+// What the flag would hold had the condition been `raw`, the answer before the
+// NOT: true or false, through the same block arithmetic as above. A question
+// answered for somebody else than the owner replaces the owner's answer with
+// this, both ways.
+inline uint8_t CompareFlagFor(uint8_t condBefore, uint16_t andOrBefore, bool notFlag, bool raw) {
+	return CompareFlagIfTrue(condBefore, andOrBefore, raw ? notFlag : !notFlag);
+}
+
+// Whether a question answered for anybody, since anybody can give the game
+// away (mission-audit.md R13), may be widened in the block it is asked in:
+// alone, or in an `if or`, where a yes for anybody is the block's yes whatever
+// the other conditions are about. Not in an `if and`, whose other conditions
+// may be one player's state. Bomb Da Base: Act II asks "a guard down or the
+// player shooting at the docks" as an `if or`.
+inline bool QuietCheckMayWiden(uint16_t andOrBefore) {
+	return andOrBefore == scripts::ANDOR_NONE ||
+	       (andOrBefore >= scripts::ANDOR_ORS_1 && andOrBefore <= scripts::ANDOR_ORS_8);
+}
+
 // Whether IS_PLAYER_IN_CAR may be answered for a participant in the car. Not
 // inside an `if and` that already asked where the owner is: "within 20 m of
 // the bistro and in Lips' car" is one player's state, and a helper in the car
@@ -1370,6 +1406,19 @@ inline bool MayAnswerInCarForAnybody(uint16_t andOrBefore, uint16_t locationAndO
 		return true;
 	const bool locationInAnd = locationAndOr >= 1 && locationAndOr <= 8;
 	return !(locationInAnd && locationAndOr > andOrBefore);
+}
+
+// Where it may not, it still may when the car itself is at the place that
+// location check asked about, the checkpoints' 5 m of slack included
+// (missions.md 5.6): the owner there, as the check said, and a participant
+// bringing the mission's car in beside him is one state of the world that
+// satisfies both halves. Give Me Liberty, Don't Spank Ma Bitch Up and
+// Cutting The Grass arrive this way ("stopped at the door, in the car").
+// `haveArea` is false when the location check named no area this knows.
+constexpr float IN_CAR_AT_PLACE_SLACK_M = 5.0f;
+
+inline bool InCarAtThePlace(const Vec3 &car, bool haveArea, const MissionArea &area) {
+	return haveArea && InMissionArea(car, area, IN_CAR_AT_PLACE_SLACK_M);
 }
 
 // ---- everybody into the car the mission put its player in (protocol.h, C_MissionBoard)
@@ -1413,16 +1462,17 @@ inline bool CheckpointOutOfReach(bool ownerInBoat, bool theyInBoat) {
 // ---- "get back in the vehicle" (the owner's run on 2026-09-24) ---------------------
 //
 // A mission tells its player to get back into the car it is meant to be in
-// when it finds them out of it: "Hey! Get back in the vehicle!" at 53 sites
-// and "Get back into the Stretch!" at 7, every one of them behind a NOT
-// IS_PLAYER_IN_CAR on the mission's car. The owner's script asks about the
+// when it finds them out of it: "Hey! Get back in the vehicle!" at 50 sites
+// in 17 missions, "Get back into the Stretch!" at 7 (Chaperone) and Uzi
+// Rider's "Get your ass back in this car!", every one of them behind a NOT
+// IS_PLAYER_IN_CAR on the mission's car (mission-audit.md R4b has the list). The owner's script asks about the
 // owner, so what it prints is the owner's alone and goes nowhere else; each
 // participant who gets out of that car is told the same, alone, by the owner's
 // machine, which sees them get out.
 constexpr size_t TEXT_LABEL = 8;
 
 inline bool IsGetBackInLabel(const uint8_t *label) {
-	static const char *const kLabels[] = {"IN_VEH", "FM1_1"};
+	static const char *const kLabels[] = {"IN_VEH", "FM1_1", "YD2_N"};
 	for (const char *known : kLabels) {
 		size_t n = 0;
 		while (known[n] != '\0' && label[n] == static_cast<uint8_t>(known[n]))
@@ -1538,6 +1588,115 @@ private:
 	};
 	Car m_cars[GET_BACK_IN_CARS];
 };
+
+// ---- a session car the mission clears away (mission-audit.md R4c) ----------------
+//
+// Cipriani's Chauffeur opens with `clear_area 1 at 1195.0 -870.25 range 15.0`
+// in front of Joey's garage, which in single player takes away the car its
+// player came in so Toni's can drive out. A car a player has driven is a
+// session car, and every copy of one is a locked mission car on every machine
+// but the one that made it (game/carlife.h), so no engine's clear takes it, and
+// the one that could, the copy its player sat in or stood on, came back from
+// the session. So the owner's mission decides: a session car inside a
+// CLEAR_AREA that is not the mission's own, has none of the mission's people
+// in it and not the owner's player, or a session car its DELETE_CAR names, is
+// taken away on every machine. Each participant first gets its own player out
+// of it, or off its roof, beside it (LeaveCarEffect), the owner's mission
+// holds the instruction until no other player sits in it (CLEAR_HOLD_MS at
+// most), and then the owner's machine takes it through C_VehicleRemoved, which
+// every machine follows (protocol.md 1.44).
+
+// Where a CLEAR_AREA reaches: CWorld::ClearExcitingStuffFromArea's 2D circle.
+inline bool InClearCircle(float carX, float carY, float x, float y, float radius) {
+	const float dx = carX - x, dy = carY - y;
+	return radius > 0.0f && dx * dx + dy * dy < radius * radius;
+}
+
+// What the owner's machine knows of one car inside it.
+struct ClearCarFacts {
+	bool sessionCar  = false;   // the session names it: a player has driven it
+	bool missionCar  = false;   // one the running mission made (g_missionCars)
+	bool wrecked     = false;   // a wreck goes the way wrecks go
+	bool ownerInside = false;   // the owner's own player sits in it
+	bool missionPed  = false;   // one of the mission's people sits in it
+};
+
+// Whether the clear takes it. The engine's own test (CVehicle::CanBeDeleted)
+// refuses a mission car and one with a mission character in it, and the
+// owner's player in a car the clear would take is never the script's idea.
+inline bool ClearTakesCar(const ClearCarFacts &f) {
+	return f.sessionCar && !f.missionCar && !f.wrecked && !f.ownerInside && !f.missionPed;
+}
+
+// How long the owner's mission waits at the instruction for the other players
+// to be out of the cars it takes. After it, what is still taken by somebody is
+// left, as before.
+constexpr uint32_t CLEAR_HOLD_MS = 3000;
+
+inline bool KeepHoldingForSeats(bool somebodySeated, uint32_t sinceMs, uint32_t nowMs) {
+	return somebodySeated && nowMs - sinceMs < CLEAR_HOLD_MS;
+}
+
+// A player on foot standing on a car: over its footprint, which its bounding
+// sphere's radius stands for, and from a metre above its centre, which a ped
+// beside it never is (his centre is about as high as the car's), to as high as
+// a bus's roof puts him.
+constexpr float ON_CAR_MIN_HEIGHT_M = 0.9f;
+constexpr float ON_CAR_MAX_HEIGHT_M = 4.5f;
+
+inline bool StandingOnCar(const Vec3 &ped, const Vec3 &car, float boundRadius) {
+	const float dx = ped.x - car.x, dy = ped.y - car.y, dz = ped.z - car.z;
+	const float r  = boundRadius > 1.5f ? boundRadius : 1.5f;
+	return dx * dx + dy * dy <= r * r && dz >= ON_CAR_MIN_HEIGHT_M && dz <= ON_CAR_MAX_HEIGHT_M;
+}
+
+// How far beside the car, across it, a player is put down: clear of its
+// widest side whatever the model, as far out as its bounding sphere goes.
+constexpr float LEAVE_CAR_GAP_M = 1.0f;
+
+inline float LeaveCarDistance(float boundRadius) {
+	return (boundRadius > 1.5f ? boundRadius : 1.5f) * 0.6f + LEAVE_CAR_GAP_M;
+}
+
+// The word that gets each participant's own player out of, or off, a session
+// car the owner's mission takes away: DELETE_CAR with the car's netId and a
+// tag, two int32 literals. A script's DELETE_CAR has one operand and is never
+// on the replay list, so nothing else reads as one.
+constexpr int32_t LEAVE_CAR_TAG          = 0x4C434152;   // "RACL"
+constexpr size_t  LEAVE_CAR_EFFECT_LENGTH = 2 + 2 * 5;
+
+inline MissionEffectBody LeaveCarEffect(uint16_t missionNumber, uint16_t netId) {
+	MissionEffectBody b{};
+	b.missionNumber = missionNumber;
+	b.kind          = MISSION_EFFECT_RUN;
+	b.handleAt      = 0xFF;
+	b.ownerBlip     = -1;
+	size_t n        = 0;
+	b.code[n++]     = static_cast<uint8_t>(scripts::op::DELETE_CAR & 0xFF);
+	b.code[n++]     = static_cast<uint8_t>(scripts::op::DELETE_CAR >> 8);
+	for (int32_t v : {static_cast<int32_t>(netId), LEAVE_CAR_TAG}) {
+		b.code[n++] = scripts::PARAM_INT32;
+		std::memcpy(b.code + n, &v, 4);
+		n += 4;
+	}
+	b.length = static_cast<uint8_t>(n);
+	return b;
+}
+
+// One of those, read back: false for anything else.
+inline bool ReadLeaveCarEffect(const MissionEffectBody &b, uint16_t *netId) {
+	if (b.kind != MISSION_EFFECT_RUN || b.length != LEAVE_CAR_EFFECT_LENGTH ||
+	    EffectOpcode(b) != scripts::op::DELETE_CAR || b.code[2] != scripts::PARAM_INT32 ||
+	    b.code[7] != scripts::PARAM_INT32)
+		return false;
+	int32_t id = 0, tag = 0;
+	std::memcpy(&id, b.code + 3, 4);
+	std::memcpy(&tag, b.code + 8, 4);
+	if (tag != LEAVE_CAR_TAG || id <= 0 || id > 0xFFFF || id == INVALID_NETID)
+		return false;
+	*netId = static_cast<uint16_t>(id);
+	return true;
+}
 
 // ---- the blue markers (the run on 2026-09-24) ---------------------------------------
 //

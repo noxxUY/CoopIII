@@ -5318,7 +5318,9 @@ On every other machine:
   the arm that pays for it can run;
 - the crane cannot see the car: `CCrane::FindCarInSectorList` skips anything
   whose scan code is already the current one, and the car is stamped with it
-  just before each of the two calls (`0x00543FFC`, `0x00544007`);
+  just before each of the two calls (`0x00543FFC`, `0x00544007`). The
+  holder's crane then settles the car and every other machine's crane follows
+  it (§1.62);
 - a safehouse garage closing on it leaves it standing: the store skips a
   `MISSION_VEHICLE` and touches nothing else about it (`0x0042794C`), so an
   engine's own car another machine holds reads `MISSION` for that one call;
@@ -5438,7 +5440,8 @@ leaver's crowd, and from then on its own engine keeps or drops the car by its
 own player and camera. The sender is sent the car and the pedestrians as
 backfill (`S_CarSpawn` / `S_PedSpawn`, tempId 0, the new owner, the dents), so
 it can build a copy when it is near. With nobody to take it, the group goes
-with `S_CarDespawn` / `S_PedDespawn` to everybody but the sender. Remembering
+with `S_CarDespawn` / `S_PedDespawn` to everybody but the sender (since §1.73,
+with `S_CrowdGone`, which a watcher fades out on its screen). Remembering
 who let go is what stops a car neither engine wants being passed back and
 forth at the round trip's rate.
 
@@ -5952,14 +5955,14 @@ from a playtest of Farewell 'Chunky' Lee Chong.
   main.scm holds its own marker (`clienttest`); Marty's payphone and Give Me
   Liberty's two starts have no contact on the radar and still need the
   host there.
-- **The start's radius is 50 m.** The server's claim (`MissionSlot::Claim`)
+- **The start's radius is 5 m (50 m, then 30 m, until 2026-10-01).** The server's claim (`MissionSlot::Claim`)
   counts a player at the start when inside its area grown by
-  `StartMarginMetres(marginCm)`, which is `MISSION_START_RADIUS_M` (50 m)
+  `StartMarginMetres(marginCm)`, which is `MISSION_START_RADIUS_M` (5 m)
   unless the server's `missionMargin` is wider, and no longer the 5 m margin
-  a checkpoint keeps. A friend in his own car across the street, or on foot
-  round the corner, is at the start; 60 m up the road is waited for. For
-  an odd job, whose area is its owner, it is 50 m round the owner, height
-  included. The host needs to be within the same 50 m for a guest to answer
+  a checkpoint keeps. A friend on foot across the street, or
+  round the corner, is at the start; 60 m up the road, or anybody still in a car at a story start, is waited for. For
+  an odd job, whose area is its owner, it is 5 m round the owner, height
+  included. The host needs to be within the same 5 m for a guest to answer
   its locate.
 - **A held start is not let go.** A start the server has not granted is held
   at its 03EE (asked again next frame) rather than answered no, since a no
@@ -6131,7 +6134,7 @@ every screen.
   not let go of him in the last 15 s, `S_AmbientAdopt` (`why` =
   `AMBIENT_ADOPT_LET_GO`) to everybody but the sender, a backfill `S_PedSpawn`
   under the new owner to the sender - and with nobody to take him, the
-  `S_PedDespawn`.
+  `S_PedDespawn` (since §1.73, `S_CrowdGone`, faded where he is seen).
 - The respawn's clear takes every pedestrian before any car, so a driver of
   ours is gone before his car is decided. He waits for it on the host and goes
   its way: in its `C_CarLetGo` when it is handed on, despawned with it when it
@@ -6601,7 +6604,7 @@ model that doesn't exist yet.
 | 0x03 | `S_PLAYER_JOIN` | 1 | `playerId`, `netId`, nickname, model id, transform, then condition: health `float`, armour `float`, weapon `u8`, flags `u8` (`PJF_POS_VALID`, `PJF_DEAD`, and `PJF_ARRIVED` on the live announcement and never on a backfill, which is what the HUD's "X joined" goes by), death anim `u16` (§2.8.1) |
 | 0x04 | `S_PLAYER_LEAVE` | 1 | `playerId`, reason |
 | 0x05 | `C_PLAYER_MODEL` / 0x06 `S_PLAYER_MODEL` | 1 | model id `u16`; `S_` also carries `playerId`. A skin change after the hello, which is how a cheat's skin reaches everybody ([cheats.md](cheats.md)) |
-| 0x07 | `S_SESSION_RULES` | 1 | `flags` `u8` (the welcome's session flags), `maxWanted` `u8` (the most stars anybody may have, 1-6), 2 pad. After every `S_WELCOME`, and to everybody when the host changes a rule (§1.46) |
+| 0x07 | `S_SESSION_RULES` | 1 | `flags` `u8` (the welcome's session flags), `maxWanted` `u8` (the most stars anybody may have, 1-6), `coopCheats` `u8` (CoopIII's own typed cheats: 0 outside missions, 1 always, 2 off; §1.61), 1 pad. After every `S_WELCOME`, and to everybody when the host changes a rule (§1.46) |
 | 0x10 | `C_PLAYER_STATE` | 0 | pos `float[3]`, heading `float`, `m_vecMoveSpeed` `float[3]`, `m_nMoveState` `u8`, `m_nPedState` `u8`, anim `u16` + time `float` + speed `float`, partial anim `u16` + time `float`, health `float`, armour `float`, weapon `u8`, the held weapon's ammo (clip `u16` + total `u32`, §1.9.6), aim yaw/pitch `float[2]`, flags `u8`, the legs: `locoWeight` `u8[5]` + `locoPhase` `u8` (§1.8.4) (77 bytes) |
 | 0x11 | `S_PLAYER_STATE` | 0 | `playerId` + the above |
 | 0x12 | `C_VEHICLE_STATE` | 0 | `netId`, pos `float[3]`, quat `float[4]`, move/turn speed `float[6]`, steer/gas/brake `float[3]`, gear `u8`, health `float`, flags `u8` (`VEH_ENGINE_ON`, `VEH_SIREN`, `VEH_LIGHTS`, `VEH_WRECKED`, `VEH_HORN`, `VEH_TAXI_LIGHT`, `VEH_HANDBRAKE`). With `VEH_WRECKED` set it is a wreck's settle: taken for a destroyed car from its custodian alone, transform only, and dropped for a car that is not a wreck yet (§1.38.3) |
@@ -6651,13 +6654,16 @@ model that doesn't exist yet.
 | 0x59 | `S_VEHICLE_CUSTODY` | 1 | `netId`, `playerId`: who settles a car nobody is driving, `INVALID_PLAYER` for nobody (§1.21). Also sent after every session car's blast, naming whoever decided the wreck, who settles it to rest (§1.38.3) |
 | 0x5A | `S_CAR_PROMOTED` | 1 | `netId`, driver `playerId`, previous host `playerId`, the car's `AmbientCarBody`: somebody got into another machine's traffic and it is a session car now (§1.22) |
 | 0x5B | `C_PED_LET_GO` | 1 | `count` `u8`, 1 pad, `peds` `u16[16]`: pedestrians of the sender's its engine dropped for its own player's sake (walked away from, a respawn, an island left) with another player near them. Answered with `S_AMBIENT_ADOPT` or the despawns (§1.58) |
+| 0x5C | `C_CROWD_GONE` / 0x5D `S_CROWD_GONE` | 1 | `count` `u8`, 1 pad, then 16 rows of `netId` `u16`, `kind` `u8` (`AMBIENT_ADOPT_PED` / `_CAR`), a pad: pedestrians and cars of the sender's its engine gave up on for its own player's sake with nobody near enough to take them. Taken from their owner only, as despawns; `S_` carries the rows taken, and every release of the server's own. A watcher fades a copy on its screen out instead of taking it at once (§1.73) |
 | 0x5E | `C_VEHICLE_COLOUR` / 0x5F `S_VEHICLE_COLOUR` | 1 | `netId` `u16`, `colour1` `u8`, `colour2` `u8`; `S_` carries `playerId` and a pad first. A session car repainted on the engine simulating it, from its driver or settler, once per change. Kept on the car for a joiner's `S_VEHICLE_SPAWN` (§1.59) |
 | 0x60 | `C_ENTERING_VEHICLE` / 0x61 `S_ENTERING_VEHICLE` | 1 | `netId`, the seat the entry ends in `u8`, the door `u8`; `S_` also carries `playerId`. A statement of intent that claims nothing (§1.14.7) |
 | 0x62 | `C_PLAYER_MONEY` | 1 | `money` `i32`, under `money = own` only, on change and at most once a second (§1.47) |
 | 0x63 | `S_PLAYER_SCORE` | 1 | `playerId` `u8`, `kills` `u16`, `deaths` `u16`, `money` `i32`, `flags` `u8`: the scoreboard's row, to everybody on change and to a joiner (§1.47) |
+| 0x64 | `C_PLAYER_VIEW` / 0x65 `S_PLAYER_VIEW` | 0 | `pos` `Vec3`, `fwd` `Vec3`: the sender's camera, four times a second; `S_` carries `playerId` first. Relayed when sane, never kept. Every machine's generators keep out of every camera at close range (§1.73) |
 | 0x68 | `C_PED_DAMAGE` / 0x69 `S_PED_DAMAGE` | 1 | a hit one machine's player landed on a pedestrian another machine hosts: `netId` `u16`, weapon `u8`, amount `float`, piece `u8`, direction `u8` - `CPed::InflictDamage`'s own five arguments less the culprit pointer; `S_` also carries `attackerId` and goes to **the ped's owner alone** (§1.19). The only ambient packet that travels *towards* an owner, so the ownership test is inverted: refused *to* the owner, accepted from anybody else. Friendly fire has no say - a pedestrian is not a player |
 | 0x6A | `C_VEHICLE_HIT` / 0x6B `S_VEHICLE_HIT` | 1 | a hit one machine's player landed on a car another player is **driving**: `netId` `u16`, weapon `u8`, amount `float` — `CVehicle::InflictDamage`'s own three arguments less the culprit pointer; `S_` also carries `attackerId` and goes to **the driver alone** (§1.21). The same inverted ownership test as `C_PED_DAMAGE`, and the exact inverse of `Session::MayReportVehicle`: refused *to* the driver, accepted from anybody else; a car nobody holds becomes the sender's to settle and the hit goes back to it. Weapon `VEHICLE_HIT_PUSH` (`0xFE`) with no amount is a shove: the custody and nothing relayed (§1.21.5). Weapon 18, the blast's own cause, is the thrower of a blast asking for a car nobody holds that it left standing; it comes back like any hit and nobody applies it (§1.38.2). No health, no position, no shot vector. Friendly fire has no say — a car is not a player |
 | 0x6C | `C_CAR_HIT` / 0x6D `S_CAR_HIT` | 1 | the same three fields as `C_VEHICLE_HIT`, for a replica of somebody else's **traffic**; `S_` also carries `attackerId` and goes to **the car's host alone** (§1.23). Refused *to* the host, accepted from anybody else, refused for a wreck or a netId that isn't traffic any more |
+| 0x6E | `C_VEHICLE_BUMP` / 0x6F `S_VEHICLE_BUMP` | 1 | what our car's collision did to our copy of somebody else's car: `netId` `u16` (the car hit), `byNetId` `u16` (the car the sender drives), `move` and `turn` `i16[3]` (change of speed and spin, ×8192 per engine step), `impulse` `u16`, `piece` `u8`, a pad; `S_` carries `attackerId` first. To the car's driver, else its custodian, else for traffic its host, alone; only from the recorded driver of `byNetId`, alive, within 30 m, at most 40 a second (§1.71) |
 | 0x6E-0x6F | - | - | Reserved for the rest of that direction |
 | 0x70 | `C_PED_SPAWN` / 0x71 `S_PED_SPAWN` | 1 | an ambient pedestrian the sender's engine made: a `tempId` `u32` and its `AmbientPedBody`; `S_` also carries the owner and the `netId` the session gave it ([population.md](population.md) §3). `flags` has `AMBIENT_MISSION` for one the session's mission made on its owner's machine ([missions.md](missions.md) §5.3) |
 | 0x72 | `C_PED_DESPAWN` / 0x73 `S_PED_DESPAWN` | 1 | `netId`. Host-only |
@@ -6712,7 +6718,8 @@ model that doesn't exist yet.
 | 0xC4-0xC9 | - | - | Free for breakable objects |
 | 0xCA | `C_PLAYER_LOOK` / 0xCB `S_PLAYER_LOOK` | 1 | the name model 0 is loaded under, `char[24]`, lower case; `S_` also carries `playerId`. Claude's clothes (§1.32). Change-only, kept by the server and backfilled right after the joins |
 | 0xCC | `S_AMBIENT_ADOPT` | 1 | `wasOwnerPlayerId` `u8`, `count` `u8`, `why` `u8` (0 a leaver, 1 a let-go, §1.45, 2 police for a wanted player, §1.47.1), 1 pad, up to 32 rows of `netId` `u16`, `kind` `u8`, `newOwnerPlayerId` `u8`: who hosts each of a leaver's peds and cars now (server/core/adopt.h). Was 0xD0 in 38 |
-| 0xCD-0xCF | - | - | Free for breakable objects |
+| 0xCD | `C_OBJECT_REBUILT` | 1 | `ObjectIdent` of an object this machine rebuilt that it heard was broken (§1.43) |
+| 0xCE | `C_CRANE_STATE` / 0xCF `S_CRANE_STATE` | 0 busy, 1 the end | `CraneStateBody`: `crane` `u8` (the sender's index), `state` `u8` (`m_nCraneState`), `active` `u8`, 1 pad, `netId` `u16` (the car it has), 2 pad, `craneX`, `craneY`, `hookAngle`, `hookOffset`, `hookHeight`, `hookX`, `hookY` `float`. From the machine working a crane while it is busy, at the send rate, and once when it is idle again; `S_` also carries `playerId` and is relayed only from the crane's one worker (§1.62) |
 | 0xD0 | `C_CAMPAIGN_DELTA` / 0xD1 `S_CAMPAIGN_DELTA` | 1 | `CampaignDeltaBody`: `seq` `u32` (the server's number, 0 from a client), `missionNumber` `u16`, `valueCount` `u8`, `threadCount` `u8`, `last` `u8`, 3 pad, `scriptHash` `u32`, 32 values (`offset` `u16`, pad `u16`, `value` `i32`), 8 threads (`label` `i32`, `name` `char[8]`), `opLength` `u8`, 3 pad, `op` `u8[64]` (one instruction the world keeps, as `MissionEffectBody::code`). What the owner's mission left in `main.scm` and the world, sent as it ends; taken from the running mission's owner alone, numbered, kept and sent to everybody. `S_` also carries `ownerId` (§1.30) |
 | 0xD2 | `C_CAMPAIGN_SINCE` | 1 | `seq` `u32`: every kept delta after this one, to the sender alone. Sent when a client first hears `S_MISSION_STATE` |
 | 0xD3-0xD7 | - | - | Reserved for the campaign |
@@ -6848,7 +6855,7 @@ engine's own enter-key rule (`CPlayerInfo::Process`, car search 0x004A0CD0,
 re3 `EvaluateCarPosition`): flat distance, within 2 m of height (0x005F6A60),
 best `(1 - |turn|/2pi) * (reach - distance)`, so the car the player faces wins.
 The engine's reach is 10 m (0x005F6A70), which is for walking to a car to
-take it; the seat key's is 5 m (`SEAT_REACH_M`). The door: on the right side
+take it; the seat key's is 3 m (`SEAT_REACH_M`, 5 m until 2026-10-01). The door: on the right side
 of the car, the back door (seat 3) is asked for first when the player stands
 behind the car's middle.
 
@@ -6882,3 +6889,648 @@ the way `PedSetInCarCB` does, when `m_pVehicleAnim` is empty or already a sit.
 Getting in, getting out, being dragged or jacked out, dying and dead are left
 to their own animations. A boat's wheel has no sit animation in the engine,
 so there it only takes the wrong ones off.
+
+### 1.61 CoopIII's own typed cheats: TPTO, and the server's say over them
+
+Version: 87.
+
+TPTO1 to TPTO8, typed in play like a game cheat, put the typist beside the
+player with that number on the Tab list ([cheats.md](cheats.md) §7). The move
+is the typist's own position, which already goes out in every snapshot, so
+nothing about the move itself is on the wire. What is new is the host's say
+over whether these cheats work at all.
+
+**What changes.**
+
+- `S_SessionRules` (0x07): its first pad byte is now `coopCheats`, a
+  `CoopCheatRule`. `0` lets them work outside missions, `1` during missions
+  too, `2` switches them off. Zero is the default, so an older server's pad
+  reads as it, and a value past `2` reads as the default too
+  (`SaneCoopCheatRule`). The SessionFlags byte has no bits left, which is why
+  this is not in `S_Welcome`. Between a welcome and its `S_SessionRules` a
+  client goes by the default.
+- The server takes it from `coopCheats = outsidemissions | always | off` in
+  `CoopIII-Server.ini` and the options window, and a change of it alone is
+  enough to send `S_SessionRules` to everybody.
+- The server cannot refuse a teleport, so each client keeps the rule itself.
+
+No opcode, no layout moves. A mix misbehaves only by ignoring the setting: an
+older client never reads the byte, and an older server always sends the
+default.
+
+### 1.62 The cranes
+
+Protocol version 88: two opcodes, `C_CraneState` (0xCE) and `S_CraneState`
+(0xCF), the last two of the C0 block. Seen in play: in Dead Skunk In The
+Trunk the crusher crane's hook went for the car on the host's screen and never
+lifted it, and on the guest's it never moved at all.
+
+**Why the hook could not lift the car.** `CCranes::UpdateCranes` runs on every
+machine, each crane over that machine's own copies. §1.44 already lets only
+the machine holding a session car (`MayRemoveCar`: its driver, its custodian,
+whoever drove it last, the host) see it from a crane, so one machine's crane
+did go for it. But a car nobody drives or settles is pinned by every machine
+to the session's last transform after every frame's physics (§1.21), the
+holder's own copy included. The hook reached the car, `CCrane::Update` hung it
+on the hook, and the correction put it back on the ground in the same frame.
+Every other machine's crane stood over a car it was not allowed to see.
+
+**One machine works a crane.** The one whose crane took a car: the car's
+holder. As soon as its crane goes for a car nobody holds, it asks for the
+car's custody with the shove's `C_VehicleHit` (`VEHICLE_HIT_PUSH`, §1.21.5),
+which the server grants as it grants a shove. It keeps the custody while the
+crane has the car, and for the whole settle window again after the drop, so
+the car falls into the crusher on its engine (`CraneHasVehicle` holds it as a
+push does). The custody stream already carries the car to every other screen.
+A crane of ours that finds another machine now holds its car (somebody got
+in, somebody else settles it) lets go of it, with its collision back on, and
+an approach goes back to idle. A car the crusher crane picks up is made
+collision-proof by the engine and never made otherwise; the custody clears
+that bit every frame on a car it settles, so it is put back on a car hanging
+from our crusher crane, and for eight seconds after the drop, before
+`CWorld::Process`.
+
+**Everybody else follows it.** While its crane is busy (going for a car,
+carrying it or dropping it) the worker sends `C_CraneState` at the send rate
+on the snapshot channel: the hook's angle, reach and height, where its swing
+has it, the state, and the car's netId. When the crane is idle with nothing on
+it again it sends one with `active` 0 on the reliable channel. The server
+takes a crane's states from one machine at a time (`server/core/cranes.h`):
+the first busy state makes its sender the worker, everybody else's are dropped
+until the worker's end, two seconds of silence, or the worker leaving, when
+the server says the end itself. A crane is named by where its building stands,
+since `CCranes::aCranes` comes from each machine's own save.
+
+A receiver stops calling `CCrane::Update` for that crane (its one call, in
+`UpdateCranes`, is redirected) and writes the state in its place: the hook's
+three numbers and its place, the state, and `m_pVehiclePickedUp` as its own
+copy of the car, held by a registered reference. Then it runs what the end of
+every `Update` runs: the building turned to the hook's angle and
+`SetHookMatrix`. A crane of its own that was busy too, in the same round trip,
+lets go of its car. On the end, or after `CRANE_FOLLOW_TIMEOUT_MS`, the crane
+is put back to idle with no car and runs its own `Update` again.
+
+**What a mission hears.** A mission's checks run on its owner's machine,
+which need not be the one working the crane. `IS_CAR_PICKED_UP_BY_CRANE`
+reads the crane's car and state, which are now the followed ones there, so it
+says yes as the car goes up on any machine. `IS_CAR_CRUSHED` compares the
+script's handle with `CGarages::CrushedCarId`, which only the crushing engine
+writes: a machine told by `S_VehicleRemoved` that another machine's crusher
+took a car now writes its own handle for the car there before the despawn
+deletes it, so the owner's `IS_CAR_CRUSHED` says yes ahead of the
+`IS_CAR_DEAD` it would otherwise hear for a car that has gone.
+
+A mix misbehaves only by missing things: an older server drops the states and
+every crane is each machine's own again, and an older client never sends or
+reads them.
+
+Not run in-game. What a game has to show: the crusher crane lifting a car
+parked by either player, the hook and the car moving on both screens, Dead
+Skunk In The Trunk and The Crook passing when either player delivers the car,
+and the emergency crane at the docks the same way.
+
+### 1.63 A session car the owner's mission clears away
+
+Protocol version 89. No opcode and no layout moves.
+
+**What was wrong.** Cipriani's Chauffeur opens with `CLEAR_AREA` 15 m round
+Joey's door, which in single player takes away the car its player arrived
+in. A car a player has driven is a session car, and every copy of one is a
+locked `MISSION_VEHICLE` on every machine but the one whose engine made it,
+so no machine's clear took it, and that one might have had its player in it
+or standing on it. The car stayed in front of the garage and Toni's could not
+drive out. A mission's `DELETE_CAR` on a session car deleted the owner's copy
+alone, and the session rebuilt it there.
+
+**The word.** The owner's machine decides which session cars its mission's
+`CLEAR_AREA` or `DELETE_CAR` takes (mission-audit.md R4c) and says, for each,
+a `C_MissionEffect`: `MISSION_EFFECT_RUN`, `onlyTo` 0, the code DELETE_CAR's
+opcode (`A6 00`) followed by two int32 literals, the car's netId and
+`LEAVE_CAR_TAG` (`0x4C434152`), twelve bytes (`game/mission.h`,
+`LeaveCarEffect`). A script's own `DELETE_CAR` has one operand and is not on
+the replay list, so no other effect reads as this one. A participant runs
+nothing: it puts its own player out of its copy of that car, or off the roof
+of it, beside it on the ground, and drops the word.
+
+**The removal.** The owner's mission holds the instruction while another
+player still sits in one of those cars, by the session's seat or by his copy
+here, 3 s at most (`CLEAR_HOLD_MS`). Then the owner's machine deletes each
+car nobody sits in and sends `C_VehicleRemoved` with
+`VEHICLE_REMOVED_MISSION` (1.44). The server already takes that from any
+player for a car nobody else is driving, drops the row, and every other
+machine deletes its copy, the one whose engine made the car included. It is
+not the holder's engine taking the car here but the owner's mission, so
+`MayRemoveCar` is not asked.
+
+**The clear itself.** While the owner's `CLEAR_AREA` runs, and while each
+participant's replay of it runs, every session car on that machine is locked
+for the length of the instruction. `CWorld::ClearExcitingStuffFromArea`
+skips a locked car (`0x004B4FAF`, before `CanBeDeleted` at `0x004B4FC4`), so
+no engine takes a session car by its own clear: not one with its player in
+it, whom its car loop would remove with the car, and not one the session
+would build again.
+
+**A mix** cannot connect; were one to, an older participant would drop the
+word as an instruction it cannot run and stay in the car, which the owner's
+mission would then leave standing, as before.
+
+### 1.65 Joey's and El Burro's missions
+
+Protocol version: 90. No opcode and no layout moves
+(`docs/mission-audit.md` §3, Joey and El Burro).
+
+**Five more instructions replayed.** Each goes as a `C_MissionEffect` the way
+the list's others do (1.29), its operands as values:
+
+| Instruction | Handler | Operands | Why |
+|---|---|---|---|
+| `ADD_BLIP_FOR_CAR_OLD` (0161) | `0x0043F8BD` | car, colour, display, the blip | Turismo's three racers were marked on the owner's radar alone |
+| `ADD_BLIP_FOR_PICKUP` (03DC) | `0x0044F600` | pickup, the blip | I Scream, You Scream's briefcase |
+| `ADD_SPRITE_BLIP_FOR_PICKUP` (03DD) | `0x0044F696` | pickup, sprite, the blip | Chunky's Colt behind Ammu-Nation |
+| `GIVE_PLAYER_DETONATOR` (037F) | `0x0044C9A7` | none | I Scream's remote, which any participant may press (1.36) |
+| `SET_CAN_RESPRAY_CAR` (0294) | `0x00444C25` | car, on/off | Lips' car keeps its paint through a helper's Pay'n'Spray |
+
+The car is a netId and the pickup the owner's handle, translated through the
+participant's pickup map as a blip is through its blip map. Both pickup
+blips read `aPickUps[i].m_pObject` with no test of the slot or the object,
+so a participant runs one only on a pickup of its own still standing with
+its object (`PickupObjectUp`), and only with a sprite inside `RadarSprites`
+(0..20). The blips go into the blip map as every other made blip does, and
+the racers' join the blips put back for the same car (`AddNamesEntity`).
+
+**A helper's lock-up, heard before the car goes.** Nothing new travels. A
+`C_VehicleRemoved` with `VEHICLE_REMOVED_MISSION` from another participant,
+for a car one of the owner's `GARAGE_MISSION` garages is waiting on
+(`GARAGE_TARGET`), now marks that garage as holding the car on that
+participant's machine at once (`MissionSync::CarDeliveredElsewhere`), the
+bit their next `C_MissionAnswers` says anyway. The despawn right behind the
+removal deletes the owner's copy, and Van Heist asks `IS_CAR_DEAD` of the
+van right after its lock-up's question; the answers come every eight frames,
+so the van read as wrecked first and the mission failed.
+
+**A mix** cannot connect; were one to, an older participant would drop the
+five instructions as ones it cannot run, as before.
+
+### 1.67 Asuka's Staunton missions
+
+Protocol version: 91. No opcode and no layout moves
+(`docs/mission-audit.md` §3, Asuka in Staunton, step by step).
+
+**One more instruction replayed.** It goes as a `C_MissionEffect` the way the
+list's others do (1.29), its operand as a value:
+
+| Instruction | Handler | Operands | Why |
+|---|---|---|---|
+| `TURN_PHONE_OFF` (024E) | `0x004447B2` | the phone | Payday For Ray switches its four phones off at the end; a participant who never lifted his copy of one had it ring on after the mission with Ray's old directions |
+
+The handler gives `SetPhoneMessage_JustOnce` (`0x0042FF90`) no message, which
+takes the phone's message away, and indexes `m_aPhones[50]` with no test, so
+a phone outside 0..49 is not run (`OperandsInRange`), as `SET_PHONE_MESSAGE`
+already was. The phones are the main script's own, made by init.sc in the
+same order on every machine, so the owner's index names each machine's own.
+
+**Nothing else travels.** The rest of what these missions needed is answered
+on the owner's machine from what it already has: Paparazzi Purge's "the
+player near the spy boat" for the participant nearest it
+(`game/nearchar.h`), Salvatore's garage kept open by anybody inside it,
+whom Luigi's guards spotted, and Two-Faced Tanner's clears sparing a car a
+participant sits in (`game/standin.h`).
+
+**A mix** cannot connect; were one to, an older participant would drop
+`TURN_PHONE_OFF` as an instruction it cannot run, as before.
+
+### 1.71 Ramming a car another machine simulates
+
+Version 92. Two opcodes, `C_VehicleBump` (0x6E) and
+`S_VehicleBump` (0x6F).
+
+Every copy of a car another machine simulates - another player's, one
+somebody is settling, somebody's traffic - is put where its owner says after
+every frame of physics. Whatever our car's collision did to the copy was
+undone the same frame, so the copy stood like a car bolted to the road and
+our car bounced off it; the owner's engine never heard of the hit at all
+when its own copy of our car, a snapshot late, missed. Now the hit goes to
+the owner and the copy moves on our screen meanwhile.
+
+**What the collision did, measured on our side.** `CWorld::Process` runs
+every moving entity's `ProcessControl` (slot 8) over the whole list and only
+then the collision passes (slot 9), with no direct call between the two.
+CAutomobile's slot 8 is swapped in `.rdata` for a function that calls the
+slot's own value and then notes the car's move and turn speed
+(`game/bump.h`, `SpeedSamples`); `ProcessControl`'s own bytes are untouched.
+After physics, a copy's speed less that note is what the frame's collisions
+did to it, with its own driving, gravity and suspension already counted. Its
+damage record is this frame's too: `CPhysical::ProcessControl` clears
+`m_fDamageImpulse`, `m_pDamageEntity` and `m_nDamagePieceType` (`0x00495F6F`)
+inside slot 8, after `VehicleDamage` (`0x00531FE3`) has read them. A note is
+read once, so a paused frame does not read one collision twice.
+
+**The rammer.** After physics and before the correction
+(`Client::TrackCopyContacts`), a copy whose damage entity is the car our
+player is at the wheel of, with an impulse of at least 5, is ours for a
+moment: not corrected and not given its owner's speed for 600 ms after the
+last contact (3 s at most however long the shoving goes on), then blended
+back onto its owner's stream over 400 ms - the offset taken off, the
+rotation slerped - or snapped as always when the two are a teleport apart.
+What the collision did is summed and sent as `C_VehicleBump`, at most every
+100 ms a car, with the netId of the car we drive. A car nobody holds is only
+kept loose: the shove (§1.21.5) already asks for its custody and our engine
+moves it from there. Our copy stays collision-proof throughout, so it takes
+no dent here.
+
+**The server** (`Session::VehicleBumpRecipient`) takes it only from the
+recorded driver of `byNetId`, alive, and sends it on by the rule a hit
+follows: a session car to its driver or custodian, traffic to its host,
+never to the sender, never for a wreck or a car nobody holds. The two cars
+have to be within 30 m on the session's record, and a player gets 40 a
+second.
+
+**The owner** holds a bump 250 ms (`BUMP_HOLD_MS`) - its copy of our car is
+100 ms late, so if its own engine is going to see the same collision it sees
+it inside that - and drops it if its engine had the two cars touching from
+250 ms before the bump arrived on. Every machine notes those touches off the
+same damage record: a copy whose damage entity is a car this machine drives,
+settles or hosts. Otherwise the change of speed and spin goes straight onto
+its car (bounded to 50 m/s and half a radian a step), as `ApplyMoveForce` and
+`ApplyTurnForce` would have put it, provided our copy of the rammer is within
+20 m of it. Either way each real car takes the one collision.
+
+**Damage is not counted twice.** The impulse goes into the owner's car's own
+damage record, when it is bigger than what the frame already has, with no
+culprit; its own `VehicleDamage` dents it on the next `ProcessControl` and the
+dents and health travel the way they always did (`docs/cardamage.md`). Our
+copy was collision-proof and dented nothing; when the owner's own engine had
+the collision, the bump is dropped with its impulse.
+
+**Not done.** A traffic car of ours or another machine's hitting a player's
+car is not forwarded: only a car a player drives sends bumps. Not run in a
+game: the feel of the window and the blend, and whether the hold is long
+enough over a real connection, are unmeasured.
+
+**A mix** cannot connect; were one to, an older server would drop the bump
+and the car would stand like a wall on the rammer's screen, as before.
+
+### 1.72 Custom skins
+
+Version 93. Two opcodes, `C_PlayerSkin` (0x08) and
+`S_PlayerSkin` (0x09), and `S_SessionRules`' spare byte, now `skins`.
+
+The skin from Options > Player Setup is a BMP in the game's `skins` folder,
+which the engine keeps as `CWorld::Players[0].m_pSkinTexture`. Nothing ties
+it to a ped: `CVisibilityPlugins::RenderPlayerCB`, the render callback of
+every atomic of a clump built from a model named `player`, writes it over
+the clump's materials before each draw (`client/src/game/addresses.h`, "the
+player's skin"). Every remote player built from that model wore our skin, so
+a player in `playa` saw everybody in `playa`.
+
+**On our screen.** Every frame, after the roster has built its peds, each
+remote player's ped has its atomics' render callback swapped, where it is
+`RenderPlayerCB`, for one of ours (`game/skin.cpp`, `SkinRenderCB`). That
+one puts the player's own texture in `m_pSkinTexture`, calls
+`RenderPlayerCB`, and puts ours back. No code is patched and nothing else is
+touched: the local player, the cutscene head and the Player Setup preview
+keep the engine's callback and our skin. A remote player whose skin has not
+come in, or every remote player while the rule is off, wears the game's
+default skin (`CPlayerSkin::GetSkinTexture("$$\"\"")`,
+`models\generic\player.bmp`), never ours. The textures are made in memory,
+one per player, with the calls `GetSkinTexture` itself makes; nothing is
+written to the skins folder. A texture replaced or dropped while a ped still
+shows it is not freed under it: the material holds a reference of its own.
+
+**On the wire.** A skin is a `SkinInfo` and a payload (`protocol.h`,
+`coopiii/skin.h`):
+
+| format | payload |
+|---|---|
+| `SKIN_FORMAT_DEFAULT` | nothing: the game's own default skin |
+| `SKIN_FORMAT_PALETTE` | 256 RGB colours, then one index a pixel, top row first |
+| `SKIN_FORMAT_RGB` | three bytes a pixel, top row first |
+
+Each side is a power of two from 16 to 512, so the most a skin is is 768 KiB;
+the game's own are 256x256 and fit a palette, 65 KiB. The sender reads its
+BMP (uncompressed, 4, 8, 24 or 32 bits) and decodes it, so no receiver ever
+parses a file from somebody else. The payload goes in 1 KiB pieces, in
+order, on `CH_EVENT`, each with the info again, at 128 KiB a second at most
+with 16 KiB at once after a pause. `hash` is the payload's FNV-1a. A new
+skin has a new `serial` and starts again from its first piece. The sender
+looks at the name its game wears once a second and sends again when Player
+Setup changes it; a file it cannot read, or one that is not a size the wire
+takes, goes as the default skin.
+
+**The server** (`server/core/skinrelay.h`) checks every piece: the format,
+the size, the payload's length for both, that the piece starts where the
+last ended and is as long as it must be, and the hash once the last is in.
+Anything else throws away what it held of that skin. Only a whole skin is
+kept, one per player, and only then sent on, as `S_PlayerSkin`, to everybody
+else and to whoever joins later, after their join. What goes to each player
+is paced on its own and takes turns between the skins it is owed; a skin
+that changes on its way to somebody starts again for him. A player's skin
+goes with him.
+
+**The rule.** `syncCustomSkins` in `CoopIII-Server.ini`, on by default, is
+`S_SessionRules::skins`: `SKIN_RULE_SYNC` (0) or `SKIN_RULE_OFF`. Off, the
+server forgets every skin and drops every piece, and each client stops
+sending and puts every remote player in the default skin. Back on, each
+client sends its own again.
+
+**Not run in a game.** The wire, the relay, the pacing and the BMP reader
+are tested; the textures and the callback swap rest on the retail
+instructions clienttest checks, but have not been seen drawn.
+
+**A mix** cannot connect; were one to, an older server would drop the
+pieces and every remote player would wear the default skin, which is no
+longer ours.
+
+### 1.73 Nothing synced appears or disappears in front of a player
+
+Version 94. Four opcodes: `C_CrowdGone` (0x5C) and
+`S_CrowdGone` (0x5D), the last two of the custody block, and `C_PlayerView`
+(0x64) and `S_PlayerView` (0x65), out of the free run after the scoreboard
+pair. `client/src/game/crowdfade.h` is the rule.
+
+**What was wrong.** Two players reported cars and pedestrians vanishing, or
+popping into existence, right in front of them: when the machine that hosts
+them drove off, died, went far or left. §1.45 and §1.58 hand a car or a
+pedestrian its host's engine drops to another player near it, and a log of a
+two-player run shows them working: the host handed on almost every car and
+most of the crowd it dropped with the other player near. What was left came
+from three places, and the same log shows each of them.
+
+- **A drop nobody could take was a despawn.** The session hands a let-go to
+  the nearest player who has not let go of it in the last 15 s, and the
+  adopter can only convert a copy it has built. A car the two engines both
+  dropped (the second one inside the 15 s), a pedestrian of a type a copy
+  cannot become (a cop, a gang member: both were in the log, 76 to 97 m from
+  the other player and "despawned"), a copy still streaming, a full table, and
+  a leaver's crowd nobody was within reach of: each went as `S_CarDespawn` or
+  `S_PedDespawn`, and the watcher took its copy away the frame it heard,
+  whether he was looking at it or not. The watcher's own log counted, every
+  30 s, between 5 and 40 copies of cars built within 195 m of him that their
+  hosts despawned.
+- **A copy was built at full alpha the frame its spawn arrived**, wherever
+  that was.
+- **A host's generators know one camera.** `CCarCtrl::GenerateOneRandomCar`
+  deletes a car it made on screen nearer than 90 m to its own camera, and
+  `CPopulation::AddToPopulation` adds no pedestrian in view nearer than 40 m
+  (`addresses.h`, "how the engine keeps its own crowd from popping"). Behind
+  its own player, off its own screen, the traffic generator makes cars out to
+  50 m and the pedestrian one out to 25 m. For the player standing beside him
+  looking the other way, that is the middle of his screen.
+
+The engine itself never pops its own crowd on its own screen: both generators
+build what they make at clump alpha 0 and `ProcessControl` raises it 16 a
+frame; both reapers take what is off the screen at once and only set
+`bFadeOut` on what is on it, which `ProcessControl` lowers 8 a frame, and
+remove it when the alpha is gone. This change runs those same three rules
+against every camera in the session.
+
+**A drop nobody can take fades.** A host whose engine drops a car or a
+pedestrian of its own for its own player's sake (the distance reaper, a
+respawn's clear, an island left behind: `game/carletgo.h`) and finds nobody
+near enough to hand it to sends `C_CrowdGone` instead of the despawn, with the
+pedestrians of its own sitting in that car beside it. The server takes each
+row from its owner only, exactly as it takes a despawn, and tells everybody
+else with `S_CrowdGone`. Its own releases go the same way: a let-go nobody can
+take (§1.45, §1.58), a leaver's crowd nobody is near (`HandOverAmbientOf`), a
+police handover it refuses. So does an adopter that cannot take what it was
+given. A despawn for any other reason stays a despawn: a claim, a script's
+clear, a crusher, a wreck reaped, a full pool. What replaces those is often
+standing on the same spot.
+
+The watcher, for each row, pedestrians first: a copy off its screen
+(`CEntity::GetIsOnScreen`, the reapers' own test) goes at once, and so does
+the mission's and a car a player is in or at the door of; a copy on its screen
+stays built, belongs to nobody from then on (no row moves it, nothing builds it
+again), gets `bFadeOut` and is faded out over 700 ms on the watcher's own
+clock, then goes. It goes at once if it leaves the screen first, or if the
+session names somebody new with its netId (`OnPedSpawn`, `OnCarSpawn`), so a
+name is never held by two things. A car's fading riders go before it, still
+in their seats.
+
+**Every copy fades in.** The frame a copy is built (a first build, back into
+reach, rebuilt after the engine took one), its clump alpha is 0, and it comes
+up to 255 over 400 ms. `bFadeOut` is clear meanwhile, so `ProcessControl`'s
+own +16 goes the same way where it runs; a copy that sleeps and never runs it
+is raised by the client.
+
+**A fresh copy inside our view waits.** A live spawn (not a backfill) of
+another machine's car or pedestrian on foot, never built here, inside our own
+camera's view nearer than the engine's 90 m or 40 m, is held unbuilt until it
+is out of view or farther, and for no more than 8 s. A pedestrian in a car
+goes with the car. Meanwhile it is an unbuilt row like one out of reach, so our
+own generators keep off its spot (§1.58).
+
+**And the hosts keep out of everybody's view.** Every client sends its
+camera, `TheCamera`'s position and forward axis (`addresses.h`,
+`TheCamera__Position`, `TheCamera__Forward`), four times a second as
+`C_PlayerView`; the server relays it, sane, as `S_PlayerView` with the
+player's id, and keeps nothing. The four spot tests §1.58 took
+(`SPAWN_SPOT_TESTS`) now also refuse a spot that is inside another player's
+view nearer than the engine's own limit for what is being made: 90 m from his
+camera for a car, 40 m for a pedestrian. Which generator is asking is known
+from which of the two wrappers the test is inside
+(`GenerateOneRandomCarWithRoom`, `AddToPopulationCountingCopReplicas`). A view
+is a flat cone of 60 degrees either side of the camera's forward axis, wide
+enough for a widescreen field of view and a quarter of a second of turning;
+a camera looking straight down sees all round. A view not heard from for 2 s
+counts for nothing.
+
+**What does not change.** Who owns what: a fading copy is nobody's, and is
+never announced; one entity has one owner and one netId throughout. The
+handover rules of §1.45 and §1.58. The mission's own pedestrians and cars,
+which never fade, never wait and are never handed on. The pools: a fading copy
+holds its slot for 700 ms at most, a held one holds none.
+
+**Logs.** On the host, the 30 s reaper line adds how many cars and
+pedestrians went out to fade; the generators say every 30 s how many spots
+they passed over inside somebody's view. On a watcher, the first four fades
+are described, and every 30 s a line says how many faded on screen, how many
+went at once off it, and how many fresh copies were held back.
+
+#### 1.73.1 Packets
+
+| Op | Name | Ch | Body |
+|---|---|---|---|
+| 0x5C | `C_CROWD_GONE` | 1 | `count` `u8`, 1 pad, `rows[16]` of `netId` `u16`, `kind` `u8` (`AMBIENT_ADOPT_PED` / `_CAR`), 1 pad (71 bytes) |
+| 0x5D | `S_CROWD_GONE` | 1 | the same, the rows the server took (71 bytes) |
+| 0x64 | `C_PLAYER_VIEW` | 0 | `pos` `Vec3`, `fwd` `Vec3` (29 bytes) |
+| 0x65 | `S_PLAYER_VIEW` | 0 | `playerId` `u8`, then the same (30 bytes) |
+
+A mix cannot connect; were one to, an older server would drop all four: the
+crowd would pop as before, and no generator would know where anybody else
+looks.
+
+Not run in-game. What a run has to confirm: that a car the other player's
+engine drops in front of you, with nobody to take it, fades rather than
+vanishes; that standing beside the other player and looking the other way,
+nothing appears out of nothing in front of you; that a respawn and a
+disconnect of the other player leave the street fading out rather than empty
+in a frame; and that no copy is left invisible (a copy that never came up to
+full alpha would be).
+
+### 1.74 Shattered glass
+
+Version 95. Two opcodes, `C_GlassBroken` (0xE6) and
+`S_GlassBroken` (0xE7), out of the free pair after the money block, and one
+bit, `OBJ_BREAK_GLASS`, in an `ObjectBreakBody`'s state. `docs/objects.md` §10
+is the investigation, `client/src/game/glass.h` the rule.
+
+**What was wrong.** A shop window shattered on one screen and stood on the
+other. A window is a map object named the way a lamp post is, but `object.dat`
+gives every glass model a damage effect of 0, so the street object seam
+(§1.43, `objects.md`) never saw one: `CGlass::WindowRespondsToCollision`
+shatters it and nothing else. Of its four callers, a blast agrees on every
+machine, but a collision is run for real only by the colliding car's owner, and
+a round on a window already cracked shatters it one time in four by
+`CGeneral::GetRandomNumber`, which each machine rolled for itself when it
+replayed the shot.
+
+**What changed.** The four calls are redirected at their sites. A machine whose
+engine shatters a window sends `C_GlassBroken` with the window's
+`ObjectIdent` (model and IPL placement) and what the engine was handed: amount,
+speed, impact point, the explosion flag. The server relays it as
+`S_GlassBroken` to everybody else, who run the same function with the same
+arguments on their copy, with the engine's own panes and sound; a copy that is
+a dummy (nobody near) or already broken does nothing. A machine replaying
+somebody else's round, on foot or from a car or a rifle, does not roll the one
+in four: the shooter's machine did, and its shatter arrives. A shatter applied
+off the wire never goes back out. Two machines that both shattered the same
+window both send it, and the second is a no-op wherever it lands, because the
+engine itself refuses a broken window.
+
+The server also keeps it, as the window's object record with
+`OBJ_BREAK_GLASS` for its state, while any player is within 120 m (§1.43's
+records). A joiner is sent it in the backfill and a machine that builds the
+window again after going 80 m away asks for it with `C_ObjectRebuilt`; both get
+the ordinary `S_ObjectBroken` stamped with nobody, which the client hands to
+the glass half to latch the window as the engine leaves it, without panes or
+sound. When nobody is near, the engine's own re-stream builds every copy whole
+and the record is gone.
+
+**Car glass did not need anything.** A car's only glass in retail III is the
+windscreen, which is panel 4 of `m_panelStatus`, already sent whole by whoever
+simulates the car and applied through `SetPanelDamage` on node `13h` (§1.11,
+`cardamage.md` §3.1).
+
+#### 1.74.1 Packets
+
+| Op | Name | Ch | Body |
+|---|---|---|---|
+| 0xE6 | `C_GLASS_BROKEN` | 1 | `ident` (`Vec3` placement, `modelIndex` `i16`, 2 pad), `speed` `Vec3`, `point` `Vec3`, `amount` `f32`, `flags` `u8` (`GLASS_BREAK_EXPLOSION`), 3 pad (53 bytes) |
+| 0xE7 | `S_GLASS_BROKEN` | 1 | `playerId` `u8`, then the same (54 bytes) |
+
+`OBJ_BREAK_GLASS` (`1 << 3`) is written by the server only, into a record.
+
+A mix cannot connect; were one to, an older server would drop the shatter and
+every window would break on one screen, as before.
+
+Not run in-game. What a run has to confirm is in `objects.md` §10.6.
+
+### 1.75 What the mission lets go of
+
+Version 96. Two opcodes: `C_MissionRelease` (0x0E) and
+`S_MissionRelease` (0x0F), the end of the free run after the skin pair.
+`client/src/game/missionclear.h` is the rule.
+
+**What was wrong.** In Taking Out The Laundry the mission's cars (netIds 410 to
+412) went on the owner's screen and stayed on the other player's. A copy marked
+`AMBIENT_MISSION` is built wherever it stands and never fades, and nothing
+told it that its owner's engine had stopped holding it. Three ways led there.
+
+- **Taken away, and the copy popped or stayed.** `DELETE_CAR`, a
+  `CLEAR_AREA`, the cars of a failed try, the crusher: each reached the others
+  as a despawn, and the despawn of a mission copy removed it in the frame it
+  was heard, in view or not. Where the despawn was lost, nothing removed it.
+- **Let go of and kept.** `MARK_CAR_AS_NO_LONGER_NEEDED`, and the mission's
+  cleanup on a pass or a fail, make what is left ordinary traffic on the
+  owner's machine. Nothing travelled for that, so every other copy stayed the
+  mission's for ever.
+- **The car the player merely drove.** `CPed::m_pMyVehicle` stays on the last
+  car a ped left, and the check that keeps a player's car off the removal
+  path read it as "he is in it", so every car he had ever got out of was
+  kept on his screen when its owner took it away.
+
+**What changes.**
+
+- The owner sends `C_MissionRelease` with a row for each pedestrian and car it
+  hosts as the mission's that its engine no longer holds as created by the
+  mission. The server clears `AMBIENT_MISSION` on each row the sender owns and
+  tells everybody else with `S_MissionRelease` (`gone` 0): the copy is
+  ordinary crowd from then on.
+- After the owner's mission ends, one more batch with `final` set. Whatever the
+  owner still hosts as the mission's goes in it as released first (it waits
+  up to 2 s for names still on their way back); then, unless a mission of the
+  owner's runs again, the server removes every row of the owner's still marked
+  `AMBIENT_MISSION` and sends it with `gone` 1.
+- A copy that goes, by that or by a despawn of one that was the mission's,
+  fades out on the watcher's screen as `crowdfade.h` fades the crowd, and goes
+  at once when it is off it. A car our player is in or at the door of is
+  handed to the engine instead, as every despawn does. Only a car he is in
+  or entering or leaving counts, no longer one he merely drove last; the same
+  test keeps a left-behind mission car from being cleared under him.
+- A retry starts with nothing of the last try's, on every machine.
+
+#### 1.75.1 Packets
+
+| Op | Name | Ch | Body |
+|---|---|---|---|
+| 0x0E | `C_MISSION_RELEASE` | 1 | `count` `u8`, `final` `u8`, `rows[16]` of `netId` `u16`, `kind` `u8` (`AMBIENT_ADOPT_PED` / `_CAR`), `gone` `u8` (unused) (71 bytes) |
+| 0x0F | `S_MISSION_RELEASE` | 1 | `count` `u8`, `ownerPlayerId` `u8`, the same rows, `gone` set (71 bytes) |
+
+A mix cannot connect; were one to, an older server would drop both, and a copy
+would stay the mission's until its despawn came, as before.
+
+Not run in-game. What a run has to confirm: the cars of Taking Out The
+Laundry go from the guest's screen when the host's script removes them, and
+fade if they were in view; at the end of the mission, pass or fail, none of
+its cars is left on either screen but one a player is in; the retry starts
+clean; a car the guest drove and got out of goes when the host's script
+removes it.
+
+### 1.76 A pedestrian's talk and wait-state animation
+
+Version 97. Two opcodes: `C_PedOverlay` (0x0A) and `S_PedOverlay`
+(0x0B), out of the free run after the skin pair. `client/src/game/ped.cpp`
+(`ReadPedOverlayAnim`, `ApplyReplicaOverlay`) and `population.cpp`
+(`DrainAmbientOverlays`) are the code.
+
+**What was wrong.** In Chaperone, when Maria buys from the dealer, the two
+stand and talk on the owner's screen and not on the guest's. The script does it
+with `SET_CHAR_WAIT_STATE` (0372, `WAITSTATE_PLAYANIM_CHAT`, 10 s), and
+`CPed::SetWaitState` blends `ANIM_STD_CHAT` (0Bh), an `ASSOC_REPEAT | ASSOC_PARTIAL`
+animation, over the ped's idle. The ped stream's `animId` is the strongest
+whole-body animation (`ReadDominantAnims`' base), and a partial is never that,
+so the copies kept the idle and stood with their arms down. The same goes for
+the other wait states that are animations: hail a taxi (0Ch), duck (A3h), hands
+up (A7h) and cower (A8h). `CPed::SetWaitState` loads exactly these five ids
+(`addresses.h`, `WAIT_STATE_ANIM_LOADS`, each checked against the exe).
+
+**What it is now.**
+
+- The host reads, for each pedestrian it hosts that the session has named, the
+  strongest of those five still blended in on its clump. When that changes it
+  sends `C_PedOverlay` with the ped's `netId` and the id, or `ANIM_NONE` when
+  it stopped, and again every 2 s while it holds, so a copy that was built late
+  or whose own engine took the overlay off gets it back.
+- The server relays it to everybody but the sender, if the sender hosts that
+  pedestrian and the id is one of the five or `ANIM_NONE`. Nothing is kept.
+- A copy records the id (`RemoteAmbientPed::overlayId`) and
+  `ApplyAmbientPedState` puts it on the clump every frame, only blending when it
+  is not live already, with `CPed::SetWaitState`'s own 4.0 blend. `ANIM_NONE`
+  fades it out. The id is checked again on the client, because it is handed to
+  `CAnimManager::BlendAnimation`.
+
+It covers every scripted talk or wait state of a mission pedestrian and of an
+ambient one, not Maria and the dealer alone.
+
+| Op | Name | Ch | Body |
+|---|---|---|---|
+| 0x0A | `C_PED_OVERLAY` | 1 | `netId` `u16`, `animId` `u16` (0Bh, 0Ch, A3h, A7h, A8h, or `ANIM_NONE`) |
+| 0x0B | `S_PED_OVERLAY` | 1 | the same, to everybody but the host |
+
+A mix cannot connect; were one to, an older server would drop both and the
+copies would stand quiet, as before.
+
+Not run in-game. What a run has to confirm: Maria and the dealer both talk on
+the guest's screen for the ten seconds the script gives each, and stop when it
+ends; a copy built while they are talking joins in within two seconds.
